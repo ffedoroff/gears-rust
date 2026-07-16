@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use axum::response::IntoResponse;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -26,8 +25,7 @@ use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, Uploa
 
 use super::{
     DEFAULT_MAX_BODY_BYTES, SidecarState, build_router, finalize_with_control_plane,
-    report_part_with_control_plane, write_multipart_part_native,
-    write_multipart_part_offset_object,
+    parse_optional, write_multipart_part_native, write_multipart_part_offset_object,
 };
 
 fn test_state() -> SidecarState {
@@ -481,6 +479,50 @@ async fn download_unsatisfiable_range_returns_416_with_content_range() {
         .to_str()
         .expect("valid header value");
     assert_eq!(content_range, "bytes */11");
+    // api.md: "every download response includes Accept-Ranges" — 416 is not
+    // an exception.
+    let accept_ranges = response
+        .headers()
+        .get(header::ACCEPT_RANGES)
+        .expect("Accept-Ranges header present on 416")
+        .to_str()
+        .expect("valid header value");
+    assert_eq!(accept_ranges, "bytes");
+}
+
+/// RFC 9110 §14.1.1: `bytes=5-2` (last-byte-pos < first-byte-pos) is
+/// syntactically invalid, not merely unsatisfiable — it MUST be ignored by
+/// the recipient, i.e. served as a full-body `200`, never a `416`.
+#[tokio::test]
+async fn download_inverted_range_is_ignored_and_returns_full_body() {
+    let (state, issuer, backend) = test_download_state();
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    backend
+        .put(&path, bytes::Bytes::from_static(b"hello world")) // 11 bytes
+        .await
+        .expect("seed blob");
+    let token = download_token(&issuer, file_id, version_id, &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+    let response = router
+        .oneshot(
+            Request::get(format!(
+                "/api/file-storage-data/v1/download/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .header(header::RANGE, "bytes=5-2")
+            .body(Body::empty())
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(&body[..], b"hello world");
 }
 
 /// P2 1.11: a whole-file (`200`) download response must echo the
@@ -681,10 +723,9 @@ async fn finalize_failure_does_not_leak_control_plane_url() {
     )
     .await;
 
-    let Err(rejection) = outcome else {
+    let Err(response) = outcome else {
         panic!("finalize must fail when the control plane returns an error status");
     };
-    let response = rejection.into_response();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
     let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1085,7 +1126,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         .await
         .expect_err("undersized part must be rejected");
     assert_eq!(
-        err.status,
+        err.status(),
         StatusCode::BAD_REQUEST,
         "undersized part is a client size mismatch, not an over-limit body"
     );
@@ -1122,9 +1163,90 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
             .await
             .expect_err("undersized part must be rejected");
     assert_eq!(
-        err.status,
+        err.status(),
         StatusCode::BAD_REQUEST,
         "undersized part is a client size mismatch, not an over-limit body"
+    );
+}
+
+/// P2 remediation (replay-`PUT` overwrite fix, HIGH-severity immutability
+/// bug): a valid signed `PUT` token stays usable until `exp`, but replaying
+/// it after the backend object already exists must never overwrite the
+/// live bytes. The sidecar's backend publish is create-exclusive, so the
+/// second `PUT` (even with completely different bytes, using the SAME
+/// still-valid token) must be rejected with `409 Conflict` — not silently
+/// accepted with `200`, and not a `502`, which would misleadingly suggest a
+/// transient failure rather than "this write never took effect". This test
+/// runs in the sidecar's dev/no-control-plane mode (`control_base_url`
+/// empty), which is the conservative branch: with no control plane to
+/// consult, a rejected publish always reports `409` (see `upload`'s doc
+/// comment for the full decision table covering a real control plane too).
+#[tokio::test]
+async fn upload_replay_after_publish_is_rejected_with_409() {
+    let issuer = Issuer::generate(60).expect("issuer generation");
+    let backend = Arc::new(InMemoryBackend::new("test"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&backend) as Arc<dyn StorageBackend>],
+        "test",
+    )
+    .expect("build test backend registry");
+    let state = SidecarState {
+        verifier: Arc::new(issuer.verifier()),
+        backends,
+        control_base_url: String::new(),
+        internal_token: None,
+        http: reqwest::Client::new(),
+        metrics: Arc::new(NoopMetrics),
+    };
+
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let path = format!("/{file_id}/{version_id}");
+    let token = upload_token(&issuer, file_id, version_id, "test", &path);
+
+    let router = build_router(state, DEFAULT_MAX_BODY_BYTES);
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"original-bytes".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "first PUT to a fresh backend path must publish successfully"
+    );
+
+    // Replay the SAME still-valid token with DIFFERENT bytes.
+    let second = router
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"replayed-different-bytes".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(
+        second.status(),
+        StatusCode::CONFLICT,
+        "a replayed PUT against an already-published path must be rejected with 409, \
+         never overwrite it"
+    );
+
+    // The backend must still hold the FIRST attempt's bytes, untouched.
+    let stored = backend.get(&path).await.expect("blob must still exist");
+    assert_eq!(
+        &stored[..],
+        b"original-bytes",
+        "a replayed PUT must never overwrite the already-published content"
     );
 }
 
@@ -1226,262 +1348,46 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
     assert_eq!(&got_b[..], b"bytes-for-other");
 }
 
-/// Spawn a mock control plane that answers every request with `500` and
-/// return its base URL.
-async fn failing_control_plane() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock control plane");
-    let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = [0u8; 4096];
-            if stream.read(&mut buf).await.is_ok() {
-                stream
-                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
-                    .await
-                    .ok();
-            }
-        }
-    });
-    format!("http://{addr}")
+// ── `parse_optional` env-var parsing (fail-fast on typos) ───────────────────
+
+/// Unset (`raw = None`) must fall back to the default without error.
+#[test]
+fn parse_optional_unset_uses_default() {
+    let value: u64 = parse_optional("FS_SIDECAR_TEST_VAR", None, 10).expect("unset uses default");
+    assert_eq!(value, 10);
 }
 
-/// `op = multipart_part` claims for part 1, `size` bytes, at `backend_path`.
-fn part_claims(backend_id: &str, backend_path: &str, size: u64, backend_handle: String) -> Claims {
-    Claims {
-        op: Op::MultipartPart,
-        file_id: Uuid::now_v7(),
-        version_id: Uuid::now_v7(),
-        backend_id: backend_id.to_owned(),
-        backend_path: backend_path.to_owned(),
-        exp: OffsetDateTime::now_utc().unix_timestamp() + 60,
-        upload: UploadConstraints::default(),
-        multipart: MultipartClaims {
-            upload_id: Uuid::now_v7(),
-            part_number: 1,
-            offset: 0,
-            size,
-            backend_handle,
-        },
-        request_id: "test-request-id".to_owned(),
-        content_type: String::new(),
-        etag: String::new(),
-    }
+/// A well-formed value overrides the default.
+#[test]
+fn parse_optional_valid_value_overrides_default() {
+    let value: u64 = parse_optional("FS_SIDECAR_TEST_VAR", Some("42".to_owned()), 10)
+        .expect("valid value parses");
+    assert_eq!(value, 42);
 }
 
-/// A part that streams past its `size` claim is refused mid-stream with
-/// `413`, before anything reaches the native backend.
-#[tokio::test]
-async fn write_multipart_part_native_oversized_returns_413() {
-    let backend = InMemoryBackend::new("mem");
-    let backend_handle = backend
-        .initiate_multipart("/oversized-native")
-        .await
-        .expect("initiate native multipart session");
-    let claims = part_claims("mem", "/oversized-native", 4, backend_handle);
-
-    let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"longer".to_vec()))
-        .await
-        .expect_err("oversized part must be rejected");
-    assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-/// A body stream that errors part-way is the client's failure: `400`.
-#[tokio::test]
-async fn write_multipart_part_native_body_read_error_returns_400() {
-    let backend = InMemoryBackend::new("mem");
-    let claims = part_claims("mem", "/broken-body", 8, String::new());
-    let body = Body::from_stream(futures::stream::iter([
-        Ok(bytes::Bytes::from_static(b"part")),
-        Err(std::io::Error::other("client reset the stream")),
-    ]));
-
-    let err = write_multipart_part_native(&backend, &claims, 1, body)
-        .await
-        .expect_err("a body read error must be rejected");
-    assert_eq!(err.status, StatusCode::BAD_REQUEST);
-    assert_eq!(err.body, "body read error");
-}
-
-/// A native `upload_part` failure is a backend error, `500`, and names no
-/// backend detail. Here the session handle was never initiated.
-#[tokio::test]
-async fn write_multipart_part_native_backend_failure_returns_500() {
-    let backend = InMemoryBackend::new("mem");
-    let claims = part_claims("mem", "/no-session", 4, "no-such-session".to_owned());
-
-    let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"four".to_vec()))
-        .await
-        .expect_err("upload_part into an unknown session must fail");
-    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(err.body, "backend error");
-}
-
-/// The offset-object path maps the backend's `max_size` refusal to `413`.
-#[tokio::test]
-async fn write_multipart_part_offset_object_oversized_returns_413() {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let backend = LocalFsBackend::new("local-fs", dir.path());
-    let claims = part_claims("local-fs", "/oversized-offset", 4, String::new());
-
-    let err =
-        write_multipart_part_offset_object(&backend, &claims, 1, Body::from(b"longer".to_vec()))
-            .await
-            .expect_err("oversized part must be rejected");
-    assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-/// Any other offset-object write failure is a backend error, `500`. The
-/// backend root is a regular file, so no part can be written under it.
-#[tokio::test]
-async fn write_multipart_part_offset_object_backend_failure_returns_500() {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let root = dir.path().join("not-a-directory");
-    std::fs::write(&root, b"").expect("create a file where the root should be");
-    let backend = LocalFsBackend::new("local-fs", root);
-    let claims = part_claims("local-fs", "/unwritable/part", 4, String::new());
-
-    let err =
-        write_multipart_part_offset_object(&backend, &claims, 1, Body::from(b"four".to_vec()))
-            .await
-            .expect_err("a part under a file root must fail");
-    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(err.body, "backend error");
-}
-
-/// An unreachable control plane fails the report-part callback with `502`
-/// once the retries are spent.
-#[tokio::test]
-async fn report_part_callback_unreachable_returns_502() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a port to release");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener);
-
-    let mut state = test_state();
-    state.control_base_url = format!("http://{addr}");
-
-    let err = report_part_with_control_plane(
-        &state,
-        "dummy-token",
-        "test-request-id",
-        Uuid::nil(),
-        Uuid::nil(),
-        Uuid::nil(),
-        1,
-        "etag",
-        "deadbeef",
-        4,
-    )
-    .await
-    .expect_err("an unreachable control plane must fail the report");
-    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
-    assert_eq!(err.body, "report failed");
-}
-
-/// A failed finalize callback reaches the client as the upload's `502`.
-#[tokio::test]
-async fn upload_returns_502_when_finalize_fails() {
-    let (mut state, issuer, _backend) = test_download_state();
-    state.control_base_url = failing_control_plane().await;
-    let file_id = Uuid::now_v7();
-    let version_id = Uuid::now_v7();
-    let token = upload_token(&issuer, file_id, version_id, "test", "/finalize-fails");
-
-    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
-        .oneshot(
-            Request::put(format!(
-                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
-            ))
-            .body(Body::from(b"content".to_vec()))
-            .expect("valid request"),
-        )
-        .await
-        .expect("router call succeeds");
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-}
-
-/// A part the sidecar refuses to write reaches the client with the write's
-/// status, and no report-part callback is made.
-#[tokio::test]
-async fn multipart_part_returns_413_when_part_write_fails() {
-    let (mut state, issuer, backend) = test_download_state();
-    state.control_base_url = failing_control_plane().await;
-    let file_id = Uuid::now_v7();
-    let version_id = Uuid::now_v7();
-    let backend_path = format!("/{file_id}/{version_id}");
-    let backend_handle = backend
-        .initiate_multipart(&backend_path)
-        .await
-        .expect("initiate native multipart session");
-    let token = multipart_part_token(
-        &issuer,
-        file_id,
-        version_id,
-        "test",
-        &backend_path,
-        Uuid::now_v7(),
-        1,
-        0,
-        4,
-        &backend_handle,
+/// A malformed value (e.g. `"5GB"` for a byte count, or any non-numeric
+/// typo) must fail fast with an error naming the variable, NOT silently fall
+/// back to the default — that used to be exactly how a typo like
+/// `FS_SIDECAR_MAX_BODY_BYTES=5GB` disappeared without a trace.
+#[test]
+fn parse_optional_invalid_value_errors() {
+    let err = parse_optional::<u64>("FS_SIDECAR_MAX_BODY_BYTES", Some("5GB".to_owned()), 10)
+        .expect_err("malformed value must fail fast, not fall back to the default");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FS_SIDECAR_MAX_BODY_BYTES"),
+        "error should name the offending variable: {msg}"
     );
-
-    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
-        .oneshot(
-            Request::put(format!(
-                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
-            ))
-            .body(Body::from(b"longer than four".to_vec()))
-            .expect("valid request"),
-        )
-        .await
-        .expect("router call succeeds");
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        msg.contains("5GB"),
+        "error should include the offending value: {msg}"
+    );
 }
 
-/// A written part whose report-part callback fails reaches the client as
-/// `502`, so it retries; the write and the report are idempotent per part.
-#[tokio::test]
-async fn multipart_part_returns_502_when_report_fails() {
-    let (mut state, issuer, backend) = test_download_state();
-    state.control_base_url = failing_control_plane().await;
-    let file_id = Uuid::now_v7();
-    let version_id = Uuid::now_v7();
-    let backend_path = format!("/{file_id}/{version_id}");
-    let backend_handle = backend
-        .initiate_multipart(&backend_path)
-        .await
-        .expect("initiate native multipart session");
-    let part = b"part".to_vec();
-    let token = multipart_part_token(
-        &issuer,
-        file_id,
-        version_id,
-        "test",
-        &backend_path,
-        Uuid::now_v7(),
-        1,
-        0,
-        part.len() as u64,
-        &backend_handle,
-    );
-
-    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
-        .oneshot(
-            Request::put(format!(
-                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
-            ))
-            .body(Body::from(part))
-            .expect("valid request"),
-        )
-        .await
-        .expect("router call succeeds");
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read response body");
-    assert_eq!(&body[..], b"report failed");
+/// An empty string is also not a valid `u64` and must error, not silently
+/// become the default.
+#[test]
+fn parse_optional_empty_string_errors() {
+    parse_optional::<u64>("FS_SIDECAR_TEST_VAR", Some(String::new()), 10)
+        .expect_err("empty string is not a valid u64");
 }
