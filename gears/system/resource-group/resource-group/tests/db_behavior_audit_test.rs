@@ -399,9 +399,8 @@ async fn trace_create_type() {
     snapshot_trace("create_type", &rec);
     assert!(
         rec.writes_outside_tx().is_empty(),
-        "create_type's writes run inside transaction_ref_mapped_with_config \
-         (SERIALIZABLE); the SEPARATE, non-trace-observable problem is the \
-         missing retry wrapper (known defect RG-03 -- see the static rule \
+        "create_type's writes run inside a transaction (RG-03's missing retry \
+         wrapper -- not trace-observable -- is fixed too, see the static rule \
          tests at the bottom of this file):\n{}",
         rec.dump()
     );
@@ -434,8 +433,8 @@ async fn trace_update_type() {
     snapshot_trace("update_type", &rec);
     assert!(
         rec.writes_outside_tx().is_empty(),
-        "update_type's writes run inside a transaction (missing retry is RG-03, \
-         a separate, non-trace-observable defect):\n{}",
+        "update_type's writes run inside a transaction (RG-03's retry wrapper, \
+         not trace-observable, is fixed too):\n{}",
         rec.dump()
     );
 }
@@ -908,28 +907,26 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 }
 
 #[test]
-fn static_rule_flags_type_service_missing_retry() {
+fn static_rule_passes_type_service_uses_retry() {
+    // Was static_rule_flags_type_service_missing_retry: RG-02 (delete_type)
+    // and RG-03 (create_type/update_type) are both fixed now, so this is a
+    // negative control (matches static_rule_passes_group_service_uses_retry)
+    // instead of a known-defect pin.
     let src = include_str!("../src/domain/type_service.rs");
     let unretried = count_occurrences(
         src,
         ".transaction_ref_mapped_with_config(TxConfig::serializable()",
     );
     let retried = count_occurrences(src, ".transaction_with_retry(TxConfig::serializable()");
-    assert!(
-        unretried >= 2,
-        "known defect RG-03: expected create_type/update_type to call \
-         transaction_ref_mapped_with_config directly (bypassing retry), found {unretried}"
-    );
-    // RG-02 fixed delete_type by wrapping it in transaction_with_retry, so
-    // this file now has exactly one retried call site (delete_type) while
-    // create_type/update_type (RG-03) remain unretried -- update this again
-    // once RG-03 is fixed (retried should become 3, unretried 0, and this
-    // test's assertion direction flips to a negative control matching
-    // static_rule_passes_group_service_uses_retry).
     assert_eq!(
-        retried, 1,
-        "expected exactly one transaction_with_retry call site (delete_type, fixed for RG-02) \
-         -- if RG-03 was also fixed, update this test and docs/analysis/DB_BEHAVIOR_AUDIT.md"
+        unretried, 0,
+        "negative control violated: type_service.rs should not bypass \
+         transaction_with_retry for its SERIALIZABLE writes (RG-03 regressed?)"
+    );
+    assert_eq!(
+        retried, 3,
+        "expected create_type/update_type/delete_type to all use \
+         transaction_with_retry, found {retried}"
     );
 }
 
@@ -1086,5 +1083,46 @@ fn static_rule_flags_external_call_inside_create_group_tx() {
         clean >= 1,
         "expected at least one transaction_with_retry closure with no \
          discovered external-client reference (move_group/delete_group)"
+    );
+}
+
+// =========================================================================
+// Section 5 -- contract-drift rules
+// =========================================================================
+//
+// A "contract" here is a documented, specific promise (DESIGN.md) about
+// observable behavior. Where the checked-in code doesn't (yet) keep that
+// promise, the drift is turned into an executable, #[ignore]d assertion
+// instead of a comment -- the same "known defect" convention used
+// throughout this file, applied to a doc-vs-code mismatch rather than a
+// DB-behavior class.
+
+#[test]
+#[ignore = "contract drift: DESIGN.md (S4.x, concurrency testing) promises an \
+            exhausted SERIALIZABLE retry maps to ServiceUnavailable (503) with a \
+            retry-after hint; DomainError::Database has no dedicated variant for \
+            'retry exhausted' (vs. any other DB error) and always maps to \
+            Internal (500) via CanonicalError::internal(...) in api/rest/error.rs, \
+            whose own comment already acknowledges the gap. Deferred -- see \
+            docs/analysis/DB_BEHAVIOR_AUDIT.md."]
+fn contract_drift_exhausted_retry_should_map_to_service_unavailable() {
+    // Representative shape of what transaction_with_retry returns after
+    // exhausting its attempt budget against a real SERIALIZABLE conflict --
+    // see RG-15's regression tests in libs/toolkit-db/src/contention.rs for
+    // the exact message shape this is modeled on.
+    let exhausted = resource_group::domain::error::DomainError::Database(sea_orm::DbErr::Custom(
+        "Query Error: error returned from database: could not serialize access due to \
+         read/write dependencies among transactions"
+            .to_owned(),
+    ));
+    let canonical: toolkit_canonical_errors::CanonicalError = exhausted.into();
+    assert_eq!(
+        canonical.status_code(),
+        503,
+        "DESIGN.md promises an exhausted SERIALIZABLE retry maps to ServiceUnavailable \
+         (503); got {} instead (DomainError::Database always maps to Internal) -- if this \
+         starts passing, the contract drift was fixed, remove the #[ignore] and update the \
+         report",
+        canonical.status_code()
     );
 }
