@@ -1,11 +1,11 @@
 -- [enter tx scope] --
-  9  SELECT  gts_type                         in_tx=true  SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
- 10  SELECT  gts_type_allowed_parent          in_tx=true  SELECT "gts_type_allowed_parent"."type_id", "gts_type_allowed_parent"."parent_type_id" FROM "gts_type_allowed_parent" WHERE "gts_type_allowed_parent"."type_id" = ?
- 11  SELECT  gts_type_allowed_membership      in_tx=true  SELECT "gts_type_allowed_membership"."type_id", "gts_type_allowed_membership"."membership_type_id" FROM "gts_type_allowed_membership" WHERE "gts_type_allowed_membership"."type_id" = ?
- 12  SELECT  gts_type                         in_tx=true  SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
- 13  DELETE  gts_type_allowed_parent          in_tx=true  DELETE FROM "gts_type_allowed_parent" WHERE "gts_type_allowed_parent"."type_id" = ?
- 14  DELETE  gts_type_allowed_membership      in_tx=true  DELETE FROM "gts_type_allowed_membership" WHERE "gts_type_allowed_membership"."type_id" = ?
- 15  UPDATE  gts_type                         in_tx=true  UPDATE "gts_type" SET "metadata_schema" = ?, "updated_at" = ? WHERE "gts_type"."id" = ?
- 16  SELECT  gts_type                         in_tx=true  SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
- 17  SELECT  gts_type_allowed_parent          in_tx=true  SELECT "gts_type_allowed_parent"."type_id", "gts_type_allowed_parent"."parent_type_id" FROM "gts_type_allowed_parent" WHERE "gts_type_allowed_parent"."type_id" = ?
- 18  SELECT  gts_type_allowed_membership      in_tx=true  SELECT "gts_type_allowed_membership"."type_id", "gts_type_allowed_membership"."membership_type_id" FROM "gts_type_allowed_membership" WHERE "gts_type_allowed_membership"."type_id" = ?
+  9  SELECT  gts_type                         in_tx=true  params=2   SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
+ 10  SELECT  gts_type_allowed_parent          in_tx=true  params=1   SELECT "gts_type_allowed_parent"."type_id", "gts_type_allowed_parent"."parent_type_id" FROM "gts_type_allowed_parent" WHERE "gts_type_allowed_parent"."type_id" = ?
+ 11  SELECT  gts_type_allowed_membership      in_tx=true  params=1   SELECT "gts_type_allowed_membership"."type_id", "gts_type_allowed_membership"."membership_type_id" FROM "gts_type_allowed_membership" WHERE "gts_type_allowed_membership"."type_id" = ?
+ 12  SELECT  gts_type                         in_tx=true  params=2   SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
+ 13  DELETE  gts_type_allowed_parent          in_tx=true  params=1   DELETE FROM "gts_type_allowed_parent" WHERE "gts_type_allowed_parent"."type_id" = ?
+ 14  DELETE  gts_type_allowed_membership      in_tx=true  params=1   DELETE FROM "gts_type_allowed_membership" WHERE "gts_type_allowed_membership"."type_id" = ?
+ 15  UPDATE  gts_type                         in_tx=true  params=3   UPDATE "gts_type" SET "metadata_schema" = ?, "updated_at" = ? WHERE "gts_type"."id" = ?
+ 16  SELECT  gts_type                         in_tx=true  params=2   SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
+ 17  SELECT  gts_type_allowed_parent          in_tx=true  params=1   SELECT "gts_type_allowed_parent"."type_id", "gts_type_allowed_parent"."parent_type_id" FROM "gts_type_allowed_parent" WHERE "gts_type_allowed_parent"."type_id" = ?
+ 18  SELECT  gts_type_allowed_membership      in_tx=true  params=1   SELECT "gts_type_allowed_membership"."type_id", "gts_type_allowed_membership"."membership_type_id" FROM "gts_type_allowed_membership" WHERE "gts_type_allowed_membership"."type_id" = ?

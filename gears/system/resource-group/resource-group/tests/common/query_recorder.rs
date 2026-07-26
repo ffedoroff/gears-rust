@@ -95,6 +95,15 @@ pub struct RecordedQuery {
     /// Whether this statement executed while the transaction-bypass guard
     /// was armed (i.e. inside a `Db::transaction*` closure).
     pub in_tx: bool,
+    /// Number of bound parameter values in this statement (e.g. an `IN (?,
+    /// ?, ?)` list of 3 contributes 3). Statement *count* is scale-invariant
+    /// for a well-batched query (one `IN (...)` regardless of N), but the
+    /// parameter count still grows with N -- this exists so scale-invariance
+    /// checks can budget for that separately from statement count. See the
+    /// audit report's "what this method does not cover" section: this
+    /// doesn't capture the cost of a single huge statement (e.g. a 10,000-
+    /// value `IN` list), only that it has 10,000 parameters.
+    pub param_count: usize,
     pub elapsed: Duration,
     pub failed: bool,
 }
@@ -201,6 +210,11 @@ impl QueryRecorder {
             let sql = normalize_sql(&raw_sql);
             // Precise, not a heuristic -- see module docs.
             let in_tx = toolkit_db::secure::in_transaction_for_testing();
+            let param_count = info
+                .statement
+                .values
+                .as_ref()
+                .map_or(0, |values| values.0.len());
             let n = seq.fetch_add(1, Ordering::Relaxed);
             let rec = RecordedQuery {
                 seq: n,
@@ -209,6 +223,7 @@ impl QueryRecorder {
                 sql,
                 raw_sql: info.statement.to_string(),
                 in_tx,
+                param_count,
                 elapsed: info.elapsed,
                 failed: info.failed,
             };
@@ -236,6 +251,15 @@ impl QueryRecorder {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
+    }
+
+    /// Sum of `param_count` across every captured statement. A companion
+    /// budget to `total()`/`stats()`: a batched query (single `IN (...)`
+    /// regardless of N) keeps statement *count* flat as N grows, but its
+    /// parameter count still scales with N -- this catches that dimension.
+    #[must_use]
+    pub fn total_params(&self) -> usize {
+        self.events().iter().map(|e| e.param_count).sum()
     }
 
     /// Clear the recorded trace. Each audit test normally builds a fresh
@@ -324,11 +348,12 @@ impl QueryRecorder {
             last_in_tx = e.in_tx;
             writeln!(
                 out,
-                "{:>3}  {:<7} {:<32} in_tx={:<5} {}",
+                "{:>3}  {:<7} {:<32} in_tx={:<5} params={:<3} {}",
                 e.seq,
                 e.kind,
                 e.table.as_deref().unwrap_or("-"),
                 e.in_tx,
+                e.param_count,
                 e.sql,
             )
             .expect("String Write is infallible");
@@ -439,9 +464,20 @@ mod tests {
             sql: format!("<stmt {seq}>"),
             raw_sql: format!("<stmt {seq}>"),
             in_tx,
+            param_count: 0,
             elapsed: std::time::Duration::ZERO,
             failed: false,
         }
+    }
+
+    #[test]
+    fn total_params_sums_param_count_across_events() {
+        let mut a = make(0, QueryKind::Select, Some("gts_type"), false);
+        a.param_count = 3;
+        let mut b = make(1, QueryKind::Insert, Some("resource_group"), true);
+        b.param_count = 5;
+        let rec = super::QueryRecorder::from_events_for_testing(vec![a, b]);
+        assert_eq!(rec.total_params(), 8);
     }
 
     #[test]
