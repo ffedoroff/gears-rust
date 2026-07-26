@@ -1034,14 +1034,19 @@ fn references_identifier(body: &str, name: &str) -> bool {
 }
 
 #[test]
-fn static_rule_flags_external_call_inside_create_group_tx() {
+fn static_rule_passes_no_external_call_inside_group_service_tx() {
+    // Was static_rule_flags_external_call_inside_create_group_tx: RG-09 is
+    // fixed now (validate_metadata_via_gts moved before the transaction in
+    // both create_group/create_group_unscoped and update_group), so this is
+    // a negative control instead of a known-defect pin.
     let src = include_str!("../src/domain/group_service.rs");
     let client_params = external_client_param_names(src);
     assert!(
         client_params.contains(&"types_registry"),
         "expected to discover an external-client parameter by its `&dyn ...Client` / \
          `Arc<dyn ...Client>` type shape (found: {client_params:?}) -- this asserts the \
-         *discovery* mechanism works, independent of the literal field name"
+         *discovery* mechanism still works (the struct field / constructor parameter still \
+         has this shape) even though no transaction closure captures it anymore"
     );
 
     let bodies = transaction_with_retry_call_bodies(src);
@@ -1052,37 +1057,27 @@ fn static_rule_flags_external_call_inside_create_group_tx() {
         bodies.len()
     );
 
-    let flagged = bodies
+    // RG-09 fixed: no SERIALIZABLE tx closure in this file should reference
+    // a discovered external-client identifier anymore -- both
+    // create_group_inner and update_group_inner had `validate_metadata_via_gts`
+    // moved out to run before the transaction opens. If this starts
+    // failing, RG-09 has regressed (an external call slipped back inside a
+    // tx closure).
+    let flagged: Vec<&str> = bodies
         .iter()
         .filter(|b| {
             client_params
                 .iter()
                 .any(|name| references_identifier(b, name))
         })
-        .count();
+        .copied()
+        .collect();
     assert!(
-        flagged >= 1,
-        "known defect RG-09: expected at least one SERIALIZABLE tx closure to \
-         reference an external client (discovered params: {client_params:?}; \
-         create_group_inner validates metadata via GTS inside the transaction)"
-    );
-
-    // Negative control, same file: move/delete's tx closures don't take any
-    // discovered external-client parameter at all -- proves the rule tells
-    // clean closures apart from the flagged one instead of matching on every
-    // closure indiscriminately.
-    let clean = bodies
-        .iter()
-        .filter(|b| {
-            !client_params
-                .iter()
-                .any(|name| references_identifier(b, name))
-        })
-        .count();
-    assert!(
-        clean >= 1,
-        "expected at least one transaction_with_retry closure with no \
-         discovered external-client reference (move_group/delete_group)"
+        flagged.is_empty(),
+        "RG-09 regression: {} of {} transaction_with_retry closures reference a discovered \
+         external-client identifier ({client_params:?})",
+        flagged.len(),
+        bodies.len()
     );
 }
 
