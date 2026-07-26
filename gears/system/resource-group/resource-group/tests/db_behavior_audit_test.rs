@@ -1259,6 +1259,16 @@ fn static_rule_passes_no_external_call_inside_group_service_tx() {
 // instead of a comment -- the same "known defect" convention used
 // throughout this file, applied to a doc-vs-code mismatch rather than a
 // DB-behavior class.
+//
+// A third DESIGN.md promise was checked and deliberately did *not* get a
+// test here: the "Database-level query timeout (statement_timeout) is
+// configured at the connection pool level per platform defaults" line
+// (~DESIGN.md:1248) is explicitly scoped, in its own wording, as a
+// deployment/platform concern -- not application code. Confirmed there is
+// no toolkit_db::ConnectOpts field or connection-setup code path for it
+// either (checked libs/toolkit-db/src/lib.rs in full), so there is no
+// code-level behavior to assert against; it would be an infra/ops
+// config-management gap, not a resource-group or toolkit-db defect.
 
 #[test]
 #[ignore = "contract drift: DESIGN.md (S4.x, concurrency testing) promises an \
@@ -1287,5 +1297,24 @@ fn contract_drift_exhausted_retry_should_map_to_service_unavailable() {
          starts passing, the contract drift was fixed, remove the #[ignore] and update the \
          report",
         canonical.status_code()
+    );
+}
+
+#[test]
+#[ignore = "contract drift: DESIGN.md's 'Concurrency Testing' section (~line 1599) promises \
+            hierarchy-mutating SERIALIZABLE transactions carry a 5s (configurable) transaction \
+            timeout, but toolkit_db::secure::TxConfig (the type transaction_with_retry takes) \
+            has no timeout field or enforcement mechanism at all -- confirmed by reading \
+            libs/toolkit-db/src/secure/tx_config.rs in full (isolation + access_mode only). \
+            Deferred -- see docs/analysis/DB_BEHAVIOR_AUDIT.md."]
+fn contract_drift_tx_config_has_no_timeout_mechanism() {
+    let cfg = toolkit_db::secure::TxConfig::serializable();
+    let debug_repr = format!("{cfg:?}");
+    assert!(
+        debug_repr.to_lowercase().contains("timeout"),
+        "DESIGN.md promises a 5s (configurable) transaction timeout for SERIALIZABLE \
+         hierarchy mutations; TxConfig::serializable()'s Debug representation is \
+         `{debug_repr}` -- no timeout field at all. If this starts passing, the contract \
+         drift may have been fixed -- remove the #[ignore] and update the report."
     );
 }
