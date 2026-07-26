@@ -250,9 +250,11 @@ async fn drive_multipart_upload(
         .await
         .unwrap();
 
-    msvc.complete_multipart_upload(ctx, file_id, plan.upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(ctx, file_id, plan.upload_id, None)
         .await
-        .unwrap().unwrap_completed();
+        .unwrap()
+        .unwrap_completed();
 
     (
         plan.upload_id,
@@ -271,7 +273,10 @@ async fn finalize_reports_positive_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None, false).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
 
     // `create_file` reports `+1 file / 0 bytes` -- confirms the pre-state
     // (0.12's premise) so the finalize credit below is proven to be the
@@ -324,7 +329,10 @@ async fn finalize_by_token_reports_positive_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None, false).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     wait_for_reports(&fake, 1).await;
 
     let payload = Bytes::from_static(b"token-path payload bytes");
@@ -373,7 +381,10 @@ async fn multipart_complete_reports_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None, false).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     wait_for_reports(&fake, 1).await;
 
     let data = Bytes::from_static(b"multipart assembled payload bytes for usage credit");
@@ -413,7 +424,10 @@ async fn delete_version_reports_negative_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None, false).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     let v1_payload = Bytes::from_static(b"version one payload");
     dp.put_content(
         &ctx,
@@ -476,7 +490,10 @@ async fn sweep_reports_deltas_for_deleted_files() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None, false).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     let payload = Bytes::from_static(b"retention-swept payload");
     dp.put_content(
         &ctx,
