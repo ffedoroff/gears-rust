@@ -585,14 +585,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         profile: &QueryProfile,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-        // Resolve type GTS path to surrogate ID; verify type exists
-        let type_id = type_repo
-            .resolve_id(tx, &req.code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&req.code))?;
-
-        let rg_type = type_repo
-            .find_by_code(tx, &req.code)
+        // Resolve type GTS path to surrogate ID; verify type exists.
+        // Fixes known defect RG-11 (redundant-io): this used to call
+        // resolve_id and find_by_code back to back for the same req.code --
+        // two round trips for data find_by_code_with_id already fetches
+        // together in one.
+        let (type_id, rg_type) = type_repo
+            .find_by_code_with_id(tx, &req.code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(&req.code))?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
@@ -838,11 +837,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // (or the new type allows root if no parent). For the immutable-type
         // case this collapses into `move_group_internal_impl` running the
         // `rg_type.allowed_parent_types` check on a parent change.
-        let existing_type_path = Self::resolve_type_path_from_id(tx, existing.gts_type_id).await?;
+        //
+        // Fixes known defect RG-11 (redundant-io): this used to resolve
+        // `existing.gts_type_id` to its code via `resolve_type_path_from_id`
+        // and then look the type up again *by that code* via `find_by_code`
+        // -- two round trips for data `load_full_type_by_id` already
+        // fetches by id in one.
         let rg_type = type_repo
-            .find_by_code(tx, &existing_type_path)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&existing_type_path))?;
+            .load_full_type_by_id(tx, existing.gts_type_id)
+            .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
 
         // Metadata-vs-schema validation (step 4e) already ran in

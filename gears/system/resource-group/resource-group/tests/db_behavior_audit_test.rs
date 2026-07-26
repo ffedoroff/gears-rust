@@ -276,6 +276,21 @@ async fn trace_create_root_group() {
          non-RETURNING fallback + the final find_by_id), got {rg_selects}:\n{}",
         rec.dump()
     );
+    // RG-11 fixed: create_group_inner used to call resolve_id then
+    // find_by_code for the same req.code (two "SELECT gts_type WHERE
+    // schema_id = ?" statements). find_by_code_with_id now resolves both
+    // the surrogate id and the full type in one query. Exactly 2 gts_type
+    // SELECTs remain: that combined lookup, plus create_group_inner's
+    // final resolve-by-id for the returned SDK model. Was 3 before the fix.
+    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
+    assert_eq!(
+        type_selects,
+        2,
+        "RG-11 regression: expected exactly 2 gts_type SELECTs (the combined \
+         find_by_code_with_id lookup + the final resolve-by-id), got \
+         {type_selects}:\n{}",
+        rec.dump()
+    );
 }
 
 #[tokio::test]
@@ -465,6 +480,23 @@ async fn trace_update_type() {
         rec.writes_outside_tx().is_empty(),
         "update_type's writes run inside a transaction (RG-03's retry wrapper, \
          not trace-observable, is fixed too):\n{}",
+        rec.dump()
+    );
+    // RG-11 fixed: update_type_in_tx used to call find_by_code then,
+    // further down, resolve_id for the same code (two "SELECT gts_type
+    // WHERE schema_id = ?" statements). find_by_code_with_id now resolves
+    // both together in one query. Exactly 2 gts_type SELECTs remain: that
+    // combined lookup, plus the necessary post-update_many re-read (update_type
+    // goes through SecureUpdateMany, which -- unlike secure_insert -- only
+    // reports rows-affected, not the model; see RG-08's commit message for
+    // why that one is not fixable the same way). Was 3 before the fix.
+    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
+    assert_eq!(
+        type_selects,
+        2,
+        "RG-11 regression: expected exactly 2 gts_type SELECTs (the combined \
+         find_by_code_with_id lookup + the necessary post-update re-read), got \
+         {type_selects}:\n{}",
         rec.dump()
     );
 }
@@ -763,6 +795,99 @@ async fn scale_create_type_junction_inserts_do_not_grow_with_parent_count() {
         small, large,
         "gts_type_allowed_parent INSERT count must not scale with \
          allowed_parent_types length (small={small} at N=2, large={large} at N=8)"
+    );
+}
+
+async fn list_types_total_statements_for_page_size(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    // Self-referencing types (non-empty allowed_parent_types) so the batch
+    // loader's junction-row and id->code resolution queries are actually
+    // exercised for every row in the page, not skipped as trivially empty.
+    for i in 0..n {
+        create_self_referencing_type(&type_svc, &format!("listscale{i}")).await;
+    }
+
+    rec.clear();
+    let query = toolkit_odata::ODataQuery {
+        limit: Some(n as u64 + 5),
+        ..Default::default()
+    };
+    let page = type_svc
+        .list_types(&query)
+        .await
+        .expect("list_types should succeed");
+    assert_eq!(page.items.len(), n, "page must contain all N created types");
+    rec.total()
+}
+
+#[tokio::test]
+async fn scale_list_types_statements_do_not_grow_with_page_size() {
+    // RG-12 fixed (n-plus-one, read path): list_types used to call
+    // load_full_type once per row -- each issuing its own junction-table
+    // queries (plus a further id->code resolution query when non-empty) --
+    // so statement count grew with page size. load_full_types_batch now
+    // issues a constant number of queries for the whole page.
+    let small = list_types_total_statements_for_page_size(3).await;
+    let large = list_types_total_statements_for_page_size(15).await;
+    assert_eq!(
+        small, large,
+        "list_types total statement count must not scale with page size \
+         (small={small} at N=3, large={large} at N=15)"
+    );
+}
+
+#[tokio::test]
+async fn create_type_conflict_check_does_not_overfetch_junctions() {
+    // RG-13 fixed (redundant-io): create_type's duplicate-check used to
+    // call find_by_code, which loads full junction data (allowed parents +
+    // memberships) just to test existence -- visible specifically on the
+    // *conflict* path (creating an already-existing code); the happy path
+    // never hit it, since it short-circuits before load_full_type. resolve_id
+    // now does the same existence check with a single, plain id lookup --
+    // no junction reads at all, on either path.
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let t = common::create_root_type(&type_svc, "conflict").await;
+
+    rec.clear();
+    let result = type_svc
+        .create_type(CreateTypeRequest {
+            code: t.code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(resource_group::domain::error::DomainError::TypeAlreadyExists { .. })
+        ),
+        "expected a clean TypeAlreadyExists for the conflicting create, got: {result:?}"
+    );
+
+    let parent_junction_selects =
+        count_in(&rec.stats(), QueryKind::Select, "gts_type_allowed_parent");
+    let membership_junction_selects = count_in(
+        &rec.stats(),
+        QueryKind::Select,
+        "gts_type_allowed_membership",
+    );
+    assert_eq!(
+        parent_junction_selects,
+        0,
+        "RG-13 regression: the duplicate-code conflict check must not read \
+         gts_type_allowed_parent at all, got {parent_junction_selects} SELECTs:\n{}",
+        rec.dump()
+    );
+    assert_eq!(
+        membership_junction_selects,
+        0,
+        "RG-13 regression: the duplicate-code conflict check must not read \
+         gts_type_allowed_membership at all, got {membership_junction_selects} SELECTs:\n{}",
+        rec.dump()
     );
 }
 

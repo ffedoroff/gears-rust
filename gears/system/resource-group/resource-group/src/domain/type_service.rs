@@ -121,7 +121,14 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // conflicting schema_id. Performed in-tx so a concurrent create
         // cannot slip a duplicate row in between this read and the
         // insert below.
-        if type_repo.find_by_code(tx, &req.code).await?.is_some() {
+        //
+        // Fixes known defect RG-13 (redundant-io): this used to call
+        // find_by_code, which loads full junction data (allowed parents +
+        // memberships) just to test existence. resolve_id does the same
+        // existence check with a single, plain id lookup -- no junction
+        // reads -- since only the boolean matters here, not the type's
+        // contents.
+        if type_repo.resolve_id(tx, &req.code).await?.is_some() {
             debug!(code = %req.code, "Type already exists, rejecting create");
             return Err(DomainError::type_already_exists(&req.code));
         }
@@ -287,11 +294,16 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         stored_schema: &serde_json::Value,
     ) -> Result<ResourceGroupType, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-2
-        // DB: SELECT FROM gts_type WHERE schema_id = {code} — load existing type
+        // DB: SELECT FROM gts_type WHERE schema_id = {code} — load existing type.
+        // Fixes known defect RG-11 (redundant-io, same shape as
+        // group_service.rs's create_group_inner/update_group_inner): this
+        // used to call find_by_code and, further down, resolve_id for the
+        // same code -- two round trips for data find_by_code_with_id
+        // already fetches together in one.
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
         // IF type not found → RETURN NotFound
-        let existing = type_repo
-            .find_by_code(tx, code)
+        let (type_id, existing) = type_repo
+            .find_by_code_with_id(tx, code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(code))?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-3
@@ -314,11 +326,6 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
                 .await?
         };
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-5
-
-        let type_id = type_repo
-            .resolve_id(tx, code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(code))?;
 
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-6
         // Invoke hierarchy safety check algorithm for

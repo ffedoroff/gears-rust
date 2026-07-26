@@ -213,6 +213,16 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         code: &str,
     ) -> Result<Option<ResourceGroupType>, DomainError>;
 
+    /// Same lookup as `find_by_code`, but also returns the surrogate
+    /// SMALLINT id the `schema_id` resolved to -- lets a caller that needs
+    /// both the id and the full type avoid a separate `resolve_id` call for
+    /// the same code (fixes known defect RG-11).
+    async fn find_by_code_with_id<C: DBRunner>(
+        &self,
+        db: &C,
+        code: &str,
+    ) -> Result<Option<(i16, ResourceGroupType)>, DomainError>;
+
     async fn load_full_type_by_id<C: DBRunner>(
         &self,
         db: &C,
