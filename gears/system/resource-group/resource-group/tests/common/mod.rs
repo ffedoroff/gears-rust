@@ -6,6 +6,8 @@
 //! Provides database setup, service construction, security context helpers,
 //! and assertion utilities. Used by Phases 2-5 of the unit test plan.
 
+pub mod query_recorder;
+
 use std::sync::Arc;
 use toolkit_gts::gts_id;
 
@@ -23,6 +25,8 @@ use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
 use toolkit_security::{SecurityContext, pep_properties};
+
+use query_recorder::QueryRecorder;
 
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::domain::membership_service::MembershipService;
@@ -263,6 +267,38 @@ pub async fn test_db() -> Arc<DBProvider<DbError>> {
         .expect("run migrations");
 
     Arc::new(DBProvider::new(db))
+}
+
+/// Create an in-memory SQLite database with migrations applied, and attach a
+/// [`QueryRecorder`] to it for the DB-behavior audit.
+///
+/// Uses `toolkit_db::connect_db_with_metric_callback` (feature
+/// `test-support`) instead of the plain `connect_db` that [`test_db`] uses:
+/// `DBProvider`/`Db` never expose the inner `SeaORM` connection, so the
+/// metric callback must be attached *before* the connection is wrapped —
+/// attaching afterwards would miss every statement (`SeaORM` captures the
+/// callback by value at query time; see the module docs on
+/// [`query_recorder`] for the full explanation).
+pub async fn test_db_with_recorder() -> (Arc<DBProvider<DbError>>, QueryRecorder) {
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..Default::default()
+    };
+    let (recorder, callback) = QueryRecorder::attach();
+    let db = toolkit_db::connect_db_with_metric_callback("sqlite::memory:", opts, callback)
+        .await
+        .expect("connect to in-memory SQLite with recorder");
+
+    run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("run migrations");
+
+    // Migrations run their own DDL through the same connection/callback --
+    // start each test's trace from a clean slate.
+    recorder.clear();
+
+    (Arc::new(DBProvider::new(db)), recorder)
 }
 
 // -- Security context --

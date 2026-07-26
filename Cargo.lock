@@ -2220,6 +2220,7 @@ dependencies = [
  "http-body-util",
  "inventory",
  "jsonschema",
+ "regex",
  "sea-orm",
  "sea-orm-migration",
  "serde",
