@@ -735,7 +735,16 @@ impl GroupRepositoryTrait for GroupRepository {
     }
 
     /// Insert ancestor closure rows for a new child group.
-    /// For each ancestor of the parent, create a row linking ancestor -> child with depth+1.
+    ///
+    /// For each ancestor of the parent, create a row linking ancestor ->
+    /// child with depth+1. Fixes known defect RG-06: this used to issue one
+    /// `secure_insert` per ancestor (statement count grows with the
+    /// parent's depth); now the whole batch is built in memory and sent as
+    /// a single multi-row `INSERT` via `secure_insert_many`, which validates
+    /// every row against the scope exactly as the per-row loop did (see
+    /// `secure_insert_many`'s doc comment) -- moot here in practice, since
+    /// this repo always calls with `system_scope()` (unconstrained), but
+    /// the batching helper preserves the same safety contract regardless.
     async fn insert_ancestor_closure_rows<C: DBRunner>(
         &self,
         db: &C,
@@ -754,16 +763,17 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
 
         // For each ancestor of parent, create ancestor -> child with depth+1
-        for ancestor_row in parent_ancestors {
-            let model = closure_entity::ActiveModel {
+        let rows: Vec<closure_entity::ActiveModel> = parent_ancestors
+            .into_iter()
+            .map(|ancestor_row| closure_entity::ActiveModel {
                 ancestor_id: Set(ancestor_row.ancestor_id),
                 descendant_id: Set(child_id),
                 depth: Set(ancestor_row.depth + 1),
-            };
-            toolkit_db::secure::secure_insert::<ClosureEntity>(model, &scope, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            })
+            .collect();
+        toolkit_db::secure::secure_insert_many::<ClosureEntity>(rows, &scope, db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(())
     }
@@ -777,6 +787,23 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         group_id: Uuid,
     ) -> Result<Vec<Uuid>, DomainError> {
+        Ok(self
+            .get_descendant_ids_with_depth(db, group_id)
+            .await?
+            .into_iter()
+            .map(|(id, _depth)| id)
+            .collect())
+    }
+
+    /// Same result set as `get_descendant_ids`, but keeps each descendant's
+    /// depth relative to `group_id` (fixes known defects RG-05/RG-10: both
+    /// used to re-derive a descendant's depth via a second per-row query
+    /// after already fetching this same closure-table result set once).
+    async fn get_descendant_ids_with_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<Vec<(Uuid, i32)>, DomainError> {
         use sea_orm::QueryOrder;
 
         let scope = system_scope();
@@ -790,7 +817,10 @@ impl GroupRepositoryTrait for GroupRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        Ok(rows.into_iter().map(|r| r.descendant_id).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.descendant_id, r.depth))
+            .collect())
     }
 
     /// Get the depth of a group from its root (max depth in closure table where
@@ -898,10 +928,45 @@ impl GroupRepositoryTrait for GroupRepository {
         Ok(())
     }
 
+    /// Delete all closure rows (both as ancestor and as descendant) for
+    /// every group in `group_ids`, in exactly 2 statements. Fixes known
+    /// defect RG-10 (`force_delete_subtree` used to call the single-group
+    /// version above once per node, at 2 statements/node).
+    async fn delete_all_closure_rows_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        let ids: Vec<Uuid> = group_ids.to_vec();
+
+        ClosureEntity::delete_many()
+            .filter(closure_entity::Column::AncestorId.is_in(ids.clone()))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        ClosureEntity::delete_many()
+            .filter(closure_entity::Column::DescendantId.is_in(ids))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        Ok(())
+    }
+
     // @cpt-algo:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1
     /// Rebuild closure rows for a subtree after a move operation.
     /// This deletes old ancestor paths for the entire subtree and
-    /// inserts new paths based on the new parent.
+    /// inserts new paths based on the new parent (batched via
+    /// `secure_insert_many` -- fixes known defect RG-04).
     async fn rebuild_subtree_closure<C: DBRunner>(
         &self,
         db: &C,
@@ -999,11 +1064,17 @@ impl GroupRepositoryTrait for GroupRepository {
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
             }
 
-            for row in new_rows {
-                toolkit_db::secure::secure_insert::<ClosureEntity>(row, &scope, db)
-                    .await
-                    .map_err(|e| DomainError::database(e.to_string()))?;
-            }
+            // Fixes known defect RG-04: this used to issue one
+            // `secure_insert` per (ancestor x subtree-descendant) pair --
+            // statement count grew with subtree size times new-parent
+            // depth. `secure_insert_many` sends the whole batch as one
+            // multi-row `INSERT`, validating every row against the scope
+            // exactly as the per-row loop did (moot in practice here --
+            // this repo always calls with `system_scope()` -- but the
+            // batching helper preserves the same safety contract).
+            toolkit_db::secure::secure_insert_many::<ClosureEntity>(new_rows, &scope, db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
         }
 
@@ -1039,6 +1110,50 @@ impl GroupRepositoryTrait for GroupRepository {
         let scope = system_scope();
         MembershipEntity::delete_many()
             .filter(membership_entity::Column::GroupId.eq(group_id))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete all memberships for every group in `group_ids` in a single
+    /// statement. Fixes known defect RG-10 (`force_delete_subtree` used to
+    /// call the single-group version above once per node).
+    async fn delete_memberships_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        MembershipEntity::delete_many()
+            .filter(membership_entity::Column::GroupId.is_in(group_ids.to_vec()))
+            .secure()
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete every group in `ids` in a single statement. Fixes known
+    /// defect RG-10 (`force_delete_subtree` used to call the single-group
+    /// `delete_by_id` once per node).
+    async fn delete_by_id_many<C: DBRunner>(
+        &self,
+        db: &C,
+        ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let scope = system_scope();
+        ResourceGroupEntity::delete_many()
+            .filter(rg_entity::Column::Id.is_in(ids.to_vec()))
             .secure()
             .scope_with(&scope)
             .exec(db)

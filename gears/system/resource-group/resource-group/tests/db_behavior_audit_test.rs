@@ -582,10 +582,10 @@ async fn trace_seeding() {
 // =========================================================================
 
 #[tokio::test]
-#[ignore = "known defect RG-06: group_repo::insert_ancestor_closure_rows \
-            inserts one closure row per ancestor, one secure_insert call at \
-            a time -- see docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth() {
+    // RG-06 fixed: group_repo::insert_ancestor_closure_rows now sends the
+    // whole ancestor batch as a single secure_insert_many call instead of
+    // one secure_insert per ancestor.
     async fn closure_inserts_for_new_child_at_depth(depth: usize) -> usize {
         let (db, rec) = common::test_db_with_recorder().await;
         let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
@@ -638,10 +638,9 @@ async fn move_stats_for_subtree_size(n: usize) -> BTreeMap<(QueryKind, String), 
 }
 
 #[tokio::test]
-#[ignore = "known defect RG-04: move's closure rebuild inserts A x N rows, \
-            one secure_insert call at a time -- see \
-            docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn scale_move_closure_inserts_do_not_grow_with_subtree_size() {
+    // RG-04 fixed: group_repo::rebuild_subtree_closure now sends the whole
+    // A x N batch as a single secure_insert_many call.
     let small = count_in(
         &move_stats_for_subtree_size(3).await,
         QueryKind::Insert,
@@ -660,11 +659,10 @@ async fn scale_move_closure_inserts_do_not_grow_with_subtree_size() {
 }
 
 #[tokio::test]
-#[ignore = "known defect RG-05: move's depth validation calls is_descendant \
-            + get_relative_depth once per descendant instead of reusing the \
-            already-loaded closure snapshot -- see \
-            docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn scale_move_descendant_depth_selects_do_not_grow_with_subtree_size() {
+    // RG-05 fixed: move's depth validation now calls
+    // get_descendant_ids_with_depth once and takes the max in memory,
+    // instead of is_descendant + get_relative_depth once per descendant.
     let small = count_in(
         &move_stats_for_subtree_size(3).await,
         QueryKind::Select,
@@ -711,10 +709,9 @@ async fn junction_inserts_for_parent_count(n: usize) -> usize {
 }
 
 #[tokio::test]
-#[ignore = "known defect RG-07: allowed-parent/membership junction rows are \
-            inserted one secure_insert call at a time -- see \
-            docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn scale_create_type_junction_inserts_do_not_grow_with_parent_count() {
+    // RG-07 fixed: allowed-parent/membership junction rows are now inserted
+    // via a single secure_insert_many call.
     let small = junction_inserts_for_parent_count(2).await;
     let large = junction_inserts_for_parent_count(8).await;
     assert_eq!(
@@ -754,10 +751,11 @@ async fn total_statements_for_force_delete(n: usize) -> usize {
 }
 
 #[tokio::test]
-#[ignore = "known defect RG-10: force delete issues ~4 statements per node \
-            (memberships delete + 2 closure deletes + group delete, each \
-            per-node in a loop) -- see docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn scale_force_delete_statements_do_not_grow_with_subtree_size() {
+    // RG-10 fixed: force delete now batches memberships/closure deletes
+    // across the whole subtree (2 + 1 statements total) and deletes groups
+    // depth-level by depth-level (one batched statement per distinct depth,
+    // deepest first) instead of ~4 statements per node in a loop.
     let small = total_statements_for_force_delete(3).await;
     let large = total_statements_for_force_delete(15).await;
     assert_eq!(

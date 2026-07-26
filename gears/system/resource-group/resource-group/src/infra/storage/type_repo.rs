@@ -275,6 +275,13 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Insert allowed parent junction entries.
+    ///
+    /// Fixes known defect RG-07: this used to issue one `secure_insert` per
+    /// entry (statement count grows with `parent_ids.len()`); now the whole
+    /// batch is sent as a single multi-row `INSERT` via `secure_insert_many`,
+    /// which validates every row against the scope exactly as the per-row
+    /// loop did -- moot here in practice (`system_scope()` is unconstrained),
+    /// but the batching helper preserves the same safety contract.
     async fn insert_allowed_parent_types<C: DBRunner>(
         &self,
         db: &C,
@@ -282,19 +289,23 @@ impl TypeRepositoryTrait for TypeRepository {
         parent_ids: &[i16],
     ) -> Result<(), DomainError> {
         let scope = system_scope();
-        for &parent_id in parent_ids {
-            let model = gts_type_allowed_parent::ActiveModel {
+        let rows: Vec<gts_type_allowed_parent::ActiveModel> = parent_ids
+            .iter()
+            .map(|&parent_id| gts_type_allowed_parent::ActiveModel {
                 type_id: Set(type_id),
                 parent_type_id: Set(parent_id),
-            };
-            toolkit_db::secure::secure_insert::<AllowedParentEntity>(model, &scope, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            })
+            .collect();
+        toolkit_db::secure::secure_insert_many::<AllowedParentEntity>(rows, &scope, db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(())
     }
 
     /// Insert allowed membership junction entries.
+    ///
+    /// Same RG-07 fix as `insert_allowed_parent_types`, batched via
+    /// `secure_insert_many`.
     async fn insert_allowed_membership_types<C: DBRunner>(
         &self,
         db: &C,
@@ -302,15 +313,16 @@ impl TypeRepositoryTrait for TypeRepository {
         membership_ids: &[i16],
     ) -> Result<(), DomainError> {
         let scope = system_scope();
-        for &membership_id in membership_ids {
-            let model = gts_type_allowed_membership::ActiveModel {
+        let rows: Vec<gts_type_allowed_membership::ActiveModel> = membership_ids
+            .iter()
+            .map(|&membership_id| gts_type_allowed_membership::ActiveModel {
                 type_id: Set(type_id),
                 membership_type_id: Set(membership_id),
-            };
-            toolkit_db::secure::secure_insert::<AllowedMembershipEntity>(model, &scope, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            })
+            .collect();
+        toolkit_db::secure::secure_insert_many::<AllowedMembershipEntity>(rows, &scope, db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(())
     }
 

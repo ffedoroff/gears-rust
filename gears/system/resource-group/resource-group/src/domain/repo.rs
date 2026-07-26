@@ -114,6 +114,18 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<Vec<Uuid>, DomainError>;
 
+    /// Same result set as `get_descendant_ids`, but keeps each descendant's
+    /// depth relative to `group_id` instead of discarding it. Used where
+    /// depth is actually needed (RG-05's move depth-limit check, RG-10's
+    /// force-delete depth-level batching) so callers don't have to issue a
+    /// second per-descendant query just to recover a value the first query
+    /// already fetched.
+    async fn get_descendant_ids_with_depth<C: DBRunner>(
+        &self,
+        db: &C,
+        group_id: Uuid,
+    ) -> Result<Vec<(Uuid, i32)>, DomainError>;
+
     async fn get_depth<C: DBRunner>(&self, db: &C, group_id: Uuid) -> Result<i32, DomainError>;
 
     async fn count_children<C: DBRunner>(
@@ -142,6 +154,18 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         group_id: Uuid,
     ) -> Result<(), DomainError>;
 
+    /// Delete all closure rows (both as ancestor and as descendant) for
+    /// every group in `group_ids`, in exactly 2 statements regardless of
+    /// how many ids are given. Used by `force_delete_subtree` (fixes known
+    /// defect RG-10) -- safe specifically because the whole batch is being
+    /// deleted together, so there is no "partial subtree" ordering to
+    /// preserve the way there would be for a single-group delete.
+    async fn delete_all_closure_rows_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError>;
+
     async fn rebuild_subtree_closure<C: DBRunner>(
         &self,
         db: &C,
@@ -160,6 +184,19 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         db: &C,
         group_id: Uuid,
     ) -> Result<(), DomainError>;
+
+    /// Delete all memberships for every group in `group_ids` in a single
+    /// statement. Used by `force_delete_subtree` (fixes known defect RG-10).
+    async fn delete_memberships_many<C: DBRunner>(
+        &self,
+        db: &C,
+        group_ids: &[Uuid],
+    ) -> Result<(), DomainError>;
+
+    /// Delete every group in `group_ids` in a single statement. Used by
+    /// `force_delete_subtree` (fixes known defect RG-10).
+    async fn delete_by_id_many<C: DBRunner>(&self, db: &C, ids: &[Uuid])
+    -> Result<(), DomainError>;
 
     async fn resolve_type_paths_batch<C: DBRunner>(
         &self,
