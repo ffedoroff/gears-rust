@@ -60,7 +60,7 @@ Every test must pass all three:
 - Real AuthN/AuthZ pipeline with tokens → E2E tests
 - MTLS certificate verification → E2E tests _(p2 — deferred, not implemented yet)_
 - Cursor codec encode/decode over HTTP → E2E tests
-- Performance, load, concurrency under contention → out of scope
+- Performance, load, concurrency under contention → see [`14_db_behavior_testing.md`](14_db_behavior_testing.md) (a dedicated third test layer — not out of scope, just not here)
 
 All of the above requires a running server with real PostgreSQL. Unit tests use SQLite and mock AuthZ — they cannot catch these bugs.
 
@@ -96,7 +96,7 @@ If a bug is catchable by calling a Rust function directly, it lives in unit test
 
 **No new crate dependencies for testing** — follow project conventions: `assert!(matches!(err, Variant { .. }), "msg: {err:?}")` not `assert_matches!`. Manual `vec![]` + loop for table-driven tests, not `rstest`. Plain `async fn` helpers, not fixtures.
 
-**No retry testing** — SERIALIZABLE retry loops are an implementation detail. Tests do not simulate contention.
+**No retry testing** — unit tests do not simulate contention or drive a SERIALIZABLE retry loop. That is not because retry semantics are an implementation detail unworthy of a test: whether a retry helper is wired up, and whether it can actually recognize a retryable error once one occurs, is real, testable behavior — see [`14_db_behavior_testing.md`](14_db_behavior_testing.md)'s `no-retry-serializable` and `error-shape-swallowing` defect classes, the latter found by exactly this kind of test on a case where the retry helper *was* present and still silently never fired.
 
 ---
 

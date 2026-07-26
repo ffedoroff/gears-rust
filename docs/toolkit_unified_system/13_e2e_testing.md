@@ -53,10 +53,12 @@ E2E tests cover integration seams — points where two independently correct com
 |------|-------------------------------|-------------------------|
 | **Handler ↔ JSON wire** | `#[serde(rename)]` typo, missing field, camelCase mismatch | Unit tests operate on Rust structs, not JSON bytes |
 | **Gear init ↔ AuthZ** | `PolicyEnforcer` not created, `AccessScope` not passed to service | Unit tests mock PolicyEnforcer; real wiring only exists in `gear.rs` |
-| **Service ↔ PostgreSQL** | FK enforcement, SERIALIZABLE isolation, domain types | Unit tests run on SQLite — different FK behavior, no domain types |
+| **Service ↔ PostgreSQL** [^1] | FK enforcement, SERIALIZABLE isolation, domain types | Unit tests run on SQLite — different FK behavior, no domain types |
 | **Error handler ↔ HTTP** | `Content-Type: application/problem+json` not set, stack trace leaked | Unit tests assert `DomainError` variant, not HTTP headers |
 | **Cursor codec ↔ HTTP** | Base64 encode/decode roundtrip, URL-encoding, offset drift | Unit tests test pagination logic; codec only runs in the handler layer |
 | **OData filter ↔ SQL** | Full parse→SQL→result chain | Unit tests verify FilterField names/kinds, not the full pipeline |
+
+[^1]: This seam, here, is happy-path only — a single request, sequentially, proving FK/SERIALIZABLE/domain-type behavior exists on real PostgreSQL. Whether that behavior stays *correct under concurrent writers* (does a transaction actually wrap a write, does a retry loop actually fire, does an invariant survive two overlapping callers) is a different question, deliberately out of E2E's stability-first scope — see [`14_db_behavior_testing.md`](14_db_behavior_testing.md).
 
 > **Note on routing**: In Axum and Actix-web, route registration can be tested in unit tests using `Router::oneshot()` — the router is instantiated in-process, no real server needed. A route smoke test (`assert non-405 for every registered path`) belongs in unit tests (`api_rest_test.rs`), not in E2E. E2E adds value here only if you need to verify routing behavior that depends on real server middleware or TLS termination.
 
