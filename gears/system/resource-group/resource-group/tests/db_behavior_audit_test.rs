@@ -440,10 +440,11 @@ async fn trace_update_type() {
     );
 }
 
+/// Known defect RG-02 fixed: delete_type's resolve/count/delete sequence now
+/// runs inside a SERIALIZABLE transaction with retry (see
+/// `TypeService::delete_type`). This is now a permanent guard, not a
+/// documented-but-ignored finding.
 #[tokio::test]
-#[ignore = "known defect RG-02: delete_type's resolve/count/delete sequence \
-            runs on a bare connection (self.db.conn()), no transaction -- \
-            see docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn trace_delete_type() {
     let (db, rec) = common::test_db_with_recorder().await;
     let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
@@ -458,16 +459,16 @@ async fn trace_delete_type() {
     snapshot_trace("delete_type", &rec);
     assert!(
         rec.writes_outside_tx().is_empty(),
-        "delete_type must run its writes inside a transaction (currently does not):\n{}",
+        "delete_type must run its writes inside a transaction:\n{}",
         rec.dump()
     );
 }
 
+/// Known defect RG-01 fixed: add_membership's check-then-insert sequence now
+/// runs inside a SERIALIZABLE transaction with retry (see
+/// `MembershipService::add_membership_inner`). This is now a permanent
+/// guard, not a documented-but-ignored finding.
 #[tokio::test]
-#[ignore = "known defect RG-01: add_membership's check-then-insert sequence \
-            runs on a bare connection (self.conn()), no transaction -- two \
-            concurrent first-memberships of the same resource in different \
-            tenants both pass -- see docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn trace_add_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
     let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
@@ -489,20 +490,18 @@ async fn trace_add_membership() {
     snapshot_trace("add_membership", &rec);
     assert!(
         rec.writes_outside_tx().is_empty(),
-        "add_membership must run its writes inside a transaction (currently does not):\n{}",
+        "add_membership must run its writes inside a transaction:\n{}",
         rec.dump()
     );
 }
 
-/// New finding beyond the known 10 (RG-14, see report): `remove_membership`
-/// has the *same* check-then-write shape as `add_membership` (resolve type,
-/// verify existence, delete) on a bare connection -- the general `no-tx-write`
-/// rule catches it too, even though only `add_membership` was in the
-/// original ground-truth list.
+/// RG-14 fixed: `remove_membership` had the *same* check-then-write shape as
+/// `add_membership` (resolve type, verify existence, delete) on a bare
+/// connection -- the general `no-tx-write` rule caught it too, even though
+/// only `add_membership` was in the original ground-truth list. Now runs
+/// inside a SERIALIZABLE transaction with retry (see
+/// `MembershipService::remove_membership`).
 #[tokio::test]
-#[ignore = "new finding RG-14: remove_membership's exists-check-then-delete \
-            also runs on a bare connection, no transaction -- see \
-            docs/analysis/DB_BEHAVIOR_AUDIT.md"]
 async fn trace_remove_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
     let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
@@ -528,7 +527,7 @@ async fn trace_remove_membership() {
     snapshot_trace("remove_membership", &rec);
     assert!(
         rec.writes_outside_tx().is_empty(),
-        "remove_membership must run its writes inside a transaction (currently does not):\n{}",
+        "remove_membership must run its writes inside a transaction:\n{}",
         rec.dump()
     );
 }
@@ -573,8 +572,9 @@ async fn trace_seeding() {
         .expect("seed_groups should succeed");
     assert_eq!(group_result.created, 1);
 
-    // NOTE: membership seeding shares add_membership_inner's no-tx defect
-    // (RG-01); trace_add_membership documents it directly, not repeated here.
+    // NOTE: membership seeding shares add_membership_inner's transaction
+    // behavior (RG-01, fixed); trace_add_membership asserts it directly, not
+    // repeated here.
     snapshot_trace("seeding", &rec);
 }
 
@@ -920,10 +920,16 @@ fn static_rule_flags_type_service_missing_retry() {
         "known defect RG-03: expected create_type/update_type to call \
          transaction_ref_mapped_with_config directly (bypassing retry), found {unretried}"
     );
+    // RG-02 fixed delete_type by wrapping it in transaction_with_retry, so
+    // this file now has exactly one retried call site (delete_type) while
+    // create_type/update_type (RG-03) remain unretried -- update this again
+    // once RG-03 is fixed (retried should become 3, unretried 0, and this
+    // test's assertion direction flips to a negative control matching
+    // static_rule_passes_group_service_uses_retry).
     assert_eq!(
-        retried, 0,
-        "type_service.rs unexpectedly uses transaction_with_retry -- if RG-03 \
-         was fixed, update docs/analysis/DB_BEHAVIOR_AUDIT.md"
+        retried, 1,
+        "expected exactly one transaction_with_retry call site (delete_type, fixed for RG-02) \
+         -- if RG-03 was also fixed, update this test and docs/analysis/DB_BEHAVIOR_AUDIT.md"
     );
 }
 

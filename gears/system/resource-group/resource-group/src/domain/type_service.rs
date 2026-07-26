@@ -328,17 +328,47 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1
     /// Delete a GTS type definition.
+    ///
+    /// Runs inside a `SERIALIZABLE` transaction with bounded retry (fixes
+    /// known defect RG-02: the reference-count-then-delete previously ran
+    /// on a bare connection, racing a concurrent `create_group` of the same
+    /// type. The FK (`resource_group.gts_type_id ... ON DELETE RESTRICT`)
+    /// already prevented data corruption -- the type row could never
+    /// actually vanish while a referencing group existed -- but the race
+    /// meant this delete's own count-check could pass and then the
+    /// `DELETE` itself hit a raw FK-violation error instead of the clean
+    /// `ConflictActiveReferences` the check is meant to produce. Wrapping
+    /// both in one SERIALIZABLE transaction with retry closes that window:
+    /// a concurrent `create_group_inner` referencing this type conflicts
+    /// with this transaction's read of `resource_group`, so `PostgreSQL`
+    /// aborts one of them and the retried attempt sees a consistent count.
     pub async fn delete_type(&self, code: &str) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
         // Actor sends DELETE /api/types-registry/v1/types/{code}
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
-        let conn = self.db.conn()?;
+        let db = self.db.db();
+        let type_repo = self.type_repo.clone();
+        let code = code.to_owned();
 
+        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+            let type_repo = type_repo.clone();
+            let code = code.clone();
+            Box::pin(async move { Self::delete_type_in_tx(&*type_repo, tx, &code).await })
+        })
+        .await
+    }
+
+    /// Inner logic for `delete_type`, runs inside the SERIALIZABLE
+    /// transaction.
+    async fn delete_type_in_tx(
+        type_repo: &TR,
+        tx: &impl DBRunner,
+        code: &str,
+    ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-2
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
-        let type_id = self
-            .type_repo
-            .resolve_id(&conn, code)
+        let type_id = type_repo
+            .resolve_id(tx, code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(code))?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-3
@@ -347,7 +377,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-5
         // Check for active references
-        let count = self.type_repo.count_groups_of_type(&conn, type_id).await?;
+        let count = type_repo.count_groups_of_type(tx, type_id).await?;
         if count > 0 {
             warn!(code = %code, count, "Cannot delete type: active group references exist");
             return Err(DomainError::conflict_active_references(format!(
@@ -358,7 +388,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-4
 
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
-        self.type_repo.delete_by_id(&conn, type_id).await?;
+        type_repo.delete_by_id(tx, type_id).await?;
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-6
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-7
         Ok(())

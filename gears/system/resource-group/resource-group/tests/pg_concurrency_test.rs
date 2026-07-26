@@ -256,22 +256,28 @@ fn describe_membership_result(
 }
 
 // =========================================================================
-// RG-01: membership first-write race
+// RG-01: membership first-write race (fixed)
 // =========================================================================
 
 /// Two concurrent `add_membership` calls for the same `(resource_type,
 /// resource_id)` in two *different* tenants. The "a resource belongs to
 /// groups of a single tenant" invariant requires exactly one of them to
-/// succeed -- `add_membership_inner`'s check-then-insert has no transaction,
-/// so both race the same "existing_tenants is empty" read and both insert.
+/// succeed. `add_membership_inner` now runs inside a `SERIALIZABLE`
+/// transaction with retry (fixes RG-01): the two transactions' predicate
+/// reads over `get_existing_membership_tenant_ids` conflict with each
+/// other's insert (textbook write-skew), so PostgreSQL aborts one with
+/// `40001` and `transaction_with_retry` retries it -- the retried attempt
+/// then sees the other's committed membership and returns the clean
+/// `TenantIncompatibility` domain error (also exercises the RG-15 fix:
+/// without it, retry detection would not recognize this repo-mapped error
+/// as retryable and the loser would get a raw serialization failure
+/// instead).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn membership_first_write_race_both_tenants_succeed() {
-    // A genuine race between two network round-trips isn't guaranteed to
-    // interleave on every single attempt (system load, scheduler luck), so
-    // run several trials and require the bug to reproduce in at least one --
-    // matches delete_type_races_create_group_reproduces_check_window's
-    // approach below. In practice this reproduces on every trial when the
-    // machine isn't under heavy concurrent load.
+async fn membership_first_write_race_exactly_one_tenant_wins() {
+    // Run several trials for the same reason
+    // delete_type_races_create_group_reproduces_check_window does: the
+    // invariant must hold under real concurrent load, not just in a single
+    // sample.
     const TRIALS: usize = 8;
 
     let (db, _pg_guard) = pg_db_or_skip!();
@@ -344,9 +350,17 @@ async fn membership_first_write_race_both_tenants_succeed() {
 
         let tenant_ids =
             distinct_tenant_ids_for_resource(&db, &member_type.code, &resource_id).await;
-        match (r1.is_ok(), r2.is_ok(), tenant_ids.len()) {
-            (true, true, 2) => both_succeeded += 1,
-            (true, false, 1) | (false, true, 1) => correctly_rejected += 1,
+        match (&r1, &r2, tenant_ids.len()) {
+            (Ok(_), Ok(_), _) => both_succeeded += 1,
+            (Ok(_), Err(e), 1) | (Err(e), Ok(_), 1) => {
+                correctly_rejected += 1;
+                assert!(
+                    matches!(e, DomainError::TenantIncompatibility { .. }),
+                    "the losing add_membership must get a clean TenantIncompatibility \
+                     (proving transaction_with_retry + the RG-15 fix absorbed the SSI \
+                     conflict), got: {e}"
+                );
+            }
             _ => {
                 unexpected += 1;
                 let tenants = tenant_ids
@@ -370,20 +384,21 @@ async fn membership_first_write_race_both_tenants_succeed() {
     );
     assert_eq!(
         unexpected, 0,
-        "every trial must be either the known bug (both succeed) or the correct outcome \
-         (one rejected) -- got {unexpected} trials with a genuinely unexpected shape"
+        "every trial must be either both-succeed (RG-01 regression) or the correct outcome \
+         (one rejected with a clean TenantIncompatibility) -- got {unexpected} trials with a \
+         genuinely unexpected shape"
     );
-    // Known defect RG-01, reproduced: with a correct implementation, every
-    // trial would land in `correctly_rejected` (one Ok, one
-    // Err(TenantIncompatibility)). Today at least some trials show both
-    // tenants' "first membership" succeeding for the same resource --
-    // add_membership_inner's check-then-insert has no transaction. Once
-    // RG-01 is fixed, invert this to `assert_eq!(both_succeeded, 0)`.
-    assert!(
-        both_succeeded > 0,
-        "known defect RG-01 not reproduced in {TRIALS} trials (correctly_rejected={correctly_rejected}) \
-         -- either the bug was fixed (update the report) or the race didn't interleave this run; \
-         try increasing TRIALS"
+    // RG-01 fixed: both tenants' "first membership" succeeding for the same
+    // resource must never happen now. If this starts failing, RG-01 has
+    // regressed.
+    assert_eq!(
+        both_succeeded, 0,
+        "RG-01 regression: {both_succeeded}/{TRIALS} trials let both tenants' first-membership \
+         add succeed for the same resource"
+    );
+    assert_eq!(
+        correctly_rejected, TRIALS,
+        "expected every trial to resolve to exactly one tenant winning, got {correctly_rejected}/{TRIALS}"
     );
 }
 
