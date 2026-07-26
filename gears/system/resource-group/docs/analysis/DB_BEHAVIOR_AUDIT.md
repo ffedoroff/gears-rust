@@ -137,18 +137,18 @@ were stable across repeated runs.
 All 10 ground-truth defects are rediscovered by a general, class-level rule
 (not a bespoke check per defect). **10/10.**
 
-| # | Class | Location | Rule that reopens it | Executable evidence |
-|---|-------|----------|----------------------|----------------------|
-| RG-01 | no-tx-write | `membership_service.rs:122-230` (`add_membership_inner`); conn at :128, tenant check :179, insert :217 | `writes_outside_tx()` | `trace_add_membership` (SQLite, `#[ignore]`); `membership_first_write_race_both_tenants_succeed` (real PG, both tenants' first-membership succeed) |
-| RG-02 | no-tx-write | `type_service.rs:331-365` (`delete_type`) | `writes_outside_tx()` | `trace_delete_type` (SQLite, `#[ignore]`); `delete_type_races_create_group_reproduces_check_window` (real PG) |
-| RG-03 | no-retry-serializable | `type_service.rs:91` (create_type), `:241` (update_type) — vs `group_service.rs`'s `transaction_with_retry` | static rule (`.transaction_ref_mapped_with_config` count) | `static_rule_flags_type_service_missing_retry` + negative control `static_rule_passes_group_service_uses_retry`; real-PG repro `create_type_conflict_no_retry_yields_raw_error_for_loser` (loser gets a raw serialization-failure error, not `TypeAlreadyExists`) |
-| RG-04 | n-plus-one | `group_repo.rs:1002-1006` (`rebuild_subtree_closure`, `for row in new_rows`) | scale-invariance (`Insert`, `resource_group_closure`) | `scale_move_closure_inserts_do_not_grow_with_subtree_size` (`#[ignore]`): 6 inserts at N=3, 30 at N=15 — exactly `2×N` (A=2 ancestors × N) |
-| RG-05 | n-plus-one | `group_service.rs:1127-1133` (`move_group_internal_impl`: `is_descendant` :1129 + `get_relative_depth` :1133 per descendant) | scale-invariance (`Select`, `resource_group_closure`) | `scale_move_descendant_depth_selects_do_not_grow_with_subtree_size` (`#[ignore]`): 16 selects at N=3, 64 at N=15 |
-| RG-06 | n-plus-one | `group_repo.rs:757-766` (`insert_ancestor_closure_rows`, loop insert at :763) | scale-invariance (`Insert`, `resource_group_closure`) | `scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth` (`#[ignore]`): 4 inserts at chain depth 3, 16 at depth 15 — exactly `depth + 1` |
-| RG-07 | n-plus-one | `type_repo.rs:278-315` (`insert_allowed_parent_types` loop :285, `insert_allowed_membership_types` loop :305) | scale-invariance (`Insert`, `gts_type_allowed_parent`) | `scale_create_type_junction_inserts_do_not_grow_with_parent_count` (`#[ignore]`): 2 inserts at N=2, 8 at N=8 |
-| RG-08 | redundant-io | `group_repo.rs:656` (`insert`), `:699` (`update`); same pattern in `type_repo.rs` (`insert`/`update_type`) and `membership_repo.rs::insert` | `redundant_reads_after_write()` | `trace_update_group` (non-ignored, pins the finding directly: `!rec.redundant_reads_after_write().is_empty()`) |
-| RG-09 | external-call-in-tx | `group_service.rs:561` (`validate_metadata_via_gts(...)` inside `create_group_inner`, itself inside `transaction_with_retry` from `group_service.rs:150`) | static rule (`external_client_param_names` + closure-body scan) | `static_rule_flags_external_call_inside_create_group_tx` + negative control (move/delete's closures don't reference any discovered client) |
-| RG-10 | n-plus-one | `group_service.rs:1210-1234` (`force_delete_subtree`, two `for &gid in all_ids.iter().rev()` loops at :1223 and :1229) | scale-invariance (`rec.total()`) | `scale_force_delete_statements_do_not_grow_with_subtree_size` (`#[ignore]`): 16 statements at N=3, 64 at N=15 |
+| # | Class | Location | Rule that reopens it | Executable evidence | Status (Step 3) |
+|---|-------|----------|----------------------|----------------------|------------------|
+| RG-01 | no-tx-write | `membership_service.rs:122-230` (`add_membership_inner`); conn at :128, tenant check :179, insert :217 | `writes_outside_tx()` | `trace_add_membership` (SQLite, `#[ignore]`); `membership_first_write_race_both_tenants_succeed` (real PG, both tenants' first-membership succeed) | **Fixed** in `bd0d9f2c` — wrapped in `transaction_with_retry(TxConfig::serializable())`; `trace_add_membership` un-ignored, race test renamed to `membership_first_write_race_exactly_one_tenant_wins` and inverted to assert the invariant holds |
+| RG-02 | no-tx-write | `type_service.rs:331-365` (`delete_type`) | `writes_outside_tx()` | `trace_delete_type` (SQLite, `#[ignore]`); `delete_type_races_create_group_reproduces_check_window` (real PG) | **Fixed** in `bd0d9f2c` (tx wrap) / `9e537fd2` (PG test hardened) — `trace_delete_type` un-ignored, race test renamed to `delete_type_races_create_group_resolves_cleanly` and asserts zero raw/unexpected outcomes |
+| RG-03 | no-retry-serializable | `type_service.rs:91` (create_type), `:241` (update_type) — vs `group_service.rs`'s `transaction_with_retry` | static rule (`.transaction_ref_mapped_with_config` count) | `static_rule_flags_type_service_missing_retry` + negative control `static_rule_passes_group_service_uses_retry`; real-PG repro `create_type_conflict_no_retry_yields_raw_error_for_loser` (loser gets a raw serialization-failure error, not `TypeAlreadyExists`) | **Fixed** in `22a92c86` — both now use `transaction_with_retry`; static rule renamed to `static_rule_passes_type_service_uses_retry` (negative control, 0 unretried / 3 retried); PG test renamed to `create_type_conflict_retried_yields_clean_already_exists_for_loser` |
+| RG-04 | n-plus-one | `group_repo.rs:1002-1006` (`rebuild_subtree_closure`, `for row in new_rows`) | scale-invariance (`Insert`, `resource_group_closure`) | `scale_move_closure_inserts_do_not_grow_with_subtree_size` (`#[ignore]`): 6 inserts at N=3, 30 at N=15 — exactly `2×N` (A=2 ancestors × N) | **Fixed** in `30f7c8f1` — batched via new `toolkit_db::secure::secure_insert_many` (`1ec463a9`); scale test un-ignored, now passes (constant statement count) |
+| RG-05 | n-plus-one | `group_service.rs:1127-1133` (`move_group_internal_impl`: `is_descendant` :1129 + `get_relative_depth` :1133 per descendant) | scale-invariance (`Select`, `resource_group_closure`) | `scale_move_descendant_depth_selects_do_not_grow_with_subtree_size` (`#[ignore]`): 16 selects at N=3, 64 at N=15 | **Fixed** in `30f7c8f1` — new `get_descendant_ids_with_depth` returns depth in the same query already fetched, eliminating the per-descendant `is_descendant` (redundant by construction) + `get_relative_depth` calls; `get_relative_depth` deleted (dead code); scale test un-ignored |
+| RG-06 | n-plus-one | `group_repo.rs:757-766` (`insert_ancestor_closure_rows`, loop insert at :763) | scale-invariance (`Insert`, `resource_group_closure`) | `scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth` (`#[ignore]`): 4 inserts at chain depth 3, 16 at depth 15 — exactly `depth + 1` | **Fixed** in `30f7c8f1` — batched via `secure_insert_many`; scale test un-ignored |
+| RG-07 | n-plus-one | `type_repo.rs:278-315` (`insert_allowed_parent_types` loop :285, `insert_allowed_membership_types` loop :305) | scale-invariance (`Insert`, `gts_type_allowed_parent`) | `scale_create_type_junction_inserts_do_not_grow_with_parent_count` (`#[ignore]`): 2 inserts at N=2, 8 at N=8 | **Fixed** in `30f7c8f1` — both junction inserts batched via `secure_insert_many`; scale test un-ignored |
+| RG-08 | redundant-io | `group_repo.rs:656` (`insert`), `:699` (`update`); same pattern in `type_repo.rs` (`insert`/`update_type`) and `membership_repo.rs::insert` | `redundant_reads_after_write()` | `trace_update_group` (non-ignored, pins the finding directly: `!rec.redundant_reads_after_write().is_empty()`) | **Partially fixed** in `9e537fd2` — the three `insert` call sites (`group_repo`/`type_repo`/`membership_repo`) now use the `Model` `secure_insert` already returns; `update`/`update_type` deliberately **not** changed (deferred, not a gap): they go through `update_many`/`SecureUpdateMany`, which reports rows-affected only, not the model, so their re-read isn't avoidable without a wider write-API change. `trace_update_group`'s pinned assertion is intentionally left in place (still true, for the update path specifically) |
+| RG-09 | external-call-in-tx | `group_service.rs:561` (`validate_metadata_via_gts(...)` inside `create_group_inner`, itself inside `transaction_with_retry` from `group_service.rs:150`) | static rule (`external_client_param_names` + closure-body scan) | `static_rule_flags_external_call_inside_create_group_tx` + negative control (move/delete's closures don't reference any discovered client) | **Fixed** in `61dec836` — moved before the transaction in **both** call sites: `create_group`/`create_group_unscoped` (using `req.code` directly, no extra read) and `update_group` (second-review finding: also present in `update_group_inner`, not just `create_group_inner` — pre-fetches via the same AuthZ scope already resolved). Static rule renamed to `static_rule_passes_no_external_call_inside_group_service_tx` (negative control) |
+| RG-10 | n-plus-one | `group_service.rs:1210-1234` (`force_delete_subtree`, two `for &gid in all_ids.iter().rev()` loops at :1223 and :1229) | scale-invariance (`rec.total()`) | `scale_force_delete_statements_do_not_grow_with_subtree_size` (`#[ignore]`): 16 statements at N=3, 64 at N=15 | **Fixed** in `30f7c8f1` — memberships and closure rows batch-deleted for the whole subtree (`delete_memberships_many`/`delete_all_closure_rows_many`); groups deleted depth-level by depth-level, deepest first (`delete_by_id_many`, one call per distinct depth, not per node) to respect `parent_id`'s `ON DELETE RESTRICT`. Scale test un-ignored |
 
 Every `#[ignore]`d test's reason string names the defect and points back to
 this document, per the "known defect RG-XX" convention used throughout
@@ -212,23 +212,23 @@ by further code reading. Severity is this audit's own judgment (impact ×
 likelihood under the gear's actual write surface — see §6), not a
 CVSS-style score.
 
-| ID | Class | Severity | Location | Repro |
-|----|-------|----------|----------|-------|
-| RG-01 | no-tx-write | **Critical** | `membership_service.rs:122-230` | `trace_add_membership` (`#[ignore]`); `membership_first_write_race_both_tenants_succeed` (real PG) |
-| RG-02 | no-tx-write | Medium | `type_service.rs:331-365` | `trace_delete_type` (`#[ignore]`); `delete_type_races_create_group_reproduces_check_window` (real PG) |
-| RG-03 | no-retry-serializable | High | `type_service.rs:91,241` | `static_rule_flags_type_service_missing_retry`; `create_type_conflict_no_retry_yields_raw_error_for_loser` (real PG) |
-| RG-04 | n-plus-one | High | `group_repo.rs:986-1006` | `scale_move_closure_inserts_do_not_grow_with_subtree_size` (`#[ignore]`) |
-| RG-05 | n-plus-one | Medium | `group_service.rs:1122-1140` | `scale_move_descendant_depth_selects_do_not_grow_with_subtree_size` (`#[ignore]`) |
-| RG-06 | n-plus-one | Medium-High | `group_repo.rs:739-766` | `scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth` (`#[ignore]`) |
-| RG-07 | n-plus-one | Low-Medium | `type_repo.rs:278-315` | `scale_create_type_junction_inserts_do_not_grow_with_parent_count` (`#[ignore]`) |
-| RG-08 | redundant-io | Low-Medium | `group_repo.rs:652-701`, `type_repo.rs` (`insert`/`update_type`), `membership_repo.rs::insert` | `trace_update_group` (non-ignored, pinned) |
-| RG-09 | external-call-in-tx | High | `group_service.rs:559-562` (call), `:150` (enclosing tx) | `static_rule_flags_external_call_inside_create_group_tx` |
-| RG-10 | n-plus-one | High | `group_service.rs:1209-1234` | `scale_force_delete_statements_do_not_grow_with_subtree_size` (`#[ignore]`) |
-| RG-11 | redundant-io (new) | Low | `group_service.rs:548-556` (`create_group_inner`: `resolve_id` then `find_by_code` for the same code); `:801-806` (`update_group_inner`, same pattern) | Visible directly in `docs/analysis/traces/create_root_group.txt` and `update_type.txt`: two `SELECT ... gts_type WHERE schema_id = ?` for the same code within one operation |
-| RG-12 | n-plus-one (new, **read path**) | Medium | `type_repo.rs:481-512` (`list_types`: `load_full_type` per row, `:503-504`) | Not covered by a committed test (found via code reading after the trace review prompted a second pass over read paths); reproducible the same way as RG-04/06/07/10 — a page of N types costs `2N+1` queries (junction reads per row) |
-| RG-13 | redundant-io (new) | Low | `type_service.rs:98` (`create_type`'s duplicate-check calls `find_by_code`, which loads full junction data just to test existence) | Visible in `docs/analysis/traces/create_type.txt`, statement 1: the pre-insert existence check is a plain `schema_id` lookup only when the type *doesn't* exist yet (short-circuits before `load_full_type`); the over-fetch triggers specifically on the **conflict path** (creating an already-existing code), not the happy path |
-| RG-14 | no-tx-write (new) | Medium | `membership_service.rs:235-286` (`remove_membership`: conn at `:252`, existence check, delete at `:280`) | `trace_remove_membership` (`#[ignore]`) — same shape as RG-01 (check-then-write, no transaction), not called out in the original ground-truth list; the general rule caught it anyway |
-| RG-15 | reliability (new) | **Critical** | `libs/toolkit-db/src/contention.rs:88` (`is_retryable_contention` only matches `DbErr::Exec`/`DbErr::Query`) × `error.rs:203` (`DomainError::database()` always wraps as `DbErr::Custom`) | `negative_control_tenant_root_race_exactly_one_succeeds` / `negative_control_width_limited_race_exactly_one_succeeds` (real PG): loser's error was `Database(Custom("... could not serialize access ..."))`, not the clean domain error, in every observed run |
+| ID | Class | Severity | Location | Repro | Status (Step 3) |
+|----|-------|----------|----------|-------|------------------|
+| RG-01 | no-tx-write | **Critical** | `membership_service.rs:122-230` | `trace_add_membership` (`#[ignore]`); `membership_first_write_race_both_tenants_succeed` (real PG) | **Fixed** — `bd0d9f2c` |
+| RG-02 | no-tx-write | Medium | `type_service.rs:331-365` | `trace_delete_type` (`#[ignore]`); `delete_type_races_create_group_reproduces_check_window` (real PG) | **Fixed** — `bd0d9f2c` |
+| RG-03 | no-retry-serializable | ~~High~~ **Critical (revised)** — `create_type`/`update_type` are live call sites for account-management's gear-init registration flow (`registration.rs:294`/`:219`), not latent code; a raw serialization failure there would surface at AM startup | `type_service.rs:91,241` | `static_rule_flags_type_service_missing_retry`; `create_type_conflict_no_retry_yields_raw_error_for_loser` (real PG) | **Fixed** — `22a92c86`; `cargo test -p cf-gears-account-management` verified green after |
+| RG-04 | n-plus-one | High | `group_repo.rs:986-1006` | `scale_move_closure_inserts_do_not_grow_with_subtree_size` (`#[ignore]`) | **Fixed** — `30f7c8f1` |
+| RG-05 | n-plus-one | Medium | `group_service.rs:1122-1140` | `scale_move_descendant_depth_selects_do_not_grow_with_subtree_size` (`#[ignore]`) | **Fixed** — `30f7c8f1` |
+| RG-06 | n-plus-one | Medium-High | `group_repo.rs:739-766` | `scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth` (`#[ignore]`) | **Fixed** — `30f7c8f1` |
+| RG-07 | n-plus-one | Low-Medium | `type_repo.rs:278-315` | `scale_create_type_junction_inserts_do_not_grow_with_parent_count` (`#[ignore]`) | **Fixed** — `30f7c8f1` |
+| RG-08 | redundant-io | Low-Medium | `group_repo.rs:652-701`, `type_repo.rs` (`insert`/`update_type`), `membership_repo.rs::insert` | `trace_update_group` (non-ignored, pinned) | **Partially fixed** — `9e537fd2` (insert paths only; update paths deferred, see §2's Status cell for why) |
+| RG-09 | external-call-in-tx | High | `group_service.rs:559-562` (call), `:150` (enclosing tx) | `static_rule_flags_external_call_inside_create_group_tx` | **Fixed** — `61dec836`; also covers a second call site inside `update_group_inner` found during Step 3 review (not in the original Step 1 location list) |
+| RG-10 | n-plus-one | High | `group_service.rs:1209-1234` | `scale_force_delete_statements_do_not_grow_with_subtree_size` (`#[ignore]`) | **Fixed** — `30f7c8f1` |
+| RG-11 | redundant-io (new) | Low | `group_service.rs:548-556` (`create_group_inner`: `resolve_id` then `find_by_code` for the same code); `:801-806` (`update_group_inner`, same pattern) | Visible directly in `docs/analysis/traces/create_root_group.txt` and `update_type.txt`: two `SELECT ... gts_type WHERE schema_id = ?` for the same code within one operation | **Fixed** — `409682fd`; a third instance of the same shape was found in `type_service.rs`'s `update_type_in_tx` during the fix (not in the original location list) and fixed too |
+| RG-12 | n-plus-one (new, **read path**) | Medium | `type_repo.rs:481-512` (`list_types`: `load_full_type` per row, `:503-504`) | Not covered by a committed test (found via code reading after the trace review prompted a second pass over read paths); reproducible the same way as RG-04/06/07/10 — a page of N types costs `2N+1` queries (junction reads per row) | **Fixed** — `409682fd`; new `scale_list_types_statements_do_not_grow_with_page_size` test added (previously uncovered) |
+| RG-13 | redundant-io (new) | Low | `type_service.rs:98` (`create_type`'s duplicate-check calls `find_by_code`, which loads full junction data just to test existence) | Visible in `docs/analysis/traces/create_type.txt`, statement 1: the pre-insert existence check is a plain `schema_id` lookup only when the type *doesn't* exist yet (short-circuits before `load_full_type`); the over-fetch triggers specifically on the **conflict path** (creating an already-existing code), not the happy path | **Fixed** — `409682fd`; new `create_type_conflict_check_does_not_overfetch_junctions` test added (previously uncovered) |
+| RG-14 | no-tx-write (new) | ~~Medium~~ **High (revised)** — `remove_membership` is called from `user/service.rs:1182` on a **live request path** in account-management, not startup-only | `membership_service.rs:235-286` (`remove_membership`: conn at `:252`, existence check, delete at `:280`) | `trace_remove_membership` (`#[ignore]`) — same shape as RG-01 (check-then-write, no transaction), not called out in the original ground-truth list; the general rule caught it anyway | **Fixed** — `bd0d9f2c`; `cargo test -p cf-gears-account-management` verified green after |
+| RG-15 | reliability (new) | **Critical** | `libs/toolkit-db/src/contention.rs:88` (`is_retryable_contention` only matches `DbErr::Exec`/`DbErr::Query`) × `error.rs:203` (`DomainError::database()` always wraps as `DbErr::Custom`) | `negative_control_tenant_root_race_exactly_one_succeeds` / `negative_control_width_limited_race_exactly_one_succeeds` (real PG): loser's error was `Database(Custom("... could not serialize access ..."))`, not the clean domain error, in every observed run | **Fixed** — `92149362` (chosen over auditing every `DomainError::database(e.to_string())` call site: fixes every current and future caller in one place) |
 
 ### RG-15 in detail (new, highest-impact finding)
 
@@ -414,6 +414,38 @@ and depends on external HTTP traffic patterns (multiple API clients/
 replicas hitting the same tenant, group, or type concurrently), not on
 whether another *gear* calls into resource-group's write path in-process.
 
+> **Step 3 correction**: the claim above — "there is no in-process
+> `ClientHub` writer today" — is **wrong** and is left in place only as a
+> historical record of what Step 1 checked (`rg-tr-plugin`, which genuinely
+> is read-only). A direct code check during Step 3 found that
+> **account-management is a real in-process `ClientHub` writer** of
+> resource-group, via `resource_group_sdk::api::ResourceGroupClient`:
+>
+> - `registration.rs:294` → `create_type` and `registration.rs:219` →
+>   `update_type`, both at AM gear-init time (RG-03's live callers — the
+>   severity of RG-03 is revised from High to Critical in §4 for exactly
+>   this reason: a raw serialization failure here surfaced at AM startup,
+>   not in some unreachable path).
+> - `user/service.rs:1182` → `remove_membership`, on a **live request
+>   path**, not startup-only (RG-14's severity is revised from Medium to
+>   High in §4 for the same reason).
+>
+> This does not weaken the "REST write surface is public" conclusion above
+> — it strengthens the overall risk picture: resource-group has *two*
+> non-zero concurrent-write surfaces (public REST, and this in-process
+> `ClientHub` caller), not one. It is a nuance worth stating precisely:
+> AM's own **test suite** is fully decoupled from these fixes (it mocks
+> `ResourceGroupClient` with hand-written fakes — `FakeRgClient`,
+> `FailingUpdateClient`, `FakeMembershipRgClient` — so none of Step 3's
+> changes to resource-group's internals could break an AM test), but AM's
+> **production runtime** is a real, live consumer of the exact code paths
+> fixed in Step 3. Both `cargo test -p cf-gears-account-management` before
+> and after every resource-group change in Step 3 stayed green (797+ tests,
+> 0 failures) — expected, given the mock boundary, and not by itself
+> evidence that the live integration is unaffected by the fixes (it can't
+> be, since AM never exercises real resource-group code in its own test
+> suite either way).
+
 ## 7. Related documents
 
 - [concurrent-write-performance-analysis.md](./concurrent-write-performance-analysis.md)
@@ -444,3 +476,230 @@ whether another *gear* calls into resource-group's write path in-process.
   adversarial review (testcontainers migration, class-based static rule,
   param-count tracking, plus this report) — each is its own commit with
   DCO sign-off, none amend prior history.
+
+---
+
+# Step 3 — Remediation
+
+Everything below this line was added during Step 3 (full remediation of
+RG-01 through RG-15, plus a second review round). Nothing above this line
+was rewritten; §2/§4's tables gained a **Status** column, and §6 gained a
+correction callout, both noted inline above. Branch `fix/rg-db-remediation`,
+based on this audit's branch (`audit/rg-db-behavior`) so the fixes can see
+and flip the recorder/audit-test guards Step 1 built.
+
+## 9. Remediation summary
+
+All 15 findings are fixed except RG-08, which is intentionally
+**partially** fixed (see its Status cell in §2 — the `update`/`update_type`
+re-read is not avoidable without a wider write-API change, and that change
+isn't justified by this remediation's scope). One commit per defect class
+(a couple of tight, closely-related clusters — RG-04/05/06/07/10 share one
+commit since they're the same n-plus-one shape at different call sites;
+RG-11/12/13 share one commit since they're the same read-path
+redundant-io/n-plus-one shapes):
+
+| Commit | Defect(s) | Summary |
+|--------|-----------|---------|
+| `92149362` | RG-15 | `is_retryable_contention` now also inspects `DbErr::Custom` |
+| `bd0d9f2c` | RG-01, RG-02, RG-14 | `add_membership`/`remove_membership`/`delete_type` wrapped in `transaction_with_retry(TxConfig::serializable())` |
+| `22a92c86` | RG-03 | `create_type`/`update_type` converted to `transaction_with_retry` |
+| `4675de75` | — (infra) | PG-suite hierarchy/membership invariant checker + 5 new move-scenario races (§11) |
+| `61dec836` | RG-09 | `validate_metadata_via_gts` moved before the transaction, both call sites |
+| `1ec463a9` | — (platform) | `toolkit_db::secure::secure_insert_many` added |
+| `30f7c8f1` | RG-04, RG-05, RG-06, RG-07, RG-10 | N+1 write/delete hotspots batched |
+| `9e537fd2` | RG-08 | `insert` call sites use the model `secure_insert` already returns (insert paths only) |
+| `409682fd` | RG-11, RG-12, RG-13 | Read-path redundant-io + n-plus-one fixed |
+| `dcd8d36d` | — (contract-drift) | Missing SERIALIZABLE tx-timeout mechanism documented as an executable, `#[ignore]`d test |
+| `191ca503` | — (docs) | Trace snapshots regenerated against the fully-fixed code |
+
+## 10. Choice of remediation: membership concurrency
+
+For RG-01 (and the broader "is a resource linked from more than one
+tenant" invariant `add_membership_inner` protects), two remediation shapes
+were on the table:
+
+1. **SSI transaction** (chosen): wrap the check-then-act sequence in
+   `transaction_with_retry(TxConfig::serializable())`. PostgreSQL's
+   Serializable Snapshot Isolation detects the write-skew pattern (two
+   transactions each read "no existing membership for this resource",
+   then each insert one) as a `40001` conflict and aborts one side; the
+   retry then sees the winner's committed row and returns a clean
+   `TenantIncompatibility`. No explicit row lock is needed — correctness
+   comes from the isolation level, not from application-level locking.
+2. **Ownership guard-table** (not built): a dedicated table mapping
+   `(resource_type, resource_id) -> owning_tenant_id`, written with an
+   `INSERT ... ON CONFLICT DO NOTHING`-style guard so a second insert for
+   an already-claimed resource fails on a unique constraint immediately,
+   without relying on SERIALIZABLE at all (would also work under weaker
+   isolation levels).
+
+**This detector approves of both** — the choice between them is a design
+decision, not something the audit's tests force. SSI was picked here
+because: (a) it reuses the exact pattern `group_service.rs` already
+established for every other hierarchy mutation, so `membership_service.rs`
+becomes consistent with the rest of the write surface instead of
+introducing a second concurrency-control mechanism; (b) it requires no
+schema migration; (c) DESIGN.md's own "Concurrency Testing" section already
+frames SERIALIZABLE + retry as the gear-wide pattern. The guard-table
+approach is documented here as an **opt-in hardening** reserved for a
+future step if SSI's retry overhead (bounded at 3 attempts, but still
+extra round-trips under sustained contention) ever becomes a measured
+problem — it is not being deferred because it's wrong, only because SSI is
+sufficient for correctness today and is the less invasive change.
+
+## 11. PG invariant checker + move-scenario races
+
+Second review round, item 3: `pg_concurrency_test.rs` gained two invariant
+checkers, run after *every* scenario in the file (not just the new ones
+below), plus 5 new scenarios that specifically exercise `move_group` —
+`SERIALIZABLE` was introduced *for* moves, but no scenario before this
+round ever called it, and none raced two hierarchy writes that touch
+*overlapping* closure rows (as opposed to two independent inserts).
+
+- **`assert_hierarchy_invariants`**: recomputes the transitive closure
+  implied by `resource_group.parent_id` across the whole table and diffs
+  it against the actual `resource_group_closure` rows (missing/extra),
+  and independently walks every node's parent chain to assert no cycles.
+- **`assert_membership_tenant_invariant`**: scans every
+  `resource_group_membership` row and asserts no `(gts_type_id,
+  resource_id)` pair is held by groups in more than one distinct tenant.
+
+Rationale: an `ok_count == 1`-style assertion only checks the call
+*outcome*; a concurrent pair of calls could in principle still leave the
+closure table or `parent_id` graph corrupted even when the primary
+invariant (exactly one logical winner) holds. Every scenario in the file
+now also logs (and asserts a generous 5s ceiling on) its winning
+transaction's wall-clock duration via a new `timed()` helper — a coarse
+transaction-window budget, not fine-grained APM, intended only to catch a
+transaction pathologically slowed by an N+1 regression.
+
+New scenarios, each followed by the invariant checker(s):
+
+- `move_a_to_b_races_move_b_to_a` — A and B each try to move under the
+  other at the same instant.
+- `move_ancestor_races_move_descendant` — an ancestor and its own
+  descendant move to unrelated new parents at the same time.
+- `create_child_races_move_parent` — a new child is created under P while
+  P itself moves elsewhere.
+- `force_delete_races_create_child` / `force_delete_races_add_membership`
+  — a force-delete races a create-child / add-membership on the group
+  being deleted.
+
+### The most interesting result
+
+`move_a_to_b_races_move_b_to_a` is a genuine write-skew "dangerous
+structure": each side's cycle check (`is_descendant`) reads exactly the
+closure row the *other* side's move would write, so there is a real
+two-way read-write dependency for PostgreSQL's SSI machinery to catch —
+not a race that would obviously resolve correctly even without
+serializable isolation. Run repeatedly against a real `testcontainers`
+PostgreSQL (6 full-suite runs, plus 15 additional focused runs of just
+this scenario, so 21 total observations):
+
+- **Every single run**: exactly one side won, the loser got a clean
+  `CycleDetected`, and `assert_hierarchy_invariants` passed (no cycle, no
+  closure/parent_id divergence).
+- **The winning side varied across runs** — 14/15 in the focused batch
+  went to "B wins" and 1/15 went to "A wins". This is the detail that
+  matters: if the outcome were scheduler-deterministic (e.g., one task
+  always finishes first regardless of contention), that would suggest the
+  "race" wasn't actually reaching the database concurrently at all, and
+  the passing assertions would be vacuous. Seeing the winner flip at least
+  once across repeated runs is evidence this is a genuine concurrent
+  execution being arbitrated by PostgreSQL's conflict detection, not an
+  artifact of task-spawn ordering.
+- `force_delete_races_create_child` / `force_delete_races_add_membership`
+  (10 trials each, run across 6+ full-suite passes — 60+ trials observed
+  per scenario): **zero** orphan survivors, **zero** raw/unexpected
+  errors. Every trial resolved to one of the two clean outcomes (create/add
+  rejected with `GroupNotFound`, or accepted and then swept up by the
+  force-delete's own retry re-reading the descendant set fresh).
+
+**Conclusion: yes, SSI really does protect the closure table under
+concurrent moves** — this was verified empirically against real
+PostgreSQL, not assumed from the isolation level's documented semantics.
+No new finding resulted (no RG-16); if any of these scenarios had shown a
+closure/parent_id divergence or an orphaned row under a clean-looking call
+outcome, that would have been logged here as RG-16 and either fixed or
+explicitly deferred, per the same convention as RG-01 through RG-15.
+
+## 12. Contract-drift: DESIGN.md promises vs. checked-in behavior
+
+A new, cheap defect class added this round: tests comparing DESIGN.md's
+documented promises against actual behavior, using the same
+`#[ignore = "..."]`-pinned-executable-assertion convention as a "known
+defect" — applied to a doc-vs-code mismatch instead of a DB-behavior
+class. Three items were checked:
+
+| DESIGN.md promise | Checked-in behavior | Outcome |
+|---|---|---|
+| Exhausted `SERIALIZABLE` retry → `ServiceUnavailable` (503) with retry-after hint (~S4.x) | `DomainError::Database` always maps to `Internal` (500) via `CanonicalError::internal(...)` in `api/rest/error.rs` — whose own comment already acknowledges the gap | `#[ignore]`d test `contract_drift_exhausted_retry_should_map_to_service_unavailable`; **not fixed** — would need a new `DomainError` variant (or a reuse of an existing one) plus a mapping change, judged too wide a contract change for this remediation pass |
+| SERIALIZABLE transactions carry a 5s (configurable) timeout (~line 1599) | `toolkit_db::secure::TxConfig` has only `isolation`/`access_mode` — no timeout field or enforcement anywhere in `transaction_with_retry` | `#[ignore]`d test `contract_drift_tx_config_has_no_timeout_mechanism`; **not fixed** — would be a new toolkit-db feature (timeout wrapping + deciding what a timeout maps to), not a remediation-scope bug fix |
+| "Database-level query timeout (statement_timeout) is configured at the connection pool level per platform defaults" (~line 1248) | No `toolkit_db::ConnectOpts` field or connection-setup code path for `statement_timeout` anywhere | **No test added** — the promise's own wording scopes it as a deployment/ops concern, not application code; there is no code-level behavior to assert against, so this isn't a code defect, just documented inline in the test file |
+
+Both `#[ignore]`d tests were run with `--ignored` and confirmed to
+currently fail (i.e. the drift is real, not already accidentally fixed):
+the retry-mapping test gets 500 instead of 503; the timeout test's
+`TxConfig::serializable()` debug output has no `timeout` field. If either
+starts passing later, remove the `#[ignore]` and update this table.
+
+## 13. Explicitly deferred (not done), with justification
+
+- **TxRunner marker / dylint lint series**: §1.2/§5 already document the
+  static rules as interim, source-text heuristics; a real implementation
+  needs a dylint late lint with type/dataflow information. Out of scope
+  for a remediation pass — this is new tooling infrastructure, not a bug
+  fix, and the existing heuristics correctly caught every real instance
+  found in this codebase.
+- **Committed fault-injection fixtures**: Step 1's fault-injection
+  validation (§3) was done by temporarily injecting defects, confirming
+  the rule caught them, then reverting (never committed). Keeping that
+  discipline for Step 3 as well — no committed "broken on purpose" fixture
+  code.
+- **Membership ownership guard-table**: see §10 — a real, viable
+  alternative, deliberately not built because SSI is sufficient for
+  correctness and is the less invasive change; documented as opt-in
+  hardening for a future step, not a gap.
+- **`EXPLAIN`/perf-suite**: §5 already documents this as out of scope for
+  the detection method; remains out of scope for remediation (no query
+  plans were run to confirm the batched queries' index usage, though the
+  batched shapes reuse the same indexed `ancestor_id`/`descendant_id`/
+  `type_id` columns the original per-row queries did, just with `IN (...)`
+  instead of `= ?`).
+- **RG-08's `update`/`update_type` re-read**: see its Status cell in §2 —
+  not fixable without changing the write pattern from `update_many` to a
+  read-then-`ActiveModel::update` shape, which trades one kind of extra
+  read for another without a net statement-count improvement, and carries
+  its own subtle risk (a stale in-memory model between the read and the
+  write). Not worth the risk for zero measured benefit.
+- **DESIGN.md's 503 mapping and 5s tx-timeout**: see §12 — both are
+  documented, executable contract-drift findings rather than silently
+  fixed or silently ignored; both would be new features/contract changes,
+  not remediation-scope bug fixes.
+
+## 14. Step 3 self-check
+
+- `cargo test -p cf-gears-resource-group`: green, including the PG suite
+  live against Docker (5 consecutive full runs during this self-check, all
+  21 tests passing every time; see §11 for the larger, scenario-specific
+  run count).
+- `cargo test -p cf-gears-toolkit-db --all-features`: green (540+ lib
+  tests plus all integration test binaries, including the new
+  `secure_insert_many` tests in `tests/secure_odata_sqlite.rs`).
+- `cargo test -p cf-gears-account-management`: green (797+ tests across
+  ~28 binaries) both before and after every resource-group change that
+  touches a live AM call site (RG-03, RG-09, RG-14) — see §6's correction
+  for why this is expected-but-not-sufficient evidence given AM's mock
+  boundary.
+- `cargo fmt --check` and `cargo clippy -p cf-gears-resource-group --tests
+  -- -D warnings`: clean, for every commit (verified before each, not just
+  at the end).
+- `cargo clippy -p cf-gears-toolkit-db --all-features --tests -- -D
+  warnings`: clean.
+- Every commit on `fix/rg-db-remediation` carries `Signed-off-by`; `git log
+  --oneline audit/rg-db-behavior..fix/rg-db-remediation` is linear, no
+  merges, no amends.
+- No pre-existing untracked file (`apps/admin-panel/`, `from-codex.md`,
+  `from-opus.md`, `tmp-review.md`, `tmp-review0.md`) was added, modified,
+  or committed at any point.
