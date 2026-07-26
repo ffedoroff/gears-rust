@@ -991,9 +991,56 @@ fn transaction_with_retry_call_bodies(src: &str) -> Vec<&str> {
     out
 }
 
+/// Find parameter names declared with an external SDK "client" trait-object
+/// type -- `&dyn some_sdk::FooClient` or `Arc<dyn some_sdk::FooClient>` --
+/// anywhere in `src`. This keys off the *type shape* (a `dyn ...Client`
+/// trait object, the idiomatic signature for an injected external
+/// dependency in this codebase: `AuthZResolverClient`, `TypesRegistryClient`,
+/// `MembershipAdder`-style adapters, etc.), not a specific field name, so
+/// renaming `types_registry` to anything else wouldn't defeat the rule.
+///
+/// Deliberately a class-level signal, not a proof: it does not confirm an
+/// `.await` call happens on the identifier, only that a value of an
+/// external-client type is reachable by name inside the closure text (it may
+/// flow into a further function call, as `create_group_inner`'s does). A
+/// real implementation of this check belongs in a dylint late lint with type
+/// information; this is the interim, source-text version -- see the
+/// "what this method does not cover" section of
+/// docs/analysis/DB_BEHAVIOR_AUDIT.md.
+fn external_client_param_names(src: &str) -> Vec<&str> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b([a-z_][a-zA-Z0-9_]*)\s*:\s*&?\s*(?:Arc<\s*)?dyn\s+[\w:]*Client\b")
+            .expect("valid regex")
+    });
+    let mut names: Vec<&str> = RE
+        .captures_iter(src)
+        .map(|c| c.get(1).expect("group 1 always present").as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Whether `body` references `name` as a whole word (not as a substring of a
+/// longer identifier).
+fn references_identifier(body: &str, name: &str) -> bool {
+    let pattern = format!(r"\b{}\b", regex::escape(name));
+    regex::Regex::new(&pattern)
+        .expect("valid regex")
+        .is_match(body)
+}
+
 #[test]
 fn static_rule_flags_external_call_inside_create_group_tx() {
     let src = include_str!("../src/domain/group_service.rs");
+    let client_params = external_client_param_names(src);
+    assert!(
+        client_params.contains(&"types_registry"),
+        "expected to discover an external-client parameter by its `&dyn ...Client` / \
+         `Arc<dyn ...Client>` type shape (found: {client_params:?}) -- this asserts the \
+         *discovery* mechanism works, independent of the literal field name"
+    );
+
     let bodies = transaction_with_retry_call_bodies(src);
     assert!(
         bodies.len() >= 4,
@@ -1004,25 +1051,34 @@ fn static_rule_flags_external_call_inside_create_group_tx() {
 
     let flagged = bodies
         .iter()
-        .filter(|b| b.contains("types_registry"))
+        .filter(|b| {
+            client_params
+                .iter()
+                .any(|name| references_identifier(b, name))
+        })
         .count();
     assert!(
         flagged >= 1,
         "known defect RG-09: expected at least one SERIALIZABLE tx closure to \
-         reference the external types_registry client (create_group_inner \
-         validates metadata via GTS inside the transaction)"
+         reference an external client (discovered params: {client_params:?}; \
+         create_group_inner validates metadata via GTS inside the transaction)"
     );
 
-    // Negative control, same file: move/delete's tx closures don't take a
-    // types_registry at all -- proves the rule tells clean closures apart
-    // from the flagged one instead of matching on every closure indiscriminately.
+    // Negative control, same file: move/delete's tx closures don't take any
+    // discovered external-client parameter at all -- proves the rule tells
+    // clean closures apart from the flagged one instead of matching on every
+    // closure indiscriminately.
     let clean = bodies
         .iter()
-        .filter(|b| !b.contains("types_registry"))
+        .filter(|b| {
+            !client_params
+                .iter()
+                .any(|name| references_identifier(b, name))
+        })
         .count();
     assert!(
         clean >= 1,
         "expected at least one transaction_with_retry closure with no \
-         external client reference (move_group/delete_group)"
+         discovered external-client reference (move_group/delete_group)"
     );
 }
