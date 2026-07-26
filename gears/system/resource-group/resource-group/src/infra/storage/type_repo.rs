@@ -252,6 +252,15 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Insert a new GTS type. Returns the inserted model.
+    ///
+    /// Fixes known defect RG-08 (redundant-io): `secure_insert` already
+    /// returns the fully-populated `Model` (including the auto-generated
+    /// SMALLINT id -- `ActiveModelTrait::insert` hydrates it regardless of
+    /// backend, falling back to an internal re-select on backends without
+    /// native `RETURNING` such as `SQLite` in this workspace's feature
+    /// set); this used to discard that and issue a second, genuinely
+    /// redundant app-level `find_model_by_code` re-read just to get a value
+    /// already in hand.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
@@ -266,12 +275,9 @@ impl TypeRepositoryTrait for TypeRepository {
             ..Default::default()
         };
 
-        let _result = toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
+        toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        // Re-read to get the auto-generated ID
-        Self::find_model_by_code(db, schema_id).await
+            .map_err(|e| DomainError::database(e.to_string()))
     }
 
     /// Insert allowed parent junction entries.

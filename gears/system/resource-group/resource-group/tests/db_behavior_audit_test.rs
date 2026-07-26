@@ -260,6 +260,22 @@ async fn trace_create_root_group() {
         "create_group must run its writes inside a transaction:\n{}",
         rec.dump()
     );
+    // RG-08 fixed: group_repo::insert used to discard secure_insert's
+    // returned model and issue its own explicit re-read. Exactly 2
+    // resource_group SELECTs remain: SeaORM's own non-RETURNING-fallback
+    // re-select (`ActiveModelTrait::insert` on SQLite, since this
+    // workspace doesn't enable `sqlite-use-returning-for-3_35` --
+    // unavoidable at the app level, absent entirely on PostgreSQL) plus
+    // create_group_inner's final find_by_id to build the returned SDK
+    // model. Was 3 before the fix (the extra explicit find_model_by_id).
+    let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
+    assert_eq!(
+        rg_selects,
+        2,
+        "RG-08 regression: expected exactly 2 resource_group SELECTs (SeaORM's \
+         non-RETURNING fallback + the final find_by_id), got {rg_selects}:\n{}",
+        rec.dump()
+    );
 }
 
 #[tokio::test]
@@ -404,6 +420,20 @@ async fn trace_create_type() {
          tests at the bottom of this file):\n{}",
         rec.dump()
     );
+    // RG-08 fixed: type_repo::insert used to discard secure_insert's
+    // returned model and issue its own explicit find_model_by_code
+    // re-read. Exactly 2 gts_type SELECTs remain: the "does this code
+    // already exist" pre-check plus SeaORM's own non-RETURNING-fallback
+    // re-select (unavoidable at the app level on SQLite, absent on
+    // PostgreSQL). Was 3 before the fix.
+    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
+    assert_eq!(
+        type_selects,
+        2,
+        "RG-08 regression: expected exactly 2 gts_type SELECTs (the exists-check + \
+         SeaORM's non-RETURNING fallback), got {type_selects}:\n{}",
+        rec.dump()
+    );
 }
 
 #[tokio::test]
@@ -490,6 +520,21 @@ async fn trace_add_membership() {
     assert!(
         rec.writes_outside_tx().is_empty(),
         "add_membership must run its writes inside a transaction:\n{}",
+        rec.dump()
+    );
+    // RG-08 fixed: membership_repo::insert used to discard secure_insert's
+    // returned model and issue its own explicit find_by_composite_key
+    // re-read. Exactly 2 resource_group_membership SELECTs remain: the
+    // tenant-compatibility pre-check plus SeaORM's own non-RETURNING-
+    // fallback re-select (unavoidable at the app level on SQLite, absent
+    // on PostgreSQL). Was 3 before the fix.
+    let membership_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group_membership");
+    assert_eq!(
+        membership_selects,
+        2,
+        "RG-08 regression: expected exactly 2 resource_group_membership SELECTs \
+         (the tenant-compatibility check + SeaORM's non-RETURNING fallback), got \
+         {membership_selects}:\n{}",
         rec.dump()
     );
 }

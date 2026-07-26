@@ -627,6 +627,13 @@ impl GroupRepositoryTrait for GroupRepository {
     // -- Write operations --
 
     /// Insert a new resource group entity.
+    ///
+    /// Fixes known defect RG-08 (redundant-io): `secure_insert` already
+    /// returns the fully-populated `Model` (including any DB-generated
+    /// defaults, hydrated by `ActiveModelTrait::insert` regardless of
+    /// backend); this used to discard that and issue a second, genuinely
+    /// redundant app-level `find_model_by_id` re-read just to get a `Model`
+    /// already in hand.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
@@ -651,11 +658,7 @@ impl GroupRepositoryTrait for GroupRepository {
 
         toolkit_db::secure::secure_insert::<ResourceGroupEntity>(model, &scope, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        self.find_model_by_id(db, id)
-            .await?
-            .ok_or_else(|| DomainError::database("Insert succeeded but row not found"))
+            .map_err(|e| DomainError::database(e.to_string()))
     }
 
     /// Update a resource group entity.
