@@ -1,0 +1,4 @@
+-- [outside tx] --
+  9  SELECT  gts_type                         in_tx=false SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
+ 10  SELECT  resource_group                   in_tx=false SELECT COUNT(*) AS num_items FROM (SELECT "resource_group"."id", "resource_group"."parent_id", "resource_group"."gts_type_id", "resource_group"."name", "resource_group"."metadata", "resource_group"."tenant_id", "resource_group"."created_at", "resource_group"."updated_at" FROM "resource_group" WHERE "resource_group"."gts_type_id" = ?) AS "sub_query"
+ 11  DELETE  gts_type                         in_tx=false DELETE FROM "gts_type" WHERE "gts_type"."id" = ?

@@ -1,0 +1,17 @@
+-- [enter tx scope] --
+ 93  SELECT  resource_group                   in_tx=true  SELECT "resource_group"."id", "resource_group"."parent_id", "resource_group"."gts_type_id", "resource_group"."name", "resource_group"."metadata", "resource_group"."tenant_id", "resource_group"."created_at", "resource_group"."updated_at" FROM "resource_group" WHERE "resource_group"."id" = ? AND "resource_group"."tenant_id" IN (?) LIMIT ?
+ 94  SELECT  gts_type                         in_tx=true  SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."id" = ? LIMIT ?
+ 95  SELECT  resource_group                   in_tx=true  SELECT "resource_group"."id", "resource_group"."parent_id", "resource_group"."gts_type_id", "resource_group"."name", "resource_group"."metadata", "resource_group"."tenant_id", "resource_group"."created_at", "resource_group"."updated_at" FROM "resource_group" WHERE "resource_group"."id" = ? LIMIT ?
+ 96  SELECT  resource_group_closure           in_tx=true  SELECT "resource_group_closure"."ancestor_id", "resource_group_closure"."descendant_id", "resource_group_closure"."depth" FROM "resource_group_closure" WHERE "resource_group_closure"."ancestor_id" = ? AND "resource_group_closure"."depth" <> ? ORDER BY "resource_group_closure"."depth" ASC
+ 97  DELETE  resource_group_membership        in_tx=true  DELETE FROM "resource_group_membership" WHERE "resource_group_membership"."group_id" = ?
+ 98  DELETE  resource_group_closure           in_tx=true  DELETE FROM "resource_group_closure" WHERE "resource_group_closure"."ancestor_id" = ?
+ 99  DELETE  resource_group_closure           in_tx=true  DELETE FROM "resource_group_closure" WHERE "resource_group_closure"."descendant_id" = ?
+100  DELETE  resource_group_membership        in_tx=true  DELETE FROM "resource_group_membership" WHERE "resource_group_membership"."group_id" = ?
+101  DELETE  resource_group_closure           in_tx=true  DELETE FROM "resource_group_closure" WHERE "resource_group_closure"."ancestor_id" = ?
+102  DELETE  resource_group_closure           in_tx=true  DELETE FROM "resource_group_closure" WHERE "resource_group_closure"."descendant_id" = ?
+103  DELETE  resource_group_membership        in_tx=true  DELETE FROM "resource_group_membership" WHERE "resource_group_membership"."group_id" = ?
+104  DELETE  resource_group_closure           in_tx=true  DELETE FROM "resource_group_closure" WHERE "resource_group_closure"."ancestor_id" = ?
+105  DELETE  resource_group_closure           in_tx=true  DELETE FROM "resource_group_closure" WHERE "resource_group_closure"."descendant_id" = ?
+106  DELETE  resource_group                   in_tx=true  DELETE FROM "resource_group" WHERE "resource_group"."id" = ?
+107  DELETE  resource_group                   in_tx=true  DELETE FROM "resource_group" WHERE "resource_group"."id" = ?
+108  DELETE  resource_group                   in_tx=true  DELETE FROM "resource_group" WHERE "resource_group"."id" = ?

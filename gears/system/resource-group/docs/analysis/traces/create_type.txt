@@ -1,0 +1,7 @@
+-- [enter tx scope] --
+  3  SELECT  gts_type                         in_tx=true  SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
+  4  INSERT  gts_type                         in_tx=true  INSERT INTO "gts_type" ("schema_id", "metadata_schema") VALUES (?)
+  5  SELECT  gts_type                         in_tx=true  SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."id" = ? LIMIT ?
+  6  SELECT  gts_type                         in_tx=true  SELECT "gts_type"."id", "gts_type"."schema_id", "gts_type"."metadata_schema", "gts_type"."created_at", "gts_type"."updated_at" FROM "gts_type" WHERE "gts_type"."schema_id" = ? LIMIT ?
+  7  SELECT  gts_type_allowed_parent          in_tx=true  SELECT "gts_type_allowed_parent"."type_id", "gts_type_allowed_parent"."parent_type_id" FROM "gts_type_allowed_parent" WHERE "gts_type_allowed_parent"."type_id" = ?
+  8  SELECT  gts_type_allowed_membership      in_tx=true  SELECT "gts_type_allowed_membership"."type_id", "gts_type_allowed_membership"."membership_type_id" FROM "gts_type_allowed_membership" WHERE "gts_type_allowed_membership"."type_id" = ?
