@@ -137,11 +137,28 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
 
+        // Validate metadata against the GTS type schema *before* opening the
+        // transaction (fixes known defect RG-09): `types_registry` is a
+        // cross-gear `ClientHub` call (DESIGN.md S/Phase-3 documents Types
+        // Registry as a *separate* gear/service reached via a saga, not
+        // something a `SERIALIZABLE` transaction on RG's own database can
+        // ever make atomic with) -- there is no consistency guarantee to
+        // preserve by keeping it in-tx, only a DB connection/lock held open
+        // for the duration of an external call. `req.code` is available
+        // directly from the request, no DB read needed first.
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
+        validation::validate_metadata_via_gts(
+            req.metadata.as_ref(),
+            &req.code,
+            &*self.types_registry,
+        )
+        .await?;
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
+
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-2
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
@@ -152,18 +169,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
             Box::pin(async move {
-                Self::create_group_inner(
-                    &*group_repo,
-                    &*type_repo,
-                    tx,
-                    &req,
-                    tenant_id,
-                    &profile,
-                    &*types_registry,
-                )
-                .await
+                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
+                    .await
             })
         })
         .await
@@ -254,11 +262,37 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         Self::validate_name(&req.name)?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
 
+        // Validate metadata against the GTS type schema *before* opening the
+        // transaction (fixes known defect RG-09, second call site):
+        // `types_registry` is a cross-gear `ClientHub` call, not a DB read,
+        // and DESIGN.md documents Types Registry as a separate gear
+        // reconciled via a saga (Phase 3) -- there is no in-tx consistency
+        // guarantee to preserve here. Uses the same AuthZ `scope` already
+        // resolved above (not an unscoped read) so a caller without access
+        // to this group still gets rejected the same way it always did,
+        // just via this scoped pre-fetch instead of the (still-repeated,
+        // for full SERIALIZABLE correctness) read inside the transaction.
+        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
+        {
+            let conn = self.db.conn()?;
+            let existing = self
+                .group_repo
+                .find_by_id(&conn, &scope, group_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(group_id))?;
+            validation::validate_metadata_via_gts(
+                req.metadata.as_ref(),
+                &existing.code,
+                &*self.types_registry,
+            )
+            .await?;
+        }
+        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
+
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
@@ -266,7 +300,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
             Box::pin(async move {
                 Self::update_group_inner(
                     &*group_repo,
@@ -276,7 +309,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     group_id,
                     &req,
                     &profile,
-                    &*types_registry,
                 )
                 .await
             })
@@ -502,29 +534,29 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
+        // Same RG-09 fix as `create_group`: validate metadata against the
+        // GTS type schema (a cross-gear ClientHub call) before opening the
+        // transaction.
+        validation::validate_metadata_via_gts(
+            req.metadata.as_ref(),
+            &req.code,
+            &*self.types_registry,
+        )
+        .await?;
+
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
-        let types_registry = self.types_registry.clone();
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
             let profile = profile.clone();
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
-            let types_registry = types_registry.clone();
             Box::pin(async move {
-                Self::create_group_inner(
-                    &*group_repo,
-                    &*type_repo,
-                    tx,
-                    &req,
-                    tenant_id,
-                    &profile,
-                    &*types_registry,
-                )
-                .await
+                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
+                    .await
             })
         })
         .await
@@ -533,6 +565,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     // -- Transaction-inner implementations --
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.
+    ///
+    /// **Metadata schema validation.** `create_group` already ran
+    /// `validate_metadata_via_gts` *before* opening this transaction (known
+    /// defect RG-09 fix) -- it is a cross-gear `ClientHub` call, not a DB
+    /// read, so it does not belong inside a `SERIALIZABLE` transaction on
+    /// this database. There is no cheap in-tx re-check kept here either:
+    /// DESIGN.md documents Types Registry as a separate gear reconciled via
+    /// a saga (Phase 3), so RG's own transaction was never able to make
+    /// metadata-vs-schema consistency atomic with a concurrent external
+    /// schema change in the first place.
     #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     async fn create_group_inner(
         group_repo: &GR,
@@ -541,26 +583,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: &CreateGroupRequest,
         tenant_id: Uuid,
         profile: &QueryProfile,
-        types_registry: &dyn types_registry_sdk::TypesRegistryClient,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-        // Resolve type GTS path to surrogate ID; verify type exists
-        let type_id = type_repo
-            .resolve_id(tx, &req.code)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&req.code))?;
-
-        let rg_type = type_repo
-            .find_by_code(tx, &req.code)
+        // Resolve type GTS path to surrogate ID; verify type exists.
+        // Fixes known defect RG-11 (redundant-io): this used to call
+        // resolve_id and find_by_code back to back for the same req.code --
+        // two round trips for data find_by_code_with_id already fetches
+        // together in one.
+        let (type_id, rg_type) = type_repo
+            .find_by_code_with_id(tx, &req.code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(&req.code))?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-
-        // Validate metadata against GTS type schema (applies to both root and child groups)
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
-        validation::validate_metadata_via_gts(req.metadata.as_ref(), &req.code, types_registry)
-            .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
 
         // Determine effective tenant_id by code-prefix rule:
         // - code starts with TENANT_RG_TYPE_PATH → tenant_id = group.id (new scope)
@@ -754,6 +788,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// rule `create_group_inner` uses for non-tenant children. Tenant-type
     /// roots already have `tenant_id = group_id`, so the same equality check
     /// trivially holds for them as well.
+    ///
+    /// **Metadata schema validation.** `update_group` already ran
+    /// `validate_metadata_via_gts` *before* opening this transaction (known
+    /// defect RG-09 fix, second call site) -- see that function's doc
+    /// comment for why (cross-gear `ClientHub` call, no in-tx consistency
+    /// guarantee was ever available to preserve).
     #[allow(clippy::too_many_arguments)]
     async fn update_group_inner(
         group_repo: &GR,
@@ -763,7 +803,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: &UpdateGroupRequest,
         profile: &QueryProfile,
-        types_registry: &dyn types_registry_sdk::TypesRegistryClient,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
         // DB: SELECT FROM resource_group WHERE id = {group_id} -- load existing group
@@ -798,21 +837,20 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // (or the new type allows root if no parent). For the immutable-type
         // case this collapses into `move_group_internal_impl` running the
         // `rg_type.allowed_parent_types` check on a parent change.
-        let existing_type_path = Self::resolve_type_path_from_id(tx, existing.gts_type_id).await?;
+        //
+        // Fixes known defect RG-11 (redundant-io): this used to resolve
+        // `existing.gts_type_id` to its code via `resolve_type_path_from_id`
+        // and then look the type up again *by that code* via `find_by_code`
+        // -- two round trips for data `load_full_type_by_id` already
+        // fetches by id in one.
         let rg_type = type_repo
-            .find_by_code(tx, &existing_type_path)
-            .await?
-            .ok_or_else(|| DomainError::type_not_found(&existing_type_path))?;
+            .load_full_type_by_id(tx, existing.gts_type_id)
+            .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
-        validation::validate_metadata_via_gts(
-            req.metadata.as_ref(),
-            &existing_type_path,
-            types_registry,
-        )
-        .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
+        // Metadata-vs-schema validation (step 4e) already ran in
+        // `update_group`, before this transaction opened -- see this
+        // function's doc comment (RG-09 fix).
 
         // Cross-tenant parent change is forbidden. `tenant_id` is established
         // at creation and never rewritten — see the function-level doc above
@@ -1121,21 +1159,22 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             if let Some(max_depth) = profile.max_depth {
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 let parent_depth = group_repo.get_depth(conn, new_pid).await?;
-                // Check depth of deepest descendant of moved node
-                let subtree_descendants = group_repo.get_descendant_ids(conn, group_id).await?;
-                let mut max_subtree_depth = 0i32;
-                for desc_id in &subtree_descendants {
-                    // Internal depth within the subtree
-                    let is_desc_result = group_repo.is_descendant(conn, group_id, *desc_id).await?;
-                    if is_desc_result {
-                        // Get the depth of this descendant relative to the moved group
-                        // by looking at the closure table
-                        let depth = Self::get_relative_depth(conn, group_id, *desc_id).await?;
-                        if depth > max_subtree_depth {
-                            max_subtree_depth = depth;
-                        }
-                    }
-                }
+                // Check depth of deepest descendant of moved node. Fixes
+                // known defect RG-05: this used to re-verify each
+                // descendant is actually a descendant (redundant --
+                // `get_descendant_ids` only ever returns descendants of
+                // `group_id` by construction) and re-query its depth
+                // individually; `get_descendant_ids_with_depth` returns
+                // both in the single query already needed, so the max is
+                // just taken in memory over the one result set.
+                let subtree_descendants = group_repo
+                    .get_descendant_ids_with_depth(conn, group_id)
+                    .await?;
+                let max_subtree_depth = subtree_descendants
+                    .iter()
+                    .map(|(_id, depth)| *depth)
+                    .max()
+                    .unwrap_or(0);
                 let new_deepest = parent_depth + 1 + max_subtree_depth;
                 // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
@@ -1207,27 +1246,46 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     /// Force-delete an entire subtree (group + descendants + memberships + closure).
+    ///
+    /// Fixes known defect RG-10: this used to issue ~4 statements per node
+    /// (one `delete_memberships` + two `delete_all_closure_rows` deletes +
+    /// one `delete_by_id`), so a subtree of N nodes cost ~4N statements.
+    /// Memberships and closure rows are deleted for the *whole* subtree in
+    /// one batched call each -- safe regardless of order, since every node
+    /// in the batch is being removed together, not partially. The groups
+    /// themselves still have to respect `resource_group.parent_id`'s
+    /// `ON DELETE RESTRICT` FK, so they are deleted **depth-level by
+    /// depth-level, deepest first** (one batched statement per distinct
+    /// depth, not per node) -- a parent's row is never removed while a
+    /// not-yet-removed child at a greater depth still references it.
     async fn force_delete_subtree(
         group_repo: &GR,
         conn: &impl DBRunner,
         root_id: Uuid,
     ) -> Result<(), DomainError> {
-        // Get all descendants
-        let descendant_ids = group_repo.get_descendant_ids(conn, root_id).await?;
+        let descendants_with_depth = group_repo
+            .get_descendant_ids_with_depth(conn, root_id)
+            .await?;
 
-        // Delete in reverse order (leaves first)
-        let mut all_ids = vec![root_id];
-        all_ids.extend(descendant_ids);
+        let all_ids: Vec<Uuid> = std::iter::once(root_id)
+            .chain(descendants_with_depth.iter().map(|(id, _depth)| *id))
+            .collect();
 
-        // Delete memberships and closure rows for all nodes
-        for &gid in all_ids.iter().rev() {
-            group_repo.delete_memberships(conn, gid).await?;
-            group_repo.delete_all_closure_rows(conn, gid).await?;
+        group_repo.delete_memberships_many(conn, &all_ids).await?;
+        group_repo
+            .delete_all_closure_rows_many(conn, &all_ids)
+            .await?;
+
+        // Group ids by their depth relative to root_id (root itself is
+        // depth 0), then delete depth levels from deepest to shallowest.
+        let mut ids_by_depth: std::collections::BTreeMap<i32, Vec<Uuid>> =
+            std::collections::BTreeMap::new();
+        ids_by_depth.entry(0).or_default().push(root_id);
+        for (id, depth) in descendants_with_depth {
+            ids_by_depth.entry(depth).or_default().push(id);
         }
-
-        // Delete group entities in reverse order (leaves first)
-        for &gid in all_ids.iter().rev() {
-            group_repo.delete_by_id(conn, gid).await?;
+        for ids in ids_by_depth.into_values().rev() {
+            group_repo.delete_by_id_many(conn, &ids).await?;
         }
 
         Ok(())
@@ -1249,34 +1307,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .all(conn)
             .await
             .map_err(|e| DomainError::database(e.to_string()))
-    }
-
-    /// Get relative depth between an ancestor and descendant via closure table.
-    async fn get_relative_depth(
-        conn: &impl DBRunner,
-        ancestor_id: Uuid,
-        descendant_id: Uuid,
-    ) -> Result<i32, DomainError> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use toolkit_db::secure::SecureEntityExt;
-
-        let scope = toolkit_security::AccessScope::allow_all();
-        let row = crate::infra::storage::entity::resource_group_closure::Entity::find()
-            .filter(
-                crate::infra::storage::entity::resource_group_closure::Column::AncestorId
-                    .eq(ancestor_id),
-            )
-            .filter(
-                crate::infra::storage::entity::resource_group_closure::Column::DescendantId
-                    .eq(descendant_id),
-            )
-            .secure()
-            .scope_with(&scope)
-            .one(conn)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        Ok(row.map_or(0, |r| r.depth))
     }
 
     /// Resolve a type ID to its GTS path.

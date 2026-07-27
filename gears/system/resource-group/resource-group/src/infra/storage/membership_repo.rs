@@ -94,7 +94,15 @@ impl MembershipRepositoryTrait for MembershipRepository {
         })
     }
 
-    /// Insert a membership. Returns the created membership with resolved type path.
+    /// Insert a membership. Returns the created membership.
+    ///
+    /// Fixes known defect RG-08 (redundant-io): `secure_insert` already
+    /// returns the fully-populated `Model` -- every column here was
+    /// explicitly `Set()` on the `ActiveModel` we just inserted, so there
+    /// is no DB-generated value left to recover. This used to discard that
+    /// return value and issue a second, genuinely redundant app-level
+    /// `find_by_composite_key` re-read (an identical filter over the same
+    /// three columns) just to get a `Model` already in hand.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
@@ -125,12 +133,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
                 } else {
                     DomainError::database(msg)
                 }
-            })?;
-
-        // Read back the inserted model
-        self.find_by_composite_key(db, group_id, gts_type_id, resource_id)
-            .await?
-            .ok_or_else(|| DomainError::database("Insert succeeded but membership not found"))
+            })
     }
 
     /// Delete a membership by its composite key. Returns the number of affected rows.

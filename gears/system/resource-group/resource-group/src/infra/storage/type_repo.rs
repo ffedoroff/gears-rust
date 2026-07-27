@@ -122,6 +122,150 @@ impl TypeRepository {
         Ok(codes)
     }
 
+    /// Assemble a `ResourceGroupType` from a raw model plus its already-
+    /// resolved junction data. Pure/in-memory -- shared by `load_full_type`
+    /// (one model at a time) and `load_full_types_batch` (a whole page at
+    /// once) so both stay byte-for-byte consistent in how `can_be_root` and
+    /// `metadata_schema` are derived from the stored row.
+    fn build_resource_group_type(
+        type_model: &gts_type::Model,
+        allowed_parent_types: Vec<String>,
+        allowed_membership_types: Vec<String>,
+    ) -> ResourceGroupType {
+        // Derive can_be_root from stored metadata_schema internal key.
+        // Per the placement invariant: can_be_root == true OR len(allowed_parent_types) >= 1.
+        // If no allowed_parent_types, can_be_root must be true.
+        let can_be_root = type_model
+            .metadata_schema
+            .as_ref()
+            .and_then(|ms| ms.get("__can_be_root"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(allowed_parent_types.is_empty());
+
+        // Extract the user-facing metadata_schema without internal keys.
+        // Non-object schemas are stored under `__user_schema`; restore them on read.
+        let metadata_schema = type_model.metadata_schema.as_ref().and_then(|ms| {
+            if let serde_json::Value::Object(map) = ms {
+                if let Some(user_schema) = map.get("__user_schema") {
+                    return Some(user_schema.clone());
+                }
+                let filtered: serde_json::Map<String, serde_json::Value> = map
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("__"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(filtered))
+                }
+            } else {
+                Some(ms.clone())
+            }
+        });
+
+        ResourceGroupType {
+            code: type_model.schema_id.clone(),
+            can_be_root,
+            allowed_parent_types,
+            allowed_membership_types,
+            metadata_schema,
+        }
+    }
+
+    /// Batch-resolve full types (junction references) for a whole page of
+    /// models in a constant number of queries, regardless of page size.
+    ///
+    /// Fixes known defect RG-12 (n-plus-one, read path): `list_types` used
+    /// to call `load_full_type` once per row -- each call issuing its own
+    /// junction-table queries (plus a further id->code resolution query
+    /// when non-empty) -- so a page of N types cost statement count that
+    /// grew with N. This issues exactly one query per junction table across
+    /// the *whole* page, one combined id->code resolution query for every
+    /// referenced parent/membership type across the whole page, and
+    /// assembles each `ResourceGroupType` in memory afterward.
+    async fn load_full_types_batch(
+        db: &impl DBRunner,
+        models: &[gts_type::Model],
+    ) -> Result<Vec<ResourceGroupType>, DomainError> {
+        if models.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = system_scope();
+        let type_ids: Vec<i16> = models.iter().map(|m| m.id).collect();
+
+        let parent_rows = AllowedParentEntity::find()
+            .filter(gts_type_allowed_parent::Column::TypeId.is_in(type_ids.clone()))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        let membership_rows = AllowedMembershipEntity::find()
+            .filter(gts_type_allowed_membership::Column::TypeId.is_in(type_ids))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        let referenced_ids: std::collections::HashSet<i16> = parent_rows
+            .iter()
+            .map(|r| r.parent_type_id)
+            .chain(membership_rows.iter().map(|r| r.membership_type_id))
+            .collect();
+
+        let code_by_id: std::collections::HashMap<i16, String> = if referenced_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let ids: Vec<i16> = referenced_ids.into_iter().collect();
+            GtsTypeEntity::find()
+                .filter(gts_type::Column::Id.is_in(ids))
+                .secure()
+                .scope_with(&scope)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?
+                .into_iter()
+                .map(|m| (m.id, m.schema_id))
+                .collect()
+        };
+
+        let mut parents_by_type: std::collections::HashMap<i16, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &parent_rows {
+            if let Some(code) = code_by_id.get(&r.parent_type_id) {
+                parents_by_type
+                    .entry(r.type_id)
+                    .or_default()
+                    .push(code.clone());
+            }
+        }
+        let mut memberships_by_type: std::collections::HashMap<i16, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &membership_rows {
+            if let Some(code) = code_by_id.get(&r.membership_type_id) {
+                memberships_by_type
+                    .entry(r.type_id)
+                    .or_default()
+                    .push(code.clone());
+            }
+        }
+
+        Ok(models
+            .iter()
+            .map(|m| {
+                let mut allowed_parent_types = parents_by_type.remove(&m.id).unwrap_or_default();
+                allowed_parent_types.sort();
+                let mut allowed_membership_types =
+                    memberships_by_type.remove(&m.id).unwrap_or_default();
+                allowed_membership_types.sort();
+                Self::build_resource_group_type(m, allowed_parent_types, allowed_membership_types)
+            })
+            .collect())
+    }
+
     /// Find the raw model by code. Used to re-read a row immediately after
     /// `INSERT … RETURNING`-less writes (insert/update); returns a
     /// `DomainError::Database` if the row is unexpectedly missing — i.e. the
@@ -156,6 +300,24 @@ impl TypeRepositoryTrait for TypeRepository {
         db: &C,
         code: &str,
     ) -> Result<Option<ResourceGroupType>, DomainError> {
+        Ok(self
+            .find_by_code_with_id(db, code)
+            .await?
+            .map(|(_type_id, rg_type)| rg_type))
+    }
+
+    /// Same lookup as `find_by_code`, but also returns the surrogate
+    /// SMALLINT id the `schema_id` resolved to. Fixes known defect RG-11
+    /// (redundant-io): callers that need *both* the id (e.g. to store as a
+    /// group's `gts_type_id` FK) and the full type (for its
+    /// `allowed_parent_types`/`can_be_root` business rules) used to call
+    /// `resolve_id` and `find_by_code` back to back for the same code --
+    /// two round trips for data this single query already has in hand.
+    async fn find_by_code_with_id<C: DBRunner>(
+        &self,
+        db: &C,
+        code: &str,
+    ) -> Result<Option<(i16, ResourceGroupType)>, DomainError> {
         let scope = system_scope();
         let type_model = GtsTypeEntity::find()
             .filter(gts_type::Column::SchemaId.eq(code))
@@ -169,7 +331,10 @@ impl TypeRepositoryTrait for TypeRepository {
             return Ok(None);
         };
 
-        self.load_full_type(db, &type_model).await.map(Some)
+        let type_id = type_model.id;
+        self.load_full_type(db, &type_model)
+            .await
+            .map(|rg_type| Some((type_id, rg_type)))
     }
 
     /// Load a full type by its surrogate SMALLINT ID.
@@ -201,45 +366,11 @@ impl TypeRepositoryTrait for TypeRepository {
         let allowed_membership_types =
             Self::load_allowed_membership_types(db, type_model.id).await?;
 
-        // Derive can_be_root from stored metadata_schema internal key.
-        // Per the placement invariant: can_be_root == true OR len(allowed_parent_types) >= 1.
-        // If no allowed_parent_types, can_be_root must be true.
-        let can_be_root = type_model
-            .metadata_schema
-            .as_ref()
-            .and_then(|ms| ms.get("__can_be_root"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(allowed_parent_types.is_empty());
-
-        // Extract the user-facing metadata_schema without internal keys.
-        // Non-object schemas are stored under `__user_schema`; restore them on read.
-        let metadata_schema = type_model.metadata_schema.as_ref().and_then(|ms| {
-            if let serde_json::Value::Object(map) = ms {
-                if let Some(user_schema) = map.get("__user_schema") {
-                    return Some(user_schema.clone());
-                }
-                let filtered: serde_json::Map<String, serde_json::Value> = map
-                    .iter()
-                    .filter(|(k, _)| !k.starts_with("__"))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                if filtered.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::Value::Object(filtered))
-                }
-            } else {
-                Some(ms.clone())
-            }
-        });
-
-        Ok(ResourceGroupType {
-            code: type_model.schema_id.clone(),
-            can_be_root,
+        Ok(Self::build_resource_group_type(
+            type_model,
             allowed_parent_types,
             allowed_membership_types,
-            metadata_schema,
-        })
+        ))
     }
 
     /// Resolve a GTS type path to its surrogate SMALLINT ID.
@@ -252,6 +383,15 @@ impl TypeRepositoryTrait for TypeRepository {
     }
 
     /// Insert a new GTS type. Returns the inserted model.
+    ///
+    /// Fixes known defect RG-08 (redundant-io): `secure_insert` already
+    /// returns the fully-populated `Model` (including the auto-generated
+    /// SMALLINT id -- `ActiveModelTrait::insert` hydrates it regardless of
+    /// backend, falling back to an internal re-select on backends without
+    /// native `RETURNING` such as `SQLite` in this workspace's feature
+    /// set); this used to discard that and issue a second, genuinely
+    /// redundant app-level `find_model_by_code` re-read just to get a value
+    /// already in hand.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
@@ -266,15 +406,19 @@ impl TypeRepositoryTrait for TypeRepository {
             ..Default::default()
         };
 
-        let _result = toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
+        toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        // Re-read to get the auto-generated ID
-        Self::find_model_by_code(db, schema_id).await
+            .map_err(|e| DomainError::database(e.to_string()))
     }
 
     /// Insert allowed parent junction entries.
+    ///
+    /// Fixes known defect RG-07: this used to issue one `secure_insert` per
+    /// entry (statement count grows with `parent_ids.len()`); now the whole
+    /// batch is sent as a single multi-row `INSERT` via `secure_insert_many`,
+    /// which validates every row against the scope exactly as the per-row
+    /// loop did -- moot here in practice (`system_scope()` is unconstrained),
+    /// but the batching helper preserves the same safety contract.
     async fn insert_allowed_parent_types<C: DBRunner>(
         &self,
         db: &C,
@@ -282,19 +426,23 @@ impl TypeRepositoryTrait for TypeRepository {
         parent_ids: &[i16],
     ) -> Result<(), DomainError> {
         let scope = system_scope();
-        for &parent_id in parent_ids {
-            let model = gts_type_allowed_parent::ActiveModel {
+        let rows: Vec<gts_type_allowed_parent::ActiveModel> = parent_ids
+            .iter()
+            .map(|&parent_id| gts_type_allowed_parent::ActiveModel {
                 type_id: Set(type_id),
                 parent_type_id: Set(parent_id),
-            };
-            toolkit_db::secure::secure_insert::<AllowedParentEntity>(model, &scope, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            })
+            .collect();
+        toolkit_db::secure::secure_insert_many::<AllowedParentEntity>(rows, &scope, db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(())
     }
 
     /// Insert allowed membership junction entries.
+    ///
+    /// Same RG-07 fix as `insert_allowed_parent_types`, batched via
+    /// `secure_insert_many`.
     async fn insert_allowed_membership_types<C: DBRunner>(
         &self,
         db: &C,
@@ -302,15 +450,16 @@ impl TypeRepositoryTrait for TypeRepository {
         membership_ids: &[i16],
     ) -> Result<(), DomainError> {
         let scope = system_scope();
-        for &membership_id in membership_ids {
-            let model = gts_type_allowed_membership::ActiveModel {
+        let rows: Vec<gts_type_allowed_membership::ActiveModel> = membership_ids
+            .iter()
+            .map(|&membership_id| gts_type_allowed_membership::ActiveModel {
                 type_id: Set(type_id),
                 membership_type_id: Set(membership_id),
-            };
-            toolkit_db::secure::secure_insert::<AllowedMembershipEntity>(model, &scope, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
-        }
+            })
+            .collect();
+        toolkit_db::secure::secure_insert_many::<AllowedMembershipEntity>(rows, &scope, db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(())
     }
 
@@ -498,12 +647,9 @@ impl TypeRepositoryTrait for TypeRepository {
         .await
         .map_err(|e| DomainError::database(e.to_string()))?;
 
-        // Resolve full types (junction references) for each model in the page
-        let mut types = Vec::with_capacity(page.items.len());
-        for model in &page.items {
-            let rg_type = self.load_full_type(db, model).await?;
-            types.push(rg_type);
-        }
+        // Resolve full types (junction references) for the whole page in a
+        // constant number of queries (fixes known defect RG-12).
+        let types = Self::load_full_types_batch(db, &page.items).await?;
 
         Ok(Page {
             items: types,

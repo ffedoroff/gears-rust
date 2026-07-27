@@ -202,6 +202,70 @@ where
     }
 }
 
+/// Secure batch-insert helper for `Scopable` entities -- the multi-row
+/// counterpart of [`secure_insert`].
+///
+/// Issues a single `INSERT INTO t (...) VALUES (r1), (r2), ...` statement
+/// instead of one `INSERT` per model, for callers that build up a `Vec` of
+/// rows to persist together (junction tables, closure-table rebuilds, and
+/// similar "insert N related rows" repo methods).
+///
+/// # Scope validation is not weakened by batching
+///
+/// Every model in `models` is validated against `scope` individually, with
+/// exactly the same [`validate_insert_scope`] check [`secure_insert`] runs
+/// per row -- this function does not skip or relax that check for the sake
+/// of batching. All validation happens in memory, before any row is sent to
+/// the database: if *any* model fails its check, the whole call returns
+/// `Err` and **nothing is inserted** (stronger than looping `secure_insert`
+/// N times, where a mid-batch failure can leave the earlier rows already
+/// committed unless the caller wraps the loop in its own transaction).
+///
+/// # Empty input
+///
+/// Returns `Ok(())` immediately for an empty `Vec` without touching the
+/// database -- `SeaORM`'s multi-row insert builder has nothing to insert
+/// for an empty row set, so there is no meaningful statement to execute.
+///
+/// # Errors
+///
+/// - Returns `ScopeError::Invalid` if any tenant-scoped model is missing `tenant_id`.
+/// - Returns `ScopeError::Denied` if any model's values do not satisfy the scope.
+/// - Returns `ScopeError::Db` if the database insert fails.
+pub async fn secure_insert_many<E>(
+    models: Vec<E::ActiveModel>,
+    scope: &AccessScope,
+    runner: &impl DBRunner,
+) -> Result<(), ScopeError>
+where
+    E: ScopableEntity + EntityTrait,
+    E::Column: ColumnTrait + Copy,
+    E::ActiveModel: ActiveModelTrait<Entity = E> + Send,
+{
+    if models.is_empty() {
+        return Ok(());
+    }
+
+    for am in &models {
+        if let Some(tenant_col) = E::tenant_col()
+            && let sea_orm::ActiveValue::NotSet = am.get(tenant_col)
+        {
+            return Err(ScopeError::Invalid("tenant_id is required"));
+        }
+        validate_insert_scope(am, scope)?;
+    }
+
+    match DBRunnerInternal::as_seaorm(runner) {
+        SeaOrmRunner::Conn(db) => {
+            E::insert_many(models).exec(db).await?;
+        }
+        SeaOrmRunner::Tx(tx) => {
+            E::insert_many(models).exec(tx).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Secure update helper for updating a single entity by ID inside a scope.
 ///
 /// # Security
