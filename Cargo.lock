@@ -2679,6 +2679,7 @@ dependencies = [
  "dirs",
  "figment",
  "futures-util",
+ "regex",
  "rust_decimal",
  "ryu",
  "sea-orm",
