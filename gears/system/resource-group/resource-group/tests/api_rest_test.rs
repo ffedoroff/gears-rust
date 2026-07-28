@@ -782,6 +782,248 @@ async fn rest_get_memberships_returns_200() {
     assert!(body["items"].is_array());
 }
 
+// =========================================================================
+// VHP-2341: membership operations must respect the caller's tenant scope
+// =========================================================================
+
+/// VHP-2341: POST membership into a cross-tenant group returns 404 (looks
+/// not-found, not a distinguishable "forbidden").
+#[tokio::test]
+async fn rest_post_membership_cross_tenant_returns_404() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+
+    let mt_code = rg_type_id!("test.xmt._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: mt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let gt_code = rg_type_id!("test.xgt._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: gt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    // Tenant A creates the group.
+    let group = group_svc
+        .create_group(
+            &ctx_a,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code,
+                name: "GA".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_a,
+        )
+        .await
+        .unwrap();
+
+    // Tenant B tries to add a member into tenant A's group.
+    let mt_encoded = mt_code.replace('~', "%7E");
+    let req = json_request(
+        "POST",
+        &format!(
+            "/resource-group/v1/memberships/{}/{}/res-xtenant",
+            group.id, mt_encoded
+        ),
+        None,
+        tenant_b,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "cross-tenant add_membership must be reported as not-found"
+    );
+}
+
+/// VHP-2341: DELETE membership from a cross-tenant group returns 404, and
+/// the membership survives.
+#[tokio::test]
+async fn rest_delete_membership_cross_tenant_returns_404() {
+    let (router, type_svc, group_svc, membership_svc) = build_shared_router().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+
+    let mt_code = rg_type_id!("test.xmtr._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: mt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let gt_code = rg_type_id!("test.xgtr._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: gt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group = group_svc
+        .create_group(
+            &ctx_a,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code,
+                name: "GAR".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_a,
+        )
+        .await
+        .unwrap();
+
+    membership_svc
+        .add_membership(&ctx_a, group.id, &mt_code, "res-xtenant-del")
+        .await
+        .unwrap();
+
+    // Tenant B tries to delete a member from tenant A's group.
+    let mt_encoded = mt_code.replace('~', "%7E");
+    let req = json_request(
+        "DELETE",
+        &format!(
+            "/resource-group/v1/memberships/{}/{}/res-xtenant-del",
+            group.id, mt_encoded
+        ),
+        None,
+        tenant_b,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "cross-tenant remove_membership must be reported as not-found"
+    );
+
+    // Tenant A must still see the membership -- the rejected cross-tenant
+    // delete must not have removed it.
+    let list_req = json_request("GET", "/resource-group/v1/memberships", None, tenant_a);
+    let list_resp = router.oneshot(list_req).await.unwrap();
+    let body = response_body(list_resp).await;
+    let items = body["items"].as_array().expect("items array");
+    assert!(
+        items.iter().any(|m| m["resource_id"] == "res-xtenant-del"),
+        "membership must survive a rejected cross-tenant delete, got: {items:?}"
+    );
+}
+
+/// VHP-2341: GET memberships is tenant-scoped -- tenant A must not see
+/// tenant B's membership rows in the list response.
+#[tokio::test]
+async fn rest_get_memberships_is_tenant_scoped() {
+    let (router, type_svc, group_svc, membership_svc) = build_shared_router().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let mt_code = rg_type_id!("test.xlst._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: mt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let gt_code = rg_type_id!("test.xglst._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: gt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group_a = group_svc
+        .create_group(
+            &ctx_a,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code.clone(),
+                name: "GAList".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_a,
+        )
+        .await
+        .unwrap();
+    let group_b = group_svc
+        .create_group(
+            &ctx_b,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code,
+                name: "GBList".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_b,
+        )
+        .await
+        .unwrap();
+
+    membership_svc
+        .add_membership(&ctx_a, group_a.id, &mt_code, "res-list-a")
+        .await
+        .unwrap();
+    membership_svc
+        .add_membership(&ctx_b, group_b.id, &mt_code, "res-list-b")
+        .await
+        .unwrap();
+
+    let req = json_request("GET", "/resource-group/v1/memberships", None, tenant_a);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    let items = body["items"].as_array().expect("items array");
+    assert!(
+        items.iter().any(|m| m["resource_id"] == "res-list-a"),
+        "tenant A must see its own membership, got: {items:?}"
+    );
+    assert!(
+        !items.iter().any(|m| m["resource_id"] == "res-list-b"),
+        "tenant A must NOT see tenant B's membership, got: {items:?}"
+    );
+}
+
 /// TC-REST-06: POST group with parent_id returns 201 with hierarchy.
 #[tokio::test]
 async fn rest_post_group_with_parent_returns_201() {

@@ -501,6 +501,21 @@ async fn trace_add_membership() {
          {membership_selects}:\n{}",
         rec.dump()
     );
+    // VHP-2341 baseline update: 2 resource_group SELECTs, not 1. The new
+    // AuthZ tenant-scope gate (`group_repo.find_by_id(tx, scope, group_id)`
+    // in `add_membership_in_tx`) adds exactly one extra scoped SELECT ahead
+    // of the pre-existing raw `find_model_by_id` read -- a single query, not
+    // a loop, so it doesn't regress RG-01's shape. Before VHP-2341 this was
+    // 1 (`find_model_by_id` only, no tenant gate existed).
+    let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
+    assert_eq!(
+        rg_selects,
+        2,
+        "VHP-2341 regression: expected exactly 2 resource_group SELECTs (the \
+         AuthZ tenant-scope gate's find_by_id + the existing find_model_by_id), \
+         got {rg_selects}:\n{}",
+        rec.dump()
+    );
 }
 
 /// `remove_membership`'s check-then-delete runs inside a SERIALIZABLE
@@ -532,6 +547,74 @@ async fn trace_remove_membership() {
     assert!(
         rec.writes_outside_tx().is_empty(),
         "remove_membership must run its writes inside a transaction:\n{}",
+        rec.dump()
+    );
+    // VHP-2341 baseline update: exactly 1 resource_group SELECT, where there
+    // were 0 before this fix. `remove_membership_in_tx` never looked up the
+    // group at all pre-fix (it went straight to `membership_repo` by
+    // composite key); the new AuthZ tenant-scope gate
+    // (`group_repo.find_by_id(tx, scope, group_id)`) adds exactly this one
+    // scoped SELECT, not a loop.
+    let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
+    assert_eq!(
+        rg_selects,
+        1,
+        "VHP-2341 regression: expected exactly 1 resource_group SELECT (the \
+         AuthZ tenant-scope gate's find_by_id), got {rg_selects}:\n{}",
+        rec.dump()
+    );
+}
+
+/// `list_memberships`'s tenant scoping (VHP-2341) runs as a correlated EXISTS
+/// subquery embedded in the page's single `SELECT`, not a second round trip
+/// and not one subquery evaluation per row (the DB engine evaluates the
+/// EXISTS per candidate row server-side, inside one statement -- there is no
+/// N+1 at the client/statement level, which is what this audit suite
+/// measures).
+#[tokio::test]
+async fn trace_list_memberships() {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let membership_svc = common::make_membership_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let member_type = common::create_root_type(&type_svc, "mbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant_id).await;
+    for i in 0..5 {
+        membership_svc
+            .add_membership(&ctx, group.id, &member_type.code, &format!("res-{i}"))
+            .await
+            .expect("add_membership should succeed");
+    }
+
+    rec.clear();
+    let page = membership_svc
+        .list_memberships(&ctx, &toolkit_odata::ODataQuery::default())
+        .await
+        .expect("list_memberships should succeed");
+    assert_eq!(
+        page.items.len(),
+        5,
+        "all 5 seeded memberships must be listed"
+    );
+
+    snapshot_trace("list_memberships", &rec);
+    // VHP-2341 baseline: exactly 1 resource_group_membership SELECT for the
+    // whole page (the EXISTS subquery against resource_group lives inside
+    // that single statement's WHERE clause, so it doesn't add a
+    // resource_group_membership SELECT of its own, and -- crucially -- it
+    // does not scale with the number of rows in the page: 5 items, 1
+    // statement, not 5).
+    let membership_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group_membership");
+    assert_eq!(
+        membership_selects,
+        1,
+        "VHP-2341 regression: expected exactly 1 resource_group_membership \
+         SELECT for the page (no N+1 from the per-row tenant-scope subquery), \
+         got {membership_selects}:\n{}",
         rec.dump()
     );
 }

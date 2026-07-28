@@ -307,9 +307,18 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
 
 #[async_trait]
 pub trait MembershipRepositoryTrait: Send + Sync + 'static {
+    /// List memberships, filtered to `scope`.
+    ///
+    /// `resource_group_membership` declares `#[secure(no_tenant, no_resource,
+    /// no_owner, no_type)]` (VHP-2341) -- `scope` cannot be applied directly
+    /// to it via `.scope_with()` (every constrained scope would resolve to
+    /// deny-all). Implementations must filter via the owning
+    /// `resource_group` row instead. Pass `AccessScope::allow_all()` for the
+    /// unscoped/system read path (see `MembershipService::list_memberships_unscoped`).
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError>;
 
