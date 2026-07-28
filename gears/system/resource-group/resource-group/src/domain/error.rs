@@ -242,6 +242,30 @@ impl From<toolkit_db::DbError> for DomainError {
     }
 }
 
+/// Classify an `OData` pagination/filter failure (`toolkit_odata::Error`,
+/// surfaced by `paginate_odata`) as caller-caused (-> `Validation`, HTTP
+/// 400) or a genuine backend failure (-> `Database`, HTTP 500).
+///
+/// Mirrors the split `toolkit_odata::problem_mapping`'s
+/// `From<Error> for CanonicalError` already applies to the `OData`-native
+/// error surface: every variant except `Db`/`ParsingUnavailable` originates
+/// from a client-supplied `$filter` / `$orderby` / cursor and is never a
+/// backend fault, so it must map to `Validation`, not `Database`.
+///
+/// Used by `MembershipRepository::list_memberships` (VHP-1954) so a
+/// malformed `$filter` (unknown field, type mismatch, bad `$orderby` field,
+/// stale cursor) surfaces as 400 instead of being folded into a blanket 500
+/// alongside actual DB failures.
+impl From<toolkit_odata::Error> for DomainError {
+    fn from(e: toolkit_odata::Error) -> Self {
+        use toolkit_odata::Error as OE;
+        match &e {
+            OE::Db(_) | OE::ParsingUnavailable(_) => DomainError::database(e.to_string()),
+            _ => DomainError::validation(e.to_string()),
+        }
+    }
+}
+
 impl From<EnforcerError> for DomainError {
     fn from(e: EnforcerError) -> Self {
         match e {

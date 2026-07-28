@@ -575,6 +575,94 @@ async def test_membership_filter_wiring(
         assert any(m["resource_id"] == "res-2" for m in items)
 
 
+# ── S10b: Membership filter by resource_type (VHP-1731) ─────────────────
+
+
+async def test_membership_filter_by_resource_type(
+    rg_base_url, rg_headers, create_type, create_group,
+):
+    """Seam: OData $filter on `resource_type` -- GTS type-path string ->
+    SMALLINT surrogate resolution at the persistence boundary (VHP-1731).
+
+    `resource_type` is exposed on the wire as a GTS type-path string but
+    stored as the SMALLINT `gts_type_id` column; the repository must resolve
+    the string to its surrogate id before filtering, mirroring the `type`
+    resolution `list_groups` already does. S10 above only filters on
+    `group_id`, so this seam -- resolve-then-filter for `resource_type` --
+    was never exercised end-to-end.
+
+    NOTE: added alongside a fix for VHP-1954/VHP-1731; not run locally (no
+    live cluster in this environment) -- verify against a real deployment.
+    """
+    member_type_a = await create_type("s10ta")
+    member_type_b = await create_type("s10tb")
+    org_type = await create_type(
+        "s10torg",
+        allowed_membership_types=[member_type_a["code"], member_type_b["code"]],
+    )
+    group = await create_group(org_type["code"], "S10b Group")
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        r = await c.post(
+            f"{_memberships(rg_base_url)}/{group['id']}/{member_type_a['code']}/res-a",
+            headers=rg_headers,
+        )
+        assert r.status_code == 201
+
+        r = await c.post(
+            f"{_memberships(rg_base_url)}/{group['id']}/{member_type_b['code']}/res-b",
+            headers=rg_headers,
+        )
+        assert r.status_code == 201
+
+        # Filter by resource_type -- should only see res-a
+        r = await c.get(
+            _memberships(rg_base_url), headers=rg_headers,
+            params={"$filter": f"resource_type eq '{member_type_a['code']}'"},
+        )
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert any(m["resource_id"] == "res-a" for m in items), (
+            "resource_type filter must resolve the GTS path to its surrogate "
+            f"id and return res-a: {items}"
+        )
+        assert not any(m["resource_id"] == "res-b" for m in items), (
+            f"resource_type filter leaked res-b: {items}"
+        )
+
+
+# ── S10c: Quoted-UUID $filter must be 400, not 500 (VHP-1954) ───────────
+
+
+async def test_membership_filter_group_id_quoted_uuid_returns_400(
+    rg_base_url, rg_headers,
+):
+    """Seam: client-caused $filter errors -> 400, not 500 (VHP-1954).
+
+    The OData grammar only parses a *bare* hex8-4-4-4-12 UUID literal as
+    `Value::Uuid`; the same literal wrapped in single quotes parses as
+    `Value::String`, which fails `FilterField` validation for `group_id`
+    (Uuid-kind) -- exactly the shape the ticket's reporter hit. Before the
+    fix this was folded into a blanket `DomainError::database(..)`, turning
+    a client mistake into a 500; S10 above never caught it because it always
+    sends the bare (unquoted) form.
+
+    NOTE: added alongside a fix for VHP-1954/VHP-1731; not run locally (no
+    live cluster in this environment) -- verify against a real deployment.
+    """
+    some_uuid = str(uuid.uuid4())
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        r = await c.get(
+            _memberships(rg_base_url), headers=rg_headers,
+            params={"$filter": f"group_id eq '{some_uuid}'"},
+        )
+        assert r.status_code == 400, (
+            f"quoted-UUID $filter must be a 400 client error, "
+            f"not {r.status_code}: {r.text}"
+        )
+
+
 # ── S11: Hierarchy depth filter wiring ─────────────────────────────────
 
 
