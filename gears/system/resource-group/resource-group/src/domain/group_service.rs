@@ -620,10 +620,25 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // Skip tenant enforcement for tenant-typed groups — they intentionally
             // create a new tenant scope (tenant_id = group.id != parent.tenant_id).
             if !is_tenant_type && parent.tenant_id != tenant_id {
-                return Err(DomainError::validation(format!(
-                    "Child group tenant_id ({tenant_id}) must match parent tenant_id ({})",
-                    parent.tenant_id
-                )));
+                // VHP-2345: generic message -- do not interpolate the
+                // parent's tenant_id. The caller supplies `parent_id`
+                // directly, so echoing the foreign tenant_id back would
+                // turn this endpoint into a cross-tenant oracle: probe an
+                // arbitrary `parent_id` and learn both that the group
+                // exists and which tenant owns it. Mirrors
+                // `update_group_inner`'s cross-tenant parent-change
+                // message below. Real values stay in this debug log only.
+                debug!(
+                    caller_tenant_id = %tenant_id,
+                    parent_tenant_id = %parent.tenant_id,
+                    parent_id = %parent_id,
+                    "create_group rejected: parent belongs to a different tenant"
+                );
+                return Err(DomainError::validation(
+                    "Cannot create group under this parent; parent belongs to a different \
+                     tenant"
+                        .to_owned(),
+                ));
             }
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-5
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-3

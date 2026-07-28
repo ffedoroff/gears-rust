@@ -419,6 +419,68 @@ async fn create_group_returns_201() {
     assert_eq!(body["hierarchy"]["tenant_id"], tenant_id.to_string());
 }
 
+/// VHP-2345: creating a group with an `id` that collides with an existing
+/// group's primary key must come back as a typed 409 `already_exists`, not
+/// a raw 500. VHP-2343's owner decision keeps client-supplied `id` accepted
+/// as-is on create — capture is not blocked by this fix.
+#[tokio::test]
+async fn create_group_duplicate_id_returns_409() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.grpdup.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let dup_id = Uuid::now_v7();
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "id": dup_id,
+            "type": type_code,
+            "name": "First"
+        })),
+        tenant_id,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_eq!(body["id"], dup_id.to_string());
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "id": dup_id,
+            "type": type_code,
+            "name": "Second"
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "expected 409");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .expect("Content-Type header must be present");
+    assert!(
+        ct.to_str().unwrap().contains("application/problem+json"),
+        "expected application/problem+json for 409, got: {ct:?}"
+    );
+    let body = response_body(resp).await;
+    assert_eq!(body["status"], 409);
+    assert_eq!(body["context"]["resource_name"], dup_id.to_string());
+}
+
 #[tokio::test]
 async fn list_groups_returns_200() {
     let (router, _) = build_test_router().await;
@@ -638,6 +700,81 @@ async fn rest_post_membership_returns_201() {
         "No tenant_id in membership response"
     );
     assert_no_surrogate_ids(&body);
+}
+
+/// VHP-2345 regression: a second `POST` of the same membership composite
+/// key must still come back as a typed 409 conflict, now that
+/// `MembershipRepository::insert` classifies the duplicate via
+/// `toolkit_db::secure::is_unique_violation` instead of a substring match
+/// on the driver's error text.
+#[tokio::test]
+async fn rest_post_membership_duplicate_returns_409() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let mt_code = rg_type_id!("test.mtdup._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: mt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let gt_code = rg_type_id!("test.gtdup.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type(resource_group_sdk::CreateTypeRequest {
+            code: gt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code,
+                name: "G1".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+
+    let mt_encoded = mt_code.replace('~', "%7E");
+    let path = format!(
+        "/resource-group/v1/memberships/{}/{}/res-dup",
+        group.id, mt_encoded
+    );
+
+    let first = json_request("POST", &path, None, tenant_id);
+    let resp = router.clone().oneshot(first).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let second = json_request("POST", &path, None, tenant_id);
+    let resp = router.oneshot(second).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "expected 409");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .expect("Content-Type header must be present");
+    assert!(
+        ct.to_str().unwrap().contains("application/problem+json"),
+        "expected application/problem+json for 409, got: {ct:?}"
+    );
+    let body = response_body(resp).await;
+    assert_eq!(body["status"], 409);
 }
 
 /// Helper: create a self-referencing root type (create, then update to allow self as parent).
