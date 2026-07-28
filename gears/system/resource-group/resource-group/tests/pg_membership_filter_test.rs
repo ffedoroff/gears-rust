@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use resource_group::domain::error::DomainError;
 use resource_group::domain::repo::MembershipRepositoryTrait;
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::migrations::Migrator;
 use resource_group::infra::storage::type_repo::TypeRepository;
@@ -133,7 +132,7 @@ async fn list_memberships_resolves_resource_type_filter_on_postgres() {
     let db = fixture.db.clone();
     let conn = db.conn().expect("db conn");
 
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let member_type = common::create_root_type(&type_svc, "pgmbrfilter").await;
 
     let group_svc = common::make_group_service(db.clone());
@@ -199,7 +198,7 @@ async fn list_memberships_is_tenant_scoped_on_postgres() {
     let db = fixture.db.clone();
     let conn = db.conn().expect("db conn");
 
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let member_type = common::create_root_type(&type_svc, "pgtenscope").await;
 
     let group_svc = common::make_group_service(db.clone());

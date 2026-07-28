@@ -134,11 +134,81 @@ fn make_enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(authz)
 }
 
-async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
+// ── Mock AuthZ: allow-all, no constraints (for `TypeService`) ──────────
+//
+// `gts_type` is a platform-global table (no `tenant_id` column), so
+// `RG_TYPE_RESOURCE` declares an empty `supported_properties` list and
+// every gate call uses `require_constraints(false)` (VHP-2342). The
+// tenant-scoping `AllowAllAuthZ` mock above always attaches an
+// `owner_tenant_id` constraint, which `RG_TYPE_RESOURCE` doesn't support --
+// wiring `TypeService` with it would fail constraint compilation instead of
+// permitting the call. This mock returns the PDP shape the gate actually
+// expects: `decision: true, constraints: []`.
+struct AllowAllNoConstraintsAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for AllowAllNoConstraintsAuthZ {
+    async fn evaluate(
+        &self,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+fn make_type_enforcer() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(AllowAllNoConstraintsAuthZ);
+    PolicyEnforcer::new(authz)
+}
+
+// ── Mock AuthZ: deny-all (for the type-registry gate rejection tests) ──
+
+struct DenyAllAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for DenyAllAuthZ {
+    async fn evaluate(
+        &self,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Ok(EvaluationResponse {
+            decision: false,
+            context: EvaluationResponseContext {
+                constraints: vec![],
+                deny_reason: Some(authz_resolver_sdk::models::DenyReason {
+                    error_code: "deny_all".to_owned(),
+                    details: Some("deny-all test enforcer".to_owned()),
+                }),
+            },
+        })
+    }
+}
+
+fn make_type_enforcer_deny() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(DenyAllAuthZ);
+    PolicyEnforcer::new(authz)
+}
+
+/// Build a fully-wired router. `type_enforcer` lets callers swap in a
+/// deny-all `PolicyEnforcer` for the type-registry routes while group/
+/// membership routes keep the normal allow-all-with-tenant-scoping mock.
+async fn build_test_router_with_type_enforcer(
+    type_enforcer: PolicyEnforcer,
+) -> (Router, Arc<TypeService<TypeRepository>>) {
     let db = test_db().await;
     let enforcer = make_enforcer();
 
-    let type_svc = Arc::new(TypeService::new(db.clone(), Arc::new(TypeRepository)));
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        type_enforcer,
+        Arc::new(TypeRepository),
+    ));
     let group_svc = Arc::new(GroupService::new(
         db.clone(),
         QueryProfile::default(),
@@ -165,6 +235,16 @@ async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
     );
 
     (router, type_svc)
+}
+
+async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
+    build_test_router_with_type_enforcer(make_type_enforcer()).await
+}
+
+/// Router wired with a deny-all enforcer for the type-registry routes only
+/// -- used by the VHP-2342 rejection tests below.
+async fn build_test_router_type_denied() -> (Router, Arc<TypeService<TypeRepository>>) {
+    build_test_router_with_type_enforcer(make_type_enforcer_deny()).await
 }
 
 fn json_request(
@@ -231,7 +311,7 @@ async fn create_type_duplicate_returns_409() {
 
     // Pre-create via service
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -285,7 +365,7 @@ async fn list_types_returns_200_with_page() {
     let code = rg_type_id!("test.list.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -312,7 +392,7 @@ async fn get_type_returns_200() {
     let code = rg_type_id!("test.get.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -360,7 +440,7 @@ async fn delete_type_returns_204() {
     let code = rg_type_id!("test.del.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -381,6 +461,106 @@ async fn delete_type_returns_204() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
+// ── Type CRUD AuthZ Tests (VHP-2342) ────────────────────────────────────
+//
+// Before this fix, all five `/types-registry/v1/types` routes were
+// `.authenticated()`-only: any caller with a valid JWT -- from any tenant --
+// could create/read/update/delete GTS type definitions. These five tests
+// wire the router with a deny-all `PolicyEnforcer` for the type routes
+// (`build_test_router_type_denied`) and assert the exact HTTP status the
+// `DomainError::AccessDenied` -> `CanonicalError` mapping produces
+// (`RgError::permission_denied()`, see `src/api/rest/error.rs`) --
+// `StatusCode::FORBIDDEN`. The companion `*_returns_2xx` tests above already
+// cover the allow path (the router's default enforcer is allow-all).
+
+#[tokio::test]
+async fn list_types_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request("GET", "/types-registry/v1/types", None, tenant_id);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn create_type_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+    let code = rg_type_id!("test.authz.create.{}.v1~", Uuid::now_v7().as_simple());
+
+    let req = json_request(
+        "POST",
+        "/types-registry/v1/types",
+        Some(serde_json::json!({
+            "code": code,
+            "can_be_root": true,
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn get_type_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+    // No type needs to exist: the AuthZ gate runs before the lookup, so a
+    // deny must short-circuit before a NotFound could ever surface.
+    let code = rg_type_id!("test.authz.get.{}.v1~", Uuid::now_v7().as_simple());
+    let encoded = code.replace('~', "%7E");
+
+    let req = json_request(
+        "GET",
+        &format!("/types-registry/v1/types/{encoded}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn update_type_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+    let code = rg_type_id!("test.authz.update.{}.v1~", Uuid::now_v7().as_simple());
+    let encoded = code.replace('~', "%7E");
+
+    let req = json_request(
+        "PUT",
+        &format!("/types-registry/v1/types/{encoded}"),
+        Some(serde_json::json!({
+            "can_be_root": true,
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn delete_type_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+    let code = rg_type_id!("test.authz.delete.{}.v1~", Uuid::now_v7().as_simple());
+    let encoded = code.replace('~', "%7E");
+
+    let req = json_request(
+        "DELETE",
+        &format!("/types-registry/v1/types/{encoded}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
 // ── Group CRUD Tests ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -390,7 +570,7 @@ async fn create_group_returns_201() {
     let type_code = rg_type_id!("test.grp.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -430,7 +610,7 @@ async fn create_group_duplicate_id_returns_409() {
     let type_code = rg_type_id!("test.grpdup.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -581,7 +761,7 @@ async fn rest_put_type_returns_200() {
     let code = rg_type_id!("test.put.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -644,7 +824,7 @@ async fn rest_post_membership_returns_201() {
 
     let mt_code = rg_type_id!("test.mt2._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -656,7 +836,7 @@ async fn rest_post_membership_returns_201() {
 
     let gt_code = rg_type_id!("test.gt2.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -715,7 +895,7 @@ async fn rest_post_membership_duplicate_returns_409() {
 
     let mt_code = rg_type_id!("test.mtdup._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -727,7 +907,7 @@ async fn rest_post_membership_duplicate_returns_409() {
 
     let gt_code = rg_type_id!("test.gtdup.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -781,7 +961,7 @@ async fn rest_post_membership_duplicate_returns_409() {
 async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &str) -> String {
     let code = rg_type_id!("test.{}.{}.v1~", suffix, Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -791,7 +971,7 @@ async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &s
         .await
         .unwrap();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -814,7 +994,11 @@ async fn build_shared_router() -> (
 ) {
     let db = test_db().await;
     let enforcer = make_enforcer();
-    let type_svc = Arc::new(TypeService::new(db.clone(), Arc::new(TypeRepository)));
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        make_type_enforcer(),
+        Arc::new(TypeRepository),
+    ));
     let group_svc = Arc::new(GroupService::new(
         db.clone(),
         QueryProfile::default(),
@@ -849,7 +1033,7 @@ async fn rest_delete_membership_returns_204() {
 
     let mt = rg_type_id!("test.mtr._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -861,7 +1045,7 @@ async fn rest_delete_membership_returns_204() {
 
     let gt = rg_type_id!("test.gtr.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -934,7 +1118,7 @@ async fn rest_post_membership_cross_tenant_returns_404() {
 
     let mt_code = rg_type_id!("test.xmt._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -946,7 +1130,7 @@ async fn rest_post_membership_cross_tenant_returns_404() {
 
     let gt_code = rg_type_id!("test.xgt._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1002,7 +1186,7 @@ async fn rest_delete_membership_cross_tenant_returns_404() {
 
     let mt_code = rg_type_id!("test.xmtr._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1014,7 +1198,7 @@ async fn rest_delete_membership_cross_tenant_returns_404() {
 
     let gt_code = rg_type_id!("test.xgtr._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1086,7 +1270,7 @@ async fn rest_get_memberships_is_tenant_scoped() {
 
     let mt_code = rg_type_id!("test.xlst._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1098,7 +1282,7 @@ async fn rest_get_memberships_is_tenant_scoped() {
 
     let gt_code = rg_type_id!("test.xglst._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1171,7 +1355,7 @@ async fn rest_post_group_with_parent_returns_201() {
     let root_type = rg_type_id!("test.rtp.{}.v1~", Uuid::now_v7().as_simple());
     // Create type first without self-reference, then update to allow self as parent
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: root_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1181,7 +1365,7 @@ async fn rest_post_group_with_parent_returns_201() {
         .await
         .unwrap();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &root_type,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -1544,7 +1728,7 @@ async fn rest_create_group_with_metadata() {
 
     let code = rg_type_id!("test.gm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1580,7 +1764,7 @@ async fn rest_group_response_omits_null_metadata() {
 
     let code = rg_type_id!("test.nm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1760,7 +1944,7 @@ async fn input_membership_non_gts_resource_type() {
 
     let rt = rg_type_id!("test.ngts.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: rt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1995,7 +2179,7 @@ async fn input_deser_group_empty_name_returns_400() {
 
     let code = rg_type_id!("test.en.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2097,7 +2281,7 @@ async fn gts_membership_post_tilde_encoded() {
 
     let mt = rg_type_id!("test.tmt._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2109,7 +2293,7 @@ async fn gts_membership_post_tilde_encoded() {
 
     let gt = rg_type_id!("test.tgt.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2157,7 +2341,7 @@ async fn gts_membership_delete_tilde_encoded() {
 
     let mt = rg_type_id!("test.tmd._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2169,7 +2353,7 @@ async fn gts_membership_delete_tilde_encoded() {
 
     let gt = rg_type_id!("test.tgd.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2221,7 +2405,7 @@ async fn gts_put_type_tilde_encoded() {
 
     let code = rg_type_id!("test.tput.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2254,7 +2438,7 @@ async fn smallint_type_response_has_no_surrogate_ids() {
 
     let code = rg_type_id!("test.sid.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2288,7 +2472,7 @@ async fn smallint_group_response_has_no_surrogate_ids() {
 
     let code = rg_type_id!("test.gsid.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2325,7 +2509,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
 
     let mt = rg_type_id!("test.msid._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2337,7 +2521,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
 
     let gt = rg_type_id!("test.gsidm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2475,7 +2659,7 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
     // --- 409 Conflict: duplicate type ---
     let code = rg_type_id!("test.errdup.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],

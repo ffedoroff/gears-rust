@@ -242,6 +242,36 @@ impl AuthZResolverClient for DenyAllAuthZ {
     }
 }
 
+// -- AllowAll-no-constraints AuthZ mock (for the `gts_type` global registry) --
+
+/// Enforcer that always permits and never attaches constraints.
+///
+/// `gts_type` is a platform-global table (no `tenant_id` column), so
+/// `TypeService`'s `RG_TYPE_RESOURCE` descriptor declares an empty
+/// `supported_properties` list and every gate call uses
+/// `require_constraints(false)` (VHP-2342). This mock is the PDP shape that
+/// setup actually expects: `decision: true, constraints: []`. Using the
+/// tenant-scoping `AllowAllAuthZ` mock above here would attach an
+/// `owner_tenant_id` constraint that `RG_TYPE_RESOURCE` doesn't support,
+/// which fails constraint compilation instead of permitting the call.
+struct AllowAllNoConstraintsAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for AllowAllNoConstraintsAuthZ {
+    async fn evaluate(
+        &self,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
 /// Build a `SecurityContext` for anonymous (nil tenant) -- matches `SecurityContext::anonymous()`.
 pub fn make_anon_ctx() -> SecurityContext {
     SecurityContext::anonymous()
@@ -311,9 +341,42 @@ pub fn make_enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(authz)
 }
 
+/// Build an allow-all-no-constraints `PolicyEnforcer` for `TypeService`
+/// (VHP-2342) -- see [`AllowAllNoConstraintsAuthZ`].
+pub fn make_type_enforcer() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(AllowAllNoConstraintsAuthZ);
+    PolicyEnforcer::new(authz)
+}
+
+/// Build a deny-all `PolicyEnforcer`, for proving `TypeService`'s gate
+/// actually rejects when wired to a denying PDP (VHP-2342).
+pub fn make_type_enforcer_deny() -> PolicyEnforcer {
+    PolicyEnforcer::new(Arc::new(DenyAllAuthZ))
+}
+
+// -- Service construction helpers (TypeService) --
+
+/// Build a `TypeService` from a DB provider using the allow-all-no-constraints
+/// enforcer (VHP-2342). Fixture helpers below use the unscoped entry points,
+/// so this enforcer is a sane default rather than a load-bearing choice.
+pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
+    TypeService::new(db, make_type_enforcer(), Arc::new(TypeRepository))
+}
+
+/// Build a `TypeService` wired with the deny-all enforcer -- for tests that
+/// exercise the gated (`ctx`-taking) entry points and expect `AccessDenied`.
+pub fn make_type_service_deny(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
+    TypeService::new(db, make_type_enforcer_deny(), Arc::new(TypeRepository))
+}
+
 // -- Type helpers --
 
 /// Create a root type (can_be_root = true, no parents, no memberships).
+///
+/// Uses `create_type_unscoped`: these fixture helpers exist to set up types
+/// for tests that exercise *other* services (groups, memberships) and don't
+/// care about type-registry AuthZ, so bypassing the `PolicyEnforcer` gate
+/// keeps them independent of which enforcer `svc` happens to be wired with.
 pub async fn create_root_type(
     svc: &TypeService<TypeRepository>,
     suffix: &str,
@@ -328,7 +391,7 @@ pub async fn create_root_type(
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: true,
         allowed_parent_types: vec![],
@@ -340,6 +403,8 @@ pub async fn create_root_type(
 }
 
 /// Create a child type with specified allowed parents and memberships.
+///
+/// See [`create_root_type`] for why this uses `create_type_unscoped`.
 pub async fn create_child_type(
     svc: &TypeService<TypeRepository>,
     suffix: &str,
@@ -356,7 +421,7 @@ pub async fn create_child_type(
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: false,
         allowed_parent_types: parents.iter().map(|s| (*s).to_owned()).collect(),
