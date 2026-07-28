@@ -675,6 +675,80 @@ async fn create_type_conflict_retried_yields_clean_already_exists_for_loser(
     assert_hierarchy_invariants(db).await;
 }
 
+// VHP-2345: real-Postgres coverage for the `resource_group.id` unique-key
+// classification path.
+
+/// `create_group` with an explicit `id` that collides with an already-inserted
+/// group's primary key must surface as a clean `DomainError::GroupAlreadyExists`,
+/// not a raw `Database`/500.
+///
+/// This is deliberately sequential, not a race: the point is not SSI
+/// contention (covered by the scenarios above) but exercising the actual
+/// SQLSTATE `23505` path of `ScopeError::is_unique_violation` /
+/// `toolkit_db::secure::is_unique_violation` against a real Postgres driver.
+/// SQLite's error text takes the string-fallback branch of the same
+/// classifier instead (see `domain_unit_test.rs` /
+/// `group_service_test.rs::group_create_duplicate_id_returns_typed_conflict`
+/// for that side); running this scenario here is the only way to prove the
+/// SQLSTATE-based fast path also lands on the same typed variant.
+async fn create_group_duplicate_id_on_postgres_yields_clean_already_exists(
+    db: &Arc<DBProvider<DbError>>,
+) {
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+
+    let root_type = common::create_root_type(&type_svc, "pgiddup").await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let dup_id = Uuid::now_v7();
+
+    let first = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: Some(dup_id),
+                code: root_type.code.clone(),
+                name: "First".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("first create with explicit id should succeed on Postgres");
+    assert_eq!(first.id, dup_id);
+
+    let err = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: Some(dup_id),
+                code: root_type.code,
+                name: "Second".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect_err("second create with the same id must be rejected on Postgres");
+
+    eprintln!("create_group_duplicate_id_on_postgres: error = {err}");
+    assert!(
+        matches!(err, DomainError::GroupAlreadyExists { id } if id == dup_id),
+        "the colliding create must get a clean GroupAlreadyExists (proving the \
+         SQLSTATE 23505 branch of is_unique_violation is reached on real Postgres), \
+         got: {err:?}"
+    );
+
+    assert_hierarchy_invariants(db).await;
+
+    group_svc
+        .delete_group(&ctx, dup_id, false)
+        .await
+        .expect("cleanup: delete the surviving group");
+}
+
 // Negative controls: SSI + retry works for hierarchy mutations
 
 fn unique_tenant_type_code() -> String {
@@ -937,6 +1011,11 @@ async fn membership_and_type_races() {
         "=== membership_and_type_races: create_type_conflict_retried_yields_clean_already_exists_for_loser ==="
     );
     create_type_conflict_retried_yields_clean_already_exists_for_loser(&db).await;
+
+    eprintln!(
+        "=== membership_and_type_races: create_group_duplicate_id_on_postgres_yields_clean_already_exists ==="
+    );
+    create_group_duplicate_id_on_postgres_yields_clean_already_exists(&db).await;
 
     eprintln!(
         "=== membership_and_type_races: negative_control_tenant_root_race_exactly_one_succeeds ==="

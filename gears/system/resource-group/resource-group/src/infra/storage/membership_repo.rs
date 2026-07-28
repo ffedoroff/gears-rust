@@ -243,6 +243,12 @@ impl MembershipRepositoryTrait for MembershipRepository {
         toolkit_db::secure::secure_insert::<MembershipEntity>(model, &scope, db)
             .await
             .map_err(|e| {
+                // VHP-2345: same duplicate-key classification as
+                // `GroupRepository::insert` -- `ScopeError::is_unique_violation`
+                // (SQLSTATE first, string fallback second) instead of a
+                // gear-local substring match on "duplicate key" / "UNIQUE
+                // constraint", which only ever covered Postgres/SQLite
+                // wording and would silently miss e.g. MySQL.
                 if e.is_unique_violation() {
                     DomainError::duplicate_membership(
                         format!("({group_id}, type_id={gts_type_id}, {resource_id})"),

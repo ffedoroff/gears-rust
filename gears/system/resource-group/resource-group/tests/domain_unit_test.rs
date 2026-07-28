@@ -472,6 +472,14 @@ fn domain_error_type_already_exists_format() {
 }
 
 #[test]
+fn domain_error_group_already_exists_format() {
+    let id = uuid::Uuid::now_v7();
+    let err = DomainError::group_already_exists(id);
+    assert!(matches!(err, DomainError::GroupAlreadyExists { .. }));
+    assert!(err.to_string().contains(&id.to_string()));
+}
+
+#[test]
 fn domain_error_validation_format() {
     let err = DomainError::validation("bad input");
     assert!(matches!(err, DomainError::Validation { .. }));

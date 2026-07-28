@@ -578,6 +578,15 @@ impl GroupRepositoryTrait for GroupRepository {
         toolkit_db::secure::secure_insert::<ResourceGroupEntity>(model, &scope, db)
             .await
             .map_err(|e| {
+                // VHP-2345: a unique-constraint violation on `resource_group.id`
+                // means the caller-supplied (or seeding-replayed) `id` already
+                // exists. Classify via `ScopeError::is_unique_violation` --
+                // SQLSTATE-based first (`sea_orm::SqlErr`), string fallback
+                // second -- rather than a bespoke substring check here, so
+                // Postgres and SQLite both land on the same typed variant.
+                // VHP-2343 deliberately keeps accepting the client-supplied
+                // `id` as-is; this only turns the resulting collision into a
+                // clean 409 instead of an opaque `Database` (500).
                 if e.is_unique_violation() {
                     DomainError::group_already_exists(id)
                 } else {

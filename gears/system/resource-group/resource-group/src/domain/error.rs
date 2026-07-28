@@ -16,6 +16,20 @@ pub enum DomainError {
     #[error("Type already exists: {code}")]
     TypeAlreadyExists { code: String },
 
+    /// Duplicate resource-group `id` on create.
+    ///
+    /// Raised by `GroupRepository::insert` when the insert hits a
+    /// unique-constraint violation on `resource_group.id` — the caller
+    /// supplied (via `CreateGroupRequest::id`) or seeding replayed an `id`
+    /// that already exists. VHP-2343's owner decision keeps client-supplied
+    /// `id` on create as-is (no derived-id, no `id_seed` — that policy
+    /// question is out of scope here); this variant only turns the
+    /// resulting primary-key collision into a typed conflict instead of an
+    /// opaque `Database` (HTTP 500). Maps to canonical `already_exists`
+    /// (HTTP 409) with `id` as the `resource_name` (VHP-2345).
+    #[error("Group already exists: {id}")]
+    GroupAlreadyExists { id: uuid::Uuid },
+
     #[error("Validation failed: {message}")]
     Validation { message: String },
 
@@ -120,6 +134,11 @@ impl DomainError {
 
     pub fn type_already_exists(code: impl Into<String>) -> Self {
         Self::TypeAlreadyExists { code: code.into() }
+    }
+
+    #[must_use]
+    pub fn group_already_exists(id: uuid::Uuid) -> Self {
+        Self::GroupAlreadyExists { id }
     }
 
     pub fn validation(message: impl Into<String>) -> Self {

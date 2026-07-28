@@ -61,6 +61,14 @@ impl From<DomainError> for CanonicalError {
                     .with_resource(code)
                     .create()
             }
+            // VHP-2345: primary-key collision on `resource_group.id` (VHP-2343
+            // deliberately keeps client-supplied `id` accepted on create) —
+            // typed 409 instead of falling through to the `Database` (500) arm.
+            DomainError::GroupAlreadyExists { id } => {
+                RgError::already_exists(format!("Resource group with id '{id}' already exists"))
+                    .with_resource(id.to_string())
+                    .create()
+            }
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
             DomainError::InvalidParentType { message } => RgError::invalid_argument()

@@ -291,8 +291,73 @@ async fn group_create_cross_tenant_parent() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::Validation { ref message } if message.contains("must match parent tenant_id")),
+        matches!(err, DomainError::Validation { .. }),
         "Expected Validation with tenant mismatch, got: {err:?}"
+    );
+    // VHP-2345: the message must not disclose the parent's (tenant A's)
+    // tenant_id -- across a tenant boundary that value is exactly the
+    // "cross-tenant oracle" a caller could otherwise use `parent_id` to
+    // probe for. Assert the *value* is absent, not merely that some new
+    // wording is present.
+    let DomainError::Validation { message } = &err else {
+        unreachable!("checked above");
+    };
+    assert!(
+        !message.contains(&tenant_a.to_string()),
+        "error message leaks parent tenant_id ({tenant_a}): {message}"
+    );
+}
+
+/// TC-GRP-23b: Create group with an `id` that collides with an existing
+/// group's primary key -> typed `GroupAlreadyExists`, not a raw `Database`
+/// (500). VHP-2343's owner decision keeps the client-supplied `id` accepted
+/// as-is on create (no derived-id); VHP-2345 only turns the resulting
+/// primary-key collision into a typed conflict.
+#[tokio::test]
+async fn group_create_duplicate_id_returns_typed_conflict() {
+    let db = common::test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "org").await;
+    let dup_id = Uuid::now_v7();
+
+    let first = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: Some(dup_id),
+                code: root_type.code.clone(),
+                name: "First".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("first create with explicit id should succeed");
+    assert_eq!(first.id, dup_id);
+
+    let err = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: Some(dup_id),
+                code: root_type.code.clone(),
+                name: "Second".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect_err("second create with the same id must be rejected");
+
+    assert!(
+        matches!(err, DomainError::GroupAlreadyExists { id } if id == dup_id),
+        "expected GroupAlreadyExists({dup_id}), got: {err:?}"
     );
 }
 
