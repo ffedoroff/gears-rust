@@ -6,25 +6,39 @@
 //! type rules. These tests cover the fix at the domain (`TypeService`)
 //! level:
 //!
-//! 1. The `require_constraints` proof: `gts_type` is a platform-global table
-//!    (no `tenant_id` column), so `RG_TYPE_RESOURCE` declares an empty
-//!    `supported_properties` list. `access_scope_denied_by_default_require_constraints`
-//!    demonstrates that the plain `PolicyEnforcer::access_scope` default
-//!    (`require_constraints = true`) turns a legitimate allow-with-no-
-//!    constraints PDP response into `EnforcerError::CompileFailed`
-//!    (`ConstraintsRequiredButAbsent`) -- which `DomainError::from` maps to
-//!    `InternalError`, a 500, not success. `access_scope_with_require_constraints_false_succeeds`
-//!    shows the fix: the same PDP response compiles cleanly to
-//!    `AccessScope::allow_all()`.
-//! 2. Deny-all vs. allow-all-no-constraints coverage for each of the five
-//!    gated `TypeService` methods.
-//! 3. `seed_types` (and the `*_unscoped` methods it calls) still works with
+//! 1. The `require_constraints` proof: a PDP may permit with *zero*
+//!    constraints at all (`decision: true, constraints: []`) --
+//!    `access_scope_denied_by_default_require_constraints` demonstrates that
+//!    the plain `PolicyEnforcer::access_scope` default (`require_constraints
+//!    = true`) turns that legitimate allow-with-no-constraints PDP response
+//!    into `EnforcerError::CompileFailed` (`ConstraintsRequiredButAbsent`) --
+//!    which `DomainError::from` maps to `InternalError`, a 500, not success.
+//!    `access_scope_with_require_constraints_false_succeeds` shows the fix:
+//!    the same PDP response compiles cleanly to `AccessScope::allow_all()`.
+//! 2. The `supported_properties` proof: real PDP plugins never actually
+//!    return the no-constraints shape above -- `static-authz-plugin` and
+//!    `tr-authz-plugin` both attach a baseline `In(OWNER_TENANT_ID)`
+//!    constraint to *every* allow decision (see [`TenantClampAuthZ`]).
+//!    `RG_TYPE_RESOURCE` originally declared an empty `supported_properties`
+//!    list on the theory that `gts_type` (a platform-global table, no
+//!    `tenant_id` column) has nothing to filter on -- but the compiler
+//!    rejects a constraint whose property isn't declared *before* anything
+//!    downstream gets a chance to ignore the resulting scope, so that empty
+//!    list turned every allowed call into `AllConstraintsFailed` ->
+//!    `InternalError` (a 500). `access_scope_with_realistic_tenant_clamp_constraint_succeeds`
+//!    and `all_five_actions_succeed_with_realistic_tenant_clamp_constraint`
+//!    reproduce and close that gap; see `RG_TYPE_RESOURCE`'s doc comment in
+//!    `type_service.rs` for the full explanation.
+//! 3. Deny-all vs. allow-all (both the no-constraints and realistic-clamp
+//!    shapes) coverage for each of the five gated `TypeService` methods.
+//! 4. `seed_types` (and the `*_unscoped` methods it calls) still works with
 //!    no `SecurityContext` at all -- even wired to a deny-all enforcer that
 //!    would reject every gated call.
 //!
 //! `tests/api_rest_test.rs` covers the same five actions at the HTTP layer
 //! (`list_types_denied_returns_403` etc.), asserting the actual wire status
-//! code produced by the `DomainError` -> `CanonicalError` mapping.
+//! code produced by the `DomainError` -> `CanonicalError` mapping, plus a
+//! realistic-clamp-mock check that a gated route succeeds end to end.
 
 mod common;
 
@@ -33,11 +47,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
 use authz_resolver_sdk::pep::{AccessRequest, ConstraintCompileError, EnforcerError};
 use authz_resolver_sdk::{
     AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
     EvaluationResponseContext, PolicyEnforcer,
 };
+use toolkit_security::pep_properties;
 
 use resource_group::domain::error::DomainError;
 use resource_group::domain::seeding::seed_types;
@@ -45,9 +61,17 @@ use resource_group::domain::type_service::{RG_TYPE_RESOURCE, TypeService};
 use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::{CreateTypeRequest, UpdateTypeRequest};
 
-/// Always permits, never attaches constraints -- the only PDP shape that
-/// makes sense for a resource whose descriptor declares zero
-/// `supported_properties` (see [`RG_TYPE_RESOURCE`]).
+/// Always permits, never attaches constraints. This is *a* valid PDP permit
+/// shape (`decision: true, constraints: []`) -- not the *only* one. It
+/// covers the `require_constraints(false)` escape hatch (see
+/// `access_scope_with_require_constraints_false_succeeds` below), but it is
+/// NOT representative of what a real PDP plugin returns: both
+/// `static-authz-plugin` and `tr-authz-plugin` always attach a baseline
+/// `In(OWNER_TENANT_ID)` constraint on every allow decision, for every
+/// resource, regardless of whether that resource has a tenant column. See
+/// [`TenantClampAuthZ`] below for that shape -- it is the one that actually
+/// caught the VHP-2342 empty-`supported_properties` regression that this
+/// mock's original doc comment ("the only sensible shape") missed.
 struct AllowAllNoConstraintsAuthZ;
 
 #[async_trait]
@@ -79,6 +103,63 @@ impl AuthZResolverClient for DenyAllAuthZ {
             decision: false,
             context: EvaluationResponseContext {
                 constraints: vec![],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// Realistic PDP mock: permit + the baseline `In(OWNER_TENANT_ID)`
+/// constraint that every real `AuthZ` plugin in this repo attaches to
+/// *every* allow decision, for *every* resource -- see
+/// `static-authz-plugin`'s `Service::evaluate` ("Baseline `OWNER_TENANT_ID`
+/// clamp -- the universal shape every PEP can bind") and
+/// `tr-authz-plugin`'s mandatory `owner_tenant_id` property. It is the same
+/// shape `tests/tenant_filtering_db_test.rs`'s `TenantScopingAuthZ` and
+/// `tests/common/mod.rs`'s `AllowAllAuthZ` use for `GroupService`/
+/// `MembershipService`.
+///
+/// This is the mock that exposes the VHP-2342 regression
+/// `AllowAllNoConstraintsAuthZ` above cannot: against an empty
+/// `supported_properties` list, `owner_tenant_id` is an "unsupported
+/// property" to the compiler, and since it is the *only* constraint on the
+/// response, `compile_to_access_scope` returns
+/// `Err(ConstraintCompileError::AllConstraintsFailed)` -- fail-closed --
+/// which `DomainError::from(EnforcerError)` maps to `InternalError` (a 500)
+/// for what the PDP intended as an *allow*.
+struct TenantClampAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for TenantClampAuthZ {
+    async fn evaluate(
+        &self,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        // `.unwrap_or(Uuid::nil())` rather than `.expect(..)`, matching
+        // `common::AllowAllAuthZ` / `common::AllowAllAuthZ` in
+        // `tests/api_rest_test.rs`: this is non-test code from clippy's
+        // point of view (an `AuthZResolverClient` impl invoked *by* test
+        // functions, not a `#[tokio::test]` fn itself), so
+        // `allow-expect-in-tests` in `clippy.toml` does not cover it. Every
+        // caller in this file goes through `common::make_ctx`, which always
+        // sets a real tenant id, so the fallback path is unreachable here.
+        let tenant_id = request
+            .subject
+            .properties
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or(Uuid::nil());
+
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [tenant_id],
+                    ))],
+                }],
                 deny_reason: None,
             },
         })
@@ -334,6 +415,99 @@ async fn all_five_actions_succeed_with_allow_all_no_constraints() {
     svc.delete_type(&ctx, &code)
         .await
         .expect("delete_type should succeed");
+}
+
+/// `access_scope_with(.., require_constraints(false))` against the
+/// *realistic* PDP shape: permit + a present `In(OWNER_TENANT_ID)`
+/// constraint (see [`TenantClampAuthZ`]), not the artificial
+/// permit-with-zero-constraints shape the other `access_scope_with_*` test
+/// above exercises. This must compile successfully once `RG_TYPE_RESOURCE`
+/// declares `OWNER_TENANT_ID` as supported -- the scope it compiles to
+/// legitimately carries a filter this time (`TypeService::gate` throws it
+/// away regardless; this test only proves compilation succeeds).
+#[tokio::test]
+async fn access_scope_with_realistic_tenant_clamp_constraint_succeeds() {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantClampAuthZ);
+    let enforcer = PolicyEnforcer::new(authz);
+    let ctx = common::make_ctx(Uuid::now_v7());
+
+    enforcer
+        .access_scope_with(
+            &ctx,
+            &RG_TYPE_RESOURCE,
+            "list",
+            None,
+            &AccessRequest::new().require_constraints(false),
+        )
+        .await
+        .expect(
+            "realistic PDP permit (In(OWNER_TENANT_ID) constraint) must compile now that \
+             RG_TYPE_RESOURCE declares OWNER_TENANT_ID as supported",
+        );
+}
+
+/// End-to-end regression proof for VHP-2342's actual defect: a PDP that
+/// responds the way real plugins do (permit + baseline `In(OWNER_TENANT_ID)`
+/// constraint, see [`TenantClampAuthZ`]) must still permit all five gated
+/// `TypeService` actions. Before `RG_TYPE_RESOURCE` declared
+/// `OWNER_TENANT_ID`, every one of these calls failed closed with
+/// `DomainError::InternalError` (`EnforcerError::CompileFailed(
+/// ConstraintCompileError::AllConstraintsFailed { .. })`) instead of
+/// succeeding -- i.e. every legitimately-allowed caller got a 500, not just
+/// denied ones. `all_five_actions_succeed_with_allow_all_no_constraints`
+/// above did not catch this because its mock never attaches a constraint at
+/// all.
+#[tokio::test]
+async fn all_five_actions_succeed_with_realistic_tenant_clamp_constraint() {
+    let db = common::test_db().await;
+    let tenant_id = Uuid::now_v7();
+    let svc = TypeService::new(
+        db,
+        PolicyEnforcer::new(Arc::new(TenantClampAuthZ)),
+        Arc::new(TypeRepository),
+    );
+    let ctx = common::make_ctx(tenant_id);
+
+    let code = unique_code("authzclamp");
+    let created = svc
+        .create_type(
+            &ctx,
+            CreateTypeRequest {
+                code: code.clone(),
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("create_type should succeed under a realistic PDP permit");
+    assert_eq!(created.code, code);
+
+    svc.get_type(&ctx, &code)
+        .await
+        .expect("get_type should succeed under a realistic PDP permit");
+
+    svc.list_types(&ctx, &toolkit_odata::ODataQuery::default())
+        .await
+        .expect("list_types should succeed under a realistic PDP permit");
+
+    svc.update_type(
+        &ctx,
+        &code,
+        UpdateTypeRequest {
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        },
+    )
+    .await
+    .expect("update_type should succeed under a realistic PDP permit");
+
+    svc.delete_type(&ctx, &code)
+        .await
+        .expect("delete_type should succeed under a realistic PDP permit");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
