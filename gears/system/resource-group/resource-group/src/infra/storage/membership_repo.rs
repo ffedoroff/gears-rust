@@ -46,10 +46,9 @@ impl MembershipRepositoryTrait for MembershipRepository {
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError> {
-        let scope = system_scope();
-
         // Validate the filter (String kind for `resource_type`) and resolve
         // GTS type-path string values to SMALLINT IDs in the typed
         // FilterNode -- BEFORE paginate_odata. Mirrors
@@ -72,7 +71,91 @@ impl MembershipRepositoryTrait for MembershipRepository {
         };
 
         // Build base query with the resolved filter applied manually.
-        let base_query = MembershipEntity::find().secure().scope_with(&scope);
+        //
+        // VHP-2341: `resource_group_membership` declares `#[secure(no_tenant,
+        // no_resource, no_owner, no_type)]` (see its entity file) --
+        // `Scopable`'s generated `resolve_property` returns `None` for
+        // *every* property on that shape, so calling
+        // `.secure().scope_with(scope)` directly on `MembershipEntity` with
+        // the caller's real (constrained) scope would resolve to deny-all
+        // for every caller, not a per-tenant filter -- an empty list for
+        // everyone, not tenant isolation. Tenant scoping instead has to run
+        // against `resource_group`, which DOES declare
+        // `tenant_col = "tenant_id"` (see `resource_group.rs`).
+        //
+        // A plain SQL JOIN on `group_id = id` was tried first and rejected:
+        // both tables happen to have a `gts_type_id` column (the group's
+        // own GTS type vs. the member resource's GTS type), and
+        // `resource_type` `$filter`/cursor predicates are built by the
+        // generic `toolkit_db::odata` helpers via `Expr::col(column)` --
+        // an *unqualified* column reference. That's unambiguous against a
+        // single-table `FROM`, but once `resource_group` is joined into the
+        // same top-level query, `"gts_type_id"` is ambiguous between the two
+        // tables and every backend (SQLite included) rejects the query.
+        // Rewriting the generic OData helpers to always table-qualify was
+        // rejected as out of scope and riskier than this gear's own fix.
+        //
+        // Instead, tenant scoping runs as a **correlated EXISTS subquery**
+        // with its own, separate `FROM resource_group` -- the outer query's
+        // `FROM` stays `resource_group_membership` only, so the ambiguity
+        // above cannot occur (the outer `$filter`/cursor/order-by columns
+        // are only ever resolved against the single outer table). The
+        // subquery's `WHERE` correlates back to the specific membership row
+        // via `resource_group.id = resource_group_membership.group_id`
+        // (table-qualified with `Expr::col((Entity, Column)).equals(..)`,
+        // so it never collides with the subquery's own unqualified
+        // scope-condition columns either), then ANDs in the ordinary
+        // `SecureSelect` scope condition for `resource_group` -- built via
+        // the same public `.secure().scope_with(scope)` API every other
+        // repo in this gear uses, not a hand-rolled `Condition`.
+        //
+        // `toolkit_db::secure` has no public helper that returns a bare
+        // `Condition` for an arbitrary entity outside a `SecureSelect`
+        // chain, and the existing `SecureSelect::scope_via_exists::<J>`
+        // helper is deliberately *uncorrelated* (see its doc comment in
+        // `libs/toolkit-db/src/secure/select.rs`): it would check whether
+        // *any* group in scope exists at all, not whether *this
+        // membership's* group is in scope -- exactly the trap VHP-2341
+        // warns about. Extending `toolkit-db`'s public API with a
+        // correlated-EXISTS or bare-`Condition` builder was considered and
+        // rejected: `.secure().scope_with(scope).into_inner().into_query()`
+        // (all public `SecureSelect`/`QueryTrait` API) plus a manually
+        // built `Expr::exists(..)` wrapper is sufficient, so no library
+        // change is needed for this gear-local fix.
+        //
+        // This is still exactly one SQL statement per page -- a subquery
+        // inside the same statement's `WHERE`, not a second round trip.
+        //
+        // Skipped for an unconstrained scope (`list_memberships_unscoped`:
+        // the in-process AuthZ-plugin read path and seeding) so that path's
+        // query shape is untouched by this fix -- an unconstrained scope
+        // adds no filter either way, so the subquery would be a pure no-op
+        // there; omitting it keeps its SQL text (and query-count baseline)
+        // exactly as it was before VHP-2341.
+        let base_query = if scope.is_unconstrained() {
+            MembershipEntity::find().secure().scope_with(scope)
+        } else {
+            use crate::infra::storage::entity::resource_group::{
+                self as rg_entity, Entity as ResourceGroupEntity,
+            };
+            use sea_orm::QueryTrait;
+            use sea_orm::sea_query::Expr;
+
+            let group_in_scope = ResourceGroupEntity::find()
+                .filter(
+                    Expr::col((ResourceGroupEntity, rg_entity::Column::Id))
+                        .equals((MembershipEntity, membership_entity::Column::GroupId)),
+                )
+                .secure()
+                .scope_with(scope)
+                .into_inner()
+                .into_query();
+
+            MembershipEntity::find()
+                .filter(sea_orm::Condition::all().add(Expr::exists(group_in_scope)))
+                .secure()
+                .scope_with(&AccessScope::allow_all())
+        };
         let base_query = if let Some(ref node) = resolved_filter {
             let cond = toolkit_db::odata::sea_orm_filter::filter_node_to_condition::<
                 MembershipFilterField,

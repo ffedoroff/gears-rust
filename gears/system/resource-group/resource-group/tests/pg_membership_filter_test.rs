@@ -158,7 +158,8 @@ async fn list_memberships_resolves_resource_type_filter_on_postgres() {
             .expect("parse resource_type filter");
     let query = toolkit_odata::ODataQuery::new().with_filter(parsed.into_expr());
 
-    let result = mbr_repo.list_memberships(&conn, &query).await;
+    let scope = toolkit_security::AccessScope::allow_all();
+    let result = mbr_repo.list_memberships(&conn, &scope, &query).await;
 
     match &result {
         Ok(page) => {
@@ -180,4 +181,89 @@ async fn list_memberships_resolves_resource_type_filter_on_postgres() {
         }
         Err(other) => panic!("unexpected error: {other}"),
     }
+}
+
+/// VHP-2341: `list_memberships`' tenant scoping (a correlated EXISTS
+/// subquery against `resource_group`, since the membership entity itself
+/// declares `no_tenant`) must actually filter rows on a real database, not
+/// just SQLite. Two tenants each get a group with one membership; a scope
+/// constrained to tenant A must return only A's row, and vice versa for B.
+///
+/// This is the one piece of VHP-2341 that specifically needs Postgres:
+/// SQLite's lenient typing/planner can mask a query that would be rejected
+/// or silently mis-plan on a real engine (see VHP-1731's `resource_type`
+/// filter for a concrete precedent of exactly that gap in this same repo).
+#[tokio::test(flavor = "multi_thread")]
+async fn list_memberships_is_tenant_scoped_on_postgres() {
+    let fixture = pg_fixture_or_skip!();
+    let db = fixture.db.clone();
+    let conn = db.conn().expect("db conn");
+
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let member_type = common::create_root_type(&type_svc, "pgtenscope").await;
+
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let ctx_b = common::make_ctx(tenant_b);
+    let group_a =
+        common::create_root_group(&group_svc, &ctx_a, &member_type.code, "PGA", tenant_a).await;
+    let group_b =
+        common::create_root_group(&group_svc, &ctx_b, &member_type.code, "PGB", tenant_b).await;
+
+    let gts_type_id = TypeRepository::resolve_id(&conn, &member_type.code)
+        .await
+        .expect("resolve member type")
+        .expect("member type must be registered");
+
+    let mbr_repo = MembershipRepository;
+    mbr_repo
+        .insert(&conn, group_a.id, gts_type_id, "res-pg-tenant-a")
+        .await
+        .expect("seed tenant A membership");
+    mbr_repo
+        .insert(&conn, group_b.id, gts_type_id, "res-pg-tenant-b")
+        .await
+        .expect("seed tenant B membership");
+
+    let query = toolkit_odata::ODataQuery::default();
+
+    let scope_a = toolkit_security::AccessScope::for_tenant(tenant_a);
+    let page_a = mbr_repo
+        .list_memberships(&conn, &scope_a, &query)
+        .await
+        .expect("list_memberships scoped to tenant A");
+    let ids_a: Vec<&str> = page_a
+        .items
+        .iter()
+        .map(|m| m.resource_id.as_str())
+        .collect();
+    assert!(
+        ids_a.contains(&"res-pg-tenant-a"),
+        "tenant A scope must see tenant A's membership, got: {ids_a:?}"
+    );
+    assert!(
+        !ids_a.contains(&"res-pg-tenant-b"),
+        "tenant A scope must NOT see tenant B's membership, got: {ids_a:?}"
+    );
+
+    let scope_b = toolkit_security::AccessScope::for_tenant(tenant_b);
+    let page_b = mbr_repo
+        .list_memberships(&conn, &scope_b, &query)
+        .await
+        .expect("list_memberships scoped to tenant B");
+    let ids_b: Vec<&str> = page_b
+        .items
+        .iter()
+        .map(|m| m.resource_id.as_str())
+        .collect();
+    assert!(
+        ids_b.contains(&"res-pg-tenant-b"),
+        "tenant B scope must see tenant B's membership, got: {ids_b:?}"
+    );
+    assert!(
+        !ids_b.contains(&"res-pg-tenant-a"),
+        "tenant B scope must NOT see tenant A's membership, got: {ids_b:?}"
+    );
 }

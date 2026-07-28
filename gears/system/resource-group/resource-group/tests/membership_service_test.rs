@@ -261,6 +261,45 @@ async fn membership_add_tenant_incompatibility() {
     );
 }
 
+// TC-MBR-06b: VHP-2341 -- add_membership into a cross-tenant group is
+// rejected as if the group didn't exist (no existence leak across tenants).
+#[tokio::test]
+async fn membership_add_cross_tenant_group_not_found() {
+    let db = test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let member_type = create_root_type(&type_svc, "mbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+
+    // Tenant A creates a group.
+    let group_a =
+        common::create_root_group(&group_svc, &ctx_a, &grp_type.code, "GA", tenant_a).await;
+
+    // Tenant B tries to add a member into tenant A's group.
+    let err = mbr_svc
+        .add_membership(&ctx_b, group_a.id, &member_type.code, "res-xtenant")
+        .await
+        .expect_err("cross-tenant add_membership must fail");
+
+    assert!(
+        matches!(err, DomainError::GroupNotFound { id } if id == group_a.id),
+        "cross-tenant group must look not-found (not a distinguishable 'forbidden'), got: {err:?}"
+    );
+
+    // Tenant A can still add to its own group -- the gate isn't over-broad.
+    mbr_svc
+        .add_membership(&ctx_a, group_a.id, &member_type.code, "res-xtenant")
+        .await
+        .expect("same-tenant add_membership must still succeed");
+}
+
 // TC-MBR-07: Remove existing membership
 #[tokio::test]
 async fn membership_remove_existing() {
@@ -300,6 +339,59 @@ async fn membership_remove_existing() {
     assert!(
         rows.is_empty(),
         "membership row should be gone after remove"
+    );
+}
+
+// TC-MBR-07b: VHP-2341 -- remove_membership from a cross-tenant group is
+// rejected as if the group didn't exist, and the membership survives.
+#[tokio::test]
+async fn membership_remove_cross_tenant_group_not_found() {
+    let db = test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let member_type = create_root_type(&type_svc, "mbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let group_a =
+        common::create_root_group(&group_svc, &ctx_a, &grp_type.code, "GA", tenant_a).await;
+
+    mbr_svc
+        .add_membership(&ctx_a, group_a.id, &member_type.code, "res-xtenant-rm")
+        .await
+        .expect("tenant A adds its own membership");
+
+    // Tenant B tries to remove a member from tenant A's group.
+    let err = mbr_svc
+        .remove_membership(&ctx_b, group_a.id, &member_type.code, "res-xtenant-rm")
+        .await
+        .expect_err("cross-tenant remove_membership must fail");
+
+    assert!(
+        matches!(err, DomainError::GroupNotFound { id } if id == group_a.id),
+        "cross-tenant group must look not-found, got: {err:?}"
+    );
+
+    // The membership must still be there -- direct DB assertion.
+    let conn = db.conn().expect("db conn");
+    let scope = AccessScope::allow_all();
+    let rows = MbrEntity::find()
+        .filter(MbrColumn::GroupId.eq(group_a.id))
+        .filter(MbrColumn::ResourceId.eq("res-xtenant-rm"))
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
+        .await
+        .expect("query membership table");
+    assert_eq!(
+        rows.len(),
+        1,
+        "membership must survive a rejected cross-tenant remove"
     );
 }
 
@@ -523,6 +615,68 @@ async fn membership_same_resource_multiple_groups_same_tenant() {
     let group_ids: Vec<Uuid> = rows.iter().map(|r| r.group_id).collect();
     assert!(group_ids.contains(&group1.id));
     assert!(group_ids.contains(&group2.id));
+}
+
+// TC-MBR-14b: VHP-2341 -- list_memberships is tenant-scoped: tenant A must
+// not see tenant B's membership rows, and must still see its own.
+#[tokio::test]
+async fn membership_list_is_tenant_scoped() {
+    let db = test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let member_type = create_root_type(&type_svc, "mbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+
+    let group_a =
+        common::create_root_group(&group_svc, &ctx_a, &grp_type.code, "GA", tenant_a).await;
+    let group_b =
+        common::create_root_group(&group_svc, &ctx_b, &grp_type.code, "GB", tenant_b).await;
+
+    mbr_svc
+        .add_membership(&ctx_a, group_a.id, &member_type.code, "res-a")
+        .await
+        .expect("tenant A adds its own membership");
+    mbr_svc
+        .add_membership(&ctx_b, group_b.id, &member_type.code, "res-b")
+        .await
+        .expect("tenant B adds its own membership");
+
+    let query = ODataQuery::default();
+
+    let page_a = mbr_svc
+        .list_memberships(&ctx_a, &query)
+        .await
+        .expect("tenant A lists memberships");
+    let ids_a: Vec<Uuid> = page_a.items.iter().map(|m| m.group_id).collect();
+    assert!(
+        ids_a.contains(&group_a.id),
+        "tenant A must see its own group"
+    );
+    assert!(
+        !ids_a.contains(&group_b.id),
+        "tenant A must NOT see tenant B's group, got: {ids_a:?}"
+    );
+
+    let page_b = mbr_svc
+        .list_memberships(&ctx_b, &query)
+        .await
+        .expect("tenant B lists memberships");
+    let ids_b: Vec<Uuid> = page_b.items.iter().map(|m| m.group_id).collect();
+    assert!(
+        ids_b.contains(&group_b.id),
+        "tenant B must see its own group"
+    );
+    assert!(
+        !ids_b.contains(&group_a.id),
+        "tenant B must NOT see tenant A's group, got: {ids_b:?}"
+    );
 }
 
 // TC-MBR-15: List memberships empty result

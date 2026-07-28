@@ -12,7 +12,7 @@ use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use resource_group_sdk::{GROUP_MEMBERSHIP_RESOURCE_TYPE, models::ResourceGroupMembership};
 use toolkit_db::secure::{DBRunner, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use tracing::debug;
@@ -22,6 +22,43 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeRepositoryTrait};
 
 /// `AuthZ` resource type descriptor for group memberships.
+///
+/// `supported_properties` deliberately lists only `owner_tenant_id`.
+///
+/// # VHP-2341: scope source for the group tenant-gate
+///
+/// `add_membership_in_tx` / `remove_membership_in_tx` / `list_memberships`
+/// all need to know whether the *target group* is inside the caller's
+/// tenant scope, but the group itself is never re-fetched from the PDP —
+/// the `AccessScope` obtained here (for the membership action) is reused
+/// directly against `resource_group`. Two options existed:
+///
+/// (a) **Reuse this scope** (chosen). Cheap — one PDP round trip per
+///     operation, same as before this fix.
+/// (b) Issue a second `access_scope(..., RG_GROUP_RESOURCE, "get"/"list", ...)`
+///     call, mirroring `group_service.rs`. Costs an extra PDP call per
+///     membership operation.
+///
+/// (a) is safe only because `authz-resolver-sdk`'s PEP compiler
+/// (`compiler.rs::compile_constraint`) *rejects* any constraint whose
+/// property is not in `ResourceType.supported_properties` (fails that
+/// constraint closed; see `compiler_tests.rs::supported_properties_validation`).
+/// Since this descriptor supports only `owner_tenant_id`, the `AccessScope`
+/// returned by `enforcer.access_scope(.., &RG_MEMBERSHIP_RESOURCE, ..)` can
+/// **only** ever be: unconstrained, deny-all, or built exclusively from
+/// filters keyed `"owner_tenant_id"` — never `resource_id` (that property
+/// isn't declared here, so the SDK would reject it before it reaches this
+/// code). That rules out the failure mode variant (a) would otherwise risk:
+/// a `resource_id` constraint compiled against `resource_group` would
+/// resolve to the *group's* id column, which is a different (and wrong)
+/// resource than the membership check intends. Because `resource_group`
+/// declares `tenant_col = "tenant_id"` (see `resource_group.rs`), every
+/// filter that *can* appear in this scope resolves correctly against it via
+/// `resolve_property("owner_tenant_id") -> Column::TenantId`. Variant (b)
+/// would be strictly safer against a future widening of
+/// `supported_properties` on this descriptor, but at the cost of a PDP call
+/// on every add/remove/list; (a) is preferred while the descriptor's
+/// property list stays narrow — re-evaluate if it ever grows.
 pub const RG_MEMBERSHIP_RESOURCE: ResourceType = ResourceType::from_static(
     GROUP_MEMBERSHIP_RESOURCE_TYPE,
     &[pep_properties::OWNER_TENANT_ID],
@@ -91,13 +128,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-2
 
         // AuthZ gate: verify the caller can create memberships
-        let _scope = self
+        let scope = self
             .enforcer
             .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "create", None)
             .await
             .map_err(DomainError::from)?;
 
-        self.add_membership_inner(group_id, resource_type, resource_id)
+        self.add_membership_inner(&scope, group_id, resource_type, resource_id)
             .await
     }
 
@@ -115,7 +152,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceGroupMembership, DomainError> {
-        self.add_membership_inner(group_id, resource_type, resource_id)
+        let scope = AccessScope::allow_all();
+        self.add_membership_inner(&scope, group_id, resource_type, resource_id)
             .await
     }
 
@@ -127,8 +165,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     ///
     /// `PostgreSQL` aborts one, and the retry sees the winner's committed
     /// membership and returns `TenantIncompatibility` instead of a raw failure.
+    ///
+    /// `scope` gates the target group against the caller's `AccessScope`
+    /// (VHP-2341) — see `add_membership_in_tx`. `add_membership_unscoped`
+    /// passes `AccessScope::allow_all()` so seeding/internal callers keep
+    /// seeing every tenant, matching its pre-existing contract.
     async fn add_membership_inner(
         &self,
+        scope: &AccessScope,
         group_id: Uuid,
         resource_type: &str,
         resource_id: &str,
@@ -139,6 +183,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         let membership_repo = self.membership_repo.clone();
         let resource_type = resource_type.to_owned();
         let resource_id = resource_id.to_owned();
+        let scope = scope.clone();
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let group_repo = group_repo.clone();
@@ -146,12 +191,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             let membership_repo = membership_repo.clone();
             let resource_type = resource_type.clone();
             let resource_id = resource_id.clone();
+            let scope = scope.clone();
             Box::pin(async move {
                 Self::add_membership_in_tx(
                     &*group_repo,
                     &*type_repo,
                     &*membership_repo,
                     tx,
+                    &scope,
                     group_id,
                     &resource_type,
                     &resource_id,
@@ -170,12 +217,28 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         type_repo: &TR,
         membership_repo: &MR,
         tx: &impl DBRunner,
+        scope: &AccessScope,
         group_id: Uuid,
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceGroupMembership, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-3
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-4
+        // AuthZ gate (VHP-2341): the target group must be inside the
+        // caller's scope *before* touching its raw model below. Mirrors
+        // `group_service.rs::update_group_inner`'s two-step pattern: a
+        // scoped `find_by_id` acts purely as a gate (its resolved SDK model
+        // is discarded) so a group belonging to another tenant returns
+        // `GroupNotFound` -- identical to a group that doesn't exist at
+        // all, never a distinguishable "forbidden". Runs inside this
+        // transaction (not before it), per VHP-2341's requirement that the
+        // gate share the SERIALIZABLE isolation the rest of the check
+        // sees.
+        group_repo
+            .find_by_id(tx, scope, group_id)
+            .await?
+            .ok_or(DomainError::GroupNotFound { id: group_id })?;
+
         // Verify the group exists and get its type info
         let group_model = group_repo
             .find_model_by_id(tx, group_id)
@@ -288,7 +351,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-1
         // Actor sends DELETE /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}
         // AuthZ gate: verify the caller can delete memberships
-        let _scope = self
+        let scope = self
             .enforcer
             .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "delete", None)
             .await
@@ -296,21 +359,26 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-1
 
         let db = self.db.db();
+        let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
         let membership_repo = self.membership_repo.clone();
         let resource_type = resource_type.to_owned();
         let resource_id = resource_id.to_owned();
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+            let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
             let membership_repo = membership_repo.clone();
             let resource_type = resource_type.clone();
             let resource_id = resource_id.clone();
+            let scope = scope.clone();
             Box::pin(async move {
                 Self::remove_membership_in_tx(
+                    &*group_repo,
                     &*type_repo,
                     &*membership_repo,
                     tx,
+                    &scope,
                     group_id,
                     &resource_type,
                     &resource_id,
@@ -323,14 +391,28 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 
     /// Inner logic for `remove_membership`, runs inside the SERIALIZABLE
     /// transaction.
+    #[allow(clippy::too_many_arguments)]
     async fn remove_membership_in_tx(
+        group_repo: &GR,
         type_repo: &TR,
         membership_repo: &MR,
         tx: &impl DBRunner,
+        scope: &AccessScope,
         group_id: Uuid,
         resource_type: &str,
         resource_id: &str,
     ) -> Result<(), DomainError> {
+        // AuthZ gate (VHP-2341): same two-step gate as `add_membership_in_tx`
+        // -- the group is not otherwise looked up at all on this path (the
+        // delete below goes straight to `membership_repo` by composite key),
+        // so without this the caller could delete memberships out of a
+        // group belonging to any tenant. A group outside scope reports
+        // `GroupNotFound`, matching a nonexistent group.
+        group_repo
+            .find_by_id(tx, scope, group_id)
+            .await?
+            .ok_or(DomainError::GroupNotFound { id: group_id })?;
+
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-2
         // Resolve resource_type GTS path to surrogate ID
         let gts_type_id = type_repo
@@ -377,7 +459,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // Parse OData $filter (handled by ODataQuery parameter)
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-2
         // AuthZ gate: verify the caller can list memberships
-        let _scope = self
+        let scope = self
             .enforcer
             .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "list", None)
             .await
@@ -389,8 +471,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-5
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-6
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-7
+        // VHP-2341: the real caller scope now reaches the repo (it used to
+        // be discarded, so every caller saw every tenant's rows). See
+        // `MembershipRepository::list_memberships` for how tenant filtering
+        // is applied despite the membership entity having no scopable
+        // tenant column of its own.
         #[allow(clippy::let_and_return)]
-        let result = self.membership_repo.list_memberships(&conn, query).await;
+        let result = self
+            .membership_repo
+            .list_memberships(&conn, &scope, query)
+            .await;
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-7
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-6
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-5
@@ -407,12 +497,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     /// *being* the PDP, so it cannot re-enter the `PolicyEnforcer` (would
     /// recurse). Mirrors `add_membership_unscoped` — only the enforcer gate is
     /// skipped; the caller supplies any subject/tenant `OData` filter.
+    ///
+    /// Passes `AccessScope::allow_all()` to the repo, which keeps this
+    /// path's query shape exactly as it was before VHP-2341 (no join added).
     pub async fn list_memberships_unscoped(
         &self,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError> {
         let conn = self.conn()?;
-        self.membership_repo.list_memberships(&conn, query).await
+        let scope = AccessScope::allow_all();
+        self.membership_repo
+            .list_memberships(&conn, &scope, query)
+            .await
     }
 }
 
