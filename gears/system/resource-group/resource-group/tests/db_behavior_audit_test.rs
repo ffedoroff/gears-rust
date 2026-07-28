@@ -78,7 +78,7 @@ async fn create_self_referencing_type(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -88,7 +88,7 @@ async fn create_self_referencing_type(
         .await
         .expect("create self-referencing type (initial)");
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -115,7 +115,7 @@ async fn create_type_with_memberships(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -198,7 +198,7 @@ fn count_in(stats: &BTreeMap<(QueryKind, String), usize>, kind: QueryKind, table
 #[tokio::test]
 async fn trace_create_root_group() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -243,7 +243,7 @@ async fn trace_create_root_group() {
 #[tokio::test]
 async fn trace_create_child_group_depth3() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service_with_profile(
         db.clone(),
         QueryProfile {
@@ -273,7 +273,7 @@ async fn trace_create_child_group_depth3() {
 #[tokio::test]
 async fn trace_update_group() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -313,7 +313,7 @@ async fn trace_update_group() {
 #[tokio::test]
 async fn trace_move_group() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -343,7 +343,7 @@ async fn trace_move_group() {
 #[tokio::test]
 async fn trace_force_delete_subtree() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -368,7 +368,7 @@ async fn trace_force_delete_subtree() {
 #[tokio::test]
 async fn trace_create_type() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     rec.clear();
     let t = common::create_root_type(&type_svc, "newtype").await;
@@ -398,12 +398,12 @@ async fn trace_create_type() {
 #[tokio::test]
 async fn trace_update_type() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let t = common::create_root_type(&type_svc, "upd").await;
 
     rec.clear();
     let updated = type_svc
-        .update_type(
+        .update_type_unscoped(
             &t.code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -445,12 +445,12 @@ async fn trace_update_type() {
 #[tokio::test]
 async fn trace_delete_type() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let t = common::create_root_type(&type_svc, "del").await;
 
     rec.clear();
     type_svc
-        .delete_type(&t.code)
+        .delete_type_unscoped(&t.code)
         .await
         .expect("delete_type should succeed (no groups reference it)");
 
@@ -467,7 +467,7 @@ async fn trace_delete_type() {
 #[tokio::test]
 async fn trace_add_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -523,7 +523,7 @@ async fn trace_add_membership() {
 #[tokio::test]
 async fn trace_remove_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -574,7 +574,7 @@ async fn trace_remove_membership() {
 #[tokio::test]
 async fn trace_list_memberships() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -622,7 +622,7 @@ async fn trace_list_memberships() {
 #[tokio::test]
 async fn trace_seeding() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
 
@@ -674,7 +674,7 @@ async fn scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth() {
     // secure_insert_many call (RG-06).
     async fn closure_inserts_for_new_child_at_depth(depth: usize) -> usize {
         let (db, rec) = common::test_db_with_recorder().await;
-        let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+        let type_svc = common::make_type_service(db.clone());
         let group_svc = make_group_service_with_profile(
             db.clone(),
             QueryProfile {
@@ -703,7 +703,7 @@ async fn scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth() {
 
 async fn move_stats_for_subtree_size(n: usize) -> BTreeMap<(QueryKind, String), usize> {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -767,7 +767,7 @@ async fn scale_move_descendant_depth_selects_do_not_grow_with_subtree_size() {
 
 async fn junction_inserts_for_parent_count(n: usize) -> usize {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let mut parent_codes = Vec::with_capacity(n);
     for i in 0..n {
         let t = common::create_root_type(&type_svc, &format!("par{i}")).await;
@@ -776,7 +776,7 @@ async fn junction_inserts_for_parent_count(n: usize) -> usize {
 
     rec.clear();
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: format!(
                 "{}x.test.child.i{}.v1~",
                 gts_id!("cf.core.rg.type.v1~"),
@@ -808,7 +808,7 @@ async fn scale_create_type_junction_inserts_do_not_grow_with_parent_count() {
 
 async fn list_types_total_statements_for_page_size(n: usize) -> usize {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     // Self-referencing types (non-empty allowed_parent_types) so the batch
     // loader's junction-row and id->code resolution queries are actually
     // exercised for every row in the page, not skipped as trivially empty.
@@ -822,7 +822,7 @@ async fn list_types_total_statements_for_page_size(n: usize) -> usize {
         ..Default::default()
     };
     let page = type_svc
-        .list_types(&query)
+        .list_types_unscoped(&query)
         .await
         .expect("list_types should succeed");
     assert_eq!(page.items.len(), n, "page must contain all N created types");
@@ -847,12 +847,12 @@ async fn create_type_conflict_check_does_not_overfetch_junctions() {
     // resolve_id's existence check is a plain id lookup, with no junction
     // reads on either the happy or conflict path (RG-13).
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let t = common::create_root_type(&type_svc, "conflict").await;
 
     rec.clear();
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: t.code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -893,7 +893,7 @@ async fn create_type_conflict_check_does_not_overfetch_junctions() {
 
 async fn total_statements_for_force_delete(n: usize) -> usize {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -951,10 +951,10 @@ fn unique_tenant_type_code() -> String {
 #[tokio::test]
 async fn negative_control_tenant_root_create_runs_in_tx() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: unique_tenant_type_code(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -981,7 +981,7 @@ async fn negative_control_tenant_root_create_runs_in_tx() {
 #[tokio::test]
 async fn negative_control_width_limited_create_runs_in_tx() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service_with_profile(
         db.clone(),
         QueryProfile {
@@ -1009,7 +1009,7 @@ async fn negative_control_width_limited_create_runs_in_tx() {
 #[tokio::test]
 async fn negative_control_read_paths_produce_no_write_statements() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -1026,7 +1026,7 @@ async fn negative_control_read_paths_produce_no_write_statements() {
         .await
         .expect("list_groups should succeed");
     type_svc
-        .list_types(&toolkit_odata::ODataQuery::default())
+        .list_types_unscoped(&toolkit_odata::ODataQuery::default())
         .await
         .expect("list_types should succeed");
 

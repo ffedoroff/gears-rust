@@ -393,7 +393,7 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
     // Repeated trials: the invariant must hold under real concurrent load,
     // not just one sample.
     const TRIALS: usize = 8;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let member_type = common::create_root_type(&type_svc, "pgmbrres").await;
@@ -406,7 +406,7 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
             Uuid::now_v7().as_simple()
         );
         type_svc
-            .create_type(resource_group_sdk::CreateTypeRequest {
+            .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
                 code,
                 can_be_root: true,
                 allowed_parent_types: vec![],
@@ -524,7 +524,7 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
 /// error; FK `ON DELETE RESTRICT` backstops actual corruption regardless (RG-02).
 async fn delete_type_races_create_group_resolves_cleanly(db: &Arc<DBProvider<DbError>>) {
     const TRIALS: usize = 15;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let tenant_id = Uuid::now_v7();
 
     let mut corruption = 0usize; // both succeeded -- would be a real invariant violation
@@ -539,13 +539,13 @@ async fn delete_type_races_create_group_resolves_cleanly(db: &Arc<DBProvider<DbE
         // Fresh instances per task -- see the comment in
         // membership_first_write_race_exactly_one_tenant_wins about why
         // these services can't just be `.clone()`d.
-        let type_svc1 = TypeService::new(db.clone(), Arc::new(TypeRepository));
+        let type_svc1 = common::make_type_service(db.clone());
         let group_svc1 = common::make_group_service(db.clone());
         let (code1, code2) = (t.code.clone(), t.code.clone());
 
         let delete_task = tokio::spawn(async move {
             b1.wait().await;
-            type_svc1.delete_type(&code1).await
+            type_svc1.delete_type_unscoped(&code1).await
         });
         let create_task = tokio::spawn(async move {
             b2.wait().await;
@@ -630,8 +630,8 @@ async fn create_type_conflict_retried_yields_clean_already_exists_for_loser(
     );
     let barrier = Arc::new(Barrier::new(2));
     let (b1, b2) = (Arc::clone(&barrier), Arc::clone(&barrier));
-    let svc1 = TypeService::new(db.clone(), Arc::new(TypeRepository));
-    let svc2 = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let svc1 = common::make_type_service(db.clone());
+    let svc2 = common::make_type_service(db.clone());
     let (code1, code2) = (code.clone(), code.clone());
 
     let req = |code: String| resource_group_sdk::CreateTypeRequest {
@@ -644,11 +644,11 @@ async fn create_type_conflict_retried_yields_clean_already_exists_for_loser(
 
     let t1 = tokio::spawn(async move {
         b1.wait().await;
-        svc1.create_type(req(code1)).await
+        svc1.create_type_unscoped(req(code1)).await
     });
     let t2 = tokio::spawn(async move {
         b2.wait().await;
-        svc2.create_type(req(code2)).await
+        svc2.create_type_unscoped(req(code2)).await
     });
 
     let (r1, r2) = timed("create_type_conflict race", async { tokio::join!(t1, t2) }).await;
@@ -694,7 +694,7 @@ async fn create_type_conflict_retried_yields_clean_already_exists_for_loser(
 async fn create_group_duplicate_id_on_postgres_yields_clean_already_exists(
     db: &Arc<DBProvider<DbError>>,
 ) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let root_type = common::create_root_type(&type_svc, "pgiddup").await;
@@ -763,11 +763,11 @@ fn unique_tenant_type_code() -> String {
 /// a clean `TenantRootAlreadyExists` -- proves `transaction_with_retry` +
 /// SERIALIZABLE protects the invariant under a real SSI conflict.
 async fn negative_control_tenant_root_race_exactly_one_succeeds(db: &Arc<DBProvider<DbError>>) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let tenant_type = type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: unique_tenant_type_code(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -883,7 +883,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
         )
     }
 
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = width_limited_group_service(db.clone());
 
     let t = {
@@ -896,7 +896,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
             Uuid::now_v7().as_simple()
         );
         type_svc
-            .create_type(resource_group_sdk::CreateTypeRequest {
+            .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
                 code,
                 can_be_root: true,
                 allowed_parent_types: vec![],
@@ -907,7 +907,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
             .expect("create type (initial)")
     };
     let t = type_svc
-        .update_type(
+        .update_type_unscoped(
             &t.code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -1041,7 +1041,7 @@ async fn self_referencing_root_type(
 ) -> resource_group_sdk::ResourceGroupType {
     let t = common::create_root_type(type_svc, suffix).await;
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &t.code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -1058,7 +1058,7 @@ async fn self_referencing_root_type(
 /// reads exactly the row the other rebuild writes, textbook write-skew. The
 /// retried loser must report `CycleDetected`, never an actual cycle.
 async fn move_a_to_b_races_move_b_to_a(db: &Arc<DBProvider<DbError>>) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let t = self_referencing_root_type(&type_svc, "pgmoveaabba").await;
 
@@ -1130,7 +1130,7 @@ async fn move_a_to_b_races_move_b_to_a(db: &Arc<DBProvider<DbError>>) {
 /// same instant, both touching overlapping closure rows for `L`. The moves
 /// are independent, so both must succeed once retry absorbs any conflict.
 async fn move_ancestor_races_move_descendant(db: &Arc<DBProvider<DbError>>) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let t = self_referencing_root_type(&type_svc, "pgmoveanc").await;
 
@@ -1204,7 +1204,7 @@ async fn move_ancestor_races_move_descendant(db: &Arc<DBProvider<DbError>>) {
 /// to `Q`, so `insert_ancestor_closure_rows` and `rebuild_subtree_closure`
 /// touch the same ancestor chain; `C` must end up with `P`'s final chain.
 async fn create_child_races_move_parent(db: &Arc<DBProvider<DbError>>) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let t = self_referencing_root_type(&type_svc, "pgcreatemove").await;
 
@@ -1284,7 +1284,7 @@ async fn create_child_races_move_parent(db: &Arc<DBProvider<DbError>>) {
 /// resolves the race cleanly (`GroupNotFound`, or child cascaded too).
 async fn force_delete_races_create_child(db: &Arc<DBProvider<DbError>>) {
     const TRIALS: usize = 10;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let t = self_referencing_root_type(&type_svc, "pgfdelcreate").await;
     let tenant_id = Uuid::now_v7();
@@ -1383,14 +1383,14 @@ async fn force_delete_races_create_child(db: &Arc<DBProvider<DbError>>) {
 /// caller concurrently tries to `add_membership` to it.
 async fn force_delete_races_add_membership(db: &Arc<DBProvider<DbError>>) {
     const TRIALS: usize = 10;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
     let member_type = common::create_root_type(&type_svc, "pgfdelmbrres").await;
     let grp_type = type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: format!(
                 "{}x.test.pgfdelmbrgrp.i{}.v1~",
                 toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
