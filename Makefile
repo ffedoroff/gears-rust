@@ -456,7 +456,7 @@ dev: dev-fmt dev-clippy dev-test
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-cluster-pg test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-cluster-pg test-rg-pg test-fips
 
 # Run all tests
 test: install-tools
@@ -506,6 +506,10 @@ test-usage-collector-pg: install-tools
 ## Docker churn without masking one.
 test-cluster-pg: install-tools
 	cargo nextest run -p cf-postgres-cluster-plugin --features integration --retries 1
+
+## Run resource-group gear PostgreSQL concurrency tests
+test-rg-pg: install-tools
+	cargo nextest run -p cf-gears-resource-group --features integration
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:
