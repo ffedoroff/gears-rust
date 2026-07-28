@@ -13,7 +13,7 @@ use resource_group_sdk::TYPE_RESOURCE_TYPE;
 use resource_group_sdk::models::{CreateTypeRequest, ResourceGroupType, UpdateTypeRequest};
 use toolkit_db::secure::{DBRunner, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
-use toolkit_security::SecurityContext;
+use toolkit_security::{SecurityContext, pep_properties};
 
 use tracing::{debug, warn};
 
@@ -25,33 +25,77 @@ use crate::domain::validation;
 
 /// `AuthZ` resource type descriptor for GTS type definitions.
 ///
-/// `supported_properties` is deliberately **empty**: `gts_type` is a
-/// platform-global table (see `m20260306_000001_initial.rs` — no
-/// `tenant_id` column, no `#[secure(tenant_col = ...)]` on the entity), so
-/// there is nothing for a PDP constraint to filter on. The gate is a pure
-/// allow/deny decision, never a row-level scope.
+/// `gts_type` is a platform-global table (see `m20260306_000001_initial.rs`
+/// — no `tenant_id` column, no `#[secure(tenant_col = ...)]` on the entity),
+/// so there is no column here for a PDP constraint to filter row-level
+/// access on: the gate below (`TypeService::gate`) always discards the
+/// `AccessScope` it computes and only cares whether compilation succeeded
+/// at all, i.e. whether the PDP said yes.
 ///
-/// # Why every call site uses `access_scope_with(.., require_constraints(false))`
+/// ## Why `supported_properties` still lists `OWNER_TENANT_ID` — do not
+/// ## "simplify" this back to an empty list
 ///
-/// and never the plain [`PolicyEnforcer::access_scope`] default: with an
-/// empty `supported_properties` list, a real PDP has no property it could
-/// legally attach a constraint to for this resource — the only correct
-/// "permit" shape is `decision: true, constraints: []`. Verified against
-/// `authz-resolver-sdk`'s compiler (`pep::compiler::compile_to_access_scope`,
-/// see its "Compilation Matrix" doc comment): under the default
-/// `require_constraints = true`, `decision: true` with empty constraints
-/// compiles to `Err(ConstraintCompileError::ConstraintsRequiredButAbsent)`
-/// (`EnforcerError::CompileFailed`), which `DomainError::from(EnforcerError)`
-/// maps to `DomainError::InternalError` — a 500, not success — for *every*
-/// legitimately-allowed caller. `tests/type_authz_test.rs` reproduces this
-/// exact failure with an allow-all-no-constraints mock PDP before switching
-/// to `require_constraints(false)`, which compiles the same response to
-/// `AccessScope::allow_all()` as intended. `require_constraints(false)` is
-/// the API's documented escape hatch for exactly this "permission check
-/// only, no constraints possible" shape (see `AccessRequest::require_constraints`
-/// doc comment; `mini-chat`'s `ModelService::list_models`/`get_model` use
-/// the identical pattern for its own global, non-tenant-scoped catalog).
-pub const RG_TYPE_RESOURCE: ResourceType = ResourceType::from_static(TYPE_RESOURCE_TYPE, &[]);
+/// It was an empty list originally, on exactly the "nothing to filter on"
+/// reasoning above. That reasoning is correct about the *scope* being
+/// unused, but wrong about the consequence: it broke every legitimately
+/// *allowed* call, not just denied ones.
+///
+/// Every real `AuthZ` plugin in this repo attaches an unconditional
+/// baseline `In(OWNER_TENANT_ID, [tid])` constraint to **every** allow
+/// decision, for **every** resource, regardless of whether that resource
+/// even has a tenant column (see `static-authz-plugin`'s `Service::evaluate`
+/// — "Baseline `OWNER_TENANT_ID` clamp — the universal shape every PEP can
+/// bind" — and `tr-authz-plugin`'s mandatory `owner_tenant_id` property).
+/// `authz_resolver_sdk::pep::compiler::compile_to_access_scope` rejects any
+/// constraint whose predicate property is not in `supported_properties`
+/// ("unsupported property", fail-closed), and when *every* constraint on
+/// the response fails that check, the whole call fails with
+/// `Err(ConstraintCompileError::AllConstraintsFailed)` — fail-closed by
+/// design. With an empty `supported_properties` list, that is exactly what
+/// happened to the baseline clamp on every single call: `EnforcerError::
+/// CompileFailed` → `DomainError::InternalError` → HTTP 500, for every
+/// legitimately-allowed caller of any of the five gated methods below, not
+/// merely the denied ones. `tests/type_authz_test.rs`'s `TenantClampAuthZ`
+/// mock reproduces the real plugins' shape and its
+/// `all_five_actions_succeed_with_realistic_tenant_clamp_constraint` test
+/// caught this exact regression (failing with
+/// `AllConstraintsFailed { reason: "unsupported property: owner_tenant_id" }`
+/// before this fix); the previous `AllowAllNoConstraintsAuthZ` mock could
+/// not, because it never attaches a constraint in the first place.
+///
+/// Declaring `OWNER_TENANT_ID` here lets that baseline constraint compile
+/// normally. That the constraint is tenant-shaped and this table has no
+/// tenant column is harmless: `gate()` never reads the resulting
+/// `AccessScope`'s filters, only whether compilation succeeded — the scope
+/// can never be anything but `allow_all()` or an error for this resource,
+/// and the property list exists purely so the compiler doesn't reject the
+/// PDP's normal output before `gate()` gets to ignore it.
+///
+/// # Why every call site *also* uses `access_scope_with(.., require_constraints(false))`
+///
+/// This is a *different, still-live* case, not a substitute for the above:
+/// a PDP may separately permit with **zero** constraints at all
+/// (`decision: true, constraints: []` — see `AllowAllNoConstraintsAuthZ` in
+/// the tests), a legitimate response shape for a resource a policy doesn't
+/// otherwise care to scope. Under the plain [`PolicyEnforcer::access_scope`]
+/// default (`require_constraints = true`), *that* shape compiles to
+/// `Err(ConstraintCompileError::ConstraintsRequiredButAbsent)`
+/// (`EnforcerError::CompileFailed`), which also maps to
+/// `DomainError::InternalError` — a 500 — for an allowed caller.
+/// `tests/type_authz_test.rs::access_scope_denied_by_default_require_constraints`
+/// reproduces that failure; `access_scope_with_require_constraints_false_succeeds`
+/// shows the fix compiles the same response to `AccessScope::allow_all()`.
+/// `require_constraints(false)` is the API's documented escape hatch for
+/// exactly this "permission check only, no constraints required" shape (see
+/// `AccessRequest::require_constraints` doc comment; `mini-chat`'s
+/// `ModelService::list_models`/`get_model` use the identical pattern for
+/// its own global, non-tenant-scoped catalog). It only changes what happens
+/// when constraints are *absent*; declaring `OWNER_TENANT_ID` above is what
+/// lets a constraint that *is* present compile instead of being rejected as
+/// unsupported. Both are needed: a real PDP's permit may show up in either
+/// shape, and each is only handled by one of the two.
+pub const RG_TYPE_RESOURCE: ResourceType =
+    ResourceType::from_static(TYPE_RESOURCE_TYPE, &[pep_properties::OWNER_TENANT_ID]);
 
 // @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-service-crud:p1
 /// Service for GTS type lifecycle management.
@@ -77,11 +121,15 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     }
 
     /// Permission-check-only `AuthZ` gate shared by every public type-CRUD
-    /// entry point. See [`RG_TYPE_RESOURCE`] for why `require_constraints(false)`
-    /// is required here rather than the [`PolicyEnforcer::access_scope`]
-    /// default. The returned `AccessScope` is intentionally discarded: this
-    /// resource has no columns to filter on, so the scope can only ever be
-    /// `allow_all()` or an error — never a row-level constraint.
+    /// entry point. See [`RG_TYPE_RESOURCE`] for why its
+    /// `supported_properties` declares `OWNER_TENANT_ID` (so a real PDP's
+    /// baseline constraint compiles instead of failing closed) and why
+    /// `require_constraints(false)` is *also* still needed on top of that
+    /// (so a permit with zero constraints compiles too). The returned
+    /// `AccessScope` is intentionally discarded here: this resource has no
+    /// columns to filter on, so nothing downstream ever consults the
+    /// scope's constraints — only whether compilation succeeded, i.e.
+    /// whether the PDP allowed the call.
     async fn gate(&self, ctx: &SecurityContext, action: &str) -> Result<(), DomainError> {
         self.enforcer
             .access_scope_with(

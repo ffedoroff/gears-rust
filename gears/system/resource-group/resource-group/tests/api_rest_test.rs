@@ -136,14 +136,17 @@ fn make_enforcer() -> PolicyEnforcer {
 
 // ── Mock AuthZ: allow-all, no constraints (for `TypeService`) ──────────
 //
-// `gts_type` is a platform-global table (no `tenant_id` column), so
-// `RG_TYPE_RESOURCE` declares an empty `supported_properties` list and
-// every gate call uses `require_constraints(false)` (VHP-2342). The
-// tenant-scoping `AllowAllAuthZ` mock above always attaches an
-// `owner_tenant_id` constraint, which `RG_TYPE_RESOURCE` doesn't support --
-// wiring `TypeService` with it would fail constraint compilation instead of
-// permitting the call. This mock returns the PDP shape the gate actually
-// expects: `decision: true, constraints: []`.
+// `gts_type` is a platform-global table (no `tenant_id` column), and
+// `TypeService`'s gate discards the `AccessScope` it computes regardless of
+// shape, so every gate call uses `require_constraints(false)` (VHP-2342) to
+// also accept this permit-with-zero-constraints PDP shape (`decision: true,
+// constraints: []`). This is *a* valid PDP response, not the only one --
+// real PDP plugins instead attach a baseline `In(OWNER_TENANT_ID)`
+// constraint on every allow decision, and since `RG_TYPE_RESOURCE` declares
+// `OWNER_TENANT_ID` as a supported property, the tenant-scoping
+// `AllowAllAuthZ` mock above works fine wired to the type routes too --
+// see `list_types_with_realistic_tenant_clamp_authz_succeeds` below, which
+// exercises exactly that.
 struct AllowAllNoConstraintsAuthZ;
 
 #[async_trait]
@@ -559,6 +562,28 @@ async fn delete_type_denied_returns_403() {
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// HTTP-level regression proof for VHP-2342's actual defect (not just the
+/// artificial no-constraints mock the rest of this file's type routes are
+/// wired with by default). Wires the type-registry routes with
+/// `AllowAllAuthZ` -- the tenant-scoping mock that attaches a baseline
+/// `In(OWNER_TENANT_ID)` constraint on every allow decision, the same shape
+/// `static-authz-plugin`/`tr-authz-plugin` actually return -- and asserts a
+/// gated route still succeeds end to end at the wire level. Before
+/// `RG_TYPE_RESOURCE` declared `OWNER_TENANT_ID` as a supported property,
+/// this exact request failed with `DomainError::InternalError`
+/// (`AllConstraintsFailed`), which the `DomainError` -> `CanonicalError`
+/// mapping turns into `StatusCode::INTERNAL_SERVER_ERROR` -- a 500 for an
+/// allowed caller, not the 200 asserted here.
+#[tokio::test]
+async fn list_types_with_realistic_tenant_clamp_authz_succeeds() {
+    let (router, _) = build_test_router_with_type_enforcer(make_enforcer()).await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request("GET", "/types-registry/v1/types", None, tenant_id);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ── Group CRUD Tests ────────────────────────────────────────────────────

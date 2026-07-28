@@ -246,14 +246,19 @@ impl AuthZResolverClient for DenyAllAuthZ {
 
 /// Enforcer that always permits and never attaches constraints.
 ///
-/// `gts_type` is a platform-global table (no `tenant_id` column), so
-/// `TypeService`'s `RG_TYPE_RESOURCE` descriptor declares an empty
-/// `supported_properties` list and every gate call uses
-/// `require_constraints(false)` (VHP-2342). This mock is the PDP shape that
-/// setup actually expects: `decision: true, constraints: []`. Using the
-/// tenant-scoping `AllowAllAuthZ` mock above here would attach an
-/// `owner_tenant_id` constraint that `RG_TYPE_RESOURCE` doesn't support,
-/// which fails constraint compilation instead of permitting the call.
+/// `gts_type` is a platform-global table (no `tenant_id` column), and
+/// `TypeService`'s `RG_TYPE_RESOURCE` gate discards the `AccessScope` it
+/// gets back regardless of shape, so every gate call uses
+/// `require_constraints(false)` (VHP-2342) to also accept this
+/// permit-with-zero-constraints PDP shape (`decision: true, constraints:
+/// []`). This is *a* valid PDP response, not the only one: real PDP plugins
+/// (`static-authz-plugin`, `tr-authz-plugin`) instead attach a baseline
+/// `In(OWNER_TENANT_ID)` constraint on every allow decision -- the
+/// tenant-scoping `AllowAllAuthZ` mock above reproduces that shape and, since
+/// `RG_TYPE_RESOURCE` declares `OWNER_TENANT_ID` as a supported property, it
+/// works fine wired to `TypeService` too (see `tests/type_authz_test.rs`'s
+/// `TenantClampAuthZ` and `tests/api_rest_test.rs`'s realistic-mock test for
+/// the regression this previously-empty `supported_properties` list caused).
 struct AllowAllNoConstraintsAuthZ;
 
 #[async_trait]
