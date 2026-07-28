@@ -49,18 +49,60 @@ impl MembershipRepositoryTrait for MembershipRepository {
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError> {
         let scope = system_scope();
-        let base_query = MembershipEntity::find().secure().scope_with(&scope);
 
+        // Validate the filter (String kind for `resource_type`) and resolve
+        // GTS type-path string values to SMALLINT IDs in the typed
+        // FilterNode -- BEFORE paginate_odata. Mirrors
+        // `GroupRepository::list_groups`; the tree walk itself is shared via
+        // `TypeRepository::resolve_type_filter_node` (VHP-1731).
+        let resolved_filter = if let Some(ast) = query.filter.as_deref() {
+            let validated =
+                toolkit_odata::filter::convert_expr_to_filter_node::<MembershipFilterField>(ast)
+                    .map_err(|e| DomainError::validation(format!("invalid $filter: {e}")))?;
+            Some(
+                crate::infra::storage::type_repo::TypeRepository::resolve_type_filter_node(
+                    db,
+                    &validated,
+                    MembershipFilterField::ResourceType,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        // Build base query with the resolved filter applied manually.
+        let base_query = MembershipEntity::find().secure().scope_with(&scope);
+        let base_query = if let Some(ref node) = resolved_filter {
+            let cond = toolkit_db::odata::sea_orm_filter::filter_node_to_condition::<
+                MembershipFilterField,
+                MembershipODataMapper,
+            >(node)
+            .map_err(|e| DomainError::validation(format!("invalid $filter: {e}")))?;
+            base_query.filter(cond)
+        } else {
+            base_query
+        };
+
+        // Strip the filter from the query -- already applied above.
+        let mut query_no_filter = query.clone();
+        query_no_filter.filter = None;
+
+        // Any remaining `paginate_odata` failure (bad `$orderby` field, stale
+        // cursor, filter/order mismatch, or a genuine DB error) is
+        // classified by `DomainError::from` (VHP-1954): client-caused query
+        // rejections map to `Validation` (400), backend failures stay
+        // `Database` (500).
         let page = paginate_odata::<MembershipFilterField, MembershipODataMapper, _, _, _, _>(
             base_query,
             db,
-            query,
+            &query_no_filter,
             ("group_id", SortDir::Desc),
             MEMBERSHIP_LIMIT_CFG,
             |m: membership_entity::Model| m,
         )
         .await
-        .map_err(|e| DomainError::database(e.to_string()))?;
+        .map_err(DomainError::from)?;
 
         // Batch-resolve type IDs to GTS paths (single query)
         let type_ids: Vec<i16> = page.items.iter().map(|m| m.gts_type_id).collect();

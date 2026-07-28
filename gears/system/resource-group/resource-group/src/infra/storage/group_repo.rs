@@ -201,88 +201,6 @@ impl GroupRepository {
         })
     }
 
-    /// Resolve `type` string values to SMALLINT IDs in a validated `FilterNode`.
-    ///
-    /// Called AFTER `convert_expr_to_filter_node` validates the filter (String kind
-    /// for `type` field). Walks the tree and replaces GTS string values
-    /// with `Value::Number(id)` for `GroupFilterField::Type` fields. The resolved
-    /// numeric value is then handled by `filter_node_to_condition` which converts
-    /// it to `sea_orm::Value::BigInt` — `PostgreSQL` implicitly casts to SMALLINT.
-    #[allow(clippy::type_complexity)]
-    fn resolve_type_filter_node<'a>(
-        db: &'a (impl DBRunner + 'a),
-        node: &'a toolkit_odata::filter::FilterNode<GroupFilterField>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        toolkit_odata::filter::FilterNode<GroupFilterField>,
-                        DomainError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        use toolkit_odata::ast::Value as V;
-        use toolkit_odata::filter::FilterNode as FN;
-
-        Box::pin(async move {
-            match node {
-                FN::Binary {
-                    field: GroupFilterField::Type,
-                    op,
-                    value: V::String(path),
-                } => {
-                    let id = TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
-                        DomainError::validation(format!("Unknown type in filter: {path}"))
-                    })?;
-                    Ok(FN::Binary {
-                        field: GroupFilterField::Type,
-                        op: *op,
-                        value: V::Number(id.into()),
-                    })
-                }
-                FN::InList {
-                    field: GroupFilterField::Type,
-                    values,
-                } => {
-                    let mut resolved = Vec::with_capacity(values.len());
-                    for v in values {
-                        if let V::String(path) = v {
-                            let id =
-                                TypeRepository::resolve_id(db, path).await?.ok_or_else(|| {
-                                    DomainError::validation(format!(
-                                        "Unknown type in filter: {path}"
-                                    ))
-                                })?;
-                            resolved.push(V::Number(id.into()));
-                        } else {
-                            resolved.push(v.clone());
-                        }
-                    }
-                    Ok(FN::InList {
-                        field: GroupFilterField::Type,
-                        values: resolved,
-                    })
-                }
-                FN::Composite { op, children } => {
-                    let mut resolved_children = Vec::with_capacity(children.len());
-                    for child in children {
-                        resolved_children.push(Self::resolve_type_filter_node(db, child).await?);
-                    }
-                    Ok(FN::Composite {
-                        op: *op,
-                        children: resolved_children,
-                    })
-                }
-                FN::Not(inner) => Ok(FN::Not(Box::new(
-                    Self::resolve_type_filter_node(db, inner).await?,
-                ))),
-                other => Ok(other.clone()),
-            }
-        })
-    }
-
     /// Parse and extract hierarchy filters from an `OData` query.
     fn parse_hierarchy_filter(query: &ODataQuery) -> (Option<DepthFilter>, Option<TypeFilter>) {
         let Some(filter_expr) = query.filter() else {
@@ -485,7 +403,10 @@ impl GroupRepositoryTrait for GroupRepository {
             let validated =
                 toolkit_odata::filter::convert_expr_to_filter_node::<GroupFilterField>(ast)
                     .map_err(|e| DomainError::validation(format!("invalid $filter: {e}")))?;
-            Some(Self::resolve_type_filter_node(db, &validated).await?)
+            Some(
+                TypeRepository::resolve_type_filter_node(db, &validated, GroupFilterField::Type)
+                    .await?,
+            )
         } else {
             None
         };

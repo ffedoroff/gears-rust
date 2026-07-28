@@ -2306,3 +2306,71 @@ async fn rest_route_smoke_all_endpoints_registered() {
         );
     }
 }
+
+// =========================================================================
+// VHP-1954: membership `$filter` client errors must be 400, not 500
+// =========================================================================
+//
+// `list_memberships` (`membership_repo.rs`) used to fold every failure out
+// of `paginate_odata` -- including caller-caused `$filter` rejections --
+// into `DomainError::database(..)`, a 500. The OData grammar only parses a
+// *bare* hex8-4-4-4-12 UUID literal (no surrounding quotes) as
+// `Value::Uuid`; the same literal wrapped in single quotes parses as
+// `Value::String`, which `convert_expr_to_filter_node::<MembershipFilterField>`
+// rejects with `FilterError::TypeMismatch` because `group_id`'s `FieldKind`
+// is `Uuid` -- exactly the shape the ticket's reporter hit (they quoted the
+// UUID; the e2e smoke test S10 does not, which is why it stayed green).
+
+/// VHP-1954: `$filter=group_id eq '<uuid>'` (quoted) must return 400, not
+/// 500 -- a caller mistake, not a backend fault.
+#[tokio::test]
+async fn rest_get_memberships_quoted_uuid_filter_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let some_uuid = Uuid::now_v7();
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/memberships\
+             ?%24filter=group_id%20eq%20%27{some_uuid}%27"
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "quoted-UUID $filter must be a 400 client error, not {status}: {body}"
+    );
+}
+
+/// VHP-1954 regression guard: the wire-correct *bare* UUID
+/// `$filter=group_id eq <uuid>` (no quotes) must keep returning 200 --
+/// pinning that the 400 fix above doesn't also start rejecting the shape
+/// e2e smoke test S10 (and every well-formed client) actually sends.
+#[tokio::test]
+async fn rest_get_memberships_bare_uuid_filter_returns_200() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let some_uuid = Uuid::now_v7();
+
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/memberships?%24filter=group_id%20eq%20{some_uuid}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bare-UUID $filter regressed: {body}"
+    );
+    assert!(body["items"].is_array());
+}

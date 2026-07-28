@@ -53,6 +53,91 @@ impl TypeRepository {
         Ok(result.map(|m| m.id))
     }
 
+    /// Resolve GTS type-path string values to SMALLINT surrogate IDs inside a
+    /// validated `FilterNode`, for whichever field represents a GTS type path
+    /// in the caller's filter-field enum (e.g. `GroupFilterField::Type`,
+    /// `MembershipFilterField::ResourceType`).
+    ///
+    /// Generic over the filter-field enum `F` so every repository that
+    /// filters on a GTS type path shares this tree walk instead of
+    /// reimplementing it per field enum --
+    /// `GroupRepository::list_groups` and
+    /// `MembershipRepository::list_memberships` each call this with their
+    /// own field variant (`type_field`).
+    ///
+    /// Must be called AFTER `convert_expr_to_filter_node` has already
+    /// validated the filter (so `type_field`'s kind is confirmed `String`).
+    #[allow(clippy::type_complexity)]
+    pub fn resolve_type_filter_node<'a, F>(
+        db: &'a (impl DBRunner + 'a),
+        node: &'a toolkit_odata::filter::FilterNode<F>,
+        type_field: F,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<toolkit_odata::filter::FilterNode<F>, DomainError>,
+                > + Send
+                + 'a,
+        >,
+    >
+    where
+        F: toolkit_odata::filter::FilterField + Send + Sync,
+    {
+        use toolkit_odata::ast::Value as V;
+        use toolkit_odata::filter::FilterNode as FN;
+
+        Box::pin(async move {
+            match node {
+                FN::Binary {
+                    field,
+                    op,
+                    value: V::String(path),
+                } if *field == type_field => {
+                    let id = Self::resolve_id(db, path).await?.ok_or_else(|| {
+                        DomainError::validation(format!("Unknown type in filter: {path}"))
+                    })?;
+                    Ok(FN::Binary {
+                        field: *field,
+                        op: *op,
+                        value: V::Number(id.into()),
+                    })
+                }
+                FN::InList { field, values } if *field == type_field => {
+                    let mut resolved = Vec::with_capacity(values.len());
+                    for v in values {
+                        if let V::String(path) = v {
+                            let id = Self::resolve_id(db, path).await?.ok_or_else(|| {
+                                DomainError::validation(format!("Unknown type in filter: {path}"))
+                            })?;
+                            resolved.push(V::Number(id.into()));
+                        } else {
+                            resolved.push(v.clone());
+                        }
+                    }
+                    Ok(FN::InList {
+                        field: *field,
+                        values: resolved,
+                    })
+                }
+                FN::Composite { op, children } => {
+                    let mut resolved_children = Vec::with_capacity(children.len());
+                    for child in children {
+                        resolved_children
+                            .push(Self::resolve_type_filter_node(db, child, type_field).await?);
+                    }
+                    Ok(FN::Composite {
+                        op: *op,
+                        children: resolved_children,
+                    })
+                }
+                FN::Not(inner) => Ok(FN::Not(Box::new(
+                    Self::resolve_type_filter_node(db, inner, type_field).await?,
+                ))),
+                other => Ok(other.clone()),
+            }
+        })
+    }
+
     /// Resolve allowed parent SMALLINT IDs to string paths.
     async fn load_allowed_parent_types(
         db: &impl DBRunner,

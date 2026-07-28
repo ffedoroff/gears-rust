@@ -543,6 +543,66 @@ async fn membership_list_empty() {
     assert!(page.items.is_empty(), "should be empty with no memberships");
 }
 
+// =========================================================================
+// VHP-1731: `resource_type` $filter must resolve the GTS type path to its
+// SMALLINT surrogate id
+// =========================================================================
+//
+// `resource_type` is a GTS type-path string on the wire but stored as the
+// SMALLINT `gts_type_id` column. `list_memberships` used to hand the raw
+// string filter straight to `paginate_odata`, comparing it directly against
+// that SMALLINT column. On SQLite this is not an error -- SQLite's affinity
+// rules coerce the non-numeric string to `0` and compare leniently -- so the
+// filter silently matches nothing instead of failing loudly. That silent
+// empty page is exactly what this test pins; the real-Postgres half of the
+// same defect (a genuine DB type-mismatch error, the ticket's actual 500)
+// is covered separately in `pg_membership_filter_test.rs`
+// (`--features integration`).
+#[tokio::test]
+async fn membership_list_filters_by_resource_type() {
+    let db = test_db().await;
+    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant = Uuid::now_v7();
+    let ctx = make_ctx(tenant);
+
+    let type_a = create_root_type(&type_svc, "rtfa").await;
+    let type_b = create_root_type(&type_svc, "rtfb").await;
+    let grp_type =
+        create_type_with_memberships(&type_svc, "rtfgrp", &[&type_a.code, &type_b.code]).await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "RTF", tenant).await;
+
+    mbr_svc
+        .add_membership(&ctx, group.id, &type_a.code, "res-a")
+        .await
+        .expect("add type A membership");
+    mbr_svc
+        .add_membership(&ctx, group.id, &type_b.code, "res-b")
+        .await
+        .expect("add type B membership");
+
+    let parsed = toolkit_odata::parse_filter_string(&format!("resource_type eq '{}'", type_a.code))
+        .expect("parse resource_type filter");
+    let query = ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = mbr_svc
+        .list_memberships(&ctx, &query)
+        .await
+        .expect("list memberships filtered by resource_type");
+
+    assert_eq!(
+        page.items.len(),
+        1,
+        "resource_type filter must resolve the GTS path to its surrogate id \
+         and return exactly the matching membership: {:?}",
+        page.items
+    );
+    assert_eq!(page.items[0].resource_id, "res-a");
+    assert_eq!(page.items[0].resource_type, type_a.code);
+}
+
 /// `list_memberships_unscoped` returns membership rows with no caller context
 /// and no tenant scope — the AuthZ-bypassing read backing the in-process PDP
 /// membership contract. The caller supplies the OData filter (the PDP uses
