@@ -657,34 +657,47 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
         // Compute removed parent types: old_allowed_parent_types - new_allowed_parent_types
-        let removed_parents: Vec<&String> = existing
+        let removed_parents: Vec<String> = existing
             .allowed_parent_types
             .iter()
             .filter(|p| !req.allowed_parent_types.contains(p))
+            .cloned()
             .collect();
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
-        for removed_parent in &removed_parents {
+        if !removed_parents.is_empty() {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
-            let parent_id = type_repo.resolve_id(conn, removed_parent).await?;
-            if let Some(parent_id) = parent_id {
-                let violations = type_repo
-                    .find_groups_using_parent_type(conn, type_id, parent_id)
-                    .await?;
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
+            // Batch: resolve every removed-parent path and find every
+            // violating group in one call (N+1 audit finding (b)) --
+            // was one `resolve_id` + one single-parent lookup *per*
+            // removed parent (slope 2.0: 1 gts_type + 1 resource_group
+            // SELECT per removed parent).
+            let violations = type_repo
+                .find_groups_violating_removed_parents(conn, type_id, &removed_parents)
+                .await?;
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
 
-                // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
-                if !violations.is_empty() {
-                    let names: Vec<String> =
-                        violations.iter().map(|(_, name)| name.clone()).collect();
-                    return Err(DomainError::allowed_parent_types_violation(format!(
-                        "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
-                        names.join(", ")
-                    )));
-                }
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
+            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
+            // Report the first removed parent (in `removed_parents` order)
+            // that has any violation -- same as the pre-batch loop, which
+            // iterated in that order and returned on the first violation
+            // it found.
+            if let Some(removed_parent) = removed_parents
+                .iter()
+                .find(|p| violations.iter().any(|(code, _, _)| code == *p))
+            {
+                let names: Vec<String> = violations
+                    .iter()
+                    .filter(|(code, _, _)| code == removed_parent)
+                    .map(|(_, _, name)| name.clone())
+                    .collect();
+                return Err(DomainError::allowed_parent_types_violation(format!(
+                    "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
+                    names.join(", ")
+                )));
             }
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
         }
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
 
