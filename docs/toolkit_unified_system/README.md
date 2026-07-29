@@ -27,6 +27,8 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 | Quick checklists, templates | `10_checklists_and_templates.md` | |
 | Unit & integration testing (philosophy, patterns, infrastructure) | `12_unit_testing.md` | |
 | E2E testing (philosophy, patterns, infrastructure) | `13_e2e_testing.md` | |
+| Security review before merge (tenant scope, global tables, leaks, in-process paths) | `14_security_review_checklist.md` | |
+| Gear API baseline (CRUD completeness, lists, error codes, contract) | `15_gear_api_baseline.md` | |
 | HTTP client (TLS, retries, timeouts, concurrency, OTel tracing, auth hook) | | `docs/adrs/toolkit/0001-toolkit-hyper-tower-http-client.md` |
 | AuthN/AuthZ, PolicyEnforcer, PEP enforcement | `06_authn_authz_secure_orm.md` | `docs/arch/authorization/DESIGN.md` |
 | Authentication (inbound JWT/OIDC policies, outbound OAuth2 client-credentials) | | `docs/adrs/toolkit/0002-toolkit-auth-oauth2-client.md` |
@@ -61,6 +63,8 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 - `11_database_patterns.md` – DBRunner/SecureTx executors, transactions, repository pattern, database migrations.
 - `12_unit_testing.md` – Philosophy, reliability principles, infrastructure, assert patterns, naming, priority matrix for unit/integration tests.
 - `13_e2e_testing.md` – Philosophy, integration seams concept, pytest infrastructure, test patterns, anti-patterns for E2E tests.
+- `14_security_review_checklist.md` – Yes/no items to walk before merging a gear PR: tenant scope on every path, gates on global tables, error-message leaks and existence oracles, in-process bypasses, SQL type compatibility.
+- `15_gear_api_baseline.md` – What a gear must provide by default: CRUD completeness (partial update, atomic moves), list behaviour (per-page counts, statement count independent of filter size), error codes, contract as an artifact.
 
 ### Related ADRs
 
