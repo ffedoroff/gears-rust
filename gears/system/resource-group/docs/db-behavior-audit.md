@@ -80,6 +80,58 @@ Empirically SSI does hold where the design assumed it would: mutual `move`
 getting a clean `CycleDetected`, and force-delete races produced no orphans in
 60+ runs.
 
+## Deviation from the unit/E2E testing guide
+
+`pg_concurrency_test.rs` (this audit's own suite), and the three narrower
+repro suites that followed it — `pg_membership_filter_test.rs` and
+`pg_group_filter_test.rs` (both in this gear) and
+`secure_group_scope_postgres.rs` (in `libs/toolkit-db`) — are Rust
+`#[tokio::test]`s that talk to a real PostgreSQL via `testcontainers`. That
+is a deliberate, written-down deviation from the general testing guide:
+[`12_unit_testing.md`](../../../../docs/toolkit_unified_system/12_unit_testing.md)
+routes PostgreSQL-specific behavior (FK `RESTRICT`, `SERIALIZABLE`
+isolation, domain types) to E2E, and
+[`13_e2e_testing.md`](../../../../docs/toolkit_unified_system/13_e2e_testing.md)
+defines E2E as pytest against a running `cf-gears-server`. None of these
+four suites are that: they call repository/service code directly,
+in-process, no HTTP, no running server.
+
+Why the deviation stands:
+
+- **Precedent, not improvisation.** This audit (`pg_concurrency_test.rs`)
+  established the pattern first: a `--features integration` suite, a
+  dedicated `test-rg-pg` `Makefile` target, and a matching step in
+  `.github/workflows/ci.yml`'s `integration` job
+  ("Test resource-group (pg concurrency, integration)", `RG_PG_REQUIRE_DOCKER=1`).
+  The three later suites reuse that exact wiring rather than inventing a
+  new one.
+- **Feature-gated, not part of the default suite.** All four are behind
+  `#![cfg(feature = "integration")]` (`secure_group_scope_postgres.rs`
+  additionally requires `feature = "pg"`); `cargo nextest run -p
+  cf-gears-resource-group` with no `--features integration` neither builds
+  nor runs them. They do not count against the unit-testing guide's "full
+  suite < 5s" target — that target is measured without `--features
+  integration`.
+- **A diagnosis pytest cannot give.** Each of the three narrower suites
+  reproduces a real Postgres-dialect rejection —
+  `pg_membership_filter_test.rs` / `pg_group_filter_test.rs`: "operator
+  does not exist: smallint = text" (VHP-1731, comparing the wire-level GTS
+  type-path string against the SMALLINT `gts_type_id` column);
+  `secure_group_scope_postgres.rs`: "operator does not exist: uuid = text"
+  (VHP-2344 defect A, comparing a `TEXT` membership column against a
+  `Uuid` resource column). A pytest test hitting the same regression
+  through HTTP would only ever observe the resulting 500 status code —
+  these tests surface, in the failure message should the guard ever
+  regress, the actual backend error text that an HTTP status code
+  swallows.
+
+This is scoped narrowly: it covers this specific pattern (dialect-rejection
+reproduction, plus the concurrency harness above), not a general license to
+write Rust-level Postgres tests instead of E2E. New PostgreSQL-dependent
+behavior should still default to E2E per the guide unless it has the same
+shape — a bug invisible above the SQL layer that would otherwise surface
+only as an opaque HTTP status code.
+
 ## Running this audit on another module
 
 The point of the exercise. Nothing needs copying: the recorder lives in
