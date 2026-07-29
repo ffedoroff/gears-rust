@@ -109,3 +109,14 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `toolkit_canonical_errors::CanonicalError` don't rely on it being pulled in
 # transitively via the normal (`[dependencies]`) build graph.
 toolkit-canonical-errors = { workspace = true }
+# Captures `tracing` output in tests/pg_concurrency_test.rs's
+# membership_first_write_race_exactly_one_tenant_wins, so a failure shows
+# each concurrent task's retry attempt history instead of nothing (see that
+# test's module doc comment). Same crate this repo already uses for exactly
+# this (`libs/toolkit`, `api-gateway`'s access_log_tests.rs, `canonical_error_layer.rs`
+# tests all build a `tracing_subscriber::fmt`/custom-`Layer` subscriber by
+# hand rather than the `tracing-test` crate's own macro -- that macro's
+# env-filter is an all-or-nothing per-crate choice, too coarse here: this
+# test runs against a real PostgreSQL, and SeaORM/sqlx's own per-query trace
+# logging would otherwise flood a failure's output).
+tracing-subscriber = { workspace = true }

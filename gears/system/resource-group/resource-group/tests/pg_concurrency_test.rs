@@ -71,6 +71,9 @@ use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
 use toolkit_security::AccessScope;
+use tracing::Instrument;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
 use uuid::Uuid;
 
 /// Ceiling on a winning transaction's duration. Deliberately far above any
@@ -395,13 +398,122 @@ fn ok_or_clean_membership_not_found(r: &Result<(), DomainError>) -> bool {
 
 // RG-01: membership first-write race
 
+/// Captures `toolkit_db`'s retry-lifecycle `tracing` events (the existing
+/// per-attempt retry `WARN`, plus the budget-exhausted /
+/// not-recognized-as-retryable events) for
+/// [`membership_first_write_race_exactly_one_tenant_wins`], printing each
+/// one -- prefixed with the enclosing `race_task` span's `side`/`trial`
+/// fields -- via a `tracing_subscriber::fmt` layer.
+///
+/// # Why a hand-rolled subscriber, not the `tracing-test` crate
+///
+/// This repo's established way to capture `tracing` in an external
+/// integration-test crate (`tests/`) is to build a `tracing_subscriber`
+/// layer/subscriber by hand and install it with `tracing::subscriber::
+/// set_default` -- see `libs/toolkit/tests/panic_tracing_tests.rs`,
+/// `api-gateway`'s `tests/access_log_tests.rs`, and
+/// `libs/toolkit/src/api/canonical_error_layer.rs`'s tests. This reuses
+/// that pattern rather than the `tracing-test` crate's `#[traced_test]`
+/// macro (used elsewhere for spawned-task-heavy `src/` unit tests in
+/// `cluster`/`account-management`/`toolkit`) for one reason specific to
+/// this test: `tracing-test`'s env filter is an all-or-nothing per-crate
+/// choice (either `{this test crate}=trace`, or -- the `no-env-filter`
+/// feature that cross-crate capture here would require -- a blanket
+/// `"trace"` for *everything*). Against a real PostgreSQL, that blanket
+/// filter also captures SeaORM/sqlx's own per-query trace logging, turning
+/// a failure's output into a wall of raw SQL instead of a focused retry
+/// history. Filtering by target (`toolkit_db` only) avoids that.
+///
+/// # Why a global default
+///
+/// The two competing `add_membership` calls run as real `tokio::spawn`
+/// tasks, potentially on different worker threads of the
+/// `#[tokio::test(flavor = "multi_thread")]` runtime. A thread-local
+/// default (`tracing::subscriber::set_default`, what the precedents above
+/// use) only covers the thread that installs it; verified empirically that
+/// a spawned task on another worker thread is invisible to it. A *global*
+/// default (`tracing::subscriber::set_global_default`) is process-wide and
+/// does not have this gap.
+///
+/// # Why `println!`, not an explicit "dump on failure"
+///
+/// Nothing here decides whether to print based on the trial's outcome --
+/// every event matching the target filter is printed unconditionally,
+/// which keeps this diagnostic itself simple and unable to influence the
+/// test's result. `cargo`/`nextest` already capture a test's stdout and
+/// print it only when the test fails (verified empirically), so a passing
+/// run stays silent for free.
+fn install_retry_diagnostics() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_test_writer()
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                // Let every *span* register regardless of target -- this is
+                // a per-layer filter, and it gates span lifecycle
+                // callbacks (`on_new_span`/`on_enter`) the same way it
+                // gates events. Filtering spans by target here would mean
+                // this layer never learns the `race_task` span's
+                // `side`/`trial` fields (its target is the test crate, not
+                // `toolkit_db`), so an event's line would print with no
+                // context at all. Only *events* are filtered by target.
+                meta.is_span() || meta.target().starts_with("toolkit_db")
+            }));
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+        // Best-effort: a diagnostic aid must never be able to affect the
+        // test's outcome, so if a global default is somehow already
+        // installed, skip silently rather than panicking.
+        tracing::subscriber::set_global_default(subscriber).ok();
+    });
+}
+
+/// Spawns one side of the membership race, `.instrument()`-wrapped with a
+/// `race_task` span tagging `side`/`trial`.
+///
+/// Without this, a spawned task's `toolkit_db` retry events would carry no
+/// span context at all under a multi-thread runtime: `tracing`'s "current
+/// span" tracking is per-thread, and a plain (non-instrumented)
+/// `tokio::spawn`ed future may run on a worker thread that never entered
+/// any span (verified empirically). `.instrument` fixes this by re-entering
+/// the given span on every poll, regardless of which thread does the
+/// polling.
+fn spawn_race_task<F>(
+    side: &'static str,
+    trial: usize,
+    fut: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(fut.instrument(tracing::info_span!("race_task", side, trial)))
+}
+
 /// Two concurrent `add_membership` calls for the same resource in different
 /// tenants: exactly one must succeed, the loser getting a clean
 /// `TenantIncompatibility`, not a raw serialization failure (RG-01).
+///
+/// # Diagnosability
+///
+/// This is the scenario that once flaked with a raw serialization error
+/// escaping instead of being absorbed by `transaction_with_retry` (see
+/// `retry_backoff_delay`'s doc comment in `toolkit-db`'s `secure::db` for
+/// the diagnosis and the backoff fix). It didn't reproduce under extensive
+/// local testing, so if it flakes again, the goal is for the failure itself
+/// to answer "what happened" instead of leaving another guessing exercise.
+/// [`install_retry_diagnostics`] makes `toolkit_db`'s retry-lifecycle events
+/// visible; each spawned task's future below is wrapped in
+/// `.instrument(info_span!("race_task", side, trial))` so those events are
+/// tagged with which side and which of the `TRIALS` iterations they belong
+/// to -- without that, `tracing`'s per-thread "current span" tracking would
+/// not attribute a spawned task's events to any span at all (verified
+/// empirically).
 async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider<DbError>>) {
     // Repeated trials: the invariant must hold under real concurrent load,
     // not just one sample.
     const TRIALS: usize = 8;
+    install_retry_diagnostics();
     let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
@@ -430,7 +542,7 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
     let mut correctly_rejected = 0usize; // one Ok + one Err(TenantIncompatibility)
     let mut unexpected = 0usize;
 
-    for _ in 0..TRIALS {
+    for trial in 0..TRIALS {
         let tenant_a = Uuid::now_v7();
         let tenant_b = Uuid::now_v7();
         let ctx_a = common::make_ctx(tenant_a);
@@ -453,11 +565,11 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
         let (rt1, rt2) = (member_type.code.clone(), member_type.code.clone());
         let (rid1, rid2) = (resource_id.clone(), resource_id.clone());
 
-        let t1 = tokio::spawn(async move {
+        let t1 = spawn_race_task("tenant_a", trial, async move {
             b1.wait().await;
             svc1.add_membership(&ctx_a, group_a.id, &rt1, &rid1).await
         });
-        let t2 = tokio::spawn(async move {
+        let t2 = spawn_race_task("tenant_b", trial, async move {
             b2.wait().await;
             svc2.add_membership(&ctx_b, group_b.id, &rt2, &rid2).await
         });
