@@ -162,6 +162,32 @@ fn retry_backoff_delay(next_attempt: u32) -> Duration {
     jitter(base)
 }
 
+/// Where inside a transaction attempt an error originated.
+///
+/// Exists only so [`Db::transaction_with_retry_max`]'s give-up diagnostics
+/// can answer "did this fail inside the transactional work, or at commit?"
+/// -- the two are indistinguishable from the returned error type `E` alone,
+/// since both surface as a plain `Err(e)` to the caller.
+#[derive(Clone, Copy, Debug)]
+enum TxPhase {
+    /// `BEGIN` (or `BEGIN ... ISOLATION LEVEL ...`) itself failed.
+    Begin,
+    /// The transaction body closure returned `Err`.
+    Body,
+    /// The body succeeded but `COMMIT` failed.
+    Commit,
+}
+
+impl std::fmt::Display for TxPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Begin => "begin",
+            Self::Body => "body",
+            Self::Commit => "commit",
+        })
+    }
+}
+
 // Task-local guard to detect transaction bypass attempts.
 //
 // When set to `true`, any call to `Db::conn()` will fail with
@@ -458,6 +484,31 @@ impl Db {
             + Send,
         T: Send + 'static,
     {
+        self.transaction_ref_mapped_with_config_tagged(tx_config, f)
+            .await
+            .map_err(|(e, _phase)| e)
+    }
+
+    /// Like [`Self::transaction_ref_mapped_with_config`], but also reports
+    /// *where* in the transaction lifecycle the error came from.
+    ///
+    /// Exists solely so [`Self::transaction_with_retry_max`] can distinguish
+    /// a body failure from a commit failure in its give-up diagnostics
+    /// without duplicating the begin/run/commit sequence --
+    /// `transaction_ref_mapped_with_config` above is now a thin wrapper
+    /// around this that discards the phase tag, so there is exactly one
+    /// place that knows how to run this sequence.
+    async fn transaction_ref_mapped_with_config_tagged<F, T, E>(
+        &self,
+        tx_config: TxConfig,
+        f: F,
+    ) -> Result<T, (E, TxPhase)>
+    where
+        E: From<DbError> + Send + 'static,
+        F: for<'a> FnOnce(&'a DbTx<'a>) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>
+            + Send,
+        T: Send + 'static,
+    {
         use sea_orm::{AccessMode, IsolationLevel};
 
         let isolation: Option<IsolationLevel> = tx_config.isolation.map(Into::into);
@@ -469,20 +520,21 @@ impl Db {
             .begin_with_config(isolation, access_mode)
             .await
             .map_err(DbError::from)
-            .map_err(E::from)?;
+            .map_err(E::from)
+            .map_err(|e| (e, TxPhase::Begin))?;
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
         let res = with_tx_guard(f(&tx)).await;
 
         match res {
-            Ok(v) => {
-                txn.commit().await.map_err(DbError::from).map_err(E::from)?;
-                Ok(v)
-            }
+            Ok(v) => match txn.commit().await {
+                Ok(()) => Ok(v),
+                Err(commit_err) => Err((E::from(DbError::from(commit_err)), TxPhase::Commit)),
+            },
             Err(e) => {
                 _ = txn.rollback().await;
-                Err(e)
+                Err((e, TxPhase::Body))
             }
         }
     }
@@ -589,6 +641,24 @@ impl Db {
     /// for tests and for the rare case where a service has a justified reason
     /// to deviate from the workspace-wide default.
     ///
+    /// # Give-up diagnostics
+    ///
+    /// Both ways this can give up and return `Err` -- exhausting the attempt
+    /// budget on a recognized contention error, and receiving a database
+    /// error that [`crate::contention::is_retryable_contention`] does *not*
+    /// recognize as retryable -- look identical to a caller (a plain `Err`),
+    /// but have different fixes (raise the budget / investigate contention
+    /// vs. extend the contention classifier). To make them distinguishable
+    /// without changing the returned value, both emit a structured
+    /// [`tracing`] event (`ERROR` for budget exhaustion, `WARN` for an
+    /// unrecognized error) carrying the attempt number, the budget, the
+    /// backend, the `retryable` flag, which phase of the transaction failed
+    /// (begin/body/commit), `SeaORM`'s best-effort `sql_err()` classification,
+    /// and the underlying `DbErr`'s message. Only emitted when
+    /// `extract_db_err` actually found a `DbErr` -- a plain non-database
+    /// domain error was never a retry candidate, so logging it here on every
+    /// occurrence would drown both outcomes above in noise.
+    ///
     /// # Errors
     ///
     /// Returns `E` if the transaction fails (after retries) or if any
@@ -613,13 +683,14 @@ impl Db {
 
         loop {
             let result = self
-                .transaction_ref_mapped_with_config(tx_config.clone(), |tx| body(tx))
+                .transaction_ref_mapped_with_config_tagged(tx_config.clone(), |tx| body(tx))
                 .await;
 
             match result {
                 Ok(value) => return Ok(value),
-                Err(e) => {
-                    let retryable = extract_db_err(&e).is_some_and(|db_err| {
+                Err((e, phase)) => {
+                    let db_err = extract_db_err(&e);
+                    let retryable = db_err.is_some_and(|db_err| {
                         crate::contention::is_retryable_contention(backend, db_err)
                     });
                     if retryable && attempt < max {
@@ -638,6 +709,56 @@ impl Db {
                         attempt = next_attempt;
                         continue;
                     }
+
+                    // Giving up. `e` is returned unchanged below -- this
+                    // block only *observes* the decision already made
+                    // above, it never changes it (no behavior/backoff
+                    // change here, diagnostics only).
+                    //
+                    // Only a recognized database error is worth a give-up
+                    // event: a plain domain error unrelated to the database
+                    // (validation failure, not-found, ...) was never a retry
+                    // candidate in the first place -- logging every such
+                    // exit here would drown the two outcomes this exists to
+                    // make visible in routine noise.
+                    if let Some(db_err) = db_err {
+                        if retryable {
+                            // attempt >= max here: this *was* a recognized
+                            // contention error, but the budget ran out
+                            // before another attempt was possible -- the
+                            // scenario `retry_backoff_delay`'s doc comment
+                            // diagnosed (and this backoff was meant to
+                            // prevent) for
+                            // `membership_first_write_race_exactly_one_tenant_wins`.
+                            tracing::error!(
+                                attempt,
+                                max_attempts = max,
+                                backend = ?backend,
+                                phase = %phase,
+                                retryable,
+                                sql_err = ?db_err.sql_err(),
+                                error = %db_err,
+                                "transaction retry budget exhausted"
+                            );
+                        } else {
+                            // `is_retryable_contention` looked at this exact
+                            // error and said no. Distinct from budget
+                            // exhaustion above: the fix here, if any, is in
+                            // that classifier, not in the attempt budget or
+                            // backoff.
+                            tracing::warn!(
+                                attempt,
+                                max_attempts = max,
+                                backend = ?backend,
+                                phase = %phase,
+                                retryable,
+                                sql_err = ?db_err.sql_err(),
+                                error = %db_err,
+                                "transaction failed with a database error not recognized as retryable"
+                            );
+                        }
+                    }
+
                     return Err(e);
                 }
             }
