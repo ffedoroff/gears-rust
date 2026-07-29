@@ -224,24 +224,23 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     ) -> Result<ResourceGroupMembership, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-3
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-4
-        // AuthZ gate (VHP-2341): the target group must be inside the
-        // caller's scope *before* touching its raw model below. Mirrors
-        // `group_service.rs::update_group_inner`'s two-step pattern: a
-        // scoped `find_by_id` acts purely as a gate (its resolved SDK model
-        // is discarded) so a group belonging to another tenant returns
-        // `GroupNotFound` -- identical to a group that doesn't exist at
-        // all, never a distinguishable "forbidden". Runs inside this
-        // transaction (not before it), per VHP-2341's requirement that the
-        // gate share the SERIALIZABLE isolation the rest of the check
-        // sees.
-        group_repo
-            .find_by_id(tx, scope, group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound { id: group_id })?;
-
-        // Verify the group exists and get its type info
+        // AuthZ gate (VHP-2341) + raw model read, in one query
+        // (N+1 audit finding (a)): the target group must be inside the
+        // caller's scope before its raw model is used below, but the gate
+        // doesn't need a resolved SDK model (with its type path), only the
+        // raw row -- which is exactly what the rest of this function needs
+        // anyway. `find_model_by_id_scoped` is `find_by_id`'s query
+        // (`SELECT resource_group ... AND` the scope's tenant condition)
+        // without the unconditional `resolve_type_path` follow-up, so a
+        // group belonging to another tenant still resolves to `None` here
+        // (-> `GroupNotFound`, identical to a group that doesn't exist at
+        // all, never a distinguishable "forbidden") -- but the previous
+        // separate `find_by_id` (gate) + `find_model_by_id` (raw read) pair
+        // collapses into this single call. Runs inside this transaction
+        // (not before it), per VHP-2341's requirement that the gate share
+        // the SERIALIZABLE isolation the rest of the check sees.
         let group_model = group_repo
-            .find_model_by_id(tx, group_id)
+            .find_model_by_id_scoped(tx, scope, group_id)
             .await?
             .ok_or(DomainError::GroupNotFound { id: group_id })?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-4
@@ -402,14 +401,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         resource_type: &str,
         resource_id: &str,
     ) -> Result<(), DomainError> {
-        // AuthZ gate (VHP-2341): same two-step gate as `add_membership_in_tx`
-        // -- the group is not otherwise looked up at all on this path (the
-        // delete below goes straight to `membership_repo` by composite key),
-        // so without this the caller could delete memberships out of a
-        // group belonging to any tenant. A group outside scope reports
-        // `GroupNotFound`, matching a nonexistent group.
+        // AuthZ gate (VHP-2341): same gate as `add_membership_in_tx`, via
+        // `find_model_by_id_scoped` -- the group is not otherwise looked up
+        // at all on this path (the delete below goes straight to
+        // `membership_repo` by composite key), so without this the caller
+        // could delete memberships out of a group belonging to any tenant.
+        // A group outside scope reports `GroupNotFound`, matching a
+        // nonexistent group. Unlike `add_membership_in_tx`, the raw model
+        // itself is never needed here, only the existence/visibility check
+        // -- but `find_model_by_id_scoped` is still the cheaper call: it
+        // skips `find_by_id`'s unconditional `resolve_type_path` query,
+        // which this gate never used anyway (N+1 audit finding (a)).
         group_repo
-            .find_by_id(tx, scope, group_id)
+            .find_model_by_id_scoped(tx, scope, group_id)
             .await?
             .ok_or(DomainError::GroupNotFound { id: group_id })?;
 

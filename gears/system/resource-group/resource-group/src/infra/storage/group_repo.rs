@@ -347,6 +347,30 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))
     }
 
+    /// Find the raw entity model by ID, filtered to `scope`.
+    ///
+    /// Same query shape as `find_by_id` (`SELECT resource_group ... AND`
+    /// the scope's tenant condition), but skips the unconditional
+    /// `resolve_type_path` follow-up `find_by_id` always pays for --
+    /// callers that only need an `AuthZ` visibility gate plus the raw model
+    /// (e.g. `add_membership_in_tx`/`remove_membership_in_tx`) get both
+    /// from this single query instead of `find_by_id` + `find_model_by_id`
+    /// (VHP-2341 audit finding (a)).
+    async fn find_model_by_id_scoped<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError> {
+        ResourceGroupEntity::find()
+            .filter(rg_entity::Column::Id.eq(id))
+            .secure()
+            .scope_with(scope)
+            .one(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))
+    }
+
     /// Return the id of any existing root group (`parent_id IS NULL`) whose
     /// `gts_type.schema_id` starts with the given prefix, or `None` when no
     /// such root exists. Used to enforce tenant-root uniqueness.

@@ -501,19 +501,47 @@ async fn trace_add_membership() {
          {membership_selects}:\n{}",
         rec.dump()
     );
-    // VHP-2341 baseline update: 2 resource_group SELECTs, not 1. The new
-    // AuthZ tenant-scope gate (`group_repo.find_by_id(tx, scope, group_id)`
-    // in `add_membership_in_tx`) adds exactly one extra scoped SELECT ahead
-    // of the pre-existing raw `find_model_by_id` read -- a single query, not
-    // a loop, so it doesn't regress RG-01's shape. Before VHP-2341 this was
-    // 1 (`find_model_by_id` only, no tenant gate existed).
+    // N+1 audit finding (a) fix: exactly 1 resource_group SELECT, not 2.
+    // Before this fix, `add_membership_in_tx` paid for the VHP-2341
+    // AuthZ tenant-scope gate (`group_repo.find_by_id`, a scoped SELECT
+    // resource_group + an unconditional `resolve_type_path` SELECT
+    // gts_type whose result the gate never used) *and* a separate
+    // `find_model_by_id` raw re-read of the same row -- 2 resource_group
+    // SELECTs + 1 wasted gts_type SELECT for what is logically one lookup.
+    // `find_model_by_id_scoped` now does the scope check and the raw read
+    // in a single scoped SELECT, with no `resolve_type_path` follow-up.
     let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
     assert_eq!(
         rg_selects,
-        2,
-        "VHP-2341 regression: expected exactly 2 resource_group SELECTs (the \
-         AuthZ tenant-scope gate's find_by_id + the existing find_model_by_id), \
-         got {rg_selects}:\n{}",
+        1,
+        "N+1 audit finding (a) regression: expected exactly 1 resource_group SELECT \
+         (find_model_by_id_scoped doing the gate + the raw read together), got \
+         {rg_selects}:\n{}",
+        rec.dump()
+    );
+    // Same fix, the other side of it: gts_type SELECTs drop from 4 to 3 --
+    // `resolve_id` for `resource_type` (1), `load_full_type_by_id`'s own
+    // id lookup (1), and its `allowed_membership_types` id->code batch
+    // resolution (1). The gate's `resolve_type_path` SELECT (the 4th, now
+    // eliminated) never contributed to any of those three.
+    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
+    assert_eq!(
+        type_selects,
+        3,
+        "N+1 audit finding (a) regression: expected exactly 3 gts_type SELECTs \
+         (resolve_id + load_full_type_by_id + allowed_membership_types batch, no \
+         gate-only resolve_type_path), got {type_selects}:\n{}",
+        rec.dump()
+    );
+    // Total statement count: 9, matching the pre-VHP-2341 baseline (the
+    // tenant gate is now free -- it rides along on find_model_by_id_scoped
+    // instead of adding 2 extra statements on top).
+    assert_eq!(
+        rec.total(),
+        9,
+        "N+1 audit finding (a) regression: expected 9 total statements (back to \
+         the pre-VHP-2341-gate baseline), got {}:\n{}",
+        rec.total(),
         rec.dump()
     );
 }
@@ -549,18 +577,46 @@ async fn trace_remove_membership() {
         "remove_membership must run its writes inside a transaction:\n{}",
         rec.dump()
     );
-    // VHP-2341 baseline update: exactly 1 resource_group SELECT, where there
-    // were 0 before this fix. `remove_membership_in_tx` never looked up the
-    // group at all pre-fix (it went straight to `membership_repo` by
-    // composite key); the new AuthZ tenant-scope gate
-    // (`group_repo.find_by_id(tx, scope, group_id)`) adds exactly this one
-    // scoped SELECT, not a loop.
+    // VHP-2341 baseline: exactly 1 resource_group SELECT, where there were 0
+    // before that fix. `remove_membership_in_tx` never looked up the group
+    // at all pre-VHP-2341 (it went straight to `membership_repo` by
+    // composite key); the AuthZ tenant-scope gate adds exactly this one
+    // scoped SELECT, not a loop. Unchanged by the N+1 audit finding (a)
+    // fix below -- `find_by_id` already cost exactly 1 resource_group
+    // SELECT here (the wasted query it also made was against `gts_type`,
+    // asserted separately).
     let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
     assert_eq!(
         rg_selects,
         1,
         "VHP-2341 regression: expected exactly 1 resource_group SELECT (the \
-         AuthZ tenant-scope gate's find_by_id), got {rg_selects}:\n{}",
+         AuthZ tenant-scope gate), got {rg_selects}:\n{}",
+        rec.dump()
+    );
+    // N+1 audit finding (a) fix: exactly 1 gts_type SELECT (from
+    // `resolve_id` for `resource_type`), not 2. Before this fix, the gate
+    // was `group_repo.find_by_id`, which -- on top of the resource_group
+    // SELECT above -- always paid for an unconditional `resolve_type_path`
+    // SELECT gts_type whose result the gate never used (this path doesn't
+    // need the group's type at all). `find_model_by_id_scoped` does the
+    // same gate with no such follow-up.
+    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
+    assert_eq!(
+        type_selects,
+        1,
+        "N+1 audit finding (a) regression: expected exactly 1 gts_type SELECT \
+         (resolve_id for resource_type only, no gate-only resolve_type_path), got \
+         {type_selects}:\n{}",
+        rec.dump()
+    );
+    // Total statement count: 4 (1 resource_group gate + 1 gts_type resolve +
+    // 1 resource_group_membership existence check + 1 DELETE), down from 5
+    // before the finding (a) fix removed the wasted gts_type SELECT.
+    assert_eq!(
+        rec.total(),
+        4,
+        "N+1 audit finding (a) regression: expected 4 total statements, got {}:\n{}",
+        rec.total(),
         rec.dump()
     );
 }
@@ -931,6 +987,177 @@ async fn scale_force_delete_statements_do_not_grow_with_subtree_size() {
         small, large,
         "force-delete total statement count must not scale with subtree size \
          (small={small} at N=3, large={large} at N=15)"
+    );
+}
+
+/// N+1 audit finding (b) guard: `gts_type` SELECTs for a `type in (...)`
+/// `$filter` on `list_groups`, with `n` values in the list. No groups of
+/// any of these types are created -- this isolates
+/// `resolve_type_filter_node`'s own query cost from `resolve_type_paths_batch`'s
+/// (which would otherwise also touch `gts_type` once per page, but is
+/// skipped entirely when the page is empty).
+async fn gts_type_selects_for_list_groups_type_in_filter(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let mut codes = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = common::create_root_type(&type_svc, &format!("infiltn{i}")).await;
+        codes.push(t.code);
+    }
+
+    rec.clear();
+    let quoted: Vec<String> = codes.iter().map(|c| format!("'{c}'")).collect();
+    let parsed = toolkit_odata::parse_filter_string(&format!("type in ({})", quoted.join(", ")))
+        .expect("parse type in-list filter");
+    let query = toolkit_odata::ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = group_svc
+        .list_groups(&ctx, &query)
+        .await
+        .expect("list_groups with a type in-list filter should succeed");
+    assert_eq!(
+        page.items.len(),
+        0,
+        "no groups were created of these types, only the types themselves"
+    );
+
+    count_in(&rec.stats(), QueryKind::Select, "gts_type")
+}
+
+#[tokio::test]
+async fn scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_value_count() {
+    // resolve_type_filter_node batches every literal in a `type in (...)`
+    // filter into one `WHERE schema_id IN (...)` query (N+1 audit finding
+    // (b)) instead of one `resolve_id` round trip per value (pre-fix:
+    // N=3 -> 4 gts_type SELECTs, N=20 -> 21, slope 1.0).
+    let small = gts_type_selects_for_list_groups_type_in_filter(3).await;
+    let large = gts_type_selects_for_list_groups_type_in_filter(20).await;
+    assert_eq!(
+        small, large,
+        "gts_type SELECT count for a `type in (...)` filter on list_groups must \
+         not scale with the number of values in the list (small={small} at N=3, \
+         large={large} at N=20)"
+    );
+}
+
+/// Same guard as the one above, but through `list_memberships`'s
+/// `resource_type in (...)` filter -- `MembershipRepository::list_memberships`
+/// calls the exact same `resolve_type_filter_node` (VHP-1954/VHP-1731), so
+/// this is a second call site for the same fix, not a second
+/// implementation of it.
+async fn gts_type_selects_for_list_memberships_resource_type_in_filter(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let membership_svc = common::make_membership_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let mut member_type_codes = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = common::create_root_type(&type_svc, &format!("mifiltn{i}")).await;
+        member_type_codes.push(t.code);
+    }
+    let grp_type = create_type_with_memberships(
+        &type_svc,
+        "mifiltgrp",
+        &member_type_codes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant_id).await;
+
+    rec.clear();
+    let quoted: Vec<String> = member_type_codes.iter().map(|c| format!("'{c}'")).collect();
+    let parsed =
+        toolkit_odata::parse_filter_string(&format!("resource_type in ({})", quoted.join(", ")))
+            .expect("parse resource_type in-list filter");
+    let query = toolkit_odata::ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = membership_svc
+        .list_memberships(&ctx, &query)
+        .await
+        .expect("list_memberships with a resource_type in-list filter should succeed");
+    assert_eq!(
+        page.items.len(),
+        0,
+        "no memberships were added -- {} exists only to make the group's type valid",
+        group.id
+    );
+
+    count_in(&rec.stats(), QueryKind::Select, "gts_type")
+}
+
+#[tokio::test]
+async fn scale_list_memberships_resource_type_in_filter_gts_type_selects_do_not_grow_with_value_count()
+ {
+    // Same fix as `scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_value_count`,
+    // exercised through the other call site of `resolve_type_filter_node`
+    // (N+1 audit finding (b): this path was affected by the same defect,
+    // and picked it up for free from the shared tree-walk generalization
+    // in fe2d609e).
+    let small = gts_type_selects_for_list_memberships_resource_type_in_filter(3).await;
+    let large = gts_type_selects_for_list_memberships_resource_type_in_filter(20).await;
+    assert_eq!(
+        small, large,
+        "gts_type SELECT count for a `resource_type in (...)` filter on \
+         list_memberships must not scale with the number of values in the list \
+         (small={small} at N=3, large={large} at N=20)"
+    );
+}
+
+/// N+1 audit finding (b) guard, second half: `update_type`'s total
+/// statement count when removing `n` allowed-parent-types at once, none of
+/// which are actually in use by any group (so the safety check runs to
+/// completion for all of them instead of early-returning on the first
+/// violation).
+async fn total_statements_for_update_type_removing_n_parents(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+
+    let mut parent_codes = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = common::create_root_type(&type_svc, &format!("rmpar{i}")).await;
+        parent_codes.push(t.code);
+    }
+    let parent_refs: Vec<&str> = parent_codes.iter().map(String::as_str).collect();
+    let child_type = common::create_child_type(&type_svc, "rmchild", &parent_refs, &[]).await;
+
+    rec.clear();
+    type_svc
+        .update_type_unscoped(
+            &child_type.code,
+            UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("update_type removing all N allowed parents should succeed (unused by any group)");
+    rec.total()
+}
+
+#[tokio::test]
+async fn scale_update_type_removed_parents_statements_do_not_grow_with_count() {
+    // check_hierarchy_safety batches the resolve + violating-group lookup
+    // for every removed parent type into a small constant number of
+    // queries (N+1 audit finding (b)) instead of one resolve_id + one
+    // single-parent lookup *per* removed parent (pre-fix: N=3 -> 16 total,
+    // N=20 -> 50, slope 2.0).
+    let small = total_statements_for_update_type_removing_n_parents(3).await;
+    let large = total_statements_for_update_type_removing_n_parents(20).await;
+    assert_eq!(
+        small, large,
+        "update_type's total statement count when removing N allowed parent \
+         types must not scale with N (small={small} at N=3, large={large} at N=20)"
     );
 }
 
