@@ -249,7 +249,7 @@ Caller: subject_tenant_id = T1
 ```
 - AccessScope: `{tenant_id IN (T1)}` — T7 excluded by TR/AuthZ.
 - `GET /groups`: sees D2, B3. Does NOT see T7, D8, or R8.
-- `GET /groups/{T1}/hierarchy`: sees T1, D2, B3. Does NOT see T7 or D8.
+- `GET /groups/{T1}/descendants`: sees T1, D2, B3. Does NOT see T7 or D8.
 
 **Scenario 2: Barrier tenant reads own data**
 ```
@@ -322,11 +322,16 @@ A type includes:
 
 **Actors**: `cpt-cf-resource-group-actor-instance-administrator`, `cpt-cf-resource-group-actor-apps`
 
-The gear **MUST** validate type code format:
+The gear **MUST** validate type code format. A code is first *canonicalized* — trimmed and lowercased — and the canonical form is what gets persisted, looked up and prefix-tested; callers never keep their raw input. The canonical form **MUST** then satisfy:
 
-- length `1..63`
-- no whitespace
-- case-insensitive uniqueness
+- non-empty
+- starts with the RG type-registry prefix `gts.cf.core.rg.type.v1~`
+- length at most **1024** characters, matching the `gts_type_path` domain's `CHECK (LENGTH(VALUE) <= 1024)`
+- structurally valid GTS: every `~`-delimited segment parses as `vendor.package.namespace.type.vMAJOR[.MINOR]`. This is delegated to the canonical parser (`GtsTypePath` → `gts::GtsId::try_new`), and it is what rejects whitespace, hyphens, wrong token counts and bare instance ids — there is no separate "no whitespace" rule
+
+Because lookups canonicalize the same way, uniqueness is **case-insensitive in effect**: `…v1~Course` and `…v1~course` are the same type, and the second create is a `TypeAlreadyExists`. The underlying `schema_id` unique constraint is byte-exact; normalization, not the constraint, provides the case folding.
+
+Membership resource types (`allowed_memberships`, and the `resource_type` path segment) are canonicalized and parsed as concrete GTS ids too, but are **not** required to carry the RG prefix — they name external domain types such as `gts.cf.core.idp.user.v1~`. Wildcard patterns are rejected.
 
 Invalid input **MUST** return validation error with field-specific details.
 
@@ -348,11 +353,19 @@ Type data seeding (populating type definitions) is **optional** and deployment-s
 - manual database administration
 - RG API calls
 
+> **Notation used from here on.** Short names such as `tenant`, `department`, `branch`, `team` and
+> `User` appear throughout this document as **readability aliases**, not as literal wire values. A real
+> type code is a full GTS path — `TENANT_RG_TYPE_PATH` for the tenant type (expanded once, in
+> [ADR-001](./ADR/ADR-001-gts-type-system.md#the-tenant-type-path-is-a-code-constant-not-a-documentation-choice)),
+> `gts.cf.core.idp.user.v1~` for the user resource type — and a bare `tenant` fails validation with a
+> 400 (missing RG prefix, and not a parsable GTS segment; see § "Validate Type Code Format"). Read
+> `tenant` below as "the type whose code is the tenant GTS path".
+
 AuthZ deployment determines which types are needed:
 
 - **AuthZ does not use RG** — no type seeding required.
-- **Flat tenants** — create type `tenant` with `can_be_root: true, allowed_parents: {}` (root placement only, no nesting).
-- **Hierarchical tenants** — create type `tenant` with for example `can_be_root: true, allowed_parents: {'tenant'}` (root placement or nested under another tenant).
+- **Flat tenants** — create the tenant type with `can_be_root: true, allowed_parents: {}` (root placement only, no nesting).
+- **Hierarchical tenants** — create the tenant type with for example `can_be_root: true, allowed_parents: {<the tenant type itself>}` (root placement or nested under another tenant).
 
 #### Validate Type Update Against Existing Hierarchy
 
@@ -383,9 +396,11 @@ The gear **MUST** provide API operations for:
 
 - create entity
 - retrieve entity by ID
-- full update of mutable fields via PUT (`name`, `type`, `metadata`)
-- move entity to new parent (subtree move)
+- full update of the entity's **ordinary attributes** via `PUT /groups/{group_id}` — `name` and `metadata`, and nothing else. Both keys are mandatory: an omitted key is a validation error, not "keep the stored value" (send `"metadata": null` to clear it), and unknown keys are rejected rather than dropped
+- move entity to a new parent, or to the forest root, via `POST /groups/{group_id}/move` with body `{ "parent_id": <uuid|null> }` — the key is mandatory and an explicit `null` means "become a root". This carries the whole subtree and is atomic: cycle detection, parent-type compatibility, `max_depth`/`max_width`, tenant-root uniqueness and the closure-table rebuild all run in one `SERIALIZABLE` transaction, so a group is never left detached from both parents. Cross-tenant moves are rejected
 - delete entity
+
+An entity's `type` is **immutable after creation.** It appears in create requests and in every response, but in no update payload: re-typing a group would invalidate its own placement, its children's placements and possibly its tenant identity all at once, so the supported migration is delete-and-recreate. Re-parenting is likewise not a field on `PUT` — it is the separate `move` operation above, because it is a structural mutation with cross-row invariants rather than a column write.
 
 Entity fields (GTS-aligned naming):
 
@@ -584,7 +599,12 @@ List endpoints **MUST** support:
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-list-groups-depth`
 
-A dedicated group hierarchy endpoint (`/groups/{group_id}/hierarchy`) **MUST** return groups with a computed `hierarchy.depth` field (relative distance from reference group) and support depth-based filtering via OData nested path `hierarchy/depth` (`eq`, `ne`, `gt`, `ge`, `lt`, `le`). Positive depth = descendants, negative depth = ancestors, `0` = reference group itself.
+Two dedicated hierarchy endpoints **MUST** return groups with a computed `hierarchy.depth` field — the relative distance from the reference group, where `0` is the reference group itself, positive depths are descendants and negative depths are ancestors:
+
+- `GET /groups/{group_id}/descendants` — the reference group and everything below it (`depth ≥ 0`)
+- `GET /groups/{group_id}/ancestors` — the reference group and each level up towards the root (`depth ≤ 0`)
+
+Both **MUST** support depth-based filtering via the OData nested path `hierarchy/depth` (`eq`, `ne`, `gt`, `ge`, `lt`, `le`) and cursor pagination (`limit`, `cursor`). The direction is chosen by the route, not by the filter; the two overlap only on the `depth = 0` row, so ask for the pair when a caller needs the whole vertical line through a group. Ordering on these routes is fixed (`depth`, then `id`) and `$orderby` does not apply. There is deliberately no aggregating `/groups/{group_id}/hierarchy` endpoint.
 
 #### Force Delete
 
@@ -659,10 +679,10 @@ Every public RG REST/gRPC endpoint authenticates via JWT bearer token and goes t
 
 In addition to JWT, RG REST API will support an MTLS path:
 
-**MTLS (private, hierarchy endpoint only)**: service-to-service requests via mutual TLS client certificate. Used by AuthZ plugin to read tenant hierarchy. Only `GET /groups/{group_id}/hierarchy` is allowed — all other endpoints return `403 Forbidden`. MTLS requests **bypass AuthZ evaluation entirely** because:
+**MTLS (private, hierarchy endpoints only)**: service-to-service requests via mutual TLS client certificate. Used by AuthZ plugin to read tenant hierarchy. Only `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors` are allowed — all other endpoints return `403 Forbidden`. MTLS requests **bypass AuthZ evaluation entirely** because:
 - AuthZ plugin is the caller and cannot evaluate itself (circular dependency)
 - MTLS certificate identity is a trusted system principal
-- Single read-only endpoint — minimal attack surface
+- Read-only hierarchy reads only — minimal attack surface
 
 In monolith deployment, AuthZ uses `ResourceGroupReadHierarchy` via in-process ClientHub — no network, no MTLS, type system enforces hierarchy-only access. In a future microservice deployment (`p2`), the same trait will be backed by an MTLS-authenticated gRPC/REST call.
 
@@ -1107,7 +1127,7 @@ See `cpt-cf-resource-group-fr-jwt-auth` in section 5.9 for the implemented JWT a
 
 - **GIVEN** caller authenticates via MTLS client certificate
 - **WHEN** caller sends request to `POST /api/resource-group/v1/groups` (non-hierarchy endpoint)
-- **THEN** `403 Forbidden` — MTLS mode only allows `GET /groups/{group_id}/hierarchy`
+- **THEN** `403 Forbidden` — MTLS mode only allows `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors`
 
 ## 9. Acceptance Criteria
 
@@ -1154,7 +1174,12 @@ See `cpt-cf-resource-group-fr-jwt-auth` in section 5.9 for the implemented JWT a
 
 - Should delete behavior support both `leaf-only` and `subtree-cascade` modes in v1? (REST API defines `force` query parameter for cascade control.) **Owner**: platform team. **Target**: resolve before DECOMPOSITION.
 - Should `resource_group_membership` be partitioned for production scale (projected 455M rows, ~110 GB)? Partitioning strategy needs evaluation since tenant scope is derived via group FK, not stored directly. **Owner**: platform team. **Target**: resolve before production deployment.
-- Should RG type `code` and membership `resource_type` be validated against GTS (Global Type System)? Current design: both are free-form strings with no external validation. Proposed alternative: validate that values correspond to registered GTS types at write time (type create/update for `code`, membership add for `resource_type`), keeping all other behavior unchanged (local storage, no runtime GTS dependency for reads). The case is stronger for `resource_type` — it references external domain entities (e.g., "User", "Document") that likely already exist as GTS types, and without validation nothing prevents typos or inconsistent naming. For `code`, the case is weaker — RG defines its own type topology, not referencing external concepts. Trade-offs: GTS validation adds governance and cross-gear type consistency, but introduces seed ordering dependency (types-registry must be available before RG writes), and adds a soft dependency on types-registry availability for write operations. Current recommendation: defer until cross-gear type reuse creates an actual governance need; `resource_type` validation is a stronger candidate to adopt first. **Owner**: platform team. **Target**: revisit when other gears begin referencing the same type codes or resource types.
+- ~~Should RG type `code` and membership `resource_type` be validated against GTS (Global Type System)?~~ **Resolved: yes, and it is implemented — neither is a free-form string any more.** The two are validated at different points, which is worth stating precisely:
+  - **Type `code`**, on type create: `validation::canonical_type_code` canonicalizes (trim + lowercase), requires the RG prefix, caps length at 1024, and parses the full segment structure through `GtsTypePath` → `gts::GtsId::try_new`. See § "Validate Type Code Format".
+  - **`allowed_memberships` entries**, on type create/update: `validation::canonical_membership_type_code` — the same structural parse, without the RG-prefix requirement (they name external domain types), and wildcard patterns are rejected because the junction table stores a FK to a concrete type row.
+  - **`resource_type` on membership add/remove**: canonicalized only, deliberately *not* re-parsed. It must resolve to a registered RG type row that the target group's type lists in `allowed_memberships`; a typo therefore stays an "unknown resource type" validation error rather than becoming a syntax complaint.
+
+  What was *not* adopted: RG validates the identifier's format and structure locally and takes no runtime dependency on types-registry to do it, so the seed-ordering and availability trade-offs weighed in this question never materialized. The only cross-gear lookup on a write path is `TypesRegistryClient::get_type_schema`, used for group `metadata` validation, and a missing schema there is treated as "nothing to validate" rather than an error.
 
 ## 14. Traceability
 

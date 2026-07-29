@@ -22,6 +22,7 @@ decision-makers: Constructor Fabric Steering Committee
 - [More Information](#more-information)
   - [Key Rules](#key-rules)
 - [Type Map](#type-map)
+  - [The tenant type path is a code constant, not a documentation choice](#the-tenant-type-path-is-a-code-constant-not-a-documentation-choice)
 - [Schemas](#schemas)
   - [RG Type Contract — `gts.cf.core.rg.type.v1~`](#rg-type-contract--gtscfcorergtypev1)
   - [Tenant — `gts.cf.core.tn.tenant.v1~`](#tenant--gtscfcoretntenantv1)
@@ -30,7 +31,7 @@ decision-makers: Constructor Fabric Steering Committee
   - [User — `gts.cf.core.idp.user.v1~`](#user--gtscfcoreidpuserv1)
   - [Course — `gts.cf.core.lms.course.v1~`](#course--gtscfcorelmscoursev1)
 - [Chained RG Type Schemas](#chained-rg-type-schemas)
-  - [Tenant as RG Type — `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`](#tenant-as-rg-type--gtscfcorergtypev1ycoretntenantv1)
+  - [Tenant as RG Type — `TENANT_RG_TYPE_PATH`](#tenant-as-rg-type--tenant_rg_type_path)
   - [Department as RG Type — `gts.cf.core.rg.type.v1~w.core.org.department.v1~`](#department-as-rg-type--gtscfcorergtypev1wcoreorgdepartmentv1)
   - [Branch as RG Type — `gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~`](#branch-as-rg-type--gtscfcorergtypev1cfcorergbranchv1)
 - [Instance Examples](#instance-examples)
@@ -38,7 +39,7 @@ decision-makers: Constructor Fabric Steering Committee
   - [Department D2 (under T1)](#department-d2-under-t1)
   - [Branch B3 (under D2)](#branch-b3-under-d2)
   - [Nested Tenant T7 (barrier, under T1)](#nested-tenant-t7-barrier-under-t1)
-  - [Root Tenant T9 (custom domain)](#root-tenant-t9-custom-domain)
+  - [Sibling Tenant T9 (custom domain, under T1)](#sibling-tenant-t9-custom-domain-under-t1)
   - [Department D8 (under T7)](#department-d8-under-t7)
 - [Example Hierarchy](#example-hierarchy)
 - [DB Schema Summary](#db-schema-summary)
@@ -142,9 +143,38 @@ Chosen option: "GTS with traits pattern", because it is the only option that pro
 | `gts.cf.core.rg.branch.v1~` | entity type | ConstructorFabric |
 | `gts.cf.core.idp.user.v1~` | resource type | ConstructorFabric |
 | `gts.cf.core.lms.course.v1~` | resource type | ConstructorFabric |
-| `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` | chained RG type | y |
+| `TENANT_RG_TYPE_PATH` (see below) | chained RG type — **tenant** | ConstructorFabric |
 | `gts.cf.core.rg.type.v1~w.core.org.department.v1~` | chained RG type | w |
 | `gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~` | chained RG type | ConstructorFabric |
+
+### The tenant type path is a code constant, not a documentation choice
+
+Tenant-ness is **not** a trait and **not** a column. A type is a tenant type when its canonical code
+starts with the prefix held in `resource_group_sdk::TENANT_RG_TYPE_PATH`
+(`resource-group-sdk/src/gts.rs`); `validation::is_tenant_type_code` is the only test, and everything
+tenant-shaped hangs off it — `tenant_id = group.id` instead of the caller's tenant, tenant-root
+uniqueness (`TenantRootAlreadyExists`), the rejection of an explicit `tenant_id` on tenant-typed
+creates, and `rg-tr-plugin`'s tenant discovery filter.
+
+**Canonical expansion, stated once in this document:**
+
+```text
+TENANT_RG_TYPE_PATH = gts.cf.core.rg.type.v1~cf.core._.tenant.v1~
+```
+
+The leading `gts.` is `GTS_ID_PREFIX`, applied by `gts_id!` at compile time and configurable per
+build; the rest is the literal in the SDK. Everywhere below — headings, JSON snippets, instance
+examples — the placeholder `<TENANT_RG_TYPE_PATH>` stands for that expansion. Substitute the constant,
+do not re-type the string: a deployment that registers a *near-miss* path gets an ordinary group with
+the caller's `tenant_id` and no root-uniqueness check, silently and with no error anywhere.
+
+> **Superseded illustration.** Earlier revisions of this ADR named the tenant type
+> `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`, with `y` as a placeholder vendor. That path differs
+> from the constant in both vendor (`y` vs `cf`) and namespace (`tn` vs `_`), so it does **not** match
+> the prefix and is not a tenant type as far as RG is concerned. It survives as test data in
+> types-registry's `rg_gts_type_system_tests.rs`, which exercises GTS schema composition (`allOf`,
+> `$ref`, `x-gts-traits`) and never consults RG's tenant classification — so that suite is unaffected
+> by this correction and is deliberately left alone.
 
 ## Schemas
 
@@ -316,11 +346,11 @@ Base contract for all RG type definitions. Traits define topology rules; propert
 
 When a type is registered as an RG type, it chains with the base contract via a **single `$ref`** and provides: (1) trait values via `x-gts-traits`, and (2) type-specific fields via inline `properties.metadata` override. Entity schemas (e.g. `gts.cf.core.tn.tenant.v1~`) are registered in GTS for reference but are **NOT `$ref`'d** from chained types — the `metadata` properties are defined inline. The `metadata` sub-object uses `additionalProperties: false` to reject unknown fields (see [Finding 3](#finding-3-entity-specific-field-validation-at-gts-level-via-metadata-object)).
 
-### Tenant as RG Type — `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`
+### Tenant as RG Type — `TENANT_RG_TYPE_PATH`
 
 ```json
 {
-  "$id": "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~",
+  "$id": "gts://<TENANT_RG_TYPE_PATH>",
   "$schema": "http://json-schema.org/draft-07/schema#",
   "allOf": [
     { "$ref": "gts://gts.cf.core.rg.type.v1~" },
@@ -337,7 +367,7 @@ When a type is registered as an RG type, it chains with the base contract via a 
       },
       "x-gts-traits": {
         "can_be_root": true,
-        "allowed_parents": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
+        "allowed_parents": ["<TENANT_RG_TYPE_PATH>"],
         "allowed_memberships": ["gts.cf.core.idp.user.v1~"]
       }
     }
@@ -345,10 +375,10 @@ When a type is registered as an RG type, it chains with the base contract via a 
 }
 ```
 
-- Root: yes
+- Root: yes — but **at most one** tenant-typed group may be a forest root; a second one is rejected with `TenantRootAlreadyExists` (409)
 - Parents: self (tenant can nest under tenant)
 - Members: users
-- Instance `metadata` fields: `custom_domain` (hostname), `barrier` (boolean)
+- Instance `metadata` fields: `custom_domain` (hostname), `self_managed` (boolean)
 
 ### Department as RG Type — `gts.cf.core.rg.type.v1~w.core.org.department.v1~`
 
@@ -371,7 +401,7 @@ When a type is registered as an RG type, it chains with the base contract via a 
       },
       "x-gts-traits": {
         "can_be_root": false,
-        "allowed_parents": ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"],
+        "allowed_parents": ["<TENANT_RG_TYPE_PATH>"],
         "allowed_memberships": ["gts.cf.core.idp.user.v1~"]
       }
     }
@@ -421,12 +451,19 @@ When a type is registered as an RG type, it chains with the base contract via a 
 
 Instances are anonymous (UUID `id`, separate `type` field). Derived type fields are nested inside a `metadata` object; DB stores them in `metadata` JSONB.
 
+`tenant_id` in these examples is not supplied by the caller — it is derived. A group whose `type` starts
+with `<TENANT_RG_TYPE_PATH>` gets `tenant_id = id` (it opens a new tenant scope, which is why T1, T7 and
+T9 each point at themselves); every other group inherits its parent's `tenant_id` (which is why D2, B3
+and D8 point at their enclosing tenant). Sending an explicit `tenant_id` for a tenant-typed group is
+rejected. Registering the tenant type under a path that does **not** match the constant makes all of
+these examples wrong: the groups become ordinary, and `tenant_id` becomes the caller's tenant.
+
 ### Tenant T1 (root)
 
 ```json
 {
   "id": "11111111-1111-1111-1111-111111111111",
-  "type": "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~",
+  "type": "<TENANT_RG_TYPE_PATH>",
   "name": "T1",
   "parent_id": null,
   "tenant_id": "11111111-1111-1111-1111-111111111111",
@@ -472,7 +509,7 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 ```json
 {
   "id": "77777777-7777-7777-7777-777777777777",
-  "type": "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~",
+  "type": "<TENANT_RG_TYPE_PATH>",
   "name": "T7",
   "parent_id": "11111111-1111-1111-1111-111111111111",
   "tenant_id": "77777777-7777-7777-7777-777777777777",
@@ -483,21 +520,27 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 }
 ```
 
-### Root Tenant T9 (custom domain)
+### Sibling Tenant T9 (custom domain, under T1)
 
 ```json
 {
   "id": "99999999-9999-9999-9999-999999999999",
-  "type": "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~",
+  "type": "<TENANT_RG_TYPE_PATH>",
   "name": "T9",
-  "parent_id": null,
+  "parent_id": "11111111-1111-1111-1111-111111111111",
   "tenant_id": "99999999-9999-9999-9999-999999999999",
-  "depth": 0,
+  "depth": 1,
   "metadata": {
     "custom_domain": "t9.example.com"
   }
 }
 ```
+
+T9 is **not** a second forest root, and earlier revisions of this ADR were wrong to draw it as one.
+`cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness` admits at most one tenant-typed root in the
+whole forest — the *main tenant* — and rejects a second with `TenantRootAlreadyExists` (409). Every
+other tenant, however unrelated operationally, lives as a sub-tenant inside the main tenant's subtree,
+exactly like T7. What makes T9 a separate tenant is the derived `tenant_id = id`, not root placement.
 
 ### Department D8 (under T7)
 
@@ -518,22 +561,24 @@ Instances are anonymous (UUID `id`, separate `type` field). Derived type fields 
 ## Example Hierarchy
 
 ```text
-tenant T1 (depth 0)
+tenant T1 (depth 0)          <- the one tenant-typed root: the main tenant
 ├── department D2 (depth 1) {metadata: {category: "finance", short_description: "Mega Department"}}
 │   └── branch B3 (depth 2) {metadata: {location: "Building A, Floor 3"}}
 │       └── [member] course R4
 │   └── [member] user R5
 ├── [member] user R4
 ├── [member] user R6
-└── tenant T7 (depth 1) {metadata: {barrier: true}}
-    ├── department D8 (depth 2) {metadata: {category: "hr"}}
-    │   └── [member] user R8
-    └── [member] user R8
-tenant T9 (depth 0) {metadata: {custom_domain: "t9.example.com"}}
-└── [member] user R0
+├── tenant T7 (depth 1) {metadata: {self_managed: true}}
+│   ├── department D8 (depth 2) {metadata: {category: "hr"}}
+│   │   └── [member] user R8
+│   └── [member] user R8
+└── tenant T9 (depth 1) {metadata: {custom_domain: "t9.example.com"}}
+    └── [member] user R0
 ```
 
 Notes:
+- **One tenant root, not two.** T9 hangs off T1 rather than standing beside it: only one tenant-typed group may be a forest root (`cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`), so a second tenant-typed root is a 409. Non-tenant roots may still coexist alongside T1 — the invariant constrains tenant-typed roots only
+- Each of T1, T7 and T9 has `tenant_id = own id`; D2, B3 carry T1's, and D8 carries T7's
 - T7 has `metadata.self_managed: true` — RG stores it in metadata JSONB. Tenant Resolver (`BarrierMode`) + AuthZ enforce it
 - R4 appears twice: as **course** in B3 and as **user** in T1 (different `gts_type_id`)
 - R8 appears twice: as **user** in D8 and T7 (same type, two group memberships)
@@ -612,10 +657,10 @@ Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
 
 | Where in RG | Format | Example | Valid? |
 |-------------|--------|---------|--------|
-| `gts_type.schema_id` (DB) | Type path, ends with `~` | `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` | Yes — each segment is 4 tokens + version |
+| `gts_type.schema_id` (DB) | Type path, ends with `~` | `<TENANT_RG_TYPE_PATH>` | Yes — each segment is 4 tokens + version |
 | `resource_group.id` (DB) | UUID | `11111111-1111-1111-1111-111111111111` | N/A — not a GTS ID |
 | `resource_group.gts_type_id` (DB) | SMALLINT FK | `3` | N/A — internal surrogate |
-| API response `type` field | Same as `gts_type.schema_id` | `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` | Yes |
+| API response `type` field | Same as `gts_type.schema_id` | `<TENANT_RG_TYPE_PATH>` | Yes |
 | `resource_group_membership.resource_id` (DB) | Opaque TEXT | `user-uuid-here` | N/A — not a GTS ID |
 
 **No contradictions with migration.sql**: The `gts_type_path` domain regex in `migration.sql` already enforces the 4-token rule per segment via:
@@ -628,7 +673,7 @@ Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
 
 This matches exactly 4 name tokens per segment — the DB constraint and the `gts` crate are consistent.
 
-**Test artifact note**: The unit tests in `rg_gts_type_system_tests.rs` use well-known GTS instance IDs (e.g. `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t1.v1`) to register test instances in the types-registry. The `cf.core._.t1.v1` segment format (with `_` as namespace placeholder) is needed only for these test-level well-known instances. **RG itself never constructs such IDs** — resource groups are anonymous instances with UUID `id` and a `type` field pointing to a type path. The `_` placeholder format is documented here for completeness in case future code needs to construct well-known instances.
+**On the `_` namespace placeholder**: `_` is a legal namespace token, and the shipped tenant type path uses it — `TENANT_RG_TYPE_PATH`'s second segment is `cf.core._.tenant.v1~`. So `_` is not a test-only device; it is part of a production type path. It also appears in the well-known *instance* IDs that `rg_gts_type_system_tests.rs` registers in the types-registry (e.g. `…~cf.core._.t1.v1`, no trailing `~`), which are test artifacts: **RG itself never constructs well-known instance IDs** — resource groups are anonymous instances with a UUID `id` and a `type` field pointing at a type path.
 
 ---
 
@@ -695,7 +740,7 @@ This matches exactly 4 name tokens per segment — the DB constraint and the `gt
 | Topology traits | `gts` crate via `x-gts-traits` against `x-gts-traits-schema` | OP#13 immutability |
 | Top-level field isolation | RG application layer | Strip/reject fields not in base contract properties on create/update |
 
-**Impact**: DB columns renamed: `data_schema` → `metadata_schema`, `data` → `metadata`. Entity schemas are registered for reference but not `$ref`'d. The second GTS segment in chained type IDs (e.g. `y.core.tn.tenant.v1~`) serves as a naming convention and reference, not as a required dependency.
+**Impact**: DB columns renamed: `data_schema` → `metadata_schema`, `data` → `metadata`. Entity schemas are registered for reference but not `$ref`'d. The second GTS segment in a chained type ID (e.g. `cf.core.rg.branch.v1~`) serves as a naming convention and reference, not as a required dependency — with one exception that is *not* mere convention: RG derives tenant-ness from the chained path itself, so the tenant type's second segment must be exactly the one in `TENANT_RG_TYPE_PATH`.
 
 ---
 

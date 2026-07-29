@@ -111,7 +111,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 
 - **Scope**:
   - Type service: create/list/get/update/delete type operations with domain validation
-  - Type code validation: length 1..63, no whitespace, case-insensitive uniqueness via `schema_id` unique constraint
+  - Type code validation (`validation::canonical_type_code`): canonicalize (trim + lowercase), reject empty, require the `RG_TYPE_PREFIX` (`gts.cf.core.rg.type.v1~`), cap at **1024** characters — matching the DB's `CHECK (LENGTH(VALUE) <= 1024)` — then parse the full GTS structure via `GtsTypePath` / `gts::GtsId`, which is what rejects whitespace, hyphens and malformed segments. Callers persist and look up the returned canonical form, which is what makes uniqueness case-insensitive in practice; the `schema_id` unique constraint itself is byte-exact
   - Duplicate rejection: deterministic `TypeAlreadyExists` on conflict
   - Hierarchy-safe updates: reject removal of `allowed_parents` or `can_be_root` changes when existing groups would violate new rules (`AllowedParentsViolation`)
   - Delete safety: reject type deletion when entities of that type exist
@@ -165,18 +165,22 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-feature-entity-hierarchy`
 
-- **Purpose**: Implement group entity lifecycle (create, get, update, move, delete) with strict forest invariants, closure-table-based hierarchy engine for efficient ancestor/descendant queries, query profile enforcement, subtree operations, and the hierarchy depth endpoint with relative depth computation.
+- **Purpose**: Implement group entity lifecycle (create, get, update, move, delete) with strict forest invariants, closure-table-based hierarchy engine for efficient ancestor/descendant queries, query profile enforcement, subtree operations, and the two hierarchy depth endpoints with relative depth computation.
 
 - **Depends On**: `cpt-cf-resource-group-feature-type-management`
 
 - **Scope**:
-  - Entity service: create/get/update (PUT full replace)/move/delete group operations with domain validation
+  - Entity service — five operations, and the split between them is part of the contract:
+    - **create** / **get** / **delete** as usual
+    - **update** = `PUT /groups/{group_id}`, a full replacement of the two ordinary attributes `name` and `metadata`, and of nothing else. Both keys are mandatory (an omitted key is a 400, not "keep the stored value"), unknown keys are rejected, and the write set excludes `parent_id`, `gts_type_id` and `tenant_id`
+    - **move** = `POST /groups/{group_id}/move` with body `{ "parent_id": <uuid|null> }`, the key mandatory and an explicit `null` meaning "become a forest root". This is the gear's only structural mutation: cycle detection, `allowed_parent_types` / `can_be_root` compatibility, `max_depth` / `max_width`, tenant-root uniqueness and the closure rebuild all run in one `SERIALIZABLE` transaction with bounded retry
+    - A group's **GTS type is immutable after creation**. There is no re-type operation and no `type` field on any update payload; changing a type is delete-and-recreate
   - Forest integrity: cycle detection and single-parent validation inside SERIALIZABLE write transactions
-  - Parent type compatibility: validate parent-child type rules on create, move, and type change (including validation that children's types still permit the new type in their `allowed_parents`)
+  - Parent type compatibility: validate parent-child type rules on create and on move. There is no type-change path, so no revalidation of children against a new parent type arises
   - Entity delete safety: reject when active references (children, memberships) prevent removal per configured deletion policy
   - Closure table engine: self-row creation on entity insert, ancestor-descendant row computation on parent assignment, subtree move with full path rebuild (delete old paths + insert new paths), cascade closure row removal on entity delete
   - Hierarchy queries: ancestors/descendants ordered by depth via indexed closure table lookups
-  - Hierarchy depth endpoint: `GET /groups/{group_id}/hierarchy` returning `ResourceGroupWithDepth` with relative depth (positive = descendants, negative = ancestors, 0 = self) and OData filtering on `hierarchy/depth`
+  - Hierarchy depth endpoints — **two routes, not one**: `GET /groups/{group_id}/descendants` (relative depth ≥ 0) and `GET /groups/{group_id}/ancestors` (relative depth ≤ 0), each returning `Page<ResourceGroupWithDepth>` with `0` = the reference group itself, and OData filtering on `hierarchy/depth`. There is no aggregating `/hierarchy` route
   - Query profile enforcement: configurable `max_depth`/`max_width` on writes, no truncation on reads for already-existing data, deterministic `DepthLimitExceeded`/`WidthLimitExceeded` errors
   - Group REST endpoints: CRUD under `/api/resource-group/v1/groups` with OData `$filter` on `type`, `hierarchy/parent_id`, `tenant_id`, `id`, `name`
   - Force delete: optional `?force=true` for cascade deletion of subtree and associated memberships
@@ -231,8 +235,10 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - POST /api/resource-group/v1/groups
   - GET /api/resource-group/v1/groups/{group_id}
   - PUT /api/resource-group/v1/groups/{group_id}
+  - POST /api/resource-group/v1/groups/{group_id}/move
   - DELETE /api/resource-group/v1/groups/{group_id}
-  - GET /api/resource-group/v1/groups/{group_id}/hierarchy
+  - GET /api/resource-group/v1/groups/{group_id}/descendants
+  - GET /api/resource-group/v1/groups/{group_id}/ancestors
 
 - **Sequences**:
 
@@ -307,7 +313,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Integration read service: expose `ResourceGroupReadHierarchy` via ClientHub for AuthZ plugin consumption, returning hierarchy data without policy or SQL semantics
   - Plugin gateway routing: built-in provider (local persistence path) vs vendor-specific provider (a vendor backend replaces the registered `dyn ResourceGroupReadHierarchy` implementation at gear init) with SecurityContext passthrough
   - JWT authentication: standard AuthZ evaluation via `PolicyEnforcer.access_scope()` on all REST endpoints, `AccessScope` applied via SecureORM for tenant-scoped queries
-  - MTLS authentication _(p2 — deferred, not implemented yet)_: client certificate verification against trusted CA bundle, endpoint allowlist (only `GET /groups/{group_id}/hierarchy`), AuthZ bypass for trusted system principals, system SecurityContext creation
+  - MTLS authentication _(p2 — deferred, not implemented yet)_: client certificate verification against trusted CA bundle, endpoint allowlist (only `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors`), AuthZ bypass for trusted system principals, system SecurityContext creation
   - MTLS configuration _(p2 — deferred, not implemented yet)_: `ca_cert`, `allowed_clients` (by certificate CN), `allowed_endpoints` (method + path pairs)
   - Tenant scope enforcement for ownership-graph profile: parent-child edges and membership writes validated for tenant-hierarchy compatibility, platform-admin provisioning exception for cross-tenant management, tenant-scoped reads via `SecurityContext.subject_tenant_id`
   - Barrier as data: `metadata.self_managed` stored in group metadata JSONB without enforcement by RG, returned in API responses within `metadata` object for consumption by Tenant Resolver and AuthZ
@@ -345,7 +351,8 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - [x] `p1` - `cpt-cf-resource-group-component-integration-read-service`
 
 - **API**:
-  - GET /api/resource-group/v1/groups/{group_id}/hierarchy (JWT; additionally over MTLS — `p2`, deferred / not implemented yet)
+  - GET /api/resource-group/v1/groups/{group_id}/descendants (JWT; additionally over MTLS — `p2`, deferred / not implemented yet)
+  - GET /api/resource-group/v1/groups/{group_id}/ancestors (JWT; additionally over MTLS — `p2`, deferred / not implemented yet)
   - All other endpoints (JWT only; MTLS path returns 403 — `p2`, deferred / not implemented yet)
 
 - **Sequences**:

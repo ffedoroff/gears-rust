@@ -140,7 +140,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 - Endpoint not in MTLS allowlist → 403 Forbidden
 
 **Steps**:
-1. [ ] - `p2` - AuthZ plugin sends GET /api/resource-group/v1/groups/{group_id}/hierarchy with MTLS client certificate - `inst-mtls-1`
+1. [ ] - `p2` - AuthZ plugin sends GET /api/resource-group/v1/groups/{group_id}/descendants (or .../ancestors) with MTLS client certificate - `inst-mtls-1`
 2. [ ] - `p2` - RG Gateway: extract client certificate from TLS handshake - `inst-mtls-2`
 3. [ ] - `p2` - Validate certificate against trusted CA bundle (ca_cert): chain, expiration, revocation - `inst-mtls-3`
 4. [ ] - `p2` - Match client identity (certificate CN/SAN) against allowed_clients list - `inst-mtls-4`
@@ -273,10 +273,10 @@ The system **MUST** authenticate every public RG REST/gRPC endpoint via JWT and 
 
 The system **WILL** additionally implement an MTLS authentication mode in the RG gateway when the AuthZ plugin is split out of the RG process.
 
-**MTLS mode (hierarchy endpoint only)**:
+**MTLS mode (hierarchy endpoints only)**:
 - Verify client certificate against trusted CA bundle
 - Match client CN/SAN against `allowed_clients` configuration
-- Check endpoint against `allowed_endpoints` allowlist (only `GET /groups/{group_id}/hierarchy`)
+- Check endpoint against `allowed_endpoints` allowlist (only `GET /groups/{group_id}/descendants` and `GET /groups/{group_id}/ancestors` — there is no aggregating `/hierarchy` route)
 - All other endpoints return 403 Forbidden in MTLS mode
 - Bypass AuthZ evaluation entirely — trusted system principal
 - Create system SecurityContext for RG service call
@@ -284,14 +284,14 @@ The system **WILL** additionally implement an MTLS authentication mode in the RG
 **MTLS configuration**:
 - `ca_cert`: path to trusted CA bundle
 - `allowed_clients`: list of allowed client CNs (e.g., `authz-resolver-plugin`)
-- `allowed_endpoints`: list of method+path pairs (e.g., `GET /api/resource-group/v1/groups/{group_id}/hierarchy`)
+- `allowed_endpoints`: list of method+path pairs (e.g., `GET /api/resource-group/v1/groups/{group_id}/descendants`)
 
 **Implements**:
 - `cpt-cf-resource-group-flow-integration-auth-mtls-request` _(p2)_
 - `cpt-cf-resource-group-algo-integration-auth-auth-mode-decision` _(p2)_
 
 **Touches**:
-- API: `GET /api/resource-group/v1/groups/{group_id}/hierarchy` (additionally over MTLS)
+- API: `GET /api/resource-group/v1/groups/{group_id}/descendants` and `GET /api/resource-group/v1/groups/{group_id}/ancestors` (additionally over MTLS)
 
 ### Tenant Scope Enforcement for Ownership-Graph Profile
 
@@ -329,7 +329,7 @@ In-source `#[cfg(test)]` tests covering auth-mode decision and tenant-scope enfo
 - [x] In-process PDP calls `list_memberships(ctx, query)` with a subject-scoped filter (`resource_id eq '<subject_id>'`) for group-membership resolution, resolved unscoped
 - [x] Integration read responses include `tenant_id` per group and `metadata` (including `self_managed`) but no AuthZ decision fields
 - [x] JWT request to any RG endpoint goes through AuthN → AuthZ (PolicyEnforcer) → AccessScope → SecureORM pipeline
-- [ ] _(p2 — deferred, not implemented yet)_ MTLS request to `/groups/{group_id}/hierarchy` bypasses AuthZ and returns hierarchy data
+- [ ] _(p2 — deferred, not implemented yet)_ MTLS request to `/groups/{group_id}/descendants` or `/groups/{group_id}/ancestors` bypasses AuthZ and returns hierarchy data
 - [ ] _(p2 — deferred, not implemented yet)_ MTLS request to any other endpoint (e.g., `POST /groups`) returns 403 Forbidden
 - [ ] _(p2 — deferred, not implemented yet)_ MTLS request with invalid certificate returns 403 Forbidden
 - [ ] _(p2 — deferred, not implemented yet)_ MTLS request with valid certificate but client CN not in allowed_clients returns 403 Forbidden

@@ -166,8 +166,8 @@ mandatory, and an omitted key is a 400, not "keep the stored value" (see
 4. [x] - `p1` - DB: SELECT FROM resource_group WHERE id = {group_id} (AccessScope-filtered) — load existing group - `inst-update-group-2`
 5. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-update-group-3`
 6. [x] - `p1` - **IF** metadata provided AND type has metadata_schema → validate metadata against the chained GTS type schema via `TypesRegistryClient` / `gts` crate. **IF** invalid → **RETURN** Validation error. Runs *before* the transaction opens — it is a cross-gear `ClientHub` call, not a DB read to make atomic (RG-09) - `inst-update-group-4e`
-7. [x] - `p1` - DB: BEGIN transaction at the backend default isolation. A single-row write by primary key, over a column set no other operation writes, has no cross-row predicate *and* no shared column for a concurrent writer to invalidate, so `SERIALIZABLE` is not required here — unlike Move Group (`rg-db-audit-transactions.md`, recommendation #3) - `inst-update-group-4f`
-8. [x] - `p1` - DB: UPDATE resource_group SET name, metadata, updated_at — and nothing else. The repository exposes two column-specific writers with disjoint write sets (`update_attributes` here, `update_parent` for Move Group); `parent_id`, `gts_type_id` and `tenant_id` are not in this statement's `SET` list and are not read back for it - `inst-update-group-5`
+7. [x] - `p1` - DB: BEGIN transaction at the backend default isolation. A single-row write by primary key, over business columns no other operation writes, has no cross-row predicate *and* no shared **business or structural** column for a concurrent writer to invalidate, so `SERIALIZABLE` is not required here — unlike Move Group (`rg-db-audit-transactions.md`, recommendation #3). The one column both writers do touch is `updated_at`, a last-write-wins audit stamp outside the parent/closure projection - `inst-update-group-4f`
+8. [x] - `p1` - DB: UPDATE resource_group SET name, metadata, updated_at — and nothing else. The repository exposes two column-specific writers whose business/structural columns are disjoint, while both maintain `updated_at` (`update_attributes` here writes `name` + `metadata`, `update_parent` for Move Group writes `parent_id`); `parent_id`, `gts_type_id` and `tenant_id` are not in this statement's `SET` list and are not read back for it - `inst-update-group-5`
 9. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
 
 **Removed steps.** The former sub-steps `inst-update-group-4`, `4a`–`4d` covered a `type`
@@ -190,8 +190,10 @@ a lost update with no serialization conflict on either side, and the mirror imag
 move reverting a concurrent rename) in the other commit order. The protocol had in fact
 been protecting a blind structural write, not the payload ambiguity. Splitting the
 repository writer into `update_attributes` (`name`, `metadata`, `updated_at`) and
-`update_parent` (`parent_id`, `updated_at`) removes the shared column, so `parent_id`
-and the closure table are now written only by Move Group, always under `SERIALIZABLE`.
+`update_parent` (`parent_id`, `updated_at`) removes the shared *structural* column — the
+two still share `updated_at`, which is an audit stamp and not part of the parent/closure
+projection — so `parent_id` and the closure table are now written only by Move Group,
+always under `SERIALIZABLE`.
 Pinned by `tests/pg_concurrency_test.rs::ordinary_update_after_committed_move_keeps_both_effects`
 (the interleaving, replayed deterministically against real PostgreSQL) and
 `tests/db_behavior_audit_test.rs::update_group_write_set_excludes_structural_columns`
@@ -361,7 +363,7 @@ The system **MUST** implement an Entity Service that provides create, get, updat
 **Required behavior**:
 - Create: validate type, parent compatibility, profile limits; persist entity + closure rows in SERIALIZABLE tx
 - Get: retrieve by UUID; return NotFound if absent
-- Update: validate type change against parent and children compatibility; update mutable fields
+- Update: replace the two ordinary attributes `name` and `metadata`, and nothing else. The group's type is immutable after creation and its parent belongs to Move; the write set excludes `parent_id`, `gts_type_id` and `tenant_id`, so no type- or parent-compatibility revalidation arises on this path
 - Move: cycle detection, parent type validation, profile limits; rebuild closure paths in SERIALIZABLE tx with bounded retry
 - Delete: reference check (children + memberships); reject or force-cascade; remove closure rows
 - All hierarchy-mutating writes (create/move/delete) use SERIALIZABLE isolation with bounded retry for serialization conflicts
@@ -388,8 +390,8 @@ The system **MUST** implement a Hierarchy Service that maintains the closure tab
 - Closure table maintenance: self-row on insert, ancestor rows from parent chain, full path rebuild on subtree move, cascade removal on delete
 - Ancestor queries: return all ancestors of a group ordered by depth (ascending)
 - Descendant queries: return all descendants of a group ordered by depth (ascending)
-- Hierarchy depth endpoint: `GET /groups/{group_id}/hierarchy` returning `Page<ResourceGroupWithDepth>` with `hierarchy.depth` (relative: 0=self, positive=descendants, negative=ancestors)
-- OData filtering on `hierarchy/depth` (eq, ne, gt, ge, lt, le) and `type` (eq, ne, in)
+- Hierarchy depth endpoints — **two routes, not one**: `GET /groups/{group_id}/descendants` (`depth ≥ 0`) and `GET /groups/{group_id}/ancestors` (`depth ≤ 0`), each returning `Page<ResourceGroupWithDepth>` with a relative `hierarchy.depth` (0 = the reference group, positive = below it, negative = above it). There is no aggregating `/hierarchy` route
+- OData filtering on `hierarchy/depth` (eq, ne, gt, ge, lt, le) and `type` (`eq` only — other operators are dropped rather than rejected); order is fixed at `depth`, then `id`, and `$orderby` is ignored
 - Query profile enforcement: `max_depth`/`max_width` checked on writes only; reads return full stored data even if profile was tightened; no data rewrite on profile change
 
 **Implements**:
@@ -415,7 +417,8 @@ The system **MUST** implement REST endpoint handlers for group management under 
 - `PUT /groups/{group_id}` — replace the group's ordinary attributes (`name`, `metadata`), return 200 OK. Both keys required; unknown fields (including `parent_id` and the immutable `type`) rejected with 400
 - `POST /groups/{group_id}/move` — move the group and its subtree to a new parent, or to the root; body `{ "parent_id": <uuid|null> }` with the key mandatory, return 200 OK
 - `DELETE /groups/{group_id}?force={true|false}` — delete group, return 204 No Content
-- `GET /groups/{group_id}/hierarchy` — hierarchy depth traversal with OData `$filter` on `hierarchy/depth` and `type`, cursor-based pagination
+- `GET /groups/{group_id}/descendants` — downward depth traversal (`depth ≥ 0`) with OData `$filter` on `hierarchy/depth` and `type`, cursor-based pagination
+- `GET /groups/{group_id}/ancestors` — upward depth traversal (`depth ≤ 0`), same query surface and response shape
 
 **Implements**:
 - `cpt-cf-resource-group-flow-entity-hier-create-group`
@@ -424,7 +427,7 @@ The system **MUST** implement REST endpoint handlers for group management under 
 - `cpt-cf-resource-group-flow-entity-hier-delete-group`
 
 **Touches**:
-- API: `GET/POST /api/resource-group/v1/groups`, `GET/PUT/DELETE /api/resource-group/v1/groups/{group_id}`, `GET /api/resource-group/v1/groups/{group_id}/hierarchy`
+- API: `GET/POST /api/resource-group/v1/groups`, `GET/PUT/DELETE /api/resource-group/v1/groups/{group_id}`, `POST /api/resource-group/v1/groups/{group_id}/move`, `GET /api/resource-group/v1/groups/{group_id}/descendants`, `GET /api/resource-group/v1/groups/{group_id}/ancestors`
 
 ### Group Data Seeding
 
@@ -452,10 +455,10 @@ The system **MUST** provide an idempotent group seeding mechanism for deployment
 All acceptance criteria from feature 0003 are covered by automated tests:
 - Child group creation with closure table verification
 - Move operations with cycle detection and closure rebuild
-- Type compatibility on create/move/update
+- Type compatibility on create and move (not on update — the type is immutable)
 - Query profile enforcement (max_depth, max_width)
 - Delete with reference checks and force cascade
-- Hierarchy depth endpoint with correct relative depths
+- Both hierarchy depth endpoints with correct relative depths
 
 ### REST API Test Coverage
 
@@ -464,7 +467,7 @@ All acceptance criteria from feature 0003 are covered by automated tests:
 REST-level tests for endpoints not covered by existing `api_rest_test.rs`:
 - PUT /types/{code} (update type)
 - POST/DELETE /memberships/{group_id}/{type}/{resource_id}
-- GET /groups/{id}/hierarchy
+- GET /groups/{id}/descendants and GET /groups/{id}/ancestors
 - DELETE /groups/{id}?force=true
 
 ## 6. Acceptance Criteria
@@ -478,21 +481,29 @@ REST-level tests for endpoints not covered by existing `api_rest_test.rs`:
 - [x] Moving group under its own descendant returns `CycleDetected` (400, precondition subject `hierarchy`)
 - [x] Moving group under itself (self-parent) returns `CycleDetected` (400, precondition subject `hierarchy`)
 - [x] Moving group to incompatible parent type returns `InvalidParentType` (400, field violation on `parent_type`)
-- [x] Updating group type validates both parent and children compatibility
+- [x] A group's type is immutable after creation: `PUT /groups/{group_id}` carries no `type` and rejects one as an unknown field (400); changing a type means delete-and-recreate
 - [x] Deleting leaf group (no children, no memberships) succeeds (204) and removes closure rows
 - [x] Deleting group with children without force returns `ConflictActiveReferences` (400, precondition subject `active_references`) with response body listing blocking entities (children count/IDs and membership count) so the caller can display what prevents deletion
 - [x] Force delete removes entire subtree including memberships and closure rows
-- [x] Hierarchy endpoint returns ancestors (negative depth) and descendants (positive depth) with correct relative distances
+- [x] `GET /groups/{group_id}/descendants` returns the group (depth 0) plus its descendants at positive relative depths, and `GET /groups/{group_id}/ancestors` returns the group plus its ancestors at negative relative depths; there is no aggregating `/hierarchy` route
 - [x] OData `$filter` on `hierarchy/depth` supports eq, ne, gt, ge, lt, le operators
 - [x] Write operations that exceed max_depth are rejected with `DepthLimitExceeded`
 - [x] Write operations that exceed max_width are rejected with `WidthLimitExceeded`
 - [x] Reads return full stored data even when profile was tightened (no truncation)
 - [x] Concurrent hierarchy mutations use SERIALIZABLE isolation with bounded retry
 - [x] Group seeding creates hierarchy with correct parent-child links and closure rows (idempotent)
-- [x] Creating group with metadata that violates type's metadata_schema returns Validation error (400) — field type mismatch, maxLength exceeded, unknown field (additionalProperties:false)
+- [ ] Creating group with metadata that violates type's metadata_schema returns Validation error (400) — field type mismatch, maxLength exceeded, unknown field (additionalProperties:false)
 - [x] Creating group with valid metadata matching type's metadata_schema succeeds
-- [x] Updating group metadata validates against type's metadata_schema
+- [ ] Updating group metadata validates against type's metadata_schema
 - [x] Creating group when type has no metadata_schema accepts any metadata (no validation)
+
+The two unchecked criteria above are the **rejection** halves of metadata validation. The code path
+exists (`validation::validate_metadata_via_gts`, called on create, update and seeded create), but no
+test reaches it: the harness's stub `TypesRegistryClient` answers `NotFound` for every type, which the
+validator treats as "no schema, nothing to validate". Unblocking them means giving the harness a fake
+registry that serves the ADR schemas — see the note above TC-ADR-09. The two criteria that stay checked
+are the accept paths, which are exercised end-to-end (TC-GRP-24, TC-ADR-01) even with the stub in place.
+
 ---
 
 ## 7. Unit Test Plan
@@ -525,10 +536,10 @@ The plan was originally based on a gap analysis against acceptance criteria defi
 | File | Tests | Covers |
 |------|-------|--------|
 | In-source `#[cfg(test)]` (lib.rs) | 23 | Inline tests in `auth.rs` (JWT mode routing — `p1`; MTLS mode routing and path matching — `p2`, deferred / not implemented yet), `dto.rs` (DTO serde attributes, `type` rename, camelCase), `odata_mapper.rs` (Type/Group/Hierarchy/Membership ODataMapper field→column) |
-| `api_rest_test.rs` | 54 | Type CRUD REST (create 201, dup 409, invalid 400, list 200, get 200/404, delete 204), Group REST (create/list/get/update/delete/hierarchy), Membership REST (add/remove/list), RFC 9457 error format + Content-Type verification (TC-REST-10), deserialization errors, SMALLINT non-exposure, metadata in REST responses, route smoke all 14 endpoints (RG7) |
+| `api_rest_test.rs` | 54 | Type CRUD REST (create 201, dup 409, invalid 400, list 200, get 200/404, delete 204), Group REST (create/list/get/update/move/delete/descendants/ancestors), Membership REST (add/remove/list), RFC 9457 error format + Content-Type verification (TC-REST-10), deserialization errors, SMALLINT non-exposure, metadata in REST responses, route smoke all 16 endpoints (RG7) |
 | `authz_integration_test.rs` | 9 | PolicyEnforcer tenant scoping, deny-all, allow-all, resource_id passing, all CRUD actions, full chain list_groups/deny |
 | `domain_unit_test.rs` | 79 | `validate_type_code` (5 cases), `DomainError` construction (13 variants), `DomainError` → `ResourceGroupError` mapping, `DomainError` → `Problem` mapping, serialization failure detection, `EnforcerError` → `DomainError` conversions, `DbErr` → `DomainError`, ADR-001 hierarchy reproduction, GTS-specific logic, invalid/non-GTS input validation |
-| `group_service_test.rs` | 55 | TC-GRP-01..38: child creation + closure rows, 3-level hierarchy, incompatible parent type, can_be_root enforcement, move with closure rebuild, cycle detection, self-parent, type change validation, leaf/force delete, hierarchy depth traversal, max_depth/max_width enforcement, name validation, cross-tenant parent, simultaneous type+parent change, detach to root, metadata barrier tests |
+| `group_service_test.rs` | 55 | TC-GRP-01..38 (less the five withdrawn type-change cases, see below): child creation + closure rows, 3-level hierarchy, incompatible parent type, can_be_root enforcement, move with closure rebuild, cycle detection, self-parent, leaf/force delete, descendant/ancestor depth traversal, max_depth/max_width enforcement, name validation, cross-tenant parent, detach to root, metadata barrier tests |
 | `type_service_test.rs` | 45 | TC-TYP-01..16 + TC-META-01..11 + TC-META-ATK-01..11 + TC-GTS-01..15: create/update/delete types, placement invariant, hierarchy safety checks, metadata_schema round-trip (Object/Array/String/Number), `__can_be_root` derivation/fallback, internal key stripping, security attack vectors (privilege escalation, DoS, SQL injection), resolve_id/resolve_ids, allowed_parents/memberships resolution |
 | `membership_service_test.rs` | 15 | TC-MBR-01..15: add/remove membership, nonexistent group, duplicate, unregistered type, not in allowed_memberships, tenant incompatibility, multiple resource types, first-always-allowed tenant, empty resource_id |
 | `seeding_test.rs` | 12 | TC-SEED-01..12: seed_types (create/skip/update/idempotent), seed_groups (create with closure/skip/wrong order), seed_memberships (create/duplicate skip/tenant-incompatible skip/nonexistent group), empty list |
@@ -615,7 +626,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-GRP-07: Self-parent -> CycleDetected [P1]
 - **Covers**: G13, 0003-AC-8
-- **Setup**: Create group. Update with parent_id = own id.
+- **Setup**: Create group. `move_group(ctx, id, Some(id))` — re-parent it onto itself.
 - **Assert**: `DomainError::CycleDetected`
 
 #### TC-GRP-08: Move group to incompatible parent type [P1]
@@ -628,15 +639,13 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **Setup**: Create group, update with new name and metadata
 - **Assert**: Updated group returned with new name/metadata
 
-#### TC-GRP-10: Update group type - validates parent compatibility [P1]
-- **Covers**: G16, 0003-AC-10
-- **Setup**: Type A (root), Type B (allowed_parents=[A]), Type C (root, no allowed_parents). Create group of type B under group of type A. Change group type to C (which doesn't allow parent A).
-- **Assert**: `DomainError::InvalidParentType` ("does not allow current parent type")
-
-#### TC-GRP-11: Update group type - validates children compatibility [P1]
-- **Covers**: G16, 0003-AC-10
-- **Setup**: Type P (root), Type C (allowed_parents=[P]), Type P2 (root). Create P group with C child. Change P group to type P2.
-- **Assert**: `DomainError::InvalidParentType` ("child group... does not allow... as parent type")
+> **TC-GRP-10 and TC-GRP-11 are withdrawn, not pending.** Both exercised a group *type* change on
+> update. The group's GTS type is immutable after creation and `UpdateGroupRequest` carries no `code`
+> field, so neither scenario is reachable through the SDK or over REST; the tests were deleted from
+> `group_service_test.rs` with that reasoning recorded in place. Coverage of the same underlying
+> invariant — a child whose type does not permit its parent's type — lives on the `create_group`
+> (TC-GRP-03, TC-GRP-04) and `move_group` (TC-GRP-08, TC-GRP-30) paths. Changing a group's type is a
+> delete-and-recreate, not an update.
 
 #### TC-GRP-12: Delete leaf group (no children, no memberships) [P1]
 - **Covers**: G17, 0003-AC-11
@@ -658,10 +667,10 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **Setup**: Create Root -> Parent -> Child, with memberships on each. Force delete Root.
 - **Assert**: All 3 groups gone, all memberships gone, all closure rows gone
 
-#### TC-GRP-16: Hierarchy endpoint - ancestors and descendants [P1]
+#### TC-GRP-16: Hierarchy endpoints - ancestors and descendants [P1]
 - **Covers**: G21, 0003-AC-14
-- **Setup**: Create 3-level tree (A -> B -> C). Call list_group_hierarchy(B).
-- **Assert**: Returns A (depth=-1), B (depth=0), C (depth=1)
+- **Setup**: Create 3-level tree (A -> B -> C). Call `get_group_ancestors(B)` and `get_group_descendants(B)` — there is no single aggregating call.
+- **Assert**: `get_group_ancestors(B)` returns A (depth=-1) then B (depth=0); `get_group_descendants(B)` returns B (depth=0) then C (depth=1)
 
 #### TC-GRP-17: max_depth enforcement on create [P1]
 - **Covers**: G22, 0003-AC-16
@@ -699,17 +708,11 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 #### TC-GRP-25: Multiple root groups of same type [P2]
 - Create 2 root groups of same can_be_root=true type, both succeed
 
-#### TC-GRP-26: Update group - simultaneous type change AND parent change [P1]
-- Both `type_changed` and `parent_changed` are true → type validation + move logic both run
-- Verify the combined operation succeeds or fails atomically
-
-#### TC-GRP-27: Update root group type to non-root type (no parent) [P1]
-- Root group (parent_id=None), change type to can_be_root=false type
-- Hits `else if !rg_type.can_be_root` branch (line 508-512)
-- **Assert**: `DomainError::InvalidParentType("cannot be a root group")`
-
-#### TC-GRP-28: Update group with nonexistent new type_path [P2]
-- **Assert**: `DomainError::TypeNotFound`
+> **TC-GRP-26, TC-GRP-27 and TC-GRP-28 are withdrawn** for the same reason as TC-GRP-10/11: all three
+> drove a type change through `update_group`. There is no longer a combined "type + parent" update to
+> be atomic about — `PUT` writes `name` and `metadata`, `POST …/move` writes the parent, and the type
+> is fixed at creation. Root placement against `can_be_root` is covered on create (TC-GRP-04) and on
+> move-to-root (TC-GRP-30); an unregistered type code is covered on create (TC-GRP-22).
 
 #### TC-GRP-29: Move child to root (detach from parent) - happy path [P1]
 - Child under parent, `POST /groups/{id}/move` with an explicit `{"parent_id": null}` (service level: `move_group(ctx, id, None)`), type allows can_be_root=true
@@ -747,8 +750,8 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - Group with no children, force=true — descendant_ids is empty, still works
 - **Assert**: Success
 
-#### TC-GRP-36: list_group_hierarchy nonexistent group [P2]
-- **Assert**: `DomainError::GroupNotFound`
+#### TC-GRP-36: get_group_descendants on a nonexistent group [P2]
+- **Assert**: `DomainError::GroupNotFound` — the scoped read runs a scope-aware preflight before touching the closure table, so an unknown (or cross-tenant) reference group is a not-found rather than an empty page
 
 #### TC-GRP-37: Depth limit exact boundary (parent_depth+1 == max_depth) [P1]
 - Comparison is `>=` not `>`: at exact limit, reject
@@ -785,13 +788,13 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-META-17: Barrier group visible in hierarchy (RG does NOT filter) [P1]
 - Create parent → child with `metadata: {"self_managed": true}` → grandchild
-- `list_group_hierarchy(parent)` → returns ALL 3 including barrier child
+- `get_group_descendants(parent)` → returns ALL 3 including barrier child
 - **Covers**: PRD "RG does not filter based on barrier", Feature 0005-AC
 - **Assert**: barrier group present in results, depth correct
 
 #### TC-META-18: Group metadata in hierarchy endpoint response [P1]
 - Create groups with various metadata
-- `list_group_hierarchy` → each `GroupWithDepthDto` includes `metadata` field
+- `get_group_descendants` → each `GroupWithDepthDto` includes `metadata` field
 - **Assert**: metadata preserved in hierarchy response (Feature 0005 requirement)
 
 ### REST-level metadata serialization
@@ -951,9 +954,35 @@ Per ADR-001, each chained RG type defines a `metadata_schema` with `additionalPr
 
 GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at schema registration time. These unit tests verify the **runtime** validation path: when a caller creates/updates a group, RG checks the `metadata` payload against the stored `metadata_schema` for the group's type.
 
-> **Note**: As of current implementation, this validation is **missing** in code — `group_service.rs` stores metadata as-is without validation. These tests will initially fail and serve as acceptance criteria for implementing the validation.
+> **Implementation: present.** The runtime path exists — `validation::validate_metadata_via_gts`
+> resolves the group's chained GTS type through `TypesRegistryClient`, takes the `metadata` property
+> off `effective_properties()` (so `allOf` composition and inherited properties apply), and validates
+> the payload against it. It is called on group create, group update and seeded creates, before the
+> transaction opens (a cross-gear `ClientHub` call has nothing to gain from being in-tx). An earlier
+> revision of this note said the validation was missing and that these tests would "initially fail";
+> that has not been true since the path landed.
 >
-> **Implementation**: Use `TypesRegistryClient` (types-registry-sdk, already used by `credstore` gear) + `gts` crate (v0.8.4, already in workspace). The GTS type system validates instance data (including `metadata` sub-object) against the chained RG type schema registered in types-registry. RG gear should resolve the group's GTS type via `TypesRegistryClient`, then validate the incoming metadata against the type's inline `metadata` schema (which includes `additionalProperties: false`, field types, `maxLength`). This follows the same pattern as `credstore` gear which uses `TypesRegistryClient` from ClientHub for GTS-level validation. Do NOT use raw `jsonschema` crate directly — validation must go through the GTS layer to respect `x-gts-traits`, `allOf` composition, and the metadata sub-object schema.
+> **Coverage: none of TC-ADR-09..14 and TC-ADR-21..31 exists, and none can exist as written.** The
+> gear's test harness installs a stub `TypesRegistryClient` that answers `NotFound` for every type
+> (`tests/common/mod.rs`), and `validate_metadata_via_gts` treats `NotFound` as "no registered schema,
+> nothing to validate" and returns `Ok(())`. Every one of these cases therefore reaches the same
+> unconditional accept, so a "rejected" assertion cannot be written and an "accepted" assertion would
+> pass vacuously. Unblocking them is a **test-infrastructure** change, not a documentation one: the
+> harness needs a fake registry that returns the ADR tenant/department/branch schemas. Until it does,
+> treat this whole block as specified-but-unimplemented, and do not read the surrounding `[x]` marks as
+> covering it.
+>
+> Note also that `validation::validate_metadata_against_schema` — the synchronous
+> `metadata`-vs-`metadata_schema` helper that `domain_unit_test.rs` exercises in ~20 cases — is called
+> from **no production path**. It is a test-only sibling of the GTS path above; its green tests say
+> nothing about group create/update behaviour.
+>
+> **ID collision, unresolved.** `TC-ADR-15`…`TC-ADR-20` are each defined **twice** in this document:
+> once in this metadata block (uncovered) and once further down (metadata_schema round-trip, chained
+> path format, SMALLINT non-exposure — all covered, and referenced by those IDs from
+> `group_service_test.rs` / `api_rest_test.rs`). Where a test names `TC-ADR-15`…`TC-ADR-20`, it means
+> the **later** definition. Renumbering the metadata cases needs an owner's call on the traceability
+> ids and is deliberately not done here.
 
 ##### Tenant metadata (`self_managed: boolean`, `custom_domain: hostname`)
 
@@ -1068,9 +1097,10 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 - **Assert**: metadata_schema matches input
 
 #### TC-ADR-16: Chained type path format in RG [P1]
-- ADR uses: `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` (multi-segment)
-- Code validates prefix: `gts.cf.core.rg.type.v1~` (different namespace!)
-- **Assert**: Verify which prefix the code actually requires. If `system` not `core` → document discrepancy with ADR.
+- **Answered — this case no longer has an open question in it.** Two different prefixes are at work and both were verified against the code:
+  - *Every* RG type code must start with `RG_TYPE_PREFIX` = `gts.cf.core.rg.type.v1~` (`validation::RG_TYPE_PREFIX`, checked by `canonical_type_code`). Not `system`; `core` is correct.
+  - A code is additionally a **tenant** type when it starts with `TENANT_RG_TYPE_PATH` (`resource-group-sdk/src/gts.rs`), i.e. the base prefix plus a second segment — see the canonical expansion in [ADR-001](../ADR/ADR-001-gts-type-system.md#the-tenant-type-path-is-a-code-constant-not-a-documentation-choice). The ADR's former illustration `…~y.core.tn.tenant.v1~` differs in vendor and namespace and is therefore **not** a tenant type; ADR-001 has been corrected and no discrepancy remains.
+- **Assert**: `canonical_type_code` accepts a code under `RG_TYPE_PREFIX` and rejects one without it (covered by `domain_unit_test.rs`); `is_tenant_type_code` is true only for codes under `TENANT_RG_TYPE_PATH`.
 
 #### TC-ADR-17: Type response contains no SMALLINT IDs [P1]
 - Create type, GET → response JSON
@@ -1085,7 +1115,7 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 - **Assert**: `resource_type` is string GTS path. No `gts_type_id`.
 
 #### TC-ADR-20: Hierarchy response contains no SMALLINT IDs [P1]
-- list_group_hierarchy → response items
+- `GET /groups/{id}/descendants` → response items
 - **Assert**: each item `type` is string, no numeric type IDs
 
 ### REST API Layer
@@ -1119,9 +1149,9 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 - **Covers**: G20
 - DELETE /groups/{id}?force=true, verify 204
 
-#### TC-REST-08: Hierarchy endpoint via REST [P2]
+#### TC-REST-08: Hierarchy endpoints via REST [P2]
 - **Covers**: G21
-- GET /groups/{id}/hierarchy, verify 200 + depth fields
+- GET /groups/{id}/descendants and GET /groups/{id}/ancestors, verify 200 + depth fields
 
 #### TC-REST-10: Error response HTTP mapping — status codes and Content-Type [P1]
 - **Covers**: RG3
@@ -1139,7 +1169,7 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 
 ### Priority Matrix
 
-#### P1 - Critical (must have, business invariants) — 64 tests
+#### P1 - Critical (must have, business invariants) — 60 tests
 
 These test domain invariants that prevent data corruption or violate core business rules:
 
@@ -1158,8 +1188,6 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-GRP-06** | Move under descendant -> cycle | Infinite loops in hierarchy |
 | **TC-GRP-07** | Self-parent -> cycle | Infinite loops in hierarchy |
 | **TC-GRP-08** | Move to incompatible type | Type system bypassed |
-| **TC-GRP-10** | Type change vs parent compat | Type constraints violated |
-| **TC-GRP-11** | Type change vs children compat | Children become orphans |
 | **TC-GRP-12** | Leaf delete | Data cleanup |
 | **TC-GRP-13** | Delete with children no force | Accidental data loss |
 | **TC-GRP-14** | Delete with memberships no force | Accidental data loss |
@@ -1176,8 +1204,6 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-MBR-14** | Same resource in multiple groups same tenant | Multi-group membership broken |
 | **TC-GRP-22** | Create group nonexistent type | Group with invalid type |
 | **TC-GRP-23** | Child group cross-tenant parent | Tenant isolation broken |
-| **TC-GRP-26** | Simultaneous type + parent change | Atomicity of combined update |
-| **TC-GRP-27** | Root group → non-root type change | Root groups orphaned |
 | **TC-GRP-29** | Move child to root (detach) | Closure corruption on detach |
 | **TC-GRP-30** | Move to root when can_be_root=false | Unauthorized root creation |
 | **TC-GRP-37** | Depth exact boundary (>=) | Off-by-one in guardrail |
@@ -1195,12 +1221,12 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-ERR-01** | EnforcerError::Denied -> AccessDenied | Auth errors mishandled |
 | **TC-REST-10** | Error response HTTP mapping — status codes + Content-Type | Incorrect HTTP status codes or missing `application/problem+json` Content-Type |
 
-#### P2 - Important (error paths, REST layer, edges) — 53 tests
+#### P2 - Important (error paths, REST layer, edges) — 52 tests
 
 | ID | Area |
 |----|------|
 | TC-TYP-03, TC-TYP-05, TC-TYP-08, TC-TYP-10..15 | Type management edges + metadata + memberships |
-| TC-GRP-09, TC-GRP-19..21, TC-GRP-24..25, TC-GRP-28, TC-GRP-31..36 | Group update/validation/error paths |
+| TC-GRP-09, TC-GRP-19..21, TC-GRP-24..25, TC-GRP-31..36 | Group update/validation/error paths |
 | TC-MBR-07..12 | Membership edges + empty resource_id + unregistered type |
 | TC-REST-01..08 | REST layer coverage |
 | TC-SDK-07, TC-SDK-09, TC-SDK-10, TC-SDK-16..23 | SDK edge cases + boundary |
@@ -1257,18 +1283,28 @@ Every test that creates, moves, or deletes groups **MUST** query the closure tab
 | Operation | Required DB Assertions |
 |-----------|----------------------|
 | **Create group** | `parent_id`, `gts_type_id`, `tenant_id`, `name`, `metadata` match request. |
-| **Update name/metadata** | `name` and `metadata` changed. `parent_id`, `gts_type_id` **unchanged** — re-supplied from the stored row, since the repository writes every column. |
-| **Move group** | `parent_id` updated. `gts_type_id`, `name`, `tenant_id` **unchanged**. |
-| **Update type** | `gts_type_id` changed. `parent_id`, `name` **unchanged**. |
+| **Update name/metadata** | `name` and `metadata` changed. `parent_id`, `gts_type_id`, `tenant_id` **unchanged, and unwritten** — assert on the emitted SQL, not just the resulting values: `update_attributes` puts only `name`, `metadata` and `updated_at` in its `SET` list, and does not read the structural columns back in order to re-supply them. The old shape (a single writer that wrote every column from a value read inside a READ COMMITTED transaction) is what allowed a concurrent move's parent change to be silently reverted, so "unchanged because nothing overwrote it" is the assertion, not "unchanged because the same value was rewritten". Pinned by `db_behavior_audit_test.rs::update_group_write_set_excludes_structural_columns`. |
+| **Move group** | `parent_id` updated. `gts_type_id`, `name`, `tenant_id`, `metadata` **unchanged** — `update_parent` writes only `parent_id` and `updated_at`. |
+
+Both writers stamp `updated_at`; that is the one column they share, and it is deliberate — it is an audit timestamp, not part of the parent/closure projection.
+
+There is no **Update type** row, because there is no operation that changes `gts_type_id`. A group's type is fixed at creation and no repository method writes that column.
 
 ### Hierarchy Endpoint Response Shape
 
-`list_group_hierarchy(B)` for tree A → B → C **MUST** return:
+For tree A → B → C, the two routes anchored at B **MUST** return:
+
+`GET /groups/{B}/ancestors`:
 - Self-node B: `hierarchy.depth == 0`
-- Ancestor A: `hierarchy.depth < 0` (e.g., -1)
-- Descendant C: `hierarchy.depth > 0` (e.g., 1)
-- **All nodes present** (no missing nodes)
-- Each node has `hierarchy.tenant_id`, `hierarchy.parent_id`
+- Ancestor A: `hierarchy.depth == -1`
+- C absent
+
+`GET /groups/{B}/descendants`:
+- Self-node B: `hierarchy.depth == 0`
+- Descendant C: `hierarchy.depth == 1`
+- A absent
+
+In both: **all nodes in range present** (no missing nodes), each node carries `hierarchy.tenant_id` and `hierarchy.parent_id`, and B is the only node the two responses have in common.
 
 ### Seeding DB Verification
 
@@ -1374,16 +1410,21 @@ Tests S5, S6, S7 verify PostgreSQL-specific behavior that unit tests cannot catc
 POST parent_type (can_be_root), child_type (allowed_parents: [parent])
 POST root → child → grandchild
 
-GET /groups/{root.id}/hierarchy     → 200
+GET /groups/{root.id}/descendants     → 200
   assert len(items) == 3
   assert root       depth == 0
   assert child      depth == 1
   assert grandchild depth == 2
 
-GET /groups/{child.id}/hierarchy    → 200
+GET /groups/{child.id}/descendants    → 200
   assert len(items) == 2
-  assert child      depth == 0     (relative to query root)
+  assert child      depth == 0     (relative to the reference group)
   assert grandchild depth == 1
+
+GET /groups/{child.id}/ancestors      → 200
+  assert len(items) == 2
+  assert root       depth == -1     (ancestor depths are negative)
+  assert child      depth == 0
 ```
 
 ### S6: `test_move_closure_rebuild_postgresql`
@@ -1398,8 +1439,12 @@ POST root_B
 
 POST /groups/{child.id}/move {parent_id: root_B.id} → 200
 
-GET /groups/{root_B.id}/hierarchy    → 200
-  assert child in items with depth == 1            (closure rebuilt on PG)
+GET /groups/{root_A.id}/descendants  → 200
+  assert child not in items                        (detached from the old tree)
+
+GET /groups/{root_B.id}/descendants  → 200
+  assert child       depth == 1                    (closure rebuilt on PG)
+  assert grandchild  depth == 2                    (whole subtree followed)
 ```
 
 ### S7: `test_force_delete_cascade_postgresql`

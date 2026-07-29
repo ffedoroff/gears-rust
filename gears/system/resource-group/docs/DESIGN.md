@@ -85,7 +85,7 @@ For AuthZ-facing deployments aligned with current platform architecture, `owners
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `cpt-cf-resource-group-fr-rest-api`                           | REST API layer with OperationBuilder and OData query support.                                                                         |
 | `cpt-cf-resource-group-fr-odata-query`                        | OData `$filter`, `$orderby`, `$select` and cursor-based pagination (`cursor`, `limit`) on all list endpoints. `$orderby` and `cursor` are mutually exclusive. |
-| `cpt-cf-resource-group-fr-list-groups-depth`                  | Dedicated depth endpoint (`/{group_id}/hierarchy`) returns hierarchy with relative depth and depth-based filtering.                       |
+| `cpt-cf-resource-group-fr-list-groups-depth`                  | Two dedicated depth endpoints (`/{group_id}/descendants`, `/{group_id}/ancestors`) return hierarchy with relative depth and depth-based filtering. There is no single `/hierarchy` route.                       |
 | `cpt-cf-resource-group-fr-manage-types`                       | Type service with validated lifecycle API and uniqueness guarantees.                                                                  |
 | `cpt-cf-resource-group-fr-validate-type-code`                 | Type service enforces code format, length, and case-insensitive normalization before persistence.                                     |
 | `cpt-cf-resource-group-fr-reject-duplicate-type`              | Unique `schema_id` persistence constraint and deterministic conflict mapping prevent duplicate type creation.                         |
@@ -180,7 +180,7 @@ Hierarchy guarantees single parent and cycle prevention for all writes. Multiple
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-tenant-root-uniqueness`
 
-The forest **MAY** contain multiple root groups, but at most **one** of them **MUST** be a tenant-type group (GTS code starts with `TENANT_RG_TYPE_PATH`). That unique tenant root is the **main tenant**; every other tenant lives as its sub-tenant. Non-tenant roots (e.g. auxiliary ownership forests that are not part of the tenant tree) may coexist alongside the main tenant root and carry the main tenant's `tenant_id`, but they are not tenants themselves. This invariant aligns the RG forest with the AuthZ/TR single-root tenant tree: `TENANT_MODEL.md`'s single-root-tree is realized as exactly the tenant-root subtree inside the RG forest. Enforcement at create time rejects a second tenant-type root with `TenantRootAlreadyExists` (409 Conflict).
+The forest **MAY** contain multiple root groups, but at most **one** of them **MUST** be a tenant-type group (GTS code starts with `TENANT_RG_TYPE_PATH` — the constant lives in `resource-group-sdk/src/gts.rs` and is expanded once, in [ADR-001 § "The tenant type path is a code constant"](ADR/ADR-001-gts-type-system.md#the-tenant-type-path-is-a-code-constant-not-a-documentation-choice); never re-type the literal, since a near-miss path silently produces an ordinary group). That unique tenant root is the **main tenant**; every other tenant lives as its sub-tenant. Non-tenant roots (e.g. auxiliary ownership forests that are not part of the tenant tree) may coexist alongside the main tenant root and carry the main tenant's `tenant_id`, but they are not tenants themselves. This invariant aligns the RG forest with the AuthZ/TR single-root tenant tree: `TENANT_MODEL.md`'s single-root-tree is realized as exactly the tenant-root subtree inside the RG forest. Enforcement at create time rejects a second tenant-type root with `TenantRootAlreadyExists` (409 Conflict).
 
 #### Dynamic Type Governance
 
@@ -190,7 +190,7 @@ Type rules are runtime-configurable through API/seed data with deterministic val
 
 **ADRs**: `cpt-cf-resource-group-adr-p1-gts-type-system`
 
-**Derived type fields — metadata object, JSONB storage (v1)**: Derived type fields (e.g. `barrier`, `custom_domain`, `category`) are nested inside a `metadata` object in API requests and responses. In the database, they are stored in a `metadata` JSONB column on `resource_group`. For chained types (e.g., `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`), the chained GTS schema defines `properties.metadata` with `additionalProperties: false` for field isolation. `metadata_schema` on the RG type definition is null for chained types — instance metadata is validated against the GTS schema. The `metadata_schema` field is reserved for optional RG-level schema overrides. Advanced validation (e.g., Starlark-based cross-field rules) is out of scope for v1.
+**Derived type fields — metadata object, JSONB storage (v1)**: Derived type fields (e.g. `self_managed`, `custom_domain`, `category`) are nested inside a `metadata` object in API requests and responses. In the database, they are stored in a `metadata` JSONB column on `resource_group`. For chained types (e.g. the tenant type at `TENANT_RG_TYPE_PATH`, or `gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~`), the chained GTS schema defines `properties.metadata` with `additionalProperties: false` for field isolation. `metadata_schema` on the RG type definition is null for chained types — instance metadata is validated against the GTS schema. The `metadata_schema` field is reserved for optional RG-level schema overrides. Advanced validation (e.g., Starlark-based cross-field rules) is out of scope for v1.
 
 #### Query Profile as Guardrail
 
@@ -417,8 +417,8 @@ Responsibilities:
 Responsibilities:
 
 - create/get/update/move/delete entities
-- validate parent type compatibility (on create, move, and type change)
-- on `type` change: validate that the new type's `allowed_parents` permits the current parent's type, AND that all children's types include the new type in their `allowed_parents` — reject with `InvalidParentType` if any child would become invalid
+- validate parent type compatibility on **create** and **move** — the only two operations that establish or change a parent-child edge
+- a group's `type` is **immutable after creation**: no operation changes `gts_type_id`, `UpdateGroupRequest` carries no `type`, and the repository has no writer for that column. Consequently there is no "on type change" validation to perform — the case that would have needed it (revalidating the group's own placement *and* every child's placement against a new type) cannot arise. Re-typing a group is delete-and-recreate
 - orchestrate subtree operations
 
 #### Hierarchy Service
@@ -538,7 +538,8 @@ Base path: `/api/resource-group/v1` (groups, memberships), `/api/types-registry/
 | PUT | resource-group | `/groups/{group_id}` | `updateGroup` | Full replace of the group's ordinary attributes: `name` and `metadata`. Both keys are required — an omitted key is a 400, not "keep the stored value". Does **not** move the group and rejects unknown fields (including `parent_id` and the immutable `type`) |
 | POST | resource-group | `/groups/{group_id}/move` | `moveGroup` | Move the group and its entire subtree to a new parent, or to the root. Body `{ "parent_id": <uuid\|null> }`; the key is mandatory and an explicit `null` means "become a root". Atomic: cycle detection, parent-type compatibility, depth/width limits, tenant-root uniqueness and the closure rebuild all run in one `SERIALIZABLE` transaction |
 | DELETE | resource-group | `/groups/{group_id}` | `deleteGroup` | Delete group (optional `?force=true`) |
-| GET | resource-group | `/groups/{group_id}/hierarchy` | `listGroupHierarchy` | Traverse hierarchy from reference group with relative depth |
+| GET | resource-group | `/groups/{group_id}/descendants` | `getGroupDescendants` | Walk **down** from the reference group: the group itself (`depth = 0`) and every descendant (`depth > 0`) |
+| GET | resource-group | `/groups/{group_id}/ancestors` | `getGroupAncestors` | Walk **up** from the reference group: the group itself (`depth = 0`) and every ancestor (`depth < 0`, one step per level towards the root) |
 | GET | resource-group | `/memberships` | `listMemberships` | List memberships with OData query |
 | POST | resource-group | `/memberships/{group_id}/{resource_type}/{resource_id}` | `addMembership` | Add membership |
 | DELETE | resource-group | `/memberships/{group_id}/{resource_type}/{resource_id}` | `deleteMembership` | Remove membership |
@@ -558,12 +559,38 @@ Query support on all list endpoints:
 - **`$select` is accepted and ignored.** The extractor parses it; no repository applies it
 - `$orderby` is supported on `/groups`, `/types` and `/memberships`; an unknown field is a 400. Sending `$orderby` together with `cursor` is rejected with 400 (`OrderWithCursor`), because a cursor already pins an order. Without `$orderby` the order is unspecified but stable, with a per-list tiebreaker. On `/descendants` and `/ancestors` the order is fixed (`depth`, then `id`) and `$orderby` is ignored. `$select` is accepted by the extractor and currently ignored by the repositories
 
-Group list (`listGroups`) `$filter` fields: `type` (eq, ne, in), `hierarchy/parent_id` (eq, ne, in — direct parent only, depth=1; for ancestor traversal use `listGroupHierarchy`), `tenant_id` (eq, ne, in — narrows the AuthZ-scoped result to a specific tenant; cannot widen access), `id` (eq, ne, in), `name` (eq, ne, in).
+Group list (`listGroups`) `$filter` fields: `type` (eq, ne, in), `hierarchy/parent_id` (eq, ne, in — direct parent only, depth=1; for ancestor traversal use `getGroupAncestors`), `tenant_id` (eq, ne, in — narrows the AuthZ-scoped result to a specific tenant; cannot widen access), `id` (eq, ne, in), `name` (eq, ne, in).
 
-Hierarchy (`getGroupDescendants` / `getGroupAncestors`) `$filter` fields: `hierarchy/depth` (eq, ne, gt, ge, lt, le) and
-`type`. Two caveats specific to these two routes: `type` honours **`eq` only** — other operators are currently dropped
-rather than rejected, so the result is unfiltered — and the page order is fixed (`depth`, then `id`), so `$orderby` is
-ignored. Their cursor is offset-based, unlike the keyset cursors of the flat lists.
+##### Hierarchy traversal: two routes, not one
+
+Depth-relative reads are served by **two** routes, and there is deliberately no aggregating `/groups/{group_id}/hierarchy`
+route — a client that asks for one gets a 404. Both are `GET`, both take the reference group in the path, both return
+`Page<GroupWithDepthDto>`, and both include the reference group itself at `depth = 0`:
+
+| Route | Operation | Depths returned | Order |
+| ----- | --------- | --------------- | ----- |
+| `/groups/{group_id}/descendants` | `getGroupDescendants` | `depth ≥ 0` — the group (`0`) and everything below it | reference group first, then each level outwards |
+| `/groups/{group_id}/ancestors` | `getGroupAncestors` | `depth ≤ 0` — the group (`0`) and each level up towards the root, one negative step per level | outermost ancestor first, reference group last |
+
+The split is intentional and is consumed as two methods by `rg-tr-plugin`; `ResourceGroupReadHierarchy` mirrors it with
+`get_group_descendants` / `get_group_ancestors`. Ask for the pair when you need the full vertical line through a group —
+they overlap only on the `depth = 0` row.
+
+Both routes share one contract:
+
+- **Query**: `limit` (1..200, default 25) and `cursor`. `$filter` fields are `hierarchy/depth` (eq, ne, gt, ge, lt, le)
+  and `type`.
+- **Ancestor depths are negative.** `$filter=hierarchy/depth ge -2` on `/ancestors` means "no further than two levels
+  up"; the same expression on `/descendants` matches everything, since descendant depths are never negative. Asking
+  `/descendants` for `hierarchy/depth le 0` or `/ancestors` for `hierarchy/depth ge 0` yields just the reference group.
+- **Order is fixed** (`depth`, then `id`) and `$orderby` is ignored rather than rejected.
+- **The cursor is offset-based**, unlike the keyset cursors of the flat lists: results are assembled in memory from two
+  closure queries, so the token carries a page offset and a fixed `depth` sort signature.
+- `type` honours **`eq` only** — other operators are currently dropped rather than rejected, so the result comes back
+  unfiltered.
+- **Over REST, an unknown or cross-tenant reference group is a 404**, not a 200 with an empty page: both scoped service
+  methods run a scope-aware preflight `find_by_id` before touching the closure table, so a foreign root is
+  indistinguishable from a random UUID.
 
 Membership list `$filter` fields: `resource_id` (eq, ne, in), `resource_type` (eq, ne, in), `group_id` (eq, ne, in).
 
@@ -582,8 +609,8 @@ These reads are resolved **unscoped** — they bypass `PolicyEnforcer`. A consum
 
 | Trait | Method | Description |
 | ----- | ------ | ----------- |
-| `ResourceGroupReadHierarchy` | `get_group_descendants(ctx, group_id, query)` | descendant hierarchy walk (depth ≥ 0); matches REST `GET /groups/{group_id}/hierarchy` — OData `$filter` (depth, type), cursor-based pagination (`cursor`, `limit`) |
-| `ResourceGroupReadHierarchy` | `get_group_ancestors(ctx, group_id, query)` | ancestor hierarchy walk (depth ≤ 0); same shape as the descendant walk |
+| `ResourceGroupReadHierarchy` | `get_group_descendants(ctx, group_id, query)` | descendant hierarchy walk (depth ≥ 0); matches REST `GET /groups/{group_id}/descendants` — OData `$filter` (depth, type), cursor-based pagination (`cursor`, `limit`) |
+| `ResourceGroupReadHierarchy` | `get_group_ancestors(ctx, group_id, query)` | ancestor hierarchy walk (depth ≤ 0); matches REST `GET /groups/{group_id}/ancestors`, same shape as the descendant walk |
 | `ResourceGroupReadHierarchy` | `list_groups(ctx, query)` | flat OData-filtered group listing; enables batch reads (`id in (…)`) for the tenant-resolver RG plugin's `get_tenants(&[TenantId])` |
 | `ResourceGroupReadHierarchy` | `get_group(ctx, id)` | single-group existence + tenant-ownership lookup; backs PDP scope validation (`/tenants/{t}/resourceGroups/{rg}`) |
 | `ResourceGroupReadHierarchy` | `list_memberships(ctx, query)` | membership listing; backs PDP group-membership resolution. Caller MUST supply a subject-scoped filter (`resource_id eq '<subject_id>'`) |
@@ -884,7 +911,7 @@ sequenceDiagram
     PE->>AZ: evaluate(EvaluationRequest)
     Note right of AZ: subject.properties.tenant_id = T1<br/>action.name = "list"<br/>resource.type = "gts.cf.lms.course.v1~"<br/>context.require_constraints = true<br/>context.supported_properties = ["owner_tenant_id"]
 
-    AZ->>RG: get_group_descendants(system_ctx, T1, filter: "type eq 'tenant'")
+    AZ->>RG: get_group_descendants(system_ctx, T1, filter: "type eq '<TENANT_RG_TYPE_PATH>'")
     RG-->>AZ: [{T1, depth:0, metadata:{}}, {T7, depth:1, metadata:{self_managed:true}}]
     Note right of AZ: AuthZ policy logic (not RG):<br/>T7.metadata.self_managed=true, caller≠T7<br/>→ exclude T7 scope from AccessScope
 
@@ -938,7 +965,9 @@ Applies to:
 - `POST/PUT/DELETE /api/types-registry/v1/types/{code}` — type lifecycle
 - `GET /api/resource-group/v1/groups` — list/get groups
 - `POST/PUT/DELETE /api/resource-group/v1/groups/{group_id}` — group lifecycle
-- `GET /api/resource-group/v1/groups/{group_id}/hierarchy` — hierarchy traversal
+- `POST /api/resource-group/v1/groups/{group_id}/move` — re-parent a group and its subtree
+- `GET /api/resource-group/v1/groups/{group_id}/descendants` — downward hierarchy traversal
+- `GET /api/resource-group/v1/groups/{group_id}/ancestors` — upward hierarchy traversal
 - `GET /api/resource-group/v1/memberships` — list memberships
 - `POST/DELETE /api/resource-group/v1/memberships/{...}` — membership lifecycle
 
@@ -955,7 +984,7 @@ caller's request. The `dyn ResourceGroupReadHierarchy` type narrows
 the surface to hierarchy-only operations, so the plugin cannot reach
 non-hierarchy reads or any write paths through this channel.
 
-##### Mode 2: MTLS (private API — hierarchy endpoint only) — deferred (`p2`, not implemented yet)
+##### Mode 2: MTLS (private API — hierarchy endpoints only) — deferred (`p2`, not implemented yet)
 
 > **Status: `p2` — designed, not implemented yet.** The MTLS path is the
 > service-to-service authentication mode planned for a future microservice
@@ -965,16 +994,17 @@ non-hierarchy reads or any write paths through this channel.
 > here so the future split has a documented contract; do not implement
 > this in the current iteration.
 
-Service-to-service requests authenticated via mutual TLS client certificate. Used exclusively by AuthZ plugin to read tenant hierarchy. **Only one endpoint** is available in MTLS mode:
+Service-to-service requests authenticated via mutual TLS client certificate. Used exclusively by AuthZ plugin to read tenant hierarchy. **Only the two hierarchy read routes** are available in MTLS mode:
 
-- `GET /api/resource-group/v1/groups/{group_id}/hierarchy` — hierarchy traversal
+- `GET /api/resource-group/v1/groups/{group_id}/descendants` — downward hierarchy traversal (`depth ≥ 0`)
+- `GET /api/resource-group/v1/groups/{group_id}/ancestors` — upward hierarchy traversal (`depth ≤ 0`)
 
 All other endpoints return `403 Forbidden` in MTLS mode. This is enforced by RG gateway-level allowlist, not by AuthZ evaluation.
 
 MTLS requests **bypass AuthZ evaluation entirely** — no `PolicyEnforcer` call, no `access_evaluation_request`. This is critical because:
 1. AuthZ plugin **is the caller** — it cannot evaluate itself (circular dependency)
 2. MTLS certificate identity is a trusted system principal — access is granted by transport-level authentication
-3. The single allowed endpoint returns read-only hierarchy data — minimal attack surface
+3. The only allowed endpoints return read-only hierarchy data — minimal attack surface
 
 ##### Authentication Decision Flow (`p2` — covers the future MTLS path)
 
@@ -998,7 +1028,7 @@ flowchart TD
 
     AUTH_CHECK -->|"MTLS client cert<br/>(AuthZ Plugin) — p2 deferred"| MTLS_PATH["RG Gateway verifies client cert<br/>against trusted CA bundle"]
     MTLS_PATH --> ENDPOINT_CHECK{RG Gateway:<br/>endpoint in MTLS allowlist?}
-    ENDPOINT_CHECK -->|"Yes: /groups/{id}/hierarchy"| SYSTEM_CTX["RG Gateway creates<br/>System SecurityContext"]
+    ENDPOINT_CHECK -->|"Yes: /groups/{id}/descendants<br/>or /groups/{id}/ancestors"| SYSTEM_CTX["RG Gateway creates<br/>System SecurityContext"]
     SYSTEM_CTX --> EXEC_DIRECT["RG Hierarchy Service executes<br/>directly — no AuthZ evaluation"]
     ENDPOINT_CHECK -->|No: any other endpoint| REJECT[403 Forbidden]
 
@@ -1021,9 +1051,9 @@ sequenceDiagram
     participant RG_SVC as RG Hierarchy Service
     participant DB as RG Database
 
-    AZ->>RG_GW: GET /groups/{T1}/hierarchy (MTLS cert)
+    AZ->>RG_GW: GET /groups/{T1}/descendants (MTLS cert)
     RG_GW->>RG_GW: verify client certificate
-    RG_GW->>RG_GW: check endpoint allowlist → ✓ /groups/{id}/hierarchy
+    RG_GW->>RG_GW: check endpoint allowlist → ✓ /groups/{id}/descendants
 
     Note over RG_GW: MTLS mode: skip AuthZ evaluation
 
@@ -1109,7 +1139,9 @@ gears:
       # Endpoints reachable via MTLS. All other endpoints return 403.
       allowed_endpoints:
         - method: GET
-          path: /api/resource-group/v1/groups/{group_id}/hierarchy
+          path: /api/resource-group/v1/groups/{group_id}/descendants
+        - method: GET
+          path: /api/resource-group/v1/groups/{group_id}/ancestors
 ```
 
 Only explicitly listed method+path combinations are reachable via MTLS. Any request to an unlisted endpoint returns `403 Forbidden` regardless of certificate validity. Similarly, a valid certificate from a client not in `allowed_clients` is rejected.
@@ -1119,7 +1151,7 @@ Only explicitly listed method+path combinations are reachable via MTLS. Any requ
 | Deployment | AuthZ → RG hierarchy read | Auth mechanism | Status |
 | ---------- | ------------------------- | -------------- | ------ |
 | Monolith (single process) | `hub.get::<dyn ResourceGroupReadHierarchy>()` — direct in-process call via ClientHub | No network auth needed — trusted in-process call, system `SecurityContext` | `p1` — implemented |
-| Microservices (separate processes) | gRPC/REST call to RG service | MTLS client certificate — only `/groups/{id}/hierarchy` endpoint allowed | `p2` — deferred, not implemented yet |
+| Microservices (separate processes) | gRPC/REST call to RG service | MTLS client certificate — only the `/groups/{id}/descendants` and `/groups/{id}/ancestors` endpoints allowed | `p2` — deferred, not implemented yet |
 
 In both cases, the AuthZ plugin uses `ResourceGroupReadHierarchy` trait. The trait implementation is either a direct local call (monolith — `p1`) or an MTLS-authenticated remote call (microservices — `p2`, deferred / not implemented yet). The RG gateway applies the same allowlist logic in both cases — but in monolith mode, the in-process ClientHub path skips the gateway entirely (no HTTP, no MTLS, no allowlist check needed — the type system enforces that only `get_group_descendants` / `get_group_ancestors` are callable via `dyn ResourceGroupReadHierarchy`).
 
@@ -1363,7 +1395,7 @@ RG relies on database-level performance rather than application-level caching:
 | `gts.cf.core.rg.group.v1~` | `delete` | `deleteGroup` | DELETE | `/groups/{group_id}` | JWT |
 | `gts.cf.core.rg.group.v1~` | `list` | `getGroupDescendants` | GET | `/groups/{group_id}/descendants` | JWT |
 | `gts.cf.core.rg.group.v1~` | `list` | `getGroupAncestors` | GET | `/groups/{group_id}/ancestors` | JWT |
-| _(AuthZ bypassed)_ | — | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | MTLS |
+| _(AuthZ bypassed)_ | — | `getGroupDescendants` / `getGroupAncestors` | GET | `/groups/{group_id}/descendants`, `/groups/{group_id}/ancestors` | MTLS (`p2`, deferred) |
 | `gts.cf.core.rg.group_membership.v1~` | `list` | `listMemberships` | GET | `/memberships` | JWT |
 | `gts.cf.core.rg.group_membership.v1~` | `create` | `addMembership` | POST | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
 | `gts.cf.core.rg.group_membership.v1~` | `delete` | `deleteMembership` | DELETE | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
@@ -1373,7 +1405,7 @@ Notes:
   - Standard action vocabulary: `list` (collection), `read` (single resource), `create`, `update`, `delete` — aligned with [AuthZ usage scenarios](../../../docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md).
   - The AuthZ plugin reads hierarchy in-process via `ResourceGroupReadHierarchy` registered in `ClientHub` and **bypasses `PolicyEnforcer` invocation** on those reads (`AccessScope::allow_all()`); the plugin still produces AuthZ tenant/subtree constraints from the returned hierarchy — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
   - MTLS-authenticated requests (AuthZ plugin only) **also** bypass `PolicyEnforcer` entirely — `p2`, **deferred / not implemented yet**, planned for the future microservice split — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
-  - `listGroupHierarchy` shares `resource_group` + `read` permission with `getGroup` — both are group read operations; the AuthZ policy may differentiate them if needed.
+  - `getGroupDescendants` and `getGroupAncestors` are gated as `list` on `gts.cf.core.rg.group.v1~`, the same action as `listGroups` — all three are collection reads. `getGroup` is gated as `get`. The AuthZ policy may differentiate the three `list` operations if needed.
   - The `gts.cf.core.rg.type.v1~` row above applies **without exception**, including to the in-process `ClientHub` path: `ResourceGroupLocalClient`'s `create_type`/`get_type`/`list_types`/`update_type`/`delete_type` — the implementation registered as `dyn ResourceGroupClient` and resolved by other gears in the same binary — call `TypeService`'s gated entry points, exactly like the REST handlers do, and run through `PolicyEnforcer` the same way. There is no separate unscoped path for in-process callers (an earlier revision briefly introduced one and was reverted — see the git history around VHP-2342). Any consumer that registers or manages GTS types — from a gear's lifecycle or otherwise — **must have a matching AuthZ policy rule** for its `subject_type`; RG will not admit it on the strength of being a platform-internal caller.
 
   - **Consequence for lifecycle-time registrations (resolved, kept as a constraint on callers).** Because the gate applies without exception, a type registration is an ordinary PDP-mediated call and therefore cannot happen during any gear's `Gear::init` **at all** — not for account-management, not for anyone, and not as a matter of init ordering. The gate calls the AuthZ resolver, which resolves its PDP plugin by looking the plugin instance up in types-registry; types-registry keeps runtime registrations in a private staging store and publishes them to the readable one only in `SystemCapability::post_init`, a barrier phase the host runtime executes strictly after `init()` has returned for *every* gear (`run_init_phase()` → `run_post_init_phase()` in `libs/toolkit/src/runtime/host_runtime.rs`). During init the catalogue therefore reads empty, PDP resolution fails with `PluginNotFound`, and the gate fails closed with `service_unavailable`. This was the first and structural reason AM's registration failed; no policy rule and no plugin change could have fixed it, because the PDP that would carry the rule is not reachable yet. An earlier revision of this note blamed only the second, narrower reason — that AM's actor carried `subject_tenant_id = Uuid::nil()` and `static-authz-plugin` denies a nil tenant unconditionally (`gears/system/authz-resolver/plugins/static-authz-plugin/src/domain/service.rs`, `tid == Uuid::default()`) — and wrongly implied a policy-layer fix existed. Both barriers were real and they fire in that order.
@@ -1436,7 +1468,7 @@ A group has three mutable-looking fields — `name`, `parent`, `metadata` — wh
 
 **Decision.** The structural operation was extracted to `POST /groups/{group_id}/move` (B1.3: atomic, single `SERIALIZABLE` transaction with bounded retry, never "detach then attach"). What remains on `PUT /groups/{group_id}` is `name` + `metadata` — two ordinary fields of comparable weight, with no cross-field validation between them.
 
-**Splitting the endpoint was not sufficient on its own; splitting the *write set* was the other half.** Extracting the move removed the payload ambiguity, so the isolation-level guess and its restart protocol had no subject left — but for a while the update path still *wrote* `parent_id`, carrying back the value it had read inside its own READ COMMITTED transaction. A move committing in that window had its parent change reverted in `resource_group` while its rebuilt `resource_group_closure` rows survived, and neither transaction had a conflict to abort on (the mirror image, a move reverting a concurrent rename, was reachable in the other commit order). The repository therefore exposes two column-specific writers with disjoint write sets — `update_attributes` (`name`, `metadata`, `updated_at`) and `update_parent` (`parent_id`, `updated_at`) — and `gts_type_id` is writable by neither, since a group's type is fixed at creation. `parent_id` and the closure projection are consequently written by exactly one path, always under `SERIALIZABLE`, which is what makes "`PUT` needs no serializable isolation" a true statement rather than an aspiration. See `features/0003-entity-hierarchy.md` ("Removed steps") and the two regression tests named there.
+**Splitting the endpoint was not sufficient on its own; splitting the *write set* was the other half.** Extracting the move removed the payload ambiguity, so the isolation-level guess and its restart protocol had no subject left — but for a while the update path still *wrote* `parent_id`, carrying back the value it had read inside its own READ COMMITTED transaction. A move committing in that window had its parent change reverted in `resource_group` while its rebuilt `resource_group_closure` rows survived, and neither transaction had a conflict to abort on (the mirror image, a move reverting a concurrent rename, was reachable in the other commit order). The repository therefore exposes two column-specific writers whose **business and structural columns are disjoint, while both maintain `updated_at`** — `update_attributes` writes `name` + `metadata`, `update_parent` writes `parent_id`, and each stamps `updated_at` — and `gts_type_id` and `tenant_id` are writable by neither, since a group's type is fixed at creation and its tenant follows from type and placement. The shared timestamp is deliberate and harmless: it is a last-write-wins audit column, not part of the parent/closure projection, so it cannot recreate the corruption described above. `parent_id` and the closure projection are consequently written by exactly one path, always under `SERIALIZABLE`, which is what makes "`PUT` needs no serializable isolation" a true statement rather than an aspiration. See `features/0003-entity-hierarchy.md` ("Removed steps") and the two regression tests named there.
 
 **There is deliberately no `PATCH` for groups, and B1.1 is satisfied without one.** B1.1's own text carves this out: the test "is not which verb is present but whether changing one field forces the client to know, and resend, the rest". After the split the only thing a client is forced to resend is the other one of `name` / `metadata`, both of which it already has from the `GET` it must perform anyway to know the group exists. Adding `PATCH` would buy a client nothing it cannot express, while re-introducing exactly the ambiguity that caused the original defect: an omitted key that means "leave alone" is one refactor away from an omitted key that means "clear". This gear keeps one verb per resource, matching the platform convention that no resource in the repository exposes both (the type registry is `PUT`-only for the same reason — a type definition is a document).
 
@@ -1636,7 +1668,7 @@ API tests verify HTTP-level behavior: request/response shapes, status codes, ODa
 | Create type — happy path | `POST /types` | 201 Created, response body matches `ResourceGroupType` schema |
 | Create type — duplicate | `POST /types` (same code) | 409 Conflict, Problem JSON with `TypeAlreadyExists` |
 | Create type — invalid code | `POST /types` (whitespace in code) | 400 Bad Request, Problem JSON with validation details |
-| List types — OData filter | `GET /types?$filter=code eq 'tenant'` | 200 OK, filtered result set |
+| List types — OData filter | `GET /types?$filter=code eq 'gts.cf.core.rg.type.v1~x.test.org.v1~'` (a full GTS path — a bare `tenant` is not a valid code) | 200 OK, filtered result set |
 | Create group — with parent | `POST /groups` | 201 Created, closure rows created |
 | Create group — invalid parent type | `POST /groups` | 400, Problem JSON with a `parent_type` field violation |
 | Move group — cycle | `POST /groups/{id}/move` (parent = descendant) | 400 with a `hierarchy` precondition violation (`CycleDetected`) |
@@ -1646,8 +1678,8 @@ API tests verify HTTP-level behavior: request/response shapes, status codes, ODa
 | Update group — `parent_id` in body | `PUT /groups/{id}` with `parent_id` | 400 (unknown field) |
 | Delete group — has children, no force | `DELETE /groups/{id}` | 400, `failed_precondition`, subject `active_references` |
 | Delete group — force cascade | `DELETE /groups/{id}?force=true` | 204 No Content, subtree + memberships removed |
-| List group hierarchy — depth filter | `GET /groups/{id}/hierarchy?$filter=hierarchy/depth ge 0` | 200 OK, descendants with `depth` field |
-| List group hierarchy — ancestors | `GET /groups/{id}/hierarchy?$filter=hierarchy/depth le 0` | 200 OK, ancestors with negative `depth` |
+| Descendants — depth filter | `GET /groups/{id}/descendants?$filter=hierarchy/depth le 1` | 200 OK, the group and its direct children, each with a `depth` field |
+| Ancestors — depth filter | `GET /groups/{id}/ancestors?$filter=hierarchy/depth ge -1` | 200 OK, the group and its direct parent, ancestor `depth` negative |
 | Add membership | `POST /memberships/{gid}/{rtype}/{rid}` | 201 Created |
 | Add membership — duplicate | `POST /memberships/{gid}/{rtype}/{rid}` again | 409 Conflict |
 | Remove membership | `DELETE /memberships/{gid}/{rtype}/{rid}` | 204 No Content |
@@ -1656,7 +1688,7 @@ API tests verify HTTP-level behavior: request/response shapes, status codes, ODa
 | Invalid OData filter | `GET /groups?$filter=invalid` | 400 Bad Request |
 | JWT auth — standard request | Request with bearer token | `PolicyEnforcer` called, response scoped by tenant |
 | JWT auth — AuthZ denies | Request + `DenyingAuthZResolverClient` | 403 Forbidden |
-| MTLS auth — hierarchy endpoint allowed | Simulated MTLS context, `GET /groups/{id}/hierarchy` | 200 OK, no PolicyEnforcer call |
+| MTLS auth — hierarchy endpoint allowed | Simulated MTLS context, `GET /groups/{id}/descendants` | 200 OK, no PolicyEnforcer call |
 | MTLS auth — non-hierarchy endpoint rejected | Simulated MTLS context, `POST /groups` | 403 Forbidden |
 | All error categories — RFC 9457 format | Trigger each error category | Response has `type`, `title`, `status`, `detail` fields |
 

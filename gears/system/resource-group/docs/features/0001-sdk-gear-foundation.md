@@ -95,8 +95,18 @@ Not applicable. This feature provides SDK contracts and gear infrastructure with
 2. [x] - `p1` - Trim whitespace and normalize to lowercase - `inst-gts-val-2`
 3. [x] - `p1` - **IF** string is empty - `inst-gts-val-3`
    1. [x] - `p1` - **RETURN** Validation error: "GTS type path must not be empty" - `inst-gts-val-3a`
-4. [x] - `p1` - **IF** string does not match pattern `^gts\.[a-z0-9_.]+~([a-z0-9_.]+~)*$` - `inst-gts-val-4`
+4. [x] - `p1` - **IF** the canonical GTS parser rejects the string — `GtsTypePath::new` delegates to `gts::GtsId::try_new` rather than applying a regex of its own - `inst-gts-val-4`
    1. [x] - `p1` - **RETURN** Validation error: "Invalid GTS type path format" - `inst-gts-val-4a`
+
+   The parser's rules, for reference — they are stricter than the character-class pattern earlier
+   revisions of this document specified, and that pattern is not what runs:
+
+   - the string starts with the compile-time `GTS_ID_PREFIX` (`gts.` by default, configurable per build) and ends with `~`
+   - every `~`-delimited segment is `vendor.package.namespace.type.vMAJOR[.MINOR]` — exactly four name tokens plus a version, no more and no fewer
+   - name tokens match `[a-z_][a-z0-9_]*`: they may not start with a digit, and hyphens are rejected
+   - `_` is a legal namespace placeholder
+   - total length at most 1024 characters; over that is reported as the same "Invalid GTS type path format", not as a distinct length message
+   - a trailing-`~`-less string is an *instance* id, not a type path, and is rejected here
 5. [x] - `p1` - Construct `GtsTypePath` value object wrapping the validated string - `inst-gts-val-6`
 6. [x] - `p1` - **RETURN** validated `GtsTypePath` - `inst-gts-val-7`
 
@@ -332,9 +342,9 @@ Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly
 - **Covers**: G36
 - **Assert**: `Err("must not be empty")`
 
-#### TC-SDK-03: GtsTypePath::new() exceeds 255 chars [P1]
+#### TC-SDK-03: GtsTypePath::new() exceeds the 1024-char limit [P1]
 - **Covers**: G36
-- **Assert**: `Err("exceeds maximum length")`
+- **Assert**: `Err("Invalid GTS type path format")` — the parser reports an over-length id through the same message as any other malformed id; there is no separate "exceeds maximum length" text. Asserted together with the boundary cases in TC-SDK-22/23.
 
 #### TC-SDK-04: GtsTypePath::new() invalid format - no gts prefix [P1]
 - **Covers**: G38
@@ -357,7 +367,7 @@ Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly
 
 #### TC-SDK-08: GtsTypePath::new() chained path (multi-segment) [P1]
 - **Covers**: G38
-- **Input**: `"gts.cf.core.rg.type.v1~x.test.v1~"`
+- **Input**: `"gts.cf.core.rg.type.v1~x.test.unit.root.v1~"` — the second segment needs its full four name tokens plus version; `x.test.v1~` is **not** valid and returns `Err`
 - **Assert**: `Ok`
 
 #### TC-SDK-09: GtsTypePath::new() double tilde (empty segment) [P2]
@@ -387,25 +397,26 @@ Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly
 #### TC-SDK-18: GtsTypePath "gts.~" (minimal rest, empty segment) [P2]
 - rest = "~", segments = ["", ""], first segment empty → Err
 
-#### TC-SDK-19: GtsTypePath numeric segments "gts.123~456~" [P2]
-- Digits are allowed chars → Ok
+#### TC-SDK-19: GtsTypePath numeric version "gts.cf.core.rg.type.v2~" [P2]
+- Digits are allowed inside a token and in the version → Ok. Note the contrast: `"gts.123~456~"` is `Err` — a name token may not *start* with a digit, and neither segment has four tokens plus a version
 
-#### TC-SDK-20: GtsTypePath underscores + dots "gts.a_b.c_d~" [P2]
-- Valid chars → Ok
+#### TC-SDK-20: GtsTypePath underscores in a token "gts.cf.core.rg.my_type.v1~" [P2]
+- Underscores are legal inside a name token → Ok. `"gts.a_b.c_d~"` is `Err`: legal characters, wrong token count
 
 #### TC-SDK-21: GtsTypePath whitespace-only input "   " [P2]
 - trim → empty → Err("must not be empty")
 
-#### TC-SDK-22: GtsTypePath exactly 255 chars [P2]
-- Boundary → Ok
+#### TC-SDK-22: GtsTypePath exactly 1024 chars [P2]
+- Boundary (the GTS id limit, matching the DB's `CHECK (LENGTH(VALUE) <= 1024)`) → Ok
 
-#### TC-SDK-23: GtsTypePath exactly 256 chars [P2]
-- Boundary → Err("exceeds maximum length")
+#### TC-SDK-23: GtsTypePath exactly 1025 chars [P2]
+- Boundary → `Err("Invalid GTS type path format")`
 
-#### TC-SDK-24: validate_type_code vs GtsTypePath normalization mismatch [P1]
-- `validate_type_code("  gts.cf.SYSTEM.RG.TYPE.V1~  ")` → fails (no trim/lowercase)
-- `GtsTypePath::new("  gts.cf.SYSTEM.RG.TYPE.V1~  ")` → succeeds (trims + lowercases)
-- Document this inconsistency and verify behavior
+#### TC-SDK-24: validate_type_code and GtsTypePath normalize identically [P1]
+- **There is no longer a mismatch here, and the test now pins the agreement.** Both layers canonicalize the same way — trim, then lowercase:
+  - `GtsTypePath::new("  GTS.CF.CORE.RG.TYPE.V1~  ")` → `Ok`, `as_str() == "gts.cf.core.rg.type.v1~"`
+  - the domain's `canonical_type_code` applies the same `canonicalize_code` and then *returns* the canonical form, which callers are required to persist and look up instead of their raw input
+- A code that round-trips through either function compares byte-for-byte against what the other would accept. The earlier revision of this case described an asymmetry (domain not trimming/lowercasing) that no longer exists; it was the source of a real defect — an uppercase or space-padded tenant code passed validation and was then classified as an *ordinary* type
 
 #### TC-SDK-14: SDK model camelCase serialization [P1]
 - **Covers**: G41
@@ -534,7 +545,8 @@ Helper `assert_group_shape(data)` verifies the JSON wire shape of a group respon
 ```
 HEAD /cf/resource-group/v1/groups               → not 404/405
 HEAD /cf/resource-group/v1/groups/{uuid}        → not 405 (404 ok — group doesn't exist)
-HEAD /cf/resource-group/v1/groups/{uuid}/hierarchy  → not 405
+HEAD /cf/resource-group/v1/groups/{uuid}/descendants → not 405
+HEAD /cf/resource-group/v1/groups/{uuid}/ancestors   → not 405
 HEAD /cf/resource-group/v1/memberships          → not 405
 POST /cf/types-registry/v1/types (empty body)   → not 404/405 (400 ok — validation)
 

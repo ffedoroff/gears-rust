@@ -1,323 +1,141 @@
-<!-- Updated: 2026-04-20 by Constructor Tech -->
+<!-- Updated: 2026-07-30 by Constructor Tech -->
 
 # Rust SDK Contracts — Resource Group
 
-> Reference document for planned Rust trait contracts and SDK types.
-> Canonical source after implementation: `resource-group-sdk/src/`.
 
-## SDK Models
+<!-- toc -->
 
-Defined in `resource-group-sdk/src/models.rs`. Aligned with REST API schemas ([openapi.yaml](./openapi.yaml)).
+- [Two traits, two audiences](#two-traits-two-audiences)
+- [What the signatures will tell you, so this page does not](#what-the-signatures-will-tell-you-so-this-page-does-not)
+- [Contract decisions that a signature does not show](#contract-decisions-that-a-signature-does-not-show)
+- [Errors](#errors)
+- [ClientHub registration](#clienthub-registration)
 
-```rust
-use uuid::Uuid;
+<!-- /toc -->
 
-// ── Type ────────────────────────────────────────────────────────────────
+> **The canonical source is the code, not this page.** Signatures, field names, error types and
+> doc-comments live in [`resource-group-sdk/src/api.rs`](../resource-group-sdk/src/api.rs) and
+> [`resource-group-sdk/src/models.rs`](../resource-group-sdk/src/models.rs). Read them, or
+> `cargo doc -p cf-gears-resource-group-sdk --open`.
 
-/// Matches REST `Type` schema.
-#[derive(Debug, Clone)]
-pub struct ResourceGroupType {
-    pub code: String,
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
+This page used to carry a hand-transcribed copy of those two files. The copy drifted twice — wrong
+field names (`allowed_parents` for `allowed_parent_types`), wrong argument types (a by-value
+`ListQuery` that never existed instead of `&ODataQuery`), wrong error type (`ResourceGroupError` where
+the trait returns `CanonicalError`), a `metadata` map flattened into the parent object where the model
+carries a nested `Option<Value>`, a `Hierarchy` type actually named `GroupHierarchy`, a `type` field
+actually named `code`, and a method count that omitted `delete_group_cascade` and `move_group` — and
+each time a consumer wrote code against it and had to be corrected by the compiler. Prose cannot be
+kept honest about a signature; the compiler can. So what follows is only the part that *is* stable:
+which traits exist, what each is for, and the handful of contract decisions that are not visible from
+a signature alone.
 
-/// Matches REST `CreateTypeRequest` schema.
-#[derive(Debug, Clone)]
-pub struct CreateTypeRequest {
-    pub code: String,
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
+## Two traits, two audiences
 
-/// Matches REST `UpdateTypeRequest` schema.
-#[derive(Debug, Clone)]
-pub struct UpdateTypeRequest {
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
+| Trait | Methods | For | ClientHub key |
+|-------|---------|-----|---------------|
+| `ResourceGroupClient` | 17 | general consumers: domain services, apps, admin flows | `dyn ResourceGroupClient` |
+| `ResourceGroupReadHierarchy` | 5 | in-process plugin consumers that must not re-enter the PEP: the AuthZ resolver plugin, the tenant-resolver RG plugin, an in-process AuthZ PDP | `dyn ResourceGroupReadHierarchy` |
 
-// ── Hierarchy context ────────────────────────────────────────────────────
+`ResourceGroupClient` covers five type operations, seven group operations (including `move_group` and
+`delete_group_cascade`), the two hierarchy walks, and three membership operations.
+`ResourceGroupReadHierarchy` carries `get_group_descendants`, `get_group_ancestors`, `list_groups`,
+`get_group` and `list_memberships` — nothing else, and no writes.
 
-/// RG hierarchy context — position in the resource group tree.
-#[derive(Debug, Clone)]
-pub struct Hierarchy {
-    pub parent_id: Option<Uuid>,
-    pub tenant_id: Uuid,
-}
+The narrow trait is **not** a subset relationship in the type system: it is a separate trait, backed
+in production by a separate object. There is no `ResourceGroupReadPluginClient`; an earlier two-tier
+design was collapsed, and `list_memberships` / `get_group` moved onto `ResourceGroupReadHierarchy`
+itself.
 
-/// Hierarchy context with computed depth (for hierarchy traversal responses).
-#[derive(Debug, Clone)]
-pub struct HierarchyWithDepth {
-    pub parent_id: Option<Uuid>,
-    pub tenant_id: Uuid,
-    pub depth: i32,
-}
+## What the signatures will tell you, so this page does not
 
-// ── Group ───────────────────────────────────────────────────────────────
+- **List methods take `&ODataQuery`** (from `toolkit-odata`), not a bespoke query struct, and return
+  `toolkit_odata::Page<T>` / `PageInfo` — the platform's pagination types, reused rather than
+  redeclared.
+- **Membership methods take scalar arguments** (`group_id`, `resource_type`, `resource_id`), not a
+  request struct.
+- **Every fallible method returns `Result<_, CanonicalError>`**, on both traits. See "Errors" below.
+- **Model field names are the wire names**, with two deliberate exceptions: `ResourceGroup.code` and
+  `ResourceGroupWithDepth.code` serialize as `type`. Type definitions use `allowed_parent_types` /
+  `allowed_membership_types`; hierarchy context is `GroupHierarchy` / `GroupHierarchyWithDepth`;
+  `metadata` is a nested `Option<serde_json::Value>`, never flattened into its parent.
+- **SDK structs serialize `camelCase`; the REST DTOs serialize `snake_case`.** These are two different
+  vocabularies over the same model, and that is a property of the contract, not an accident — a
+  consumer serializing an SDK struct directly gets `canBeRoot`, a consumer reading REST gets
+  `can_be_root`.
 
-/// Matches REST `Group` schema. GTS-aligned: `id`/`type`/`name` + derived type
-/// fields at top level. Hierarchy context in `hierarchy` envelope.
-/// Derived type fields (e.g. `menu_bold`, `barrier`) are flattened to top level
-/// in API; stored in `metadata` JSONB column in DB. `id`/`name` are not duplicated
-/// in DB `metadata`.
-#[derive(Debug, Clone)]
-pub struct ResourceGroup {
-    pub id: Uuid,
-    pub r#type: String,
-    pub name: String,
-    pub hierarchy: Hierarchy,
-    /// Derived type fields, flattened. Stored in DB as `metadata` JSONB.
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
+## Contract decisions that a signature does not show
 
-/// Matches REST `GroupWithDepth` schema.
-#[derive(Debug, Clone)]
-pub struct ResourceGroupWithDepth {
-    pub id: Uuid,
-    pub r#type: String,
-    pub name: String,
-    pub hierarchy: HierarchyWithDepth,
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
+**A group's type is immutable after creation.** `UpdateGroupRequest` carries no `code` / `type` field,
+and none will be added. Re-typing a group would invalidate its own placement, its children's
+placements and possibly its tenant identity at once; the supported migration is delete-and-recreate.
 
-/// Matches REST `CreateGroupRequest` schema.
-/// Derived type fields sent as top-level properties.
-#[derive(Debug, Clone)]
-pub struct CreateGroupRequest {
-    pub id: Option<Uuid>,
-    pub r#type: String,
-    pub name: String,
-    pub parent_id: Option<Uuid>,
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
+**Re-parenting is `move_group`, not a field on `update_group`.** `update_group` replaces the two
+ordinary attributes `name` and `metadata`. `move_group` is the gear's only structural mutation: cycle
+detection, `allowed_parent_types` / `can_be_root` compatibility, `max_depth` / `max_width`,
+tenant-root uniqueness and the closure-table rebuild all run in one `SERIALIZABLE` transaction with
+bounded retry. `new_parent_id: Option<Uuid>` is an explicit choice, not an optional argument: `None`
+**means** "make this group a root" and never "leave the parent alone". A caller that does not want to
+move a group must not call the method. Full rationale in `DESIGN.md` § API Baseline Decisions,
+B1.1/B1.3.
 
-/// Matches REST `UpdateGroupRequest` schema.
-///
-/// Ordinary attributes only. The group's `type` is immutable after creation
-/// and its `parent_id` is not part of this payload — re-parenting is
-/// `move_group`, a separate operation (see `DESIGN.md` § API Baseline
-/// Decisions, B1.1/B1.3).
-#[derive(Debug, Clone)]
-pub struct UpdateGroupRequest {
-    pub name: String,
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
+**Both request types are strict.** Every replaceable key is required — an omitted key is a 400, not
+"keep the stored value" — and unknown keys are rejected rather than dropped. `metadata` and
+`metadata_schema` are tri-state on the wire, so an explicit `null` (clear it) is distinguishable from
+an omission (an error).
 
-// ── Membership ──────────────────────────────────────────────────────────
+**Tenant-ness is derived from the type code, not declared.** A group whose type code starts with
+`TENANT_RG_TYPE_PATH` opens a new tenant scope (`tenant_id = group.id`); every other group inherits its
+parent's tenant. There is no `is_tenant` flag anywhere. The constant is expanded once, in
+[ADR-001](./ADR/ADR-001-gts-type-system.md#the-tenant-type-path-is-a-code-constant-not-a-documentation-choice).
 
-/// Matches REST `Membership` schema.
-#[derive(Debug, Clone)]
-pub struct ResourceGroupMembership {
-    pub group_id: Uuid,
-    pub resource_type: String,
-    pub resource_id: String,
-}
+**The hierarchy walks are two operations, not one filtered operation.** `get_group_descendants`
+returns `depth ≥ 0`, `get_group_ancestors` returns `depth ≤ 0`, and both include the reference group at
+`depth = 0`. They mirror `GET /groups/{id}/descendants` and `GET /groups/{id}/ancestors`; there is no
+aggregating `/hierarchy` route and no single method that returns both directions.
 
-/// Matches REST `addMembership` / `deleteMembership` path params.
-#[derive(Debug, Clone)]
-pub struct AddMembershipRequest {
-    pub group_id: Uuid,
-    pub resource_type: String,
-    pub resource_id: String,
-}
+**`ResourceGroupReadHierarchy` reads are resolved unscoped** — they bypass `PolicyEnforcer` by
+construction. A consumer that *is* the PDP cannot route reads back through the PEP without recursing
+into itself, so the implementation resolves them with `AccessScope::allow_all()`. The caller supplies
+any subject/tenant OData filter and owns its own scoping. This is why the trait is narrow: the type
+system, not a runtime check, is what stops a plugin from reaching writes or non-hierarchy reads through
+this channel.
 
-/// Matches REST `addMembership` / `deleteMembership` path params.
-#[derive(Debug, Clone)]
-pub struct RemoveMembershipRequest {
-    pub group_id: Uuid,
-    pub resource_type: String,
-    pub resource_id: String,
-}
+**`delete_group_cascade` exists for cross-gear cleanup**, mirroring the REST `force=true` flag, and has
+a default implementation that delegates to the non-cascade `delete_group`. Most consumers want
+`delete_group` and should surface its `FailedPrecondition` / `Subject::ActiveReferences` to their caller.
 
-// ── Pagination ──────────────────────────────────────────────────────────
+## Errors
 
-/// Cursor-based pagination metadata. Matches REST `PageInfo` schema.
-#[derive(Debug, Clone)]
-pub struct PageInfo {
-    pub next_cursor: Option<String>,
-    pub prev_cursor: Option<String>,
-    pub limit: u64,
-}
+The trait boundary is `CanonicalError` (per platform ADR 0005 on canonical SDK projections). The single
+authoritative AIP-193 ladder is `From<DomainError> for CanonicalError` in the impl crate's
+`api::rest::error` — the SDK surfaces that envelope unchanged and adds no classification of its own.
 
-/// Generic paginated response. Matches REST `*Page` schemas.
-#[derive(Debug, Clone)]
-pub struct Page<T> {
-    pub items: Vec<T>,
-    pub page_info: PageInfo,
-}
-```
+`ResourceGroupError` is an **optional typed projection** over `CanonicalError`
+(`From<CanonicalError>`), offered for consumers who want flat `match` dispatch. It is not the trait's
+error type and it is not the source of the mapping — the direction of dependency is the opposite of
+what earlier revisions of this page implied. Its variants are the canonical families (`NotFound`,
+`AlreadyExists`, `InvalidArgument`, `FailedPrecondition`, `Aborted`, `PermissionDenied`, `Internal`,
+`Other`), not RG-specific ones; domain families inside `FailedPrecondition` are distinguished by
+`precondition::Subject` rather than by a variant. See the `error` module's own docs for the dispatch
+table.
 
-## Core API Trait — `ResourceGroupClient`
+## ClientHub registration
 
-Defined in `resource-group-sdk/src/api.rs`. Full read+write contract for general consumers.
+Two registrations, and — unlike what this page previously claimed — **two distinct objects**:
+`ResourceGroupLocalClient` implements `ResourceGroupClient`, `RgReadService` implements
+`ResourceGroupReadHierarchy`. Both are constructed in `Gear::init` (the ordinary phase; `pre_init` is
+for gears with the `system` capability). See `resource-group/src/gear.rs` for the current wiring, and
+`resource-group/src/domain/local_client.rs` for the adapter that bridges the SDK trait to the domain
+services.
+
+Consumers resolve them the usual way:
 
 ```rust
-use async_trait::async_trait;
-use toolkit_security::SecurityContext;
-use uuid::Uuid;
-
-#[async_trait]
-pub trait ResourceGroupClient: Send + Sync {
-    // ── Type lifecycle ──────────────────────────────────────────────
-    async fn create_type(&self, ctx: &SecurityContext, request: CreateTypeRequest) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn get_type(&self, ctx: &SecurityContext, code: &str) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn list_types(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroupType>, ResourceGroupError>;
-    async fn update_type(&self, ctx: &SecurityContext, code: &str, request: UpdateTypeRequest) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn delete_type(&self, ctx: &SecurityContext, code: &str) -> Result<(), ResourceGroupError>;
-
-    // ── Group lifecycle ─────────────────────────────────────────────
-    async fn create_group(&self, ctx: &SecurityContext, request: CreateGroupRequest) -> Result<ResourceGroup, ResourceGroupError>;
-    async fn get_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<ResourceGroup, ResourceGroupError>;
-    async fn list_groups(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroup>, ResourceGroupError>;
-    async fn update_group(&self, ctx: &SecurityContext, group_id: Uuid, request: UpdateGroupRequest) -> Result<ResourceGroup, ResourceGroupError>;
-    /// Structural counterpart of `update_group`: move the group and its subtree
-    /// to `new_parent_id`, or to the root when it is `None`. Atomic
-    /// (SERIALIZABLE + bounded retry). `None` always means "become a root",
-    /// never "leave the parent alone".
-    async fn move_group(&self, ctx: &SecurityContext, group_id: Uuid, new_parent_id: Option<Uuid>) -> Result<ResourceGroup, ResourceGroupError>;
-    async fn delete_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<(), ResourceGroupError>;
-
-    // ── Hierarchy ───────────────────────────────────────────────────
-    async fn get_group_descendants(&self, ctx: &SecurityContext, group_id: Uuid, query: &ODataQuery) -> Result<Page<ResourceGroupWithDepth>, CanonicalError>;
-    async fn get_group_ancestors(&self, ctx: &SecurityContext, group_id: Uuid, query: &ODataQuery) -> Result<Page<ResourceGroupWithDepth>, CanonicalError>;
-
-    // ── Membership lifecycle ────────────────────────────────────────
-    async fn add_membership(&self, ctx: &SecurityContext, request: AddMembershipRequest) -> Result<ResourceGroupMembership, ResourceGroupError>;
-    async fn remove_membership(&self, ctx: &SecurityContext, request: RemoveMembershipRequest) -> Result<(), ResourceGroupError>;
-    async fn list_memberships(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroupMembership>, ResourceGroupError>;
-}
+let rg = hub.get::<dyn ResourceGroupClient>()?;              // full CRUD
+let rg_reads = hub.get::<dyn ResourceGroupReadHierarchy>()?; // narrow, unscoped reads
 ```
 
-## Integration Read Trait — `ResourceGroupReadHierarchy`
-
-Narrow read-only contract for in-process plugin consumers — the AuthZ resolver
-plugin, the tenant-resolver RG plugin, and an in-process AuthZ PDP. Carries
-hierarchy walks, flat group listing, single-group existence lookup, and
-membership listing. All methods are resolved **unscoped** (they bypass
-`PolicyEnforcer`): a consumer that *is* the PDP cannot route reads back through
-the PEP without recursing. Writes remain on `ResourceGroupClient`.
-
-```rust
-/// Narrow reads for in-process plugin consumers (AuthZ resolver, tenant-resolver
-/// RG plugin, in-process AuthZ PDP). Resolved unscoped — bypasses PolicyEnforcer.
-#[async_trait]
-pub trait ResourceGroupReadHierarchy: Send + Sync {
-    /// Descendants of a reference group (depth >= 0).
-    async fn get_group_descendants(
-        &self,
-        ctx: &SecurityContext,
-        group_id: Uuid,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
-
-    /// Ancestors of a reference group (depth <= 0).
-    async fn get_group_ancestors(
-        &self,
-        ctx: &SecurityContext,
-        group_id: Uuid,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
-
-    /// Flat OData-filtered group listing; enables batch reads (`id in (…)`).
-    async fn list_groups(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError>;
-
-    /// Single-group existence + tenant-ownership lookup. Backs PDP scope
-    /// validation (`/tenants/{t}/resourceGroups/{rg}`). Resolved unscoped.
-    async fn get_group(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError>;
-
-    /// Membership listing. Backs PDP group-membership resolution; the caller
-    /// MUST supply a subject-scoped filter (`resource_id eq '<subject_id>'`).
-    /// Resolved unscoped.
-    async fn list_memberships(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError>;
-}
-```
-
-## Plugin Trait — collapsed into `ResourceGroupReadHierarchy`
-
-The earlier two-tier design had a separate `ResourceGroupReadPluginClient`
-extending `ResourceGroupReadHierarchy` with `list_memberships`. The shipped SDK
-collapses this: `list_memberships` (and `get_group`) live directly on
-`ResourceGroupReadHierarchy`, and the vendor-specific plugin gateway resolves
-`dyn ResourceGroupReadHierarchy`. A vendor backend replaces the registered
-`ResourceGroupReadHierarchy` implementation at gear init rather than
-implementing a distinct plugin trait.
-
-## ClientHub Registration
-
-Single implementation, two registrations:
-
-```rust
-let svc: Arc<ResourceGroupLocalClient> = Arc::new(ResourceGroupLocalClient::new(/* ... */));
-
-// Full read+write client: hub.get::<dyn ResourceGroupClient>()
-hub.register::<dyn ResourceGroupClient>(svc.clone());
-
-// AuthZ plugin: hub.get::<dyn ResourceGroupReadHierarchy>()
-hub.register::<dyn ResourceGroupReadHierarchy>(svc.clone());
-```
-
-## Usage Example
-
-```rust
-use toolkit_security::SecurityContext;
-use resource_group_sdk::{ResourceGroupClient, ResourceGroupReadHierarchy};
-use uuid::Uuid;
-
-// AuthZ plugin — hierarchy only
-let rg_hierarchy = hub.get::<dyn ResourceGroupReadHierarchy>()?;
-
-// General consumer — full CRUD including reads
-let rg = hub.get::<dyn ResourceGroupClient>()?;
-
-let ctx = SecurityContext::builder()
-    .subject_id(Uuid::new_v4())
-    .subject_tenant_id(Uuid::parse_str("11111111-1111-1111-1111-111111111111")?)
-    .build()?;
-
-// Hierarchy traversal — descendants (unscoped read)
-let query = ODataQuery::default(); // e.g. $filter "hierarchy/depth ge 0"
-let descendants = rg_hierarchy
-    .get_group_descendants(&ctx, group_id, &query)
-    .await?;
-
-// Full CRUD — create group
-let group = rg
-    .create_group(&ctx, CreateGroupRequest {
-        id: None,
-        r#type: "gts.cf.core.rg.type.v1~y.system.tn.tenant.v1~".into(),
-        name: "Acme Corp".into(),
-        parent_id: None,
-        metadata: Default::default(),
-    })
-    .await?;
-```
-
-## Trait Hierarchy Summary
-
-| Trait | Methods | Consumers | ClientHub key |
-|-------|---------|-----------|---------------|
-| `ResourceGroupClient` | 15 (full CRUD: types, groups, memberships, hierarchy, plus the `move_group` structural operation) | Domain services, Apps, Admins | `dyn ResourceGroupClient` |
-| `ResourceGroupReadHierarchy` | 5 (`get_group_descendants`, `get_group_ancestors`, `list_groups`, `get_group`, `list_memberships`; all unscoped / PEP-bypassing) | AuthZ resolver plugin, tenant-resolver RG plugin, in-process AuthZ PDP | `dyn ResourceGroupReadHierarchy` |
+Both traits also have a REST surface; the gear registers `/resource-group/v1/...` and
+`/types-registry/v1/...` and declares `capabilities = [db, rest]` — there is no gRPC surface. REST
+handlers call the domain services directly rather than going through the SDK trait, per the platform's
+gear-layout convention.
