@@ -35,17 +35,20 @@
 //!    no `SecurityContext` at all -- even wired to a deny-all enforcer that
 //!    would reject every gated call.
 //! 5. `RgService` -- the `dyn ResourceGroupClient` adapter registered in
-//!    `ClientHub` -- deliberately bypasses this same gate for its five type
-//!    methods (a follow-up to VHP-2342, not a regression of it): it calls
-//!    `TypeService`'s `*_unscoped` variants directly, because
-//!    account-management's gear-init type registration goes through this
-//!    exact trait with a nil-tenant system-actor `SecurityContext` that
-//!    `static-authz-plugin` would otherwise deny unconditionally. See the
-//!    doc comment on `RgService`'s `ResourceGroupClient` impl
-//!    (`src/domain/rg_service.rs`) for the full rationale and precedent
-//!    (`ResourceGroupReadHierarchy`). The REST surface VHP-2342 actually
-//!    closed (`/types-registry/v1/types`) is untouched -- it resolves a
-//!    separate `ConcreteTypeService` object, not `RgService`.
+//!    `ClientHub` -- is gated exactly like `TypeService`'s direct entry
+//!    points, with no exception for any caller shape:
+//!    `rg_service_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant`
+//!    drives all five type methods through `RgService` with a deny-all
+//!    enforcer and an `am.system`-shaped, nil-tenant `SecurityContext`
+//!    (account-management's gear-init actor,
+//!    `system_actor.rs::for_gear_init`) and asserts every one comes back
+//!    `PermissionDenied`. A prior commit (`484d0582`) briefly routed these
+//!    five methods around the gate for exactly this caller; that bypass was
+//!    reverted (owner decision -- see `docs/DESIGN.md` and the revert
+//!    commit) because it handed every in-process `ClientHub` caller the
+//!    same unscoped access, not just this one bootstrap path. This test is
+//!    the replacement coverage and must keep failing (i.e. keep asserting
+//!    denial) for as long as that decision stands.
 //!
 //! `tests/api_rest_test.rs` covers the same five actions at the HTTP layer
 //! (`list_types_denied_returns_403` etc.), asserting the actual wire status
@@ -564,24 +567,35 @@ async fn seed_types_succeeds_with_deny_all_enforcer() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 4. RgService (the ClientHub `dyn ResourceGroupClient` adapter) bypasses
-//    the gate for its five type methods -- the trusted in-process path
-//    account-management's gear-init type registration relies on.
+// 5. RgService (the ClientHub `dyn ResourceGroupClient` adapter) is gated
+//    -- no in-process bypass exists for its five type methods.
 // ═══════════════════════════════════════════════════════════════════════
 
-/// `RgService`'s five type-lifecycle methods must succeed even when every
-/// service they wrap is wired to a deny-all enforcer, and even when the
-/// caller `SecurityContext` carries a nil `subject_tenant_id` -- this
-/// reproduces account-management's gear-init actor exactly
+/// `RgService`'s five type-lifecycle methods must be denied when the
+/// `TypeService` they delegate to is wired to a deny-all enforcer -- even
+/// for a nil-tenant, `am.system`-shaped `SecurityContext`, the exact shape
+/// account-management's gear-init actor uses
 /// (`account-management/src/domain/system_actor.rs::for_gear_init`,
-/// `subject_type = "am.system"`, `subject_tenant_id = Uuid::nil()`), which
-/// `static-authz-plugin` denies unconditionally. If this test ever fails,
-/// the fix is to make `RgService`'s type methods call `TypeService`'s
-/// `*_unscoped` variants again -- not to loosen any enforcer; the deny-all
-/// wiring here stands in for a dev/monolith stack with no `am.system`
-/// policy deployed, which is the whole point of the bypass.
+/// `subject_type = "am.system"`, `subject_tenant_id = Uuid::nil()`).
+///
+/// `484d0582` briefly routed these five methods around `TypeService`'s gate
+/// (calling the `*_unscoped` variants directly) specifically so this
+/// nil-tenant actor would succeed. The owner reverted that: it handed every
+/// in-process `ClientHub` caller -- not just AM's bootstrap path -- the same
+/// unscoped access to the whole type registry, without ever inspecting
+/// `ctx`. See `docs/DESIGN.md`'s expected-permissions notes and the revert
+/// commit for the full rationale, including the now-restored consequence
+/// that a dev stack running `static-authz-plugin` fails AM's gear-init
+/// closed until policy or the plugin learns to admit this system actor.
+///
+/// This test is the replacement coverage for the bypass test the revert
+/// removed: it proves the adapter is gated again, and it must keep failing
+/// (i.e. keep observing denial) for as long as the revert stands. If AM's
+/// gear-init needs to succeed against a real deployed `PolicyEnforcer`,
+/// that is a policy or plugin problem to solve on those layers -- not a
+/// reason to reintroduce an unscoped path here.
 #[tokio::test]
-async fn rg_service_type_lifecycle_bypasses_gate_under_deny_all_enforcer_and_nil_tenant() {
+async fn rg_service_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant() {
     let db = common::test_db().await;
     let rg_service = RgService::new(
         Arc::new(common::make_type_service_deny(db.clone())),
@@ -598,8 +612,9 @@ async fn rg_service_type_lifecycle_bypasses_gate_under_deny_all_enforcer_and_nil
         .build()
         .expect("valid SecurityContext");
 
-    let code = unique_code("rgbypass");
-    let created = rg_service
+    let code = unique_code("rggated");
+
+    let err = rg_service
         .create_type(
             &ctx,
             CreateTypeRequest {
@@ -611,22 +626,34 @@ async fn rg_service_type_lifecycle_bypasses_gate_under_deny_all_enforcer_and_nil
             },
         )
         .await
-        .expect(
-            "RgService::create_type must bypass PolicyEnforcer on the in-process ClientHub path",
-        );
-    assert_eq!(created.code, code);
+        .expect_err("RgService::create_type must be denied by the gate, not bypass it");
+    assert_eq!(
+        err.status_code(),
+        403,
+        "expected PermissionDenied (403): {err:?}"
+    );
 
-    rg_service
+    let err = rg_service
         .get_type(&ctx, &code)
         .await
-        .expect("RgService::get_type must bypass PolicyEnforcer");
+        .expect_err("RgService::get_type must be denied by the gate, not bypass it");
+    assert_eq!(
+        err.status_code(),
+        403,
+        "expected PermissionDenied (403): {err:?}"
+    );
 
-    rg_service
+    let err = rg_service
         .list_types(&ctx, &toolkit_odata::ODataQuery::default())
         .await
-        .expect("RgService::list_types must bypass PolicyEnforcer");
+        .expect_err("RgService::list_types must be denied by the gate, not bypass it");
+    assert_eq!(
+        err.status_code(),
+        403,
+        "expected PermissionDenied (403): {err:?}"
+    );
 
-    rg_service
+    let err = rg_service
         .update_type(
             &ctx,
             &code,
@@ -638,10 +665,20 @@ async fn rg_service_type_lifecycle_bypasses_gate_under_deny_all_enforcer_and_nil
             },
         )
         .await
-        .expect("RgService::update_type must bypass PolicyEnforcer");
+        .expect_err("RgService::update_type must be denied by the gate, not bypass it");
+    assert_eq!(
+        err.status_code(),
+        403,
+        "expected PermissionDenied (403): {err:?}"
+    );
 
-    rg_service
+    let err = rg_service
         .delete_type(&ctx, &code)
         .await
-        .expect("RgService::delete_type must bypass PolicyEnforcer");
+        .expect_err("RgService::delete_type must be denied by the gate, not bypass it");
+    assert_eq!(
+        err.status_code(),
+        403,
+        "expected PermissionDenied (403): {err:?}"
+    );
 }
