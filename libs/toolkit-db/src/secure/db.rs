@@ -41,7 +41,7 @@
 //! let user_id = result?;
 //! ```
 
-use std::{cell::Cell, future::Future, pin::Pin, sync::Arc};
+use std::{cell::Cell, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use sea_orm::{DatabaseConnection, DatabaseTransaction, TransactionTrait};
 
@@ -60,12 +60,107 @@ use crate::{DbError, DbHandle};
 ///   [`crate::contention::is_retryable_contention`] (`PostgreSQL`
 ///   serialization failures / deadlocks, `MySQL`/`InnoDB` deadlocks,
 ///   `SQLite` `BUSY` / `BUSY_SNAPSHOT`);
-/// - bounded latency on the hot path — no exponential backoff, just
-///   immediate retry of a guaranteed-stale transaction;
+/// - bounded latency on the hot path — the success path pays no backoff at
+///   all, and even a fully-exhausted retry sequence only ever waits through
+///   [`RETRY_BACKOFF_MAX`]-capped, millisecond-scale delays (see
+///   [`retry_backoff_delay`]), not a real exponential-backoff schedule;
 /// - predictable failure semantics — after exhausting attempts the
 ///   original error is returned, so callers can surface e.g.
 ///   `503 Service Unavailable`.
 pub const DEFAULT_TX_RETRY_ATTEMPTS: u32 = 3;
+
+/// Base delay (milliseconds) for the retry backoff computed by
+/// [`retry_backoff_delay`].
+///
+/// Deliberately tiny: the only job of this delay is to de-synchronize two
+/// transactions that just collided, not to add real latency to a path that
+/// is already a bounded, small-N retry loop. See [`retry_backoff_delay`]
+/// for the full rationale.
+const RETRY_BACKOFF_BASE_MS: u64 = 2;
+
+/// Growth factor applied on top of [`RETRY_BACKOFF_BASE_MS`] by
+/// [`retry_backoff_delay`]'s [`ExponentialBackoff`](tokio_retry::strategy::ExponentialBackoff).
+///
+/// With base `2` and factor `5`, pre-jitter delays are `10ms, 20ms, 40ms,
+/// …` — i.e. attempt 2 waits up to ~10ms, attempt 3 up to ~20ms, doubling
+/// per further attempt (workspace default `DEFAULT_TX_RETRY_ATTEMPTS = 3`
+/// only ever reaches the first of these).
+const RETRY_BACKOFF_FACTOR: u64 = 5;
+
+/// Upper bound on any single retry backoff delay, in case a caller raises
+/// `max_attempts` well above [`DEFAULT_TX_RETRY_ATTEMPTS`].
+const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(100);
+
+/// Delay to wait before retrying transaction attempt `next_attempt`
+/// (1-based, counting the attempt about to run — so `next_attempt == 2` is
+/// the delay before the *second* try, right after the first collided).
+///
+/// # Why back off at all
+///
+/// Before this, [`Db::transaction_with_retry_max`] looped straight back to
+/// `BEGIN` on a retryable contention error, with no delay whatsoever. Two
+/// transactions that collide once (e.g. both inserting a first row under
+/// the same predicate lock) restart at essentially the same instant; with
+/// nothing to de-synchronize them, they are liable to collide again on the
+/// very next attempt and burn through the whole (small) attempt budget
+/// within a few milliseconds without ever getting staggered. This is the
+/// diagnosed root cause of a rare (reported ~1-in-14 runs) flake in
+/// `pg_concurrency_test.rs::membership_first_write_race_exactly_one_tenant_wins`,
+/// where two concurrent `add_membership` calls under `SERIALIZABLE` retry
+/// each other into exhaustion instead of the invariant-preserving "one
+/// wins, one gets a clean `TenantIncompatibility`" outcome. The failure
+/// mode itself did not reproduce in extensive local testing (see the
+/// commit message for numbers) -- this fix closes the one genuine gap the
+/// diagnosis identified (this is the only retry loop in the workspace with
+/// no backoff at all; see `git log --oneline -- libs/toolkit-db/src/advisory_locks.rs`
+/// for the sibling lock-retry path, which always had one), on a mechanism
+/// that is well established for this class of database contention retry.
+///
+/// # Why jitter is mandatory
+///
+/// Without jitter, two competing transactions computing the *same*
+/// deterministic delay from the *same* backoff schedule would simply sleep
+/// in lockstep and re-collide synchronized, defeating the point of backing
+/// off at all. [`tokio_retry::strategy::jitter`] is already a dependency of
+/// this crate -- see `advisory_locks::LockManager::try_lock` for its other,
+/// pre-existing use in this same module tree -- so reusing it here adds no
+/// new dependency; it applies `rand`-backed full jitter (multiplying the
+/// delay by a fresh uniform `[0, 1)` sample), which is exactly the
+/// de-synchronization primitive contention retries need.
+///
+/// # Why this shape, this small
+///
+/// [`ExponentialBackoff`](tokio_retry::strategy::ExponentialBackoff) from
+/// `tokio-retry` (already used the same way for advisory-lock retries)
+/// gives growth-with-attempt for free. The base/factor are tuned so the
+/// *pre-jitter* delay is single-to-double-digit milliseconds even at the
+/// first retry point, capped at [`RETRY_BACKOFF_MAX`] — enough to scatter
+/// competing retries across a real window, not enough to meaningfully slow
+/// down the already-rare contention path. This is unconditional on backend:
+/// the same tiny delay is correct whether the caller is retrying a
+/// `PostgreSQL` serialization failure, a `MySQL`/`InnoDB` deadlock, or a
+/// `SQLite` `database is locked` -- all three benefit equally from not
+/// re-colliding in lockstep, and none of them need more than milliseconds
+/// of staggering to avoid it.
+fn retry_backoff_delay(next_attempt: u32) -> Duration {
+    use tokio_retry::strategy::{ExponentialBackoff, jitter};
+
+    debug_assert!(
+        next_attempt >= 2,
+        "attempt 1 (the first try) is never delayed"
+    );
+    // 0-based index into the backoff sequence: the delay before attempt 2
+    // is the sequence's first element, attempt 3's delay is the second, …
+    let index = next_attempt.saturating_sub(2) as usize;
+
+    let base = ExponentialBackoff::from_millis(RETRY_BACKOFF_BASE_MS)
+        .factor(RETRY_BACKOFF_FACTOR)
+        .max_delay(RETRY_BACKOFF_MAX)
+        .nth(index)
+        .unwrap_or(RETRY_BACKOFF_MAX);
+
+    jitter(base)
+}
 
 // Task-local guard to detect transaction bypass attempts.
 //
@@ -441,10 +536,13 @@ impl Db {
     ///    - if `extract_db_err(&e)` yields a `DbErr` that
     ///      [`crate::contention::is_retryable_contention`] flags as
     ///      retryable for the active backend, and attempts remain, log at
-    ///      `WARN` and retry;
+    ///      `WARN`, wait a small jittered backoff (see
+    ///      [`retry_backoff_delay`]), and retry;
     ///    - otherwise, return the error.
     ///
-    /// On exhausting all attempts the **last** error is returned.
+    /// On exhausting all attempts the **last** error is returned. The
+    /// backoff only ever runs between a failed attempt and the next retry —
+    /// the success path (first-try or otherwise) never waits.
     ///
     /// # Errors
     ///
@@ -525,12 +623,19 @@ impl Db {
                         crate::contention::is_retryable_contention(backend, db_err)
                     });
                     if retryable && attempt < max {
+                        let next_attempt = attempt + 1;
+                        let delay = retry_backoff_delay(next_attempt);
                         tracing::warn!(
                             attempt,
                             max_attempts = max,
+                            delay = ?delay,
                             "retrying transaction after retryable failure"
                         );
-                        attempt += 1;
+                        // Small jittered backoff so two transactions that
+                        // just collided don't restart in lockstep and
+                        // collide again -- see `retry_backoff_delay`.
+                        tokio::time::sleep(delay).await;
+                        attempt = next_attempt;
                         continue;
                     }
                     return Err(e);
@@ -797,3 +902,114 @@ impl std::fmt::Debug for DbTx<'_> {
 
 // NOTE: tests for `Db` live under `libs/toolkit-db/tests/` so they can be gated per-backend
 // without creating feature-specific unused-import warnings in this gear.
+//
+// `retry_backoff_delay` is the exception: it's pure `Duration` arithmetic
+// with no backend dependency (no `pg`/`sqlite`/`mysql` feature needed, no
+// I/O, no actual sleeping), so it's tested in-place instead -- same pattern
+// `contention.rs` uses for its own backend-agnostic pure logic in this
+// crate. These tests never call `tokio::time::sleep`, so they're
+// synchronous, deterministic, and effectively instantaneous.
+#[cfg(test)]
+mod backoff_tests {
+    use super::{
+        RETRY_BACKOFF_BASE_MS, RETRY_BACKOFF_FACTOR, RETRY_BACKOFF_MAX, retry_backoff_delay,
+    };
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    /// The deterministic pre-jitter ceiling for a given `next_attempt`,
+    /// computed independently of `retry_backoff_delay` from the same
+    /// constants, so this test doesn't just re-execute the production
+    /// formula and trivially agree with itself.
+    fn pre_jitter_ceiling(next_attempt: u32) -> Duration {
+        let power = next_attempt.saturating_sub(2);
+        let millis = RETRY_BACKOFF_BASE_MS
+            .saturating_pow(power + 1)
+            .saturating_mul(RETRY_BACKOFF_FACTOR);
+        Duration::from_millis(millis).min(RETRY_BACKOFF_MAX)
+    }
+
+    #[test]
+    fn delay_is_bounded_by_the_pre_jitter_ceiling() {
+        // Full jitter (`tokio_retry::strategy::jitter`) multiplies by a
+        // uniform `[0, 1)` sample, so every observed delay must fall in
+        // `[0, ceiling]` -- never above it, never negative (Duration can't
+        // be negative, but this also guards against an accidental >1.0
+        // multiplier creeping in).
+        for next_attempt in 2..=6 {
+            let ceiling = pre_jitter_ceiling(next_attempt);
+            for _ in 0..200 {
+                let delay = retry_backoff_delay(next_attempt);
+                assert!(
+                    delay <= ceiling,
+                    "attempt {next_attempt}: delay {delay:?} exceeded ceiling {ceiling:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delay_grows_with_attempt_number() {
+        // Structural growth check on the *ceiling* (deterministic), not on
+        // any individual jittered sample -- two samples from a later
+        // attempt aren't guaranteed to exceed an earlier one (jitter can
+        // draw close to zero), but the achievable ceiling must strictly
+        // grow attempt-over-attempt up to the cap.
+        let ceilings: Vec<Duration> = (2..=5).map(pre_jitter_ceiling).collect();
+        for pair in ceilings.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "backoff ceiling must not shrink as attempts increase: {ceilings:?}"
+            );
+        }
+        // And it must actually increase somewhere in this range (not
+        // flat-lined at the cap immediately) -- otherwise "growing per
+        // attempt" would be vacuously true.
+        assert!(
+            ceilings.iter().collect::<HashSet<_>>().len() > 1,
+            "expected the ceiling to vary across attempts 2..=5, got {ceilings:?}"
+        );
+    }
+
+    #[test]
+    fn delay_stays_small() {
+        // Order-of-magnitude guard: the whole point of this backoff is to
+        // desynchronize retries without adding real latency, so even the
+        // worst case (attempt exhaustion with a caller-raised max_attempts)
+        // must stay well under a second.
+        for next_attempt in 2..=10 {
+            assert!(
+                retry_backoff_delay(next_attempt) <= RETRY_BACKOFF_MAX,
+                "attempt {next_attempt} exceeded RETRY_BACKOFF_MAX"
+            );
+        }
+        assert!(RETRY_BACKOFF_MAX <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn jitter_is_actually_applied() {
+        // If jitter were accidentally dropped (e.g. a refactor that calls
+        // the base strategy directly), every sample for a fixed
+        // `next_attempt` would come back identical. Full jitter over a
+        // continuous `[0, 1)` sample makes repeated exact ties
+        // astronomically unlikely, so requiring >1 distinct value across
+        // 100 samples is a robust, non-flaky way to prove randomization is
+        // wired in without asserting on any specific duration.
+        let samples: HashSet<Duration> = (0..100).map(|_| retry_backoff_delay(2)).collect();
+        assert!(
+            samples.len() > 1,
+            "expected jittered delays to vary, got {} identical samples",
+            100 - samples.len() + 1
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt 1 (the first try) is never delayed")]
+    fn debug_assert_catches_delaying_the_first_attempt() {
+        // `next_attempt` is 1-based counting the attempt about to run;
+        // attempt 1 is the first try and must never be delayed (that would
+        // put latency on the success path). This only fires in debug
+        // builds (`debug_assert!`), which is how `cargo test` runs.
+        let _ = retry_backoff_delay(1);
+    }
+}
