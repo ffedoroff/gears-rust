@@ -2758,3 +2758,178 @@ async fn get_group_unscoped_missing_is_not_found() {
         "expected GroupNotFound, got: {err:?}"
     );
 }
+
+// =========================================================================
+// list_groups `type` $filter coverage (fe2d609e generalization follow-up)
+// =========================================================================
+//
+// `fe2d609e` (VHP-1954/1731) lifted `resolve_type_filter_node` out of
+// `GroupRepository` and into `TypeRepository`, generic over the caller's
+// filter-field enum, so `GroupRepository::list_groups` now calls the exact
+// same tree-walk `MembershipRepository::list_memberships` does instead of
+// its own private copy. Independent review found that `list_groups`' own
+// `type` `$filter` had no dedicated test of its own after that: mutating
+// the shared resolve logic only turns one, unrelated membership test red.
+// These tests close that gap directly against `list_groups`, with at least
+// two distinct types in the fixture so a broken resolve (or a resolve that
+// silently no-ops) cannot pass by accident.
+
+/// `$filter=type eq '<gts-path>'` must resolve the GTS path to its
+/// SMALLINT surrogate id and return exactly the groups of that type --
+/// never groups of another type also present for the same tenant.
+#[tokio::test]
+async fn group_list_filters_by_type_returns_only_matching_type() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let type_a = common::create_root_type(&type_svc, "grptypea").await;
+    let type_b = common::create_root_type(&type_svc, "grptypeb").await;
+
+    let group_a1 = common::create_root_group(&group_svc, &ctx, &type_a.code, "A1", tenant_id).await;
+    let group_a2 = common::create_root_group(&group_svc, &ctx, &type_a.code, "A2", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &type_b.code, "B1", tenant_id).await;
+
+    let parsed = toolkit_odata::parse_filter_string(&format!("type eq '{}'", type_a.code))
+        .expect("parse type filter");
+    let query = ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = group_svc
+        .list_groups(&ctx, &query)
+        .await
+        .expect("list groups filtered by type");
+
+    let ids: std::collections::HashSet<Uuid> = page.items.iter().map(|g| g.id).collect();
+    assert_eq!(
+        ids,
+        [group_a1.id, group_a2.id].into_iter().collect(),
+        "type filter must return exactly type A's groups, excluding type B's: {:?}",
+        page.items
+            .iter()
+            .map(|g| (g.id, g.code.clone()))
+            .collect::<Vec<_>>()
+    );
+    for item in &page.items {
+        assert_eq!(item.code, type_a.code);
+    }
+}
+
+/// A `$filter` combining `type` with another field (`name`) must walk the
+/// `Composite` `AND` node and resolve only the `type` child -- the `name`
+/// child must be left untouched. Proves the recursive tree-walk, not just
+/// the trivial single-binary-node case covered above.
+#[tokio::test]
+async fn group_list_filters_by_type_and_name() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let type_a = common::create_root_type(&type_svc, "grptypeana").await;
+    let type_b = common::create_root_type(&type_svc, "grptypeanb").await;
+
+    let target =
+        common::create_root_group(&group_svc, &ctx, &type_a.code, "Target", tenant_id).await;
+    // Same name, different type -- must NOT match (type differs).
+    common::create_root_group(&group_svc, &ctx, &type_b.code, "Target", tenant_id).await;
+    // Same type, different name -- must NOT match (name differs).
+    common::create_root_group(&group_svc, &ctx, &type_a.code, "Other", tenant_id).await;
+
+    let parsed = toolkit_odata::parse_filter_string(&format!(
+        "type eq '{}' and name eq 'Target'",
+        type_a.code
+    ))
+    .expect("parse combined type+name filter");
+    let query = ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = group_svc
+        .list_groups(&ctx, &query)
+        .await
+        .expect("list groups filtered by type AND name");
+
+    assert_eq!(
+        page.items.len(),
+        1,
+        "combined type+name filter must return exactly the one group matching both \
+         conditions: {:?}",
+        page.items
+    );
+    assert_eq!(page.items[0].id, target.id);
+}
+
+/// `$filter=type in (...)` must resolve every listed GTS path in the
+/// `InList` branch, returning groups of any listed type and excluding
+/// groups of a type that was not listed.
+#[tokio::test]
+async fn group_list_filters_by_type_in_list() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let type_a = common::create_root_type(&type_svc, "grptypeina").await;
+    let type_b = common::create_root_type(&type_svc, "grptypeinb").await;
+    let type_c = common::create_root_type(&type_svc, "grptypeinc").await;
+
+    let group_a = common::create_root_group(&group_svc, &ctx, &type_a.code, "A", tenant_id).await;
+    let group_b = common::create_root_group(&group_svc, &ctx, &type_b.code, "B", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &type_c.code, "C", tenant_id).await;
+
+    let parsed = toolkit_odata::parse_filter_string(&format!(
+        "type in ('{}', '{}')",
+        type_a.code, type_b.code
+    ))
+    .expect("parse type in-list filter");
+    let query = ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = group_svc
+        .list_groups(&ctx, &query)
+        .await
+        .expect("list groups filtered by type in-list");
+
+    let ids: std::collections::HashSet<Uuid> = page.items.iter().map(|g| g.id).collect();
+    assert_eq!(
+        ids,
+        [group_a.id, group_b.id].into_iter().collect(),
+        "type in-list filter must resolve every listed GTS path and exclude type C's \
+         group: {:?}",
+        page.items
+    );
+}
+
+/// An unregistered GTS path in `$filter=type eq '<path>'` must surface as
+/// a clean `DomainError::Validation` -- `resolve_type_filter_node` raises
+/// "Unknown type in filter" before the value ever reaches the DB layer, so
+/// this must be neither a raw DB error nor (SQLite's lenient-typing
+/// failure mode) a silently empty page.
+#[tokio::test]
+async fn group_list_filter_unknown_type_returns_validation_error() {
+    let db = common::test_db().await;
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let bogus_type = format!(
+        "{}x.test.doesnotexist.i{}.v1~",
+        gts_id!("cf.core.rg.type.v1~"),
+        Uuid::now_v7().as_simple()
+    );
+
+    let parsed = toolkit_odata::parse_filter_string(&format!("type eq '{bogus_type}'"))
+        .expect("parse type filter");
+    let query = ODataQuery::new().with_filter(parsed.into_expr());
+
+    let err = group_svc
+        .list_groups(&ctx, &query)
+        .await
+        .expect_err("unknown GTS type in $filter must be rejected, not silently return a page");
+
+    assert!(
+        matches!(&err, DomainError::Validation { message } if message.contains("Unknown type")),
+        "expected a Validation error naming the unknown type, got: {err:?}"
+    );
+}

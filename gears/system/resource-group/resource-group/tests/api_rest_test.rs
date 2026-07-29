@@ -2962,3 +2962,127 @@ async fn rest_get_memberships_bare_uuid_filter_returns_200() {
     );
     assert!(body["items"].is_array());
 }
+
+// =========================================================================
+// list_groups `$filter=type` coverage (fe2d609e generalization follow-up)
+// =========================================================================
+//
+// `resolve_type_filter_node` moved from `GroupRepository` into
+// `TypeRepository` (generic over the filter-field enum) so `list_groups`
+// and `list_memberships` share one implementation. Independent review
+// found `list_groups`' own `type` `$filter` had no REST-level coverage at
+// all -- these mirror the membership `$filter` REST tests directly above
+// for the groups path.
+
+/// End-to-end HTTP coverage: `GET .../groups?$filter=type eq '<gts-path>'`
+/// must return exactly the groups of that type, not another type's groups
+/// also present for the same tenant -- proves the whole pipeline (URL/query
+/// decoding, `OData` parsing, JSON response), not just the repository call.
+#[tokio::test]
+async fn rest_list_groups_filters_by_type() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let type_a = type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: rg_type_id!("test.restgta.i{}.v1~", Uuid::now_v7().as_simple()),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+    let type_b = type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: rg_type_id!("test.restgtb.i{}.v1~", Uuid::now_v7().as_simple()),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group_a = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: type_a.code.clone(),
+                name: "RestTypeA".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+    group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: type_b.code.clone(),
+                name: "RestTypeB".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/groups?%24filter=type%20eq%20%27{}%27",
+            type_a.code
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "type filter request failed: {body}");
+
+    let items = body["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        1,
+        "type filter must return exactly the one group of type A, not type B's: {body}"
+    );
+    assert_eq!(items[0]["id"], group_a.id.to_string());
+    assert_eq!(items[0]["type"], type_a.code);
+}
+
+/// Mirrors the membership `$filter` 400-not-500 guard above
+/// (`rest_get_memberships_quoted_uuid_filter_returns_400_not_500`) for
+/// groups: an unregistered GTS type path in `$filter=type eq '<path>'`
+/// must classify as a caller error (400), never a raw 500 -- and must not
+/// silently degrade to an empty 200 page either
+/// (`resolve_type_filter_node` raises "Unknown type in filter" before the
+/// value ever reaches the DB).
+#[tokio::test]
+async fn rest_list_groups_unknown_type_filter_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let bogus_type = rg_type_id!("test.restgtunknown.i{}.v1~", Uuid::now_v7().as_simple());
+
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups?%24filter=type%20eq%20%27{bogus_type}%27"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown GTS type in $filter must be a 400 client error, not {status}: {body}"
+    );
+}
