@@ -251,7 +251,7 @@ extracted to remove.
    1. [x] - `p1` - Collect entire subtree: DB: SELECT descendant_id FROM resource_group_closure WHERE ancestor_id = {group_id} - `inst-delete-group-5a`
    2. [x] - `p1` - DB: DELETE FROM resource_group_membership WHERE group_id IN (subtree IDs) — cascade memberships - `inst-delete-group-5b`
    3. [x] - `p1` - DB: DELETE FROM resource_group_closure WHERE ancestor_id IN (subtree IDs) OR descendant_id IN (subtree IDs) — cascade closure - `inst-delete-group-5c`
-   4. [x] - `p1` - DB: DELETE FROM resource_group WHERE id IN (subtree IDs) — delete groups bottom-up - `inst-delete-group-5d`
+   4. [x] - `p1` - DB: delete the groups **level by level**, deepest first, grouping the subtree ids by depth. A single `DELETE ... WHERE id IN (subtree IDs)` would fail on PostgreSQL: `fk_resource_group_parent` is `ON DELETE RESTRICT`, so a parent cannot be removed in the same statement as its children - `inst-delete-group-5d`
 6. [x] - `p1` - **ELSE** (leaf delete without force) - `inst-delete-group-6`
    1. [x] - `p1` - DB: DELETE FROM resource_group_closure WHERE descendant_id = {group_id} — remove closure rows - `inst-delete-group-6a`
    2. [x] - `p1` - DB: DELETE FROM resource_group WHERE id = {group_id} - `inst-delete-group-6b`
@@ -285,7 +285,7 @@ extracted to remove.
 1. [x] - `p1` - Collect subtree: DB: SELECT descendant_id FROM resource_group_closure WHERE ancestor_id = {group_id} — includes group itself - `inst-closure-rebuild-1`
 2. [x] - `p1` - Delete affected paths: DB: DELETE FROM resource_group_closure WHERE descendant_id IN (subtree) AND ancestor_id NOT IN (subtree) — remove old ancestor paths above the moving group - `inst-closure-rebuild-2`
 3. [x] - `p1` - Compute new ancestor paths from new parent: DB: SELECT ancestor_id, depth FROM resource_group_closure WHERE descendant_id = {new_parent_id} — get new parent's ancestors - `inst-closure-rebuild-3`
-4. [x] - `p1` - **FOR EACH** new_ancestor in new parent's ancestors (including new parent) - `inst-closure-rebuild-4`
+4. [x] - `p1` - Build every (ancestor, subtree-node) pair for the new parent's ancestors — including the new parent — and insert them with **one multi-row INSERT**. The nested loops below describe how the pairs and depths are computed, not the number of statements: the count does not grow with ancestor depth or subtree size. When the group moves to the forest root there are no ancestors, so no rows are inserted at all - `inst-closure-rebuild-4`
    1. [x] - `p1` - **FOR EACH** subtree_node in subtree - `inst-closure-rebuild-4a`
       1. [x] - `p1` - DB: INSERT INTO resource_group_closure (ancestor_id = new_ancestor, descendant_id = subtree_node, depth = new_ancestor_depth + subtree_node_relative_depth + 1) - `inst-closure-rebuild-4a1`
 5. [x] - `p1` - **RETURN** (closure rows updated within transaction — commit handled by caller) - `inst-closure-rebuild-5`

@@ -175,9 +175,31 @@ The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-dod-sdk-foundation-sdk-errors`
 
-The system **MUST** define `ResourceGroupError` enum in `resource-group-sdk/src/error.rs` covering all deterministic failure categories.
+The error envelope follows ADR 0005. The **trait boundary is `CanonicalError`**: every fallible method on
+`ResourceGroupClient` and `ResourceGroupReadHierarchy` returns `Result<_, CanonicalError>`. The single authoritative
+AIP-193 classification is the `From<DomainError> for CanonicalError` ladder in the impl crate
+(`resource-group/src/api/rest/error.rs`) — there is exactly one, and both the REST handlers and the in-process client
+adapter go through it.
 
-**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentsViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `Internal`.
+`ResourceGroupError` in `resource-group-sdk/src/error.rs` is an **opt-in typed projection** over that envelope, not its
+source, and it carries canonical variants rather than domain ones: `NotFound`, `AlreadyExists`, `InvalidArgument`,
+`FailedPrecondition`, `Aborted`, `PermissionDenied`, `Internal`, and `Other { canonical }` as the forward-compatible
+fall-through for anything it does not recognise. A consumer may propagate `CanonicalError` untouched or project into
+this view for flat dispatch.
+
+Because five domain families collapse into `FailedPrecondition`, the SDK also publishes the vocabulary needed to tell
+them apart. This is part of the contract, not an implementation detail:
+
+- `precondition::Subject` — `allowed_parents`, `hierarchy`, `active_references`, `limit`, `tenant`, plus
+  `Unknown(String)` so a new subject does not break older consumers. All five share one wire `type` (`STATE`), so the
+  **subject is the only discriminator**.
+- `field::{PARENT_TYPE_FIELD, INVALID_PARENT_TYPE}` — the field violation attached to `InvalidParentType`.
+- `reason::aborted::CONFLICT`, `reason::permission::ACCESS_DENIED`.
+- `gts::{GROUP_RESOURCE_TYPE, GROUP_MEMBERSHIP_RESOURCE_TYPE, TYPE_RESOURCE_TYPE}` and `TENANT_RG_TYPE_PATH` — the
+  last is the single source of truth for "this type denotes a tenant".
+
+One thing the taxonomy deliberately does **not** carry: the reason text behind `PermissionDenied`. A denial reason from
+the PDP is logged at debug level and never sent to the client.
 
 Each variant **MUST** carry structured context (field details for Validation, entity identifier for NotFound, conflicting code for TypeAlreadyExists, etc.) sufficient for the error mapping algorithm to produce informative Problem responses.
 

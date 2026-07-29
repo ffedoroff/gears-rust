@@ -20,6 +20,7 @@
   - [Delete Type](#delete-type)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Type Input Validation](#type-input-validation)
+  - [Storage of `can_be_root` and the reserved `__` namespace](#storage-of-can_be_root-and-the-reserved-__-namespace)
   - [Hierarchy Safety Check for Type Update](#hierarchy-safety-check-for-type-update)
   - [Type Seeding](#type-seeding)
   - [Type Registry Authorization](#type-registry-authorization)
@@ -104,7 +105,7 @@ Types define the structural rules for the resource group hierarchy — which par
 6. [x] - `p1` - Resolve GTS type path to SMALLINT surrogate ID at persistence boundary - `inst-create-type-6`
 7. [x] - `p1` - DB: INSERT INTO gts_type (schema_id, metadata_schema) — with uniqueness constraint on schema_id - `inst-create-type-7`
 8. [x] - `p1` - **IF** unique constraint violation → **RETURN** TypeAlreadyExists with conflicting schema_id - `inst-create-type-8`
-9. [x] - `p1` - DB: INSERT INTO gts_type_allowed_parent (type_id, parent_type_id) for each allowed parent - `inst-create-type-9`
+9. [x] - `p1` - DB: INSERT INTO gts_type_allowed_parent (type_id, parent_type_id) — **one multi-row INSERT** for the whole set, not one statement per parent - `inst-create-type-9`
 10. [x] - `p1` - DB: INSERT INTO gts_type_allowed_membership (type_id, membership_type_id) for each allowed membership - `inst-create-type-10`
 11. [x] - `p1` - **RETURN** created ResourceGroupType with schema_id, allowed_parent_types, allowed_membership_types, can_be_root, metadata_schema - `inst-create-type-11`
 
@@ -188,6 +189,20 @@ Types define the structural rules for the resource group hierarchy — which par
 7. [x] - `p1` - **IF** metadata_schema provided, validate it is a valid JSON Schema via `jsonschema::validator_for()` (compile-check). Runtime metadata validation against group instances uses `validate_metadata_via_gts()` through `TypesRegistryClient`. - `inst-val-input-7`
 8. [x] - `p1` - **RETURN** validated type definition - `inst-val-input-8`
 
+### Storage of `can_be_root` and the reserved `__` namespace
+
+`can_be_root` has no column of its own. It is persisted inside `metadata_schema` under the reserved key
+`__can_be_root`, and the `__` prefix is reserved for system keys generally:
+
+- **On write**, the service injects `__can_be_root` into the stored document. A user schema that is not a JSON object
+  (`true` is a legal JSON Schema, as is an array) cannot hold keys, so it is wrapped as
+  `{"__user_schema": <original>, "__can_be_root": <bool>}`.
+- **On read**, every `__`-prefixed key is stripped before the type is returned, `__user_schema` is unwrapped back to the
+  original document, and an empty remainder becomes `None`. The API therefore never exposes a `__` key.
+- **When `__can_be_root` is absent** — a row written before the key existed — the value falls back to
+  `allowed_parent_types.is_empty()`.
+- A user key colliding with a reserved name is overwritten by the system value; the reserved namespace wins.
+
 ### Hierarchy Safety Check for Type Update
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety`
@@ -198,7 +213,7 @@ Types define the structural rules for the resource group hierarchy — which par
 
 **Steps**:
 1. [x] - `p1` - Compute removed parent types: `old_allowed_parent_types - new_allowed_parent_types` - `inst-hier-check-1`
-2. [x] - `p1` - **FOR EACH** removed_parent_type in removed set - `inst-hier-check-2`
+2. [x] - `p1` - Check every removed parent type **in one pass**: a fixed number of statements regardless of how many were removed, with the results grouped in memory. The per-type loop below describes the logic, not the query count - `inst-hier-check-2`
    1. [x] - `p1` - DB: SELECT rg.id, rg.name FROM resource_group rg JOIN resource_group parent ON rg.parent_id = parent.id WHERE rg.gts_type_id = {this_type_id} AND parent.gts_type_id = {removed_parent_type_id} - `inst-hier-check-2a`
    2. [x] - `p1` - **IF** any groups found → collect as violations - `inst-hier-check-2b`
 3. [x] - `p1` - **IF** can_be_root changed from true to false - `inst-hier-check-3`

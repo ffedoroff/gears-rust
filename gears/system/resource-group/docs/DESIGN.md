@@ -466,7 +466,7 @@ Boundaries:
 | `move_group` | `ResourceGroup` | move a group and its subtree to a new parent, or to the root (`new_parent_id: None`) — the structural operation, separate from `update_group` |
 | `get_group` | `ResourceGroup` | get group by ID |
 | `list_groups` | `Page<ResourceGroup>` | list groups with OData query |
-| `delete_group` | `()` | delete group (non-cascade; cascade only via REST) |
+| `delete_group` | `()` | delete group (non-cascade). Cascade is a separate trait method, `delete_group_cascade`, which the in-process adapter overrides to mirror the REST `force=true` path — a consumer is not limited to REST |
 | `get_group_descendants` | `Page<ResourceGroupWithDepth>` | descendants of the reference group, depth >= 0 (self first) |
 | `get_group_ancestors` | `Page<ResourceGroupWithDepth>` | ancestors of the reference group, depth <= 0 |
 | `add_membership` | `ResourceGroupMembership` | add membership |
@@ -529,11 +529,22 @@ Query support on all list endpoints:
 - `$filter` — OData field-specific operators (eq, ne, in)
 - `limit` — page size (1..200, default 25)
 - `cursor` — opaque token from previous response for next/previous page
+- **Error classification.** Everything a client can get wrong in a query is a 400, not a 500: an unparseable or
+  wrongly-typed `$filter`, an unknown `$orderby` field, a stale cursor whose filter hash no longer matches, and a GTS
+  type path in a filter that does not resolve ("Unknown type in filter"). Only a genuine database failure or an
+  unavailable parser becomes a 500. The conversion lives in one place, `From<toolkit_odata::Error> for DomainError`
+- **UUID literals must be bare.** The OData grammar parses `hierarchy/parent_id eq 11111111-…` as a UUID; the same
+  value in single quotes parses as a string and is rejected with a 400. This applies to every UUID-typed filter field
+  (`id`, `hierarchy/parent_id`, `tenant_id`, `group_id`)
+- **`$select` is accepted and ignored.** The extractor parses it; no repository applies it
 - `$orderby` is supported on `/groups`, `/types` and `/memberships`; an unknown field is a 400. Sending `$orderby` together with `cursor` is rejected with 400 (`OrderWithCursor`), because a cursor already pins an order. Without `$orderby` the order is unspecified but stable, with a per-list tiebreaker. On `/descendants` and `/ancestors` the order is fixed (`depth`, then `id`) and `$orderby` is ignored. `$select` is accepted by the extractor and currently ignored by the repositories
 
 Group list (`listGroups`) `$filter` fields: `type` (eq, ne, in), `hierarchy/parent_id` (eq, ne, in — direct parent only, depth=1; for ancestor traversal use `listGroupHierarchy`), `tenant_id` (eq, ne, in — narrows the AuthZ-scoped result to a specific tenant; cannot widen access), `id` (eq, ne, in), `name` (eq, ne, in).
 
-Group depth (`listGroupHierarchy`) `$filter` fields: `hierarchy/depth` (eq, ne, gt, ge, lt, le), `type` (eq, ne, in).
+Hierarchy (`getGroupDescendants` / `getGroupAncestors`) `$filter` fields: `hierarchy/depth` (eq, ne, gt, ge, lt, le) and
+`type`. Two caveats specific to these two routes: `type` honours **`eq` only** — other operators are currently dropped
+rather than rejected, so the result is unfiltered — and the page order is fixed (`depth`, then `id`), so `$orderby` is
+ignored. Their cursor is offset-based, unlike the keyset cursors of the flat lists.
 
 Membership list `$filter` fields: `resource_id` (eq, ne, in), `resource_type` (eq, ne, in), `group_id` (eq, ne, in).
 

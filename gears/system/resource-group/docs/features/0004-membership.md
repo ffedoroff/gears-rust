@@ -131,7 +131,7 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 **Steps**:
 1. [x] - `p1` - Actor sends GET /api/resource-group/v1/memberships?$filter={expr}&cursor={token}&limit={n} - `inst-list-memb-1`
 2. [x] - `p1` - Parse OData $filter: supported fields `resource_id` (eq, ne, in), `resource_type` (eq, ne, in), `group_id` (eq, ne, in) - `inst-list-memb-2`
-3. [x] - `p1` - Resolve any GTS type paths in filter values to surrogate IDs at persistence boundary - `inst-list-memb-3`
+3. [x] - `p1` - Resolve any GTS type paths in filter values to surrogate IDs at the persistence boundary. The whole filter tree is resolved with **one** `WHERE schema_id IN (...)` query rather than a lookup per value, and an unknown path is a 400 ("Unknown type in filter"), not an empty result - `inst-list-memb-3`
 4. [x] - `p1` - DB: SELECT group_id, gts_type_id, resource_id FROM resource_group_membership WHERE {filter} AND EXISTS (SELECT 1 FROM resource_group WHERE resource_group.id = resource_group_membership.group_id AND {scope}) ORDER BY {stable} LIMIT {limit+1}. The correlated `EXISTS` is how tenant scope reaches this table: it carries no `tenant_id` column of its own, so the scope is applied to the referenced group instead. A `JOIN` was rejected because `gts_type_id` exists on both tables and would be ambiguous. For an unconstrained scope the subquery is omitted entirely - `inst-list-memb-4`
 5. [x] - `p1` - Resolve surrogate IDs back to GTS type paths for response - `inst-list-memb-5`
 6. [x] - `p1` - Build Page response with items and cursor tokens - `inst-list-memb-6`
