@@ -1,0 +1,120 @@
+# Created: 2026-07-29 by Constructor Tech
+#
+# Hand-maintained preamble for the generated openapi.yaml.
+#
+# This is the only part of gears/system/resource-group/docs/openapi.yaml that is written by hand.
+# Paths, schemas and response codes all come from the platform document (docs/api/api.json) via
+# tools/scripts/extract_gear_openapi.py — see config/openapi-gears.yaml.
+#
+# Edit this file, then run `make openapi-gears`.
+
+title: Resource Group API
+
+description: |
+  Resource Group API — a generic hierarchy and membership engine.
+
+  **This document is generated.** It is the resource-group subset of `docs/api/api.json`, which
+  `make openapi` produces from the running server. Do not edit it by hand — edit
+  `docs/openapi.preamble.yaml` (this preamble) or the code, then run `make openapi-gears`.
+
+  ## Path prefix
+
+  The paths below are gear-relative, exactly as the gear registers them. A deployment may nest
+  them under a gateway prefix configured as `api-gateway.prefix_path`; in `config/quickstart.yaml`
+  that prefix is `/cf`, and in the local e2e stack there is none. The `servers` entry reflects the
+  configuration the document was generated from.
+
+  ## Types API
+
+  `/types-registry/v1/types` is a structured registry, not a raw schema store. A type is created
+  from a flat DTO — `code`, `can_be_root`, `allowed_parent_types`, `allowed_membership_types`,
+  `metadata_schema` — and is addressed by its `code` (a GTS type path). `can_be_root` has no
+  column of its own: it is persisted inside `metadata_schema` under the reserved key
+  `__can_be_root`, and reserved `__`-prefixed keys are stripped on read.
+
+  Registration order matters: types referenced in `allowed_parent_types` or
+  `allowed_membership_types` must already exist, so base types come before chained ones. Seeding
+  is strictly sequential for this reason.
+
+  All five type-registry operations are authorized: a caller needs a PDP permission for the
+  corresponding action (`create`, `read`, `list`, `update`, `delete`) on the resource
+  `gts.cf.core.rg.type.v1~`. There is no exception for the in-process `ClientHub` path.
+
+  ## Groups and memberships
+
+  Groups form a hierarchy maintained by a closure table. A group's type is **immutable after
+  creation**, and so is its position as far as `PUT` is concerned: updating a group and moving a
+  group are two operations.
+
+  `PUT /groups/{group_id}` replaces the group's ordinary attributes — `name` and `metadata`,
+  nothing else. It is a strict full replacement: **both keys are required**, and an omitted key is
+  a 400, not "keep the stored value". Send `"metadata": null` to clear the metadata deliberately.
+  Unknown fields are rejected, so a body carrying the immutable `type`, or `parent_id`, gets an
+  explicit 400 rather than having the field silently dropped.
+
+  `POST /groups/{group_id}/move` moves a group **and its entire subtree** to a new parent, or to
+  the forest root. The body is `{"parent_id": <uuid|null>}` and the key is mandatory: an explicit
+  `null` means "make this group a root", while omitting it is a 400 — `null` is the destructive
+  value here, so it has to be typed out rather than arrived at by omission. The whole operation is
+  atomic: cycle detection, parent-type compatibility (`can_be_root` when moving to root), the
+  `max_depth`/`max_width` limits, tenant-root uniqueness and the closure-table rebuild all run
+  inside one `SERIALIZABLE` transaction, so a group is never left detached from both the old and
+  the new parent. Cross-tenant moves are rejected, and the rejection never names the other
+  tenant. The response is the updated group; `name` and `metadata` are untouched by a move.
+
+  `PUT /types/{code}` is strict in the same way: every replaceable field is required (send
+  `"metadata_schema": null` to clear the schema), and `code` — the type's identity, taken from the
+  path — is rejected in the body.
+
+  Group responses nest `parent_id` and `tenant_id` inside a `hierarchy` object and carry no
+  timestamps. `depth` appears only on the hierarchy endpoints, which are two separate routes:
+  `/descendants` (depth ≥ 0, self first) and `/ancestors` (depth ≤ 0). There is no single
+  `/hierarchy` route.
+
+  Field names on the wire are `snake_case`.
+
+  ## Lists
+
+  Cursor pagination (`limit`, `cursor`) plus OData `$filter`, `$orderby` and `$select`. `limit`
+  defaults to 25 and is capped at 200. `$orderby` and `cursor` are mutually exclusive — sending
+  both is a 400. `$select` is accepted and currently ignored. On the hierarchy endpoints the order
+  is fixed (`depth`, then `id`) and `$orderby` is ignored.
+
+  UUID-valued filter fields (`id`, `hierarchy/parent_id`, `tenant_id`, `group_id`) require a
+  **bare** UUID literal. The same value in single quotes parses as a string and is rejected with a
+  400.
+
+  ## Errors
+
+  RFC-9457 problem responses. Note the status codes: hierarchy and state conflicts — cycle
+  detection, allowed-parent violations, active references, limit violations and membership tenant
+  incompatibility — return **400** with a `precondition` violation whose `subject` distinguishes
+  the case (`hierarchy`, `allowed_parents`, `active_references`, `limit`, `tenant`). 409 is
+  reserved for identity collisions: duplicate type code, duplicate group id, duplicate membership,
+  and a second root for a tenant. A request for a tenant the caller cannot reach returns 404, not
+  403, so the endpoint cannot be used to probe for foreign tenants.
+
+  ## Example hierarchy
+
+  ```text
+    tenant T1 (depth 0)
+    ├── department D2 (depth 1) {metadata: {category: "finance"}}
+    │   └── branch B3 (depth 2) {metadata: {location: "Building A, Floor 3"}}
+    └── tenant T7 (depth 1) {metadata: {barrier: true}}
+    tenant T9 (depth 0) {metadata: {custom_domain: "t9.example.com"}}
+  ```
+
+tags:
+  - name: types
+    description: >-
+      GTS type registry: structured type definitions addressed by GTS type path. Every operation
+      requires a PDP permission on `gts.cf.core.rg.type.v1~`.
+  - name: groups
+    description: >-
+      Resource groups in a hierarchy. `parent_id` and `tenant_id` are nested under `hierarchy`;
+      the group's type is immutable after creation. Updating a group's attributes (`PUT`) and
+      moving it in the hierarchy (`POST .../move`) are separate operations.
+  - name: memberships
+    description: >-
+      Links resources to groups, keyed by `(group_id, resource_type, resource_id)`. Responses
+      carry no `tenant_id` — tenant scope is derived from the referenced group.

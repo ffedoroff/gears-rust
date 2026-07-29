@@ -406,9 +406,9 @@ cfs-validate-kit-local: cfs-repair
 
 # -------- API and docs --------
 
-.PHONY: openapi md-fabric slides web-docs-preview
+.PHONY: openapi openapi-gears openapi-gears-check md-fabric slides web-docs-preview
 
-# Generate OpenAPI spec from running cf-gears-example-server
+# Generate OpenAPI spec from running cf-gears-example-server, then refresh per-gear subsets
 openapi:
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
 	@cargo build --bin cf-gears-example-server $(E2E_ARGS)
@@ -420,6 +420,15 @@ openapi:
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
 	$(PYTHON) tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
 	echo "OpenAPI spec saved to $(OPENAPI_OUT)"
+	@$(MAKE) --no-print-directory openapi-gears
+
+## Regenerate per-gear OpenAPI subsets from $(OPENAPI_OUT) (see config/openapi-gears.yaml)
+openapi-gears:
+	$(PYTHON) tools/scripts/extract_gear_openapi.py --src "$(OPENAPI_OUT)"
+
+## Verify committed per-gear OpenAPI subsets match $(OPENAPI_OUT); writes nothing
+openapi-gears-check:
+	$(PYTHON) tools/scripts/extract_gear_openapi.py --src "$(OPENAPI_OUT)" --check
 
 ## Generate Markdown files map
 md-fabric:

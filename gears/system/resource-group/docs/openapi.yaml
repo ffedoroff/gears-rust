@@ -1,1327 +1,1298 @@
-# Created: 2026-03-06 by Constructor Tech
-# Updated: 2026-04-07 by Constructor Tech
+# GENERATED — do not edit by hand.
+#
+# Source:     platform-openapi.json (local run, outside the repository) (produced by `make openapi` from the running server)
+# Registry:   config/openapi-gears.yaml (entry `resource-group`)
+# Preamble:   gears/system/resource-group/docs/openapi.preamble.yaml
+# Regenerate: make openapi-gears
+#
+# NOTE: generated from a source other than docs/api/api.json — that document could not be
+# regenerated at the time (see the gear's DESIGN / open issues). Re-run `make openapi` followed by
+# `make openapi-gears` once the platform document can be produced from the full gear set.
 
 openapi: 3.1.0
 info:
   title: Resource Group API
-  version: 1.0.0
+  version: 0.1.0
   description: |
-    Resource Group API — generic hierarchy and membership engine.
+    Resource Group API — a generic hierarchy and membership engine.
+
+    **This document is generated.** It is the resource-group subset of `docs/api/api.json`, which
+    `make openapi` produces from the running server. Do not edit it by hand — edit
+    `docs/openapi.preamble.yaml` (this preamble) or the code, then run `make openapi-gears`.
+
+    ## Path prefix
+
+    The paths below are gear-relative, exactly as the gear registers them. A deployment may nest
+    them under a gateway prefix configured as `api-gateway.prefix_path`; in `config/quickstart.yaml`
+    that prefix is `/cf`, and in the local e2e stack there is none. The `servers` entry reflects the
+    configuration the document was generated from.
 
     ## Types API
 
-    The `/types` endpoint is a **GTS schema store**. You POST raw GTS JSON Schema documents
-    and the server stores them as-is. The server extracts type metadata from the schema structure:
-    - `$id` → GTS type path (becomes the `schema_id` for lookups)
-    - `x-gts-traits-schema` → trait shape definition (on base contracts)
-    - `x-gts-traits` → concrete trait values like `can_be_root`, `allowed_parents`, `allowed_memberships`
-    - `allOf` + `$ref` → type inheritance chain
+    `/types-registry/v1/types` is a structured registry, not a raw schema store. A type is created
+    from a flat DTO — `code`, `can_be_root`, `allowed_parent_types`, `allowed_membership_types`,
+    `metadata_schema` — and is addressed by its `code` (a GTS type path). `can_be_root` has no
+    column of its own: it is persisted inside `metadata_schema` under the reserved key
+    `__can_be_root`, and reserved `__`-prefixed keys are stripped on read.
 
-    For chained RG types, the server stores extracted traits in junction tables
-    for DB-enforced referential integrity.
+    Registration order matters: types referenced in `allowed_parent_types` or
+    `allowed_membership_types` must already exist, so base types come before chained ones. Seeding
+    is strictly sequential for this reason.
 
-    **Registration order**: base types first (entity types, resource types, base contract),
-    then chained types (that reference base types via `$ref`).
+    All five type-registry operations are authorized: a caller needs a PDP permission for the
+    corresponding action (`create`, `read`, `list`, `update`, `delete`) on the resource
+    `gts.cf.core.rg.type.v1~`. There is no exception for the in-process `ClientHub` path.
 
-    ## Groups & Memberships API
+    ## Groups and memberships
 
-    Supports cursor-based pagination and OData-style `$filter`.
+    Groups form a hierarchy maintained by a closure table. A group's type is **immutable after
+    creation** — `PUT /groups/{group_id}` carries `name`, `parent_id` and `metadata` only; send an
+    explicit `null` to clear `parent_id` or `metadata`.
 
-    Type codes and resource types are GTS type paths.
-    Format: `gts.<vendor>.<package>.<namespace>.<type>.v<MAJOR>[.<MINOR>]~`
+    Group responses nest `parent_id` and `tenant_id` inside a `hierarchy` object and carry no
+    timestamps. `depth` appears only on the hierarchy endpoints, which are two separate routes:
+    `/descendants` (depth ≥ 0, self first) and `/ancestors` (depth ≤ 0). There is no single
+    `/hierarchy` route.
 
-    Example hierarchy:
+    Field names on the wire are `snake_case`.
+
+    ## Lists
+
+    Cursor pagination (`limit`, `cursor`) plus OData `$filter`, `$orderby` and `$select`. `limit`
+    defaults to 25 and is capped at 200. `$orderby` and `cursor` are mutually exclusive — sending
+    both is a 400. `$select` is accepted and currently ignored. On the hierarchy endpoints the order
+    is fixed (`depth`, then `id`) and `$orderby` is ignored.
+
+    UUID-valued filter fields (`id`, `hierarchy/parent_id`, `tenant_id`, `group_id`) require a
+    **bare** UUID literal. The same value in single quotes parses as a string and is rejected with a
+    400.
+
+    ## Errors
+
+    RFC-9457 problem responses. Note the status codes: hierarchy and state conflicts — cycle
+    detection, allowed-parent violations, active references, limit violations and membership tenant
+    incompatibility — return **400** with a `precondition` violation whose `subject` distinguishes
+    the case (`hierarchy`, `allowed_parents`, `active_references`, `limit`, `tenant`). 409 is
+    reserved for identity collisions: duplicate type code, duplicate group id, duplicate membership,
+    and a second root for a tenant. A request for a tenant the caller cannot reach returns 404, not
+    403, so the endpoint cannot be used to probe for foreign tenants.
+
+    ## Example hierarchy
+
     ```text
       tenant T1 (depth 0)
-      ├── department D2 (depth 1) {metadata: {category: "finance", short_description: "Mega Department"}}
+      ├── department D2 (depth 1) {metadata: {category: "finance"}}
       │   └── branch B3 (depth 2) {metadata: {location: "Building A, Floor 3"}}
       └── tenant T7 (depth 1) {metadata: {barrier: true}}
       tenant T9 (depth 0) {metadata: {custom_domain: "t9.example.com"}}
     ```
 servers:
-  - url: https://api.example.com
+- url: /cf
 tags:
-  - name: types
-    description: |
-      GTS schema store. Accepts and returns raw GTS JSON Schema documents.
-      The server extracts type-level metadata from `x-gts-traits` for internal use.
-  - name: groups
-    description: |
-      Resource groups organized in a hierarchy.
-      Every group has `parent_id`, `tenant_id`, and `depth` at the top level.
-  - name: memberships
-    description: Resource memberships bind resources to groups.
-
+- name: types
+  description: 'GTS type registry: structured type definitions addressed by GTS type path. Every operation
+    requires a PDP permission on `gts.cf.core.rg.type.v1~`.'
+- name: groups
+  description: Resource groups in a hierarchy. `parent_id` and `tenant_id` are nested under `hierarchy`;
+    the group's type is immutable after creation.
+- name: memberships
+  description: Links resources to groups, keyed by `(group_id, resource_type, resource_id)`. Responses
+    carry no `tenant_id` — tenant scope is derived from the referenced group.
 paths:
-
-  # ── Types ──────────────────────────────────────────────────────────
-
-  /api/types-registry/v1/types:
+  /resource-group/v1/groups:
     get:
-      operationId: listTypes
-      tags: [types]
-      summary: List registered GTS schemas
-      description: |
-        Returns paginated GTS JSON Schema documents.
-
-        - `$filter`: `schema_id` (eq, ne, in) — matches against the `$id` field (without `gts://` prefix)
-        - `limit`: page size (1..200), default 25
-        - `cursor`: opaque token for pagination
-      x-odata-filter:
-        supported_fields:
-          schema_id: [eq, ne, in]
+      tags:
+      - Resource Groups
+      summary: List resource groups
+      description: Retrieve a paginated list of resource groups with OData filtering
+      operationId: resource_group.list_groups
       parameters:
-        - $ref: '#/components/parameters/ODataFilter'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
+      - name: limit
+        in: query
+        description: Maximum number of groups to return
+        required: false
+        schema:
+          type: integer
+      - name: cursor
+        in: query
+        description: Cursor for pagination
+        required: false
+        schema:
+          type: string
+      - name: $filter
+        in: query
+        description: |-
+          OData v4 filter expression
+          - type: eq|ne|contains|startswith|endswith|in
+          - hierarchy/parent_id: eq|ne|in
+          - tenant_id: eq|ne|in
+          - id: eq|ne|in
+          - name: eq|ne|contains|startswith|endswith|in
+        required: false
+        schema:
+          type: string
       responses:
         '200':
-          description: Paginated list of GTS schemas
+          description: Paginated list of resource groups
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/GtsSchemaPage'
-              examples:
-                chained-types:
-                  summary: Chained RG types
-                  value:
-                    items:
-                      - $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        $schema: "http://json-schema.org/draft-07/schema#"
-                        allOf:
-                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                          - properties:
-                              metadata:
-                                type: object
-                                additionalProperties: false
-                                properties:
-                                  custom_domain: { type: string, format: hostname }
-                                  barrier: { type: boolean, default: false }
-                            x-gts-traits:
-                              can_be_root: true
-                              allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                              allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-                      - $id: "gts://gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        $schema: "http://json-schema.org/draft-07/schema#"
-                        allOf:
-                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                          - properties:
-                              metadata:
-                                type: object
-                                additionalProperties: false
-                                properties:
-                                  category: { type: string, maxLength: 100 }
-                                  short_description: { type: string, maxLength: 500 }
-                            x-gts-traits:
-                              can_be_root: false
-                              allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                              allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-                      - $id: "gts://gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                        $schema: "http://json-schema.org/draft-07/schema#"
-                        allOf:
-                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                          - properties:
-                              metadata:
-                                type: object
-                                additionalProperties: false
-                                properties:
-                                  location: { type: string }
-                            x-gts-traits:
-                              can_be_root: false
-                              allowed_parents: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
-                              allowed_memberships: ["gts.cf.core.idp.user.v1~", "gts.cf.core.lms.course.v1~"]
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-
-    post:
-      operationId: createType
-      tags: [types]
-      summary: Register a GTS schema
-      description: |
-        Accepts a raw GTS JSON Schema document. The `$id` field determines the GTS type path.
-
-        **Registration order**: base types first, then chained types.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/GtsSchema'
-            examples:
-
-              # ── Step 1: Base contract ──
-
-              rg-base-contract:
-                summary: "Step 1a: RG base contract (x-gts-traits-schema)"
-                value:
-                  $id: "gts://gts.cf.core.rg.type.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: "Resource Group Type"
-                  type: object
-                  x-gts-traits-schema:
-                    type: object
-                    additionalProperties: false
-                    properties:
-                      can_be_root:
-                        type: boolean
-                        description: "Whether this type permits root placement."
-                        default: false
-                      allowed_parents:
-                        type: array
-                        items: { type: string, x-gts-ref: "gts.cf.core.rg.type.v1~" }
-                        description: "Well-known instances of allowed parent RG types."
-                        default: []
-                      allowed_memberships:
-                        type: array
-                        items: { type: string, x-gts-ref: "gts.*" }
-                        description: "Resource types allowed as members."
-                        default: []
-                  x-gts-traits:
-                    can_be_root: false
-                    allowed_parents: []
-                    allowed_memberships: []
-                  required: [id, name]
-                  properties:
-                    id: { type: string, format: uuid }
-                    name: { type: string, minLength: 1, maxLength: 255 }
-                    parent_id: { type: [string, "null"], format: uuid }
-                    tenant_id: { type: string, format: uuid, readOnly: true }
-                    depth: { type: integer, readOnly: true }
-                    metadata: { type: object, description: "Type-specific fields. Schema overridden by each chained RG type via allOf." }
-                  x-gts-constraints:
-                    placement-invariant: "can_be_root OR len(allowed_parents) >= 1"
-
-              # ── Step 2: Entity types ──
-
-              tenant-entity:
-                summary: "Step 2a: Tenant entity type"
-                value:
-                  $id: "gts://gts.cf.core.tn.tenant.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: Tenant
-                  type: object
-                  required: [id, name]
-                  properties:
-                    id: { type: string, format: uuid }
-                    name: { type: string, minLength: 1, maxLength: 255 }
-                    custom_domain: { type: string, format: hostname }
-                    barrier: { type: boolean, default: false }
-
-              department-entity:
-                summary: "Step 2b: Department entity type"
-                value:
-                  $id: "gts://gts.cf.core.org.department.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: Department
-                  type: object
-                  required: [id]
-                  properties:
-                    id: { type: string, format: uuid }
-                    short_description: { type: string, maxLength: 500 }
-                    category: { type: string, maxLength: 100 }
-
-              branch-entity:
-                summary: "Step 2c: Branch entity type"
-                value:
-                  $id: "gts://gts.cf.core.rg.branch.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: Branch
-                  type: object
-                  required: [id, name]
-                  properties:
-                    id: { type: string, format: uuid }
-                    name: { type: string, minLength: 1, maxLength: 255 }
-                    location: { type: string }
-
-              user-resource:
-                summary: "Step 2d: User resource type"
-                value:
-                  $id: "gts://gts.cf.core.idp.user.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: User
-                  type: object
-                  required: [id, email, display_name]
-                  properties:
-                    id: { type: string, format: uuid }
-                    email: { type: string, format: email }
-                    display_name: { type: string, minLength: 1, maxLength: 255 }
-                    avatar_url: { type: string, format: uri }
-
-              course-resource:
-                summary: "Step 2e: Course resource type"
-                value:
-                  $id: "gts://gts.cf.core.lms.course.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: Course
-                  type: object
-                  required: [id, title]
-                  properties:
-                    id: { type: string, format: uuid }
-                    title: { type: string, minLength: 1, maxLength: 255 }
-
-              # ── Step 3: Chained RG types (base types must exist) ──
-
-              tenant-rg-type:
-                summary: "Step 3a: Tenant as RG type (chained, x-gts-traits)"
-                value:
-                  $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  allOf:
-                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                    - properties:
-                        metadata:
-                          type: object
-                          additionalProperties: false
-                          properties:
-                            custom_domain: { type: string, format: hostname }
-                            barrier: { type: boolean, default: false }
-                      x-gts-traits:
-                        can_be_root: true
-                        allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                        allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-
-              department-rg-type:
-                summary: "Step 3b: Department as RG type (chained, x-gts-traits)"
-                value:
-                  $id: "gts://gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  allOf:
-                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                    - properties:
-                        metadata:
-                          type: object
-                          additionalProperties: false
-                          properties:
-                            category: { type: string, maxLength: 100 }
-                            short_description: { type: string, maxLength: 500 }
-                      x-gts-traits:
-                        can_be_root: false
-                        allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                        allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-
-              branch-rg-type:
-                summary: "Step 3c: Branch as RG type (chained, x-gts-traits)"
-                value:
-                  $id: "gts://gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  allOf:
-                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                    - properties:
-                        metadata:
-                          type: object
-                          additionalProperties: false
-                          properties:
-                            location: { type: string }
-                      x-gts-traits:
-                        can_be_root: false
-                        allowed_parents: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
-                        allowed_memberships: ["gts.cf.core.idp.user.v1~", "gts.cf.core.lms.course.v1~"]
-
-      responses:
-        '201':
-          description: Schema registered
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GtsSchema'
-              examples:
-                rg-base-contract:
-                  summary: "Base contract registered"
-                  value:
-                    $id: "gts://gts.cf.core.rg.type.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    title: "Resource Group Type"
-                    type: object
-                    x-gts-traits-schema:
-                      type: object
-                      additionalProperties: false
-                      properties:
-                        can_be_root:
-                          type: boolean
-                          description: "Whether this type permits root placement."
-                          default: false
-                        allowed_parents:
-                          type: array
-                          items: { type: string, x-gts-ref: "gts.cf.core.rg.type.v1~" }
-                          description: "Well-known instances of allowed parent RG types."
-                          default: []
-                        allowed_memberships:
-                          type: array
-                          items: { type: string, x-gts-ref: "gts.*" }
-                          description: "Resource types allowed as members."
-                          default: []
-                    x-gts-traits:
-                      can_be_root: false
-                      allowed_parents: []
-                      allowed_memberships: []
-                    required: [id, name]
-                    properties:
-                      id: { type: string, format: uuid }
-                      name: { type: string, minLength: 1, maxLength: 255 }
-                      parent_id: { type: [string, "null"], format: uuid }
-                      tenant_id: { type: string, format: uuid, readOnly: true }
-                      depth: { type: integer, readOnly: true }
-                      metadata: { type: object, description: "Type-specific fields. Schema overridden by each chained RG type via allOf." }
-                    x-gts-constraints:
-                      placement-invariant: "can_be_root OR len(allowed_parents) >= 1"
-                tenant-rg-type:
-                  summary: "Chained tenant RG type registered"
-                  value:
-                    $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    allOf:
-                      - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                      - properties:
-                          metadata:
-                            type: object
-                            additionalProperties: false
-                            properties:
-                              custom_domain: { type: string, format: hostname }
-                              barrier: { type: boolean, default: false }
-                        x-gts-traits:
-                          can_be_root: true
-                          allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                          allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-                tenant-entity:
-                  summary: "Entity type registered"
-                  value:
-                    $id: "gts://gts.cf.core.tn.tenant.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    title: Tenant
-                    type: object
-                    required: [id, name]
-                    properties:
-                      id: { type: string, format: uuid }
-                      name: { type: string, minLength: 1, maxLength: 255 }
-                      custom_domain: { type: string, format: hostname }
-                      barrier: { type: boolean, default: false }
-
-  /api/types-registry/v1/types/{schema_id}:
-    parameters:
-      - $ref: '#/components/parameters/TypeSchemaId'
-    get:
-      operationId: getType
-      tags: [types]
-      summary: Get a GTS schema by schema_id
-      description: Returns the raw GTS JSON Schema document.
-      responses:
-        '200':
-          description: Schema found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GtsSchema'
-              examples:
-                tenant-rg-type:
-                  summary: "Chained: Tenant as RG type"
-                  value:
-                    $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    allOf:
-                      - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                      - properties:
-                          metadata:
-                            type: object
-                            additionalProperties: false
-                            properties:
-                              custom_domain: { type: string, format: hostname }
-                              barrier: { type: boolean, default: false }
-                        x-gts-traits:
-                          can_be_root: true
-                          allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                          allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-                tenant-entity:
-                  summary: "Entity: Tenant"
-                  value:
-                    $id: "gts://gts.cf.core.tn.tenant.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    title: Tenant
-                    type: object
-                    required: [id, name]
-                    properties:
-                      id: { type: string, format: uuid }
-                      name: { type: string, minLength: 1, maxLength: 255 }
-                      custom_domain: { type: string, format: hostname }
-                      barrier: { type: boolean, default: false }
-                rg-base-contract:
-                  summary: "Base: RG contract"
-                  value:
-                    $id: "gts://gts.cf.core.rg.type.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    title: "Resource Group Type"
-                    type: object
-                    x-gts-traits-schema:
-                      type: object
-                      additionalProperties: false
-                      properties:
-                        can_be_root: { type: boolean, default: false }
-                        allowed_parents: { type: array, items: { type: string }, default: [] }
-                        allowed_memberships: { type: array, items: { type: string }, default: [] }
-                    x-gts-traits:
-                      can_be_root: false
-                      allowed_parents: []
-                      allowed_memberships: []
-                    required: [id, name]
-                    properties:
-                      id: { type: string, format: uuid }
-                      name: { type: string, minLength: 1, maxLength: 255 }
-                      parent_id: { type: [string, "null"], format: uuid }
-                      tenant_id: { type: string, format: uuid, readOnly: true }
-                      depth: { type: integer, readOnly: true }
-                      metadata: { type: object }
-        '404':
-          $ref: '#/components/responses/NotFound'
-    put:
-      operationId: updateType
-      tags: [types]
-      summary: Update a GTS schema
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/GtsSchema'
-      responses:
-        '200':
-          description: Schema updated
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GtsSchema'
-    delete:
-      operationId: deleteType
-      tags: [types]
-      summary: Delete a GTS schema
-      responses:
-        '204':
-          description: Schema deleted
-
-  # ── Groups ─────────────────────────────────────────────────────────
-
-  /api/resource-group/v1/groups:
-    get:
-      operationId: listGroups
-      tags: [groups]
-      summary: List groups with filters and pagination
-      description: |
-        Returns paginated resource groups.
-
-        For hierarchy traversal (ancestors, descendants, depth),
-        use the dedicated `/{group_id}/hierarchy` endpoint.
-
-        - `$filter`: `type` (eq, ne, in), `hierarchy/parent_id` (eq, ne, in), `tenant_id` (eq, ne, in), `id` (eq, ne, in), `name` (eq, ne, in)
-        - `limit`: page size (1..200), default 25
-        - `cursor`: opaque token for pagination
-      x-odata-filter:
-        supported_fields:
-          type: [eq, ne, in]
-          hierarchy/parent_id: [eq, ne, in]
-          tenant_id: [eq, ne, in]
-          id: [eq, ne, in]
-          name: [eq, ne, in]
-      parameters:
-        - $ref: '#/components/parameters/ODataFilter'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
-      responses:
-        '200':
-          description: Paginated list of groups
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GroupPage'
-              examples:
-                all-groups:
-                  summary: "GET ...groups — all groups"
-                  value:
-                    items:
-                      - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T1
-                        parent_id: null
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                      - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        name: D2
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        metadata:
-                          category: "finance"
-                          short_description: "Mega Department"
-                      - id: 33333333-3333-3333-3333-333333333333
-                        type: "gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                        name: B3
-                        parent_id: 22222222-2222-2222-2222-222222222222
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        metadata:
-                          location: "Building A, Floor 3"
-                      - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T7
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 77777777-7777-7777-7777-777777777777
-                        metadata:
-                          barrier: true
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-
-                type-eq-tenant:
-                  summary: "$filter=type eq '...tenant.v1~'"
-                  value:
-                    items:
-                      - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T1
-                        parent_id: null
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                      - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T7
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 77777777-7777-7777-7777-777777777777
-                        metadata:
-                          barrier: true
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-
-                parent-id-eq:
-                  summary: "$filter=hierarchy/parent_id eq '11111111-...'"
-                  description: Direct children of T1.
-                  value:
-                    items:
-                      - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        name: D2
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        metadata:
-                          category: "finance"
-                          short_description: "Mega Department"
-                      - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T7
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 77777777-7777-7777-7777-777777777777
-                        metadata:
-                          barrier: true
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-
-    post:
-      operationId: createGroup
-      tags: [groups]
-      summary: Create a group
-      description: |
-        `type` must be a chained GTS type with `gts.cf.core.rg.type.v1~` prefix.
-        Derived type fields (e.g. `category`) are sent inside `metadata` object.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateGroupRequest'
-            examples:
-              create-tenant:
-                summary: Create root tenant T1
-                value:
-                  id: 11111111-1111-1111-1111-111111111111
-                  type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                  name: T1
-              create-department:
-                summary: Create department D2 under T1
-                value:
-                  type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                  name: D2
-                  parent_id: 11111111-1111-1111-1111-111111111111
-                  metadata:
-                    category: "finance"
-                    short_description: "Mega Department"
-              create-branch:
-                summary: Create branch B3 under D2
-                value:
-                  type: "gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                  name: B3
-                  parent_id: 22222222-2222-2222-2222-222222222222
-                  metadata:
-                    location: "Building A, Floor 3"
-              create-barrier-tenant:
-                summary: Create nested tenant T7 (barrier) under T1
-                value:
-                  id: 77777777-7777-7777-7777-777777777777
-                  type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                  name: T7
-                  parent_id: 11111111-1111-1111-1111-111111111111
-                  metadata:
-                    barrier: true
-              create-tenant-custom-domain:
-                summary: Create root tenant T9 (custom domain)
-                value:
-                  type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                  name: T9
-                  metadata:
-                    custom_domain: "t9.example.com"
-      responses:
-        '201':
-          description: Group created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Group'
-              examples:
-                tenant-created:
-                  summary: Tenant T1 response
-                  value:
-                    id: 11111111-1111-1111-1111-111111111111
-                    type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                    name: T1
-                    parent_id: null
-                    tenant_id: 11111111-1111-1111-1111-111111111111
-                department-created:
-                  summary: Department D2 response
-                  value:
-                    id: 22222222-2222-2222-2222-222222222222
-                    type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                    name: D2
-                    parent_id: 11111111-1111-1111-1111-111111111111
-                    tenant_id: 11111111-1111-1111-1111-111111111111
-                    metadata:
-                      category: "finance"
-                      short_description: "Mega Department"
-                branch-created:
-                  summary: Branch B3 response
-                  value:
-                    id: 33333333-3333-3333-3333-333333333333
-                    type: "gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                    name: B3
-                    parent_id: 22222222-2222-2222-2222-222222222222
-                    tenant_id: 11111111-1111-1111-1111-111111111111
-                    metadata:
-                      location: "Building A, Floor 3"
+                $ref: '#/components/schemas/Page_GroupDto'
         '400':
-          description: Validation error
+          description: Bad Request
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
-              examples:
-                invalid-parent-type:
-                  summary: Parent type not allowed
-                  value:
-                    type: https://api.example.com/errors/invalid-parent-type
-                    title: Invalid parent type
-                    status: 400
-                    detail: "Type 'gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~' does not allow parent of type 'gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~'"
-                    trace_id: 01HXYZRGVALIDATION
-                root-not-allowed:
-                  summary: Type cannot be root
-                  value:
-                    type: https://api.example.com/errors/validation
-                    title: Validation error
-                    status: 400
-                    detail: "Type 'gts.cf.core.rg.type.v1~w.core.org.department.v1~' cannot be root (can_be_root=false and no parent_id provided)"
-                    trace_id: 01HXYZRGNOROOT
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+      x-odata-filter:
+        allowedFields:
+          hierarchy/parent_id:
+          - eq
+          - ne
+          - in
+          id:
+          - eq
+          - ne
+          - in
+          name:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+          tenant_id:
+          - eq
+          - ne
+          - in
+          type:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+    post:
+      tags:
+      - Resource Groups
+      summary: Create a new resource group
+      description: Create a new resource group with the provided type, name, and optional parent
+      operationId: resource_group.create_group
+      requestBody:
+        description: Group creation data
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateGroupDto'
+        required: true
+      responses:
+        '201':
+          description: Created resource group
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '409':
           description: Conflict
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
-              examples:
-                cycle-detected:
-                  summary: Cycle detected in hierarchy
-                  value:
-                    type: https://api.example.com/errors/cycle-detected
-                    title: Cycle detected
-                    status: 409
-                    detail: "Setting parent_id would create a cycle in the hierarchy"
-                    trace_id: 01HXYZRGCYCLE
-
-  /api/resource-group/v1/groups/{group_id}:
-    parameters:
-      - $ref: '#/components/parameters/GroupId'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+  /resource-group/v1/groups/{group_id}:
     get:
-      operationId: getGroup
-      tags: [groups]
-      summary: Get a group by group_id
+      tags:
+      - Resource Groups
+      summary: Get resource group by ID
+      description: Retrieve a specific resource group by its UUID
+      operationId: resource_group.get_group
+      parameters:
+      - name: group_id
+        in: path
+        description: Group UUID
+        required: true
+        schema:
+          type: string
       responses:
         '200':
-          description: Group found
+          description: Resource group found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Group'
-              examples:
-                tenant:
-                  summary: Tenant T1
-                  value:
-                    id: 11111111-1111-1111-1111-111111111111
-                    type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                    name: T1
-                    parent_id: null
-                    tenant_id: 11111111-1111-1111-1111-111111111111
-                department:
-                  summary: Department D2
-                  value:
-                    id: 22222222-2222-2222-2222-222222222222
-                    type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                    name: D2
-                    parent_id: 11111111-1111-1111-1111-111111111111
-                    tenant_id: 11111111-1111-1111-1111-111111111111
-                    metadata:
-                      category: "finance"
-                      short_description: "Mega Department"
-                branch:
-                  summary: Branch B3
-                  value:
-                    id: 33333333-3333-3333-3333-333333333333
-                    type: "gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                    name: B3
-                    parent_id: 22222222-2222-2222-2222-222222222222
-                    tenant_id: 11111111-1111-1111-1111-111111111111
-                    metadata:
-                      location: "Building A, Floor 3"
+                $ref: '#/components/schemas/GroupDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '404':
-          $ref: '#/components/responses/NotFound'
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
     put:
-      operationId: updateGroup
-      tags: [groups]
-      summary: Update a group by group_id
-      requestBody:
+      tags:
+      - Resource Groups
+      summary: Update resource group
+      description: Update a resource group (full replacement via PUT, including parent move)
+      operationId: resource_group.update_group
+      parameters:
+      - name: group_id
+        in: path
+        description: Group UUID
         required: true
+        schema:
+          type: string
+      requestBody:
+        description: Group update data
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpdateGroupRequest'
+              $ref: '#/components/schemas/UpdateGroupDto'
+        required: true
       responses:
         '200':
-          description: Group updated
+          description: Updated resource group
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Group'
+                $ref: '#/components/schemas/GroupDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
     delete:
-      operationId: deleteGroup
-      tags: [groups]
-      summary: Delete a group by group_id
+      tags:
+      - Resource Groups
+      summary: Delete resource group
+      description: Delete a resource group. Use ?force=true to cascade delete subtree and memberships.
+      operationId: resource_group.delete_group
       parameters:
-        - $ref: '#/components/parameters/DeleteForce'
+      - name: group_id
+        in: path
+        description: Group UUID
+        required: true
+        schema:
+          type: string
+      - name: force
+        in: query
+        description: Force cascade delete of subtree and memberships
+        required: false
+        schema:
+          type: boolean
       responses:
         '204':
-          description: Group deleted
-
-  /api/resource-group/v1/groups/{group_id}/hierarchy:
-    parameters:
-      - $ref: '#/components/parameters/GroupId'
-    get:
-      operationId: listGroupHierarchy
-      tags: [groups]
-      summary: Traverse hierarchy from a reference group
-      description: |
-        Returns groups related to the reference group `{group_id}`.
-        `depth` is **relative** to the reference group:
-        - `depth = 0` — the reference group itself
-        - `depth > 0` — descendants
-        - `depth < 0` — ancestors
-
-        - `$filter`: `depth` (eq, ne, gt, ge, lt, le), `type` (eq, ne, in)
-        - `limit`: page size (1..200), default 25
-        - `cursor`: opaque token for pagination
-      x-odata-filter:
-        supported_fields:
-          depth: [eq, ne, gt, ge, lt, le]
-          type: [eq, ne, in]
-      parameters:
-        - $ref: '#/components/parameters/ODataFilter'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
-      responses:
-        '200':
-          description: Paginated groups with relative depth
+          description: Group deleted successfully
+        '400':
+          description: Bad Request
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: '#/components/schemas/GroupHierarchyPage'
-              examples:
-                subtree-of-T1:
-                  summary: "Full subtree of T1"
-                  value:
-                    items:
-                      - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T1
-                        parent_id: null
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: 0
-                      - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        name: D2
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: 1
-                        metadata:
-                          category: "finance"
-                          short_description: "Mega Department"
-                      - id: 33333333-3333-3333-3333-333333333333
-                        type: "gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                        name: B3
-                        parent_id: 22222222-2222-2222-2222-222222222222
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: 2
-                        metadata:
-                          location: "Building A, Floor 3"
-                      - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T7
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 77777777-7777-7777-7777-777777777777
-                        depth: 1
-                        metadata:
-                          barrier: true
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-
-                depth-eq-1:
-                  summary: "$filter=depth eq 1 — direct children of T1"
-                  value:
-                    items:
-                      - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        name: D2
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: 1
-                        metadata:
-                          category: "finance"
-                          short_description: "Mega Department"
-                      - id: 77777777-7777-7777-7777-777777777777
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T7
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 77777777-7777-7777-7777-777777777777
-                        depth: 1
-                        metadata:
-                          barrier: true
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-
-                ancestors-of-B3:
-                  summary: "$filter=depth ge -10 and depth le -1 — ancestors of B3"
-                  value:
-                    items:
-                      - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T1
-                        parent_id: null
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: -2
-                      - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        name: D2
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: -1
-                        metadata:
-                          category: "finance"
-                          short_description: "Mega Department"
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-
-                full-range-D2:
-                  summary: "Ancestors + self + descendants of D2"
-                  value:
-                    items:
-                      - id: 11111111-1111-1111-1111-111111111111
-                        type: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        name: T1
-                        parent_id: null
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: -1
-                      - id: 22222222-2222-2222-2222-222222222222
-                        type: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        name: D2
-                        parent_id: 11111111-1111-1111-1111-111111111111
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: 0
-                        metadata:
-                          category: "finance"
-                          short_description: "Mega Department"
-                      - id: 33333333-3333-3333-3333-333333333333
-                        type: "gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                        name: B3
-                        parent_id: 22222222-2222-2222-2222-222222222222
-                        tenant_id: 11111111-1111-1111-1111-111111111111
-                        depth: 1
-                        metadata:
-                          location: "Building A, Floor 3"
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
+                $ref: '#/components/schemas/Problem'
         '404':
-          $ref: '#/components/responses/NotFound'
-
-  # ── Memberships ────────────────────────────────────────────────────
-
-  /api/resource-group/v1/memberships:
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+  /resource-group/v1/groups/{group_id}/ancestors:
     get:
-      operationId: listMemberships
-      tags: [memberships]
-      summary: List memberships
-      description: |
-        Returns paginated memberships.
-
-        - `$filter`: `resource_id` (eq, ne, in), `resource_type` (eq, ne, in), `group_id` (eq, ne, in)
-        - `limit`: page size (1..200), default 25
-        - `cursor`: opaque token for pagination
-      x-odata-filter:
-        supported_fields:
-          resource_id: [eq, ne, in]
-          resource_type: [eq, ne, in]
-          group_id: [eq, ne, in]
+      tags:
+      - Resource Groups
+      summary: Get group ancestors
+      description: Get ancestors of a reference group (depth <= 0) with OData filtering
+      operationId: resource_group.get_group_ancestors
       parameters:
-        - $ref: '#/components/parameters/ODataFilter'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
+      - name: group_id
+        in: path
+        description: Reference group UUID
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Maximum entries to return
+        required: false
+        schema:
+          type: integer
+      - name: cursor
+        in: query
+        description: Cursor for pagination
+        required: false
+        schema:
+          type: string
+      - name: $filter
+        in: query
+        description: |-
+          OData v4 filter expression
+          - hierarchy/depth: eq|ne|gt|ge|lt|le|in
+          - type: eq|ne|contains|startswith|endswith|in
+        required: false
+        schema:
+          type: string
       responses:
         '200':
-          description: Paginated memberships
+          description: Paginated ancestors with relative depth
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MembershipPage'
-              example:
-                items:
-                  - group_id: 33333333-3333-3333-3333-333333333333
-                    resource_id: R4
-                    resource_type: "gts.cf.core.lms.course.v1~"
-                  - group_id: 22222222-2222-2222-2222-222222222222
-                    resource_id: R5
-                    resource_type: "gts.cf.core.idp.user.v1~"
-                page_info:
-                  next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                  limit: 25
-
-  /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}:
-    parameters:
-      - $ref: '#/components/parameters/MembershipGroupId'
-      - $ref: '#/components/parameters/MembershipResourceType'
-      - $ref: '#/components/parameters/MembershipResourceId'
+                $ref: '#/components/schemas/Page_GroupWithDepthDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+      x-odata-filter:
+        allowedFields:
+          hierarchy/depth:
+          - eq
+          - ne
+          - gt
+          - ge
+          - lt
+          - le
+          - in
+          type:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+  /resource-group/v1/groups/{group_id}/descendants:
+    get:
+      tags:
+      - Resource Groups
+      summary: Get group descendants
+      description: Get descendants of a reference group (depth >= 0) with OData filtering
+      operationId: resource_group.get_group_descendants
+      parameters:
+      - name: group_id
+        in: path
+        description: Reference group UUID
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Maximum entries to return
+        required: false
+        schema:
+          type: integer
+      - name: cursor
+        in: query
+        description: Cursor for pagination
+        required: false
+        schema:
+          type: string
+      - name: $filter
+        in: query
+        description: |-
+          OData v4 filter expression
+          - hierarchy/depth: eq|ne|gt|ge|lt|le|in
+          - type: eq|ne|contains|startswith|endswith|in
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Paginated descendants with relative depth
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_GroupWithDepthDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+      x-odata-filter:
+        allowedFields:
+          hierarchy/depth:
+          - eq
+          - ne
+          - gt
+          - ge
+          - lt
+          - le
+          - in
+          type:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+  /resource-group/v1/memberships:
+    get:
+      tags:
+      - Resource Group Memberships
+      summary: List memberships
+      description: Retrieve a paginated list of memberships with OData filtering on group_id, resource_type,
+        resource_id
+      operationId: resource_group.list_memberships
+      parameters:
+      - name: limit
+        in: query
+        description: Maximum number of memberships to return
+        required: false
+        schema:
+          type: integer
+      - name: cursor
+        in: query
+        description: Cursor for pagination
+        required: false
+        schema:
+          type: string
+      - name: $filter
+        in: query
+        description: |-
+          OData v4 filter expression
+          - group_id: eq|ne|in
+          - resource_type: eq|ne|contains|startswith|endswith|in
+          - resource_id: eq|ne|contains|startswith|endswith|in
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Paginated list of memberships
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_MembershipDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+      x-odata-filter:
+        allowedFields:
+          group_id:
+          - eq
+          - ne
+          - in
+          resource_id:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+          resource_type:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+  /resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}:
     post:
-      operationId: addMembership
-      tags: [memberships]
-      summary: Attach membership to a group
+      tags:
+      - Resource Group Memberships
+      summary: Add membership
+      description: Add a membership link between a resource group and a resource
+      operationId: resource_group.add_membership
+      parameters:
+      - name: group_id
+        in: path
+        description: Group UUID
+        required: true
+        schema:
+          type: string
+      - name: resource_type
+        in: path
+        description: GTS type path of the resource type
+        required: true
+        schema:
+          type: string
+      - name: resource_id
+        in: path
+        description: Resource identifier
+        required: true
+        schema:
+          type: string
       responses:
         '201':
-          description: Membership attached
+          description: Membership created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Membership'
-              example:
-                group_id: 33333333-3333-3333-3333-333333333333
-                resource_id: R4
-                resource_type: "gts.cf.core.lms.course.v1~"
+                $ref: '#/components/schemas/MembershipDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
     delete:
-      operationId: deleteMembership
-      tags: [memberships]
-      summary: Detach membership from a group
+      tags:
+      - Resource Group Memberships
+      summary: Remove membership
+      description: Remove a membership link between a resource group and a resource
+      operationId: resource_group.remove_membership
+      parameters:
+      - name: group_id
+        in: path
+        description: Group UUID
+        required: true
+        schema:
+          type: string
+      - name: resource_type
+        in: path
+        description: GTS type path of the resource type
+        required: true
+        schema:
+          type: string
+      - name: resource_id
+        in: path
+        description: Resource identifier
+        required: true
+        schema:
+          type: string
       responses:
         '204':
-          description: Membership detached
-
-# ── Components ─────────────────────────────────────────────────────
-
+          description: Membership removed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+  /types-registry/v1/types:
+    get:
+      tags:
+      - Resource Group Types
+      summary: List GTS types
+      description: Retrieve a list of GTS resource group type definitions with OData filtering
+      operationId: resource_group.list_types
+      parameters:
+      - name: limit
+        in: query
+        description: Maximum number of types to return
+        required: false
+        schema:
+          type: integer
+      - name: cursor
+        in: query
+        description: Cursor for pagination
+        required: false
+        schema:
+          type: string
+      - name: $filter
+        in: query
+        description: |-
+          OData v4 filter expression
+          - code: eq|ne|contains|startswith|endswith|in
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: List of GTS types
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_TypeDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+      x-odata-filter:
+        allowedFields:
+          code:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+    post:
+      tags:
+      - Resource Group Types
+      summary: Create a new GTS type
+      description: Create a new GTS resource group type definition
+      operationId: resource_group.create_type
+      requestBody:
+        description: Type creation data
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTypeDto'
+        required: true
+      responses:
+        '201':
+          description: Created type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TypeDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+  /types-registry/v1/types/{code}:
+    get:
+      tags:
+      - Resource Group Types
+      summary: Get GTS type by code
+      description: Retrieve a specific GTS type definition by its GTS type path
+      operationId: resource_group.get_type
+      parameters:
+      - name: code
+        in: path
+        description: GTS type path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Type found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TypeDto'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+    put:
+      tags:
+      - Resource Group Types
+      summary: Update GTS type
+      description: Update a GTS resource group type definition (full replacement)
+      operationId: resource_group.update_type
+      parameters:
+      - name: code
+        in: path
+        description: GTS type path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: Type update data
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTypeDto'
+        required: true
+      responses:
+        '200':
+          description: Updated type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TypeDto'
+        '400':
+          description: Bad Request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
+    delete:
+      tags:
+      - Resource Group Types
+      summary: Delete GTS type
+      description: Delete a GTS resource group type definition
+      operationId: resource_group.delete_type
+      parameters:
+      - name: code
+        in: path
+        description: GTS type path
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Type deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Internal Server Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - bearerAuth: []
 components:
-
-  parameters:
-    GroupId:
-      name: group_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-      example: 22222222-2222-2222-2222-222222222222
-
-    TypeSchemaId:
-      name: schema_id
-      in: path
-      required: true
-      description: "GTS type path (`$id` value without `gts://` prefix)."
-      schema:
-        type: string
-      example: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-
-    MembershipGroupId:
-      name: group_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-      example: 33333333-3333-3333-3333-333333333333
-
-    MembershipResourceType:
-      name: resource_type
-      in: path
-      required: true
-      description: "GTS type identifier of the resource (ends with `~`)."
-      schema:
-        type: string
-      example: "gts.cf.core.idp.user.v1~"
-
-    MembershipResourceId:
-      name: resource_id
-      in: path
-      required: true
-      schema:
-        type: string
-      example: R4
-
-    DeleteForce:
-      name: force
-      in: query
-      required: false
-      schema:
-        type: boolean
-        default: false
-
-    Limit:
-      name: limit
-      in: query
-      required: false
-      description: Number of items per page.
-      schema:
-        type: integer
-        minimum: 1
-        maximum: 200
-        default: 25
-
-    Cursor:
-      name: cursor
-      in: query
-      required: false
-      description: |
-        Opaque cursor token from a previous response (`next_cursor` or `prev_cursor`).
-        Changing `$filter` with an existing cursor returns `400 FILTER_MISMATCH`.
-      schema:
-        type: string
-
-    ODataFilter:
-      name: $filter
-      in: query
-      required: false
-      description: OData v4.01 filter expression.
-      schema:
-        type: string
-
-  responses:
-    NotFound:
-      description: Resource not found
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Problem'
-          example:
-            detail: Requested entity does not exist
-            status: 404
-            title: Resource not found
-            trace_id: 01HXYZRGNOTFOUND
-            type: https://api.example.com/errors/not-found
-
   schemas:
-
-    # ── Types ──
-
-    GtsSchema:
+    CreateGroupDto:
       type: object
-      description: |
-        Raw GTS JSON Schema document. The server stores the schema as-is and extracts metadata:
-        - `$id` → GTS type path (used as lookup key)
-        - `x-gts-traits-schema` → trait shape (on base contracts)
-        - `x-gts-traits` → trait values like `can_be_root`, `allowed_parents`, `allowed_memberships` (on chained types)
-        - `allOf` + `$ref` → type inheritance chain
-        For chained RG types, extracted traits are stored in junction tables for DB-enforced referential integrity.
-      additionalProperties: true
-
-    GtsSchemaPage:
-      type: object
-      required: [items, page_info]
+      description: REST DTO for creating a new resource group.
+      required:
+      - type
+      - name
       properties:
-        items:
+        id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Optional caller-supplied ID. If omitted, the server generates a UUID.
+        metadata:
+          description: Type-specific metadata.
+        name:
+          type: string
+          description: Display name (1..255 characters).
+        parent_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Parent group ID (null for root groups).
+        tenant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: |-
+            Optional target tenant for the created group (VHP-2162).
+
+            If omitted, the tenant scope is derived from the caller's own
+            `SecurityContext` -- today's unchanged default behavior. If present
+            and different from the caller's own tenant, the create succeeds only
+            when the caller's `create`-action `AccessScope` actually covers the
+            target tenant (platform-admin / onboarding use case); otherwise the
+            request is rejected as though the target tenant did not exist.
+            Rejected as a contradiction for tenant-typed groups: their effective
+            tenant is always `group.id`.
+        type:
+          type: string
+          description: GTS chained type path. Must have prefix `gts.cf.core.rg.type.v1~`.
+    CreateTypeDto:
+      type: object
+      description: REST DTO for creating a new GTS type.
+      required:
+      - code
+      - can_be_root
+      properties:
+        allowed_membership_types:
           type: array
           items:
-            $ref: '#/components/schemas/GtsSchema'
-        page_info:
-          $ref: '#/components/schemas/PageInfo'
+            type: string
+          description: GTS type paths of allowed membership resource types.
+        allowed_parent_types:
+          type: array
+          items:
+            type: string
+          description: GTS type paths of allowed parent types.
+        can_be_root:
+          type: boolean
+          description: Whether groups of this type can be root nodes.
+        code:
+          type: string
+          description: |-
+            GTS type path. Must have prefix `gts.cf.core.rg.type.v1~`.
 
-    # ── Groups ──
-
-    Group:
+            Whether the type creates a new tenant scope is derived from the code:
+            any path starting with the tenant RG type prefix is a tenant type.
+        metadata_schema:
+          description: Optional JSON Schema for instance metadata.
+    GroupDto:
       type: object
-      description: |
-        Group entity. Base fields: `id`, `type`, `name`, `parent_id`, `tenant_id`.
-        Derived type fields (e.g. `category`, `barrier`) are nested inside a `metadata` object.
-        DB stores derived fields in `metadata` JSONB column.
-      required: [id, type, name, parent_id, tenant_id]
+      description: |-
+        REST DTO for resource group representation.
+
+        Group responses do NOT include `created_at`/`updated_at` (per DESIGN).
+      required:
+      - id
+      - type
+      - name
+      - hierarchy
       properties:
+        hierarchy:
+          $ref: '#/components/schemas/HierarchyDto'
+          description: Hierarchy context.
         id:
           type: string
           format: uuid
-          example: 22222222-2222-2222-2222-222222222222
-        type:
-          type: string
-          description: "GTS type identifier (chained type path, ends with `~`)."
-          example: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
+          description: Group identifier.
+        metadata:
+          description: Type-specific metadata.
         name:
           type: string
-          example: D2
-        parent_id:
-          type: [string, 'null']
+          description: Display name.
+        type:
+          type: string
+          description: GTS chained type path.
+    GroupWithDepthDto:
+      type: object
+      description: REST DTO for resource group with depth (hierarchy queries).
+      required:
+      - id
+      - type
+      - name
+      - hierarchy
+      properties:
+        hierarchy:
+          $ref: '#/components/schemas/HierarchyWithDepthDto'
+          description: Hierarchy context with depth.
+        id:
+          type: string
           format: uuid
-          description: "Direct parent group (null for root groups)."
-          example: 11111111-1111-1111-1111-111111111111
+          description: Group identifier.
+        metadata:
+          description: Type-specific metadata.
+        name:
+          type: string
+          description: Display name.
+        type:
+          type: string
+          description: GTS chained type path.
+    HierarchyDto:
+      type: object
+      description: REST DTO for hierarchy context in group responses.
+      required:
+      - parent_id
+      - tenant_id
+      properties:
+        parent_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Parent group ID (null for root groups).
         tenant_id:
           type: string
           format: uuid
-          readOnly: true
-          description: "Computed by server. Derived from hierarchy — equals own id for tenant types, inherited from nearest tenant ancestor otherwise."
-          example: 11111111-1111-1111-1111-111111111111
-        metadata:
-          type: object
-          description: "Type-specific fields defined by the chained RG type schema. Schema varies per type."
-
-    GroupPage:
+          description: Tenant scope.
+    HierarchyWithDepthDto:
       type: object
-      required: [items, page_info]
+      description: REST DTO for hierarchy context with depth in group responses.
+      required:
+      - parent_id
+      - tenant_id
+      - depth
       properties:
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/Group'
-        page_info:
-          $ref: '#/components/schemas/PageInfo'
-
-    GroupHierarchyItem:
-      description: "Group with relative `depth` from reference group. Returned only by the hierarchy endpoint."
-      allOf:
-        - $ref: '#/components/schemas/Group'
-        - type: object
-          required: [depth]
-          properties:
-            depth:
-              type: integer
-              readOnly: true
-              description: "Relative depth from reference group (0 = self, positive = descendants, negative = ancestors)."
-              example: 1
-
-    GroupHierarchyPage:
-      type: object
-      required: [items, page_info]
-      properties:
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/GroupHierarchyItem'
-        page_info:
-          $ref: '#/components/schemas/PageInfo'
-
-    CreateGroupRequest:
-      type: object
-      description: "Derived type fields (e.g. `category`) are sent inside the `metadata` object."
-      required: [type, name]
-      properties:
-        id:
-          type: string
-          format: uuid
-          description: "Optional. If omitted, server generates a UUID."
-        type:
-          type: string
-          description: "GTS type identifier (chained type path, ends with `~`)."
-          example: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-        name:
-          type: string
-          example: D2
+        depth:
+          type: integer
+          format: int32
+          description: Relative distance from reference group.
         parent_id:
-          type: [string, 'null']
+          type:
+          - string
+          - 'null'
           format: uuid
-          description: "Parent group ID."
-          example: 11111111-1111-1111-1111-111111111111
-        metadata:
-          type: object
-          description: "Type-specific fields defined by the chained RG type schema."
-
-    UpdateGroupRequest:
-      type: object
-      required: [type, name]
-      properties:
-        type:
+          description: Parent group ID (null for root groups).
+        tenant_id:
           type: string
-          example: "gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-        name:
-          type: string
-          example: D2
-        parent_id:
-          type: [string, 'null']
           format: uuid
-          example: 11111111-1111-1111-1111-111111111111
-      additionalProperties: true
-
-    # ── Memberships ──
-
-    Membership:
+          description: Tenant scope.
+    MembershipDto:
       type: object
-      required: [group_id, resource_id, resource_type]
+      description: |-
+        REST DTO for membership representation.
+
+        Membership responses do NOT include `tenant_id` (derived from group).
+      required:
+      - group_id
+      - resource_type
+      - resource_id
       properties:
         group_id:
           type: string
           format: uuid
-          example: 33333333-3333-3333-3333-333333333333
+          description: Group identifier.
         resource_id:
           type: string
-          example: R4
+          description: Resource identifier.
         resource_type:
           type: string
-          example: "gts.cf.core.idp.user.v1~"
-
-    MembershipPage:
+          description: GTS type path of the resource type.
+    PageInfo:
       type: object
-      required: [items, page_info]
+      required:
+      - limit
+      properties:
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        prev_cursor:
+          type:
+          - string
+          - 'null'
+    Page_GroupDto:
+      type: object
+      required:
+      - items
+      - page_info
       properties:
         items:
           type: array
           items:
-            $ref: '#/components/schemas/Membership'
+            $ref: '#/components/schemas/GroupDto'
         page_info:
           $ref: '#/components/schemas/PageInfo'
-
-    # ── Common ──
-
+    Page_GroupWithDepthDto:
+      type: object
+      required:
+      - items
+      - page_info
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupWithDepthDto'
+        page_info:
+          $ref: '#/components/schemas/PageInfo'
+    Page_MembershipDto:
+      type: object
+      required:
+      - items
+      - page_info
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MembershipDto'
+        page_info:
+          $ref: '#/components/schemas/PageInfo'
+    Page_TypeDto:
+      type: object
+      required:
+      - items
+      - page_info
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TypeDto'
+        page_info:
+          $ref: '#/components/schemas/PageInfo'
     Problem:
       type: object
+      description: RFC 9457 problem+json. `context` varies by error category.
+      required:
+      - type
+      - title
+      - status
+      - detail
+      - context
       properties:
-        type: { type: string }
-        title: { type: string }
-        status: { type: integer }
-        detail: { type: string }
-        trace_id: { type: string }
-
-    PageInfo:
-      type: object
-      required: [limit]
-      properties:
-        next_cursor:
+        context:
+          type: object
+        detail:
           type: string
-          description: Opaque token for next page. Omitted on last page.
-        prev_cursor:
+        instance:
           type: string
-          description: Opaque token for previous page. Omitted on first page.
-        limit:
+        status:
           type: integer
-          format: int64
+          format: int32
+        title:
+          type: string
+        trace_id:
+          type: string
+        type:
+          type: string
+    TypeDto:
+      type: object
+      description: REST DTO for GTS type representation.
+      required:
+      - code
+      - can_be_root
+      - allowed_parent_types
+      - allowed_membership_types
+      properties:
+        allowed_membership_types:
+          type: array
+          items:
+            type: string
+          description: GTS type paths of allowed membership resource types
+        allowed_parent_types:
+          type: array
+          items:
+            type: string
+          description: GTS type paths of allowed parent types
+        can_be_root:
+          type: boolean
+          description: Whether groups of this type can be root nodes
+        code:
+          type: string
+          description: GTS type path
+        metadata_schema:
+          description: Optional JSON Schema for instance metadata
+    UpdateGroupDto:
+      type: object
+      description: |-
+        REST DTO for updating a resource group (full replacement via PUT).
+
+        **The group's GTS type is immutable after creation.** The payload
+        deliberately does not carry a `type` field — to change a group's type,
+        delete the existing group and create a new one. See the SDK
+        `UpdateGroupRequest` doc for the full rationale.
+
+        Every replaceable field is **required** so an omitted field cannot be
+        confused with "preserve previous value". Nullable fields (`parent_id`,
+        `metadata`) must be sent explicitly as `null` to clear them — for
+        example, moving a group to root requires `"parent_id": null`, not an
+        omitted key.
+      required:
+      - name
+      - parent_id
+      - metadata
+      properties:
+        metadata:
+          description: Type-specific metadata (`null` to clear).
+        name:
+          type: string
+          description: Display name (1..255 characters).
+        parent_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Parent group ID (`null` for root groups).
+    UpdateTypeDto:
+      type: object
+      description: |-
+        REST DTO for updating a GTS type (full replacement via PUT).
+
+        Every replaceable field is **required** so an omitted field cannot be
+        confused with "preserve previous value". Nullable fields
+        (`metadata_schema`) must be sent explicitly as `null` to clear them.
+      required:
+      - can_be_root
+      - allowed_parent_types
+      - allowed_membership_types
+      - metadata_schema
+      properties:
+        allowed_membership_types:
+          type: array
+          items:
+            type: string
+          description: GTS type paths of allowed membership resource types.
+        allowed_parent_types:
+          type: array
+          items:
+            type: string
+          description: GTS type paths of allowed parent types.
+        can_be_root:
+          type: boolean
+          description: Whether groups of this type can be root nodes.
+        metadata_schema:
+          description: JSON Schema for instance metadata (`null` to clear).
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

@@ -1,0 +1,48 @@
+# Created: 2026-07-29 by Constructor Tech
+#
+# Registry of per-gear OpenAPI subsets.
+#
+# `make openapi` produces one platform-wide document (docs/api/api.json) from the running
+# example server. Some gears additionally publish a spec covering only their own surface, so a
+# consuming team can be handed one file instead of a 60+ path document. Those subsets are
+# **generated** from the platform document by tools/scripts/extract_gear_openapi.py, driven by
+# this registry — never edited by hand.
+#
+# Each entry:
+#   name      identifier used by `--gear` and in log output
+#   out       generated file, committed to the repo
+#   preamble  hand-maintained YAML with title / description / tags (and optionally servers);
+#             everything else is taken from the platform document
+#   paths     regular expressions matched against platform path keys; a path is included when
+#             any expression matches
+#
+# Adding a gear is one entry. Regenerate with `make openapi-gears`; verify with
+# `make openapi-gears-check` (fails when a committed file no longer matches the source).
+
+gears:
+  - name: resource-group
+    out: gears/system/resource-group/docs/openapi.yaml
+    preamble: gears/system/resource-group/docs/openapi.preamble.yaml
+    paths:
+      - '^/resource-group/v1/'
+      # The gear owns the type registry's `types` surface; `/types-registry/v1/entities*`
+      # belongs to the types-registry gear and is deliberately excluded.
+      - '^/types-registry/v1/types(/|$)'
+
+  # Other gears that currently keep a hand-maintained per-gear spec and could be moved onto this
+  # tool by their owners (each needs a preamble file extracted from its current `info`/`tags`):
+  #
+  # - name: credstore
+  #   out: gears/credstore/docs/api/openapi.yaml
+  #   preamble: gears/credstore/docs/api/openapi.preamble.yaml
+  #   paths: ['^/credstore/v1/']
+  #
+  # - name: event-broker
+  #   out: gears/system/event-broker/docs/openapi.yaml
+  #   preamble: gears/system/event-broker/docs/openapi.preamble.yaml
+  #   paths: ['^/event-broker/v1/']
+  #
+  # - name: mini-chat
+  #   out: gears/mini-chat/docs/openapi.json      # note: JSON, tool emits YAML only today
+  #   preamble: gears/mini-chat/docs/openapi.preamble.yaml
+  #   paths: ['^/mini-chat/v1/']
