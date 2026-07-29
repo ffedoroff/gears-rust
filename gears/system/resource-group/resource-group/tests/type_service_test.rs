@@ -1206,6 +1206,46 @@ async fn gts_resolve_id_nonexistent() {
     );
 }
 
+/// rg-db-audit-transactions.md fix #1: `TypeRepository::insert` maps a
+/// unique-constraint violation on `schema_id` to the typed
+/// `TypeAlreadyExists` domain error, symmetric with
+/// `GroupRepository::insert`/`MembershipRepository::insert`
+/// (`group_repo.rs`/`membership_repo.rs`).
+///
+/// Calls the repository directly (not `TypeService::create_type_unscoped`)
+/// so the assertion is against `type_repo::insert`'s own mapping, not
+/// `create_type_in_tx`'s `resolve_id` pre-check, which would otherwise
+/// intercept the duplicate before `insert` is ever called a second time.
+#[tokio::test]
+async fn type_repo_insert_duplicate_schema_id_returns_type_already_exists() {
+    let db = common::test_db().await;
+    let conn = db.conn().expect("get conn");
+    let code = type_code("dupinsert");
+
+    TypeRepository
+        .insert(&conn, &code, None)
+        .await
+        .expect("first insert should succeed");
+
+    let err = TypeRepository
+        .insert(&conn, &code, None)
+        .await
+        .expect_err("second insert with the same schema_id must fail");
+
+    match err {
+        DomainError::TypeAlreadyExists { code: conflicting } => {
+            assert_eq!(
+                conflicting, code,
+                "conflicting code must be the duplicated schema_id"
+            );
+        }
+        other => panic!(
+            "expected a typed TypeAlreadyExists for the duplicate schema_id, got a general \
+             error instead: {other:?}"
+        ),
+    }
+}
+
 /// TC-GTS-03: resolve_ids batch -- all found -> Ok(vec![id1, id2, id3]).
 #[tokio::test]
 async fn gts_resolve_ids_all_found() {

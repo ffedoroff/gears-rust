@@ -549,6 +549,18 @@ impl TypeRepositoryTrait for TypeRepository {
     /// `secure_insert` already returns the fully-populated `Model`,
     /// including the auto-generated SMALLINT id, so no separate re-read is
     /// needed to get it (RG-08).
+    ///
+    /// Classifies a unique-constraint violation on `schema_id` (the
+    /// migration's `UNIQUE(schema_id)`, independent of isolation level) into
+    /// the typed `TypeAlreadyExists` domain variant, symmetric with
+    /// `GroupRepository::insert`/`MembershipRepository::insert`. Before this,
+    /// `create_type_in_tx`'s pre-check (`resolve_id`) plus its SERIALIZABLE
+    /// transaction were the only thing standing between a duplicate `code`
+    /// and a raw, unclassified `DomainError::Database` -- the SSI abort+retry
+    /// papered over the missing mapping rather than the mapping making the
+    /// isolation level optional. This does not change when the error is
+    /// raised, only that it is now typed (and 409s on the REST layer)
+    /// regardless of what isolation level the caller happens to run under.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
@@ -565,7 +577,13 @@ impl TypeRepositoryTrait for TypeRepository {
 
         toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))
+            .map_err(|e| {
+                if e.is_unique_violation() {
+                    DomainError::type_already_exists(schema_id)
+                } else {
+                    DomainError::database(e.to_string())
+                }
+            })
     }
 
     /// Insert allowed parent junction entries.

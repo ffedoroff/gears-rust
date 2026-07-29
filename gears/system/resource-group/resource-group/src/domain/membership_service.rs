@@ -337,9 +337,25 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     ///
     /// Resolves the GTS type path, verifies the membership exists, and deletes it.
     ///
-    /// Runs inside a `SERIALIZABLE` transaction with bounded retry, the same
-    /// check-then-act shape as `add_membership` (RG-14), even though a plain
-    /// delete-by-key has a narrower race window than a predicate-driven insert.
+    /// Runs inside a transaction with bounded retry (`TxConfig::default()`,
+    /// not `SERIALIZABLE`). The delete targets the exact composite primary
+    /// key `(group_id, gts_type_id, resource_id)` -- there is no predicate
+    /// whose result set a concurrent writer could change out from under this
+    /// transaction (contrast `add_membership_in_tx`'s RG-01 check on
+    /// "existing tenants for this resource", a genuine write-skew hazard).
+    /// The base PR's commit introducing this transaction (`ab073c7a`)
+    /// documented `SERIALIZABLE` here as "for symmetry" with `add_membership`,
+    /// not as a correctness requirement; the DB-behavior audit
+    /// (`rg-db-audit-transactions.md`, finding #7 / recommendation #2)
+    /// confirmed write-skew is impossible on a delete-by-primary-key and
+    /// recommended the downgrade. Bounded retry is kept (not dropped) because
+    /// a real deadlock (`40P01`) is still possible between two transactions
+    /// taking row locks in different orders, independent of isolation level;
+    /// `is_retryable_contention` already treats `40001`/`40P01` alike, so
+    /// this still retries a genuine deadlock exactly as before, just without
+    /// paying for SSI predicate tracking on every call. The tenant gate
+    /// (`find_model_by_id_scoped`, "foreign tenant -> `GroupNotFound`") and
+    /// its semantics are unchanged.
     pub async fn remove_membership(
         &self,
         ctx: &SecurityContext,
@@ -364,7 +380,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         let resource_type = resource_type.to_owned();
         let resource_id = resource_id.to_owned();
 
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+        // TxConfig::default() (not ::serializable()) -- see this method's
+        // doc comment for why a delete-by-primary-key does not need SSI.
+        db.transaction_with_retry(TxConfig::default(), DomainError::db_err, |tx| {
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
             let membership_repo = membership_repo.clone();
@@ -388,8 +406,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         .await
     }
 
-    /// Inner logic for `remove_membership`, runs inside the SERIALIZABLE
-    /// transaction.
+    /// Inner logic for `remove_membership`, runs inside the transaction
+    /// opened by `remove_membership` (`TxConfig::default()`, not
+    /// `SERIALIZABLE` -- see that method's doc comment).
     #[allow(clippy::too_many_arguments)]
     async fn remove_membership_in_tx(
         group_repo: &GR,
