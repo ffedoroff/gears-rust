@@ -8,10 +8,15 @@
 //! cycle detection, closure table management, query profile enforcement,
 //! and CRUD orchestration.
 //!
-//! All hierarchy-mutating operations (`create_group`, `update_group`,
-//! `move_group`, `delete_group`) use `SERIALIZABLE` transactions with
-//! bounded retry (max 3 attempts) to prevent phantom reads and ensure
-//! closure table consistency under concurrent mutations.
+//! All hierarchy-mutating operations (`create_group`, `move_group`,
+//! `delete_group`, and `update_group`'s parent-change branch) use
+//! `SERIALIZABLE` transactions with bounded retry (max 3 attempts) to
+//! prevent phantom reads and ensure closure table consistency under
+//! concurrent mutations. `update_group`'s pure rename/metadata path (no
+//! `parent_id` change) has no cross-row predicate to protect and runs at the
+//! backend default isolation instead (`rg-db-audit-transactions.md`,
+//! recommendation #3) -- see `update_group`'s own doc comment for the
+//! isolation-selection and race-closing rationale.
 
 use std::sync::Arc;
 
@@ -20,7 +25,7 @@ use resource_group_sdk::models::{
     CreateGroupRequest, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use resource_group_sdk::{GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
-use toolkit_db::secure::{DBRunner, TxConfig};
+use toolkit_db::secure::{DBRunner, Db, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
 use tracing::debug;
@@ -54,6 +59,33 @@ impl Default for QueryProfile {
             max_width: None,
         }
     }
+}
+
+/// Outcome of one `update_group_inner` attempt.
+///
+/// Purely an internal control-flow value for `update_group` -- it never
+/// crosses a `?` boundary into `DomainError`/`CanonicalError`, so it changes
+/// no error semantics visible to callers. See `update_group`'s isolation
+/// comment for why this exists: `update_group` opens the transaction at a
+/// isolation level chosen from a pre-transaction hint (does this update
+/// change the group's parent?). `NeedsSerializable` is how the
+/// fresh-inside-the-transaction read tells `update_group` that the hint was
+/// stale in the dangerous direction -- the move branch (cycle detection +
+/// closure rebuild) is required but the open transaction is not
+/// SERIALIZABLE -- so the whole operation must be redone at
+/// `TxConfig::serializable()`. It is returned before any write happens in
+/// that attempt, so discarding it is always a no-op commit, never a partial
+/// write.
+enum UpdateGroupOutcome {
+    /// The update completed (rename-only or parent-change) under a
+    /// transaction whose isolation level was sufficient for what it turned
+    /// out to need.
+    Done(ResourceGroup),
+    /// The fresh in-tx read disagreed with the pre-transaction hint: this
+    /// update does need the parent-change (move) branch, but the current
+    /// transaction was opened below `TxConfig::serializable()`. No writes
+    /// were made in this attempt.
+    NeedsSerializable,
 }
 
 // @cpt-dod:cpt-cf-resource-group-dod-entity-hier-entity-service:p1
@@ -114,8 +146,48 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // whose path starts with `TENANT_RG_TYPE_PATH` opens a new tenant scope.
         let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
 
-        // AuthZ gate with provisioning context
-        let _scope =
+        // VHP-2162: a tenant-typed group's effective tenant is always its
+        // own (generated) id -- see `create_group_inner`'s
+        // `effective_tenant_id` derivation. A caller-supplied `tenant_id` on
+        // such a request can never be consulted, so treat it as a
+        // contradiction rather than silently discarding it.
+        Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
+
+        // VHP-2162: resolve the target tenant for this create. Omitted
+        // `tenant_id` (`None`) is today's unchanged default: target == the
+        // caller's own tenant (`tenant_id`, derived by the REST handler from
+        // `SecurityContext::subject_tenant_id`). A present `tenant_id` lets
+        // an authorized caller (platform admin / onboarding) target a
+        // tenant other than their own, subject to the AuthZ checks below.
+        let target_tenant_id = req.tenant_id.unwrap_or(tenant_id);
+
+        // VHP-2343 guardrail: a client-supplied `id` is already accepted
+        // as-is on create (owner decision, tracked separately under
+        // VHP-2343 -- no derived-id, no id_seed, no restriction to tenant
+        // types). Combined with an explicit cross-tenant target, that
+        // identity-capture gap gets strictly worse: today a captured id
+        // lands in the attacker's own tenant; letting `tenant_id` differ
+        // too would let it be planted directly inside a tenant the caller
+        // does not belong to. Reject the combination outright -- a stopgap,
+        // not a fix for VHP-2343 -- until an identifier-ownership policy
+        // exists.
+        if req.id.is_some() && target_tenant_id != tenant_id {
+            return Err(DomainError::validation(
+                "id and tenant_id cannot both be set on group creation: an explicit id \
+                 combined with a cross-tenant target is not accepted while identifier \
+                 ownership policy is undecided (VHP-2343)"
+                    .to_owned(),
+            ));
+        }
+
+        // AuthZ gate with provisioning context. `owner_tenant_id` now also
+        // carries the *target* tenant (VHP-2162) alongside the pre-existing
+        // `is_tenant`/`parent_id` properties, so a policy that keys off it
+        // can decide whether this caller may create groups in that tenant --
+        // mirrors account-management's `authz_scope` helper
+        // (`domain/authz.rs`) and the CREATE example in `AccessRequest`'s
+        // own doc comment.
+        let scope =
             self.enforcer
                 .access_scope_with(
                     ctx,
@@ -131,10 +203,57 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                                     serde_json::Value::String(id.to_string())
                                 }),
                             ),
+                            (
+                                pep_properties::OWNER_TENANT_ID.to_owned(),
+                                serde_json::Value::String(target_tenant_id.to_string()),
+                            ),
                         ])),
                 )
                 .await
                 .map_err(DomainError::from)?;
+
+        // VHP-2162: when the target tenant differs from the caller's own
+        // token tenant, re-verify it against the *compiled* `AccessScope` --
+        // do not rely solely on the PDP's `decision: true`. This is
+        // defense-in-depth: a policy misconfiguration that grants "create"
+        // unconditionally must not translate into an unbounded cross-tenant
+        // create. When the target equals the caller's own tenant (the
+        // common case, including every request that omits `tenant_id`),
+        // this block is skipped entirely -- byte-for-byte the pre-VHP-2162
+        // behavior.
+        //
+        // **`InTenantSubtree` limitation (deliberate, not a bug).**
+        // `AccessScope::contains_uuid` cannot resolve subtree membership --
+        // per `toolkit_security::access_scope::ScopeFilter::values`'s
+        // documented write-path limitation, it always returns `false` for an
+        // `InTenantSubtree` filter, because doing so would require a
+        // DB-backed lookup against `tenant_closure` (owned by Account
+        // Management; this crate has no dependency on it). A caller whose
+        // only grant for the target tenant is an `InTenantSubtree`
+        // constraint (e.g. "parent tenant admins may manage descendant
+        // tenants") is therefore denied here even when `target_tenant_id` is
+        // genuinely inside that subtree. This is a conservative fail-closed
+        // choice over trusting an unverifiable claim; lifting it would
+        // require RG to gain a dependency on AM's `tenant_closure`, which is
+        // out of scope for this change.
+        if target_tenant_id != tenant_id {
+            let permitted = scope.is_unconstrained()
+                || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, target_tenant_id);
+            if !permitted {
+                // Not-found shape, not forbidden (mirrors the VHP-2341
+                // membership gates in `membership_service.rs`): a tenant the
+                // caller has no grant for must be indistinguishable from a
+                // tenant that does not exist -- this gear owns no tenant
+                // data and cannot legitimately claim to know the
+                // difference.
+                debug!(
+                    caller_tenant_id = %tenant_id,
+                    target_tenant_id = %target_tenant_id,
+                    "create_group rejected: target tenant outside caller's AccessScope"
+                );
+                return Err(DomainError::tenant_not_found(target_tenant_id));
+            }
+        }
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
 
         // Validate metadata against the GTS type schema before opening the
@@ -163,8 +282,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
             Box::pin(async move {
-                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
-                    .await
+                Self::create_group_inner(
+                    &*group_repo,
+                    &*type_repo,
+                    tx,
+                    &req,
+                    target_tenant_id,
+                    &profile,
+                )
+                .await
             })
         })
         .await
@@ -231,8 +357,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-update-group:p1
     /// Update a resource group (full replacement via PUT, AuthZ-scoped).
     ///
-    /// Runs inside a `SERIALIZABLE` transaction with bounded retry (max 3 attempts)
-    /// to ensure invariant checks, closure table mutations, and the update are atomic.
+    /// Runs inside a transaction with bounded retry (max 3 attempts). The
+    /// isolation level is chosen per-request, not hard-coded to
+    /// `SERIALIZABLE`: see the comment on `guessed_parent_changed` below for
+    /// the rationale and for how the race between that pre-transaction hint
+    /// and the transaction's own fresh read is closed.
     pub async fn update_group(
         &self,
         ctx: &SecurityContext,
@@ -256,9 +385,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
 
         // Validate metadata against the GTS type schema before opening the
-        // transaction: same rationale as `create_group` (RG-09).
+        // transaction: same rationale as `create_group` (RG-09). The same
+        // read also gives us the group's current `parent_id`, reused below
+        // to pick the transaction's isolation level -- no extra query for
+        // that. `conn` is scoped to this block so the pool connection is
+        // released before the transaction (below) requests its own.
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
-        {
+        let existing = {
             let conn = self.db.conn()?;
             let existing = self
                 .group_repo
@@ -271,15 +404,119 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 &*self.types_registry,
             )
             .await?;
-        }
+            existing
+        };
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
+
+        // Pick the least-strict isolation level that stays correct for this
+        // update. Per the DB-behavior audit
+        // (`rg-db-audit-transactions.md`, recommendation #3): write-skew
+        // (cycle detection racing a concurrent create/move; closure-table
+        // rebuild) is only reachable on `update_group_inner`'s parent-change
+        // branch (`move_group_internal_impl`). A pure rename/metadata edit
+        // touches a single row by primary key and has no cross-row
+        // predicate to protect, so it needs nothing stronger than the
+        // backend default (`TxConfig::default()` -- READ COMMITTED on
+        // PostgreSQL; SQLite always runs SERIALIZABLE regardless, per
+        // `TxIsolationLevel`'s backend notes, so this is a PostgreSQL-only
+        // saving).
+        //
+        // This is only a *hint*, computed from the `existing` read above,
+        // taken *before* the transaction opens -- it can go stale if a
+        // concurrent request changes this group's parent in the window
+        // between that read and the transaction start. The authoritative
+        // decision is always the fresh, in-transaction read
+        // (`update_group_inner`'s own `find_model_by_id`); closing that gap
+        // is `attempt_update_group`/`UpdateGroupOutcome`'s job (see their
+        // doc comments): if the fresh read disagrees with this hint in the
+        // *dangerous* direction (hint said "no move", the fresh read says
+        // otherwise), `update_group_inner` bails out with
+        // `NeedsSerializable` *before writing anything*, and the retry
+        // below reruns the whole operation under
+        // `TxConfig::serializable()`. A hint that overshoots (guesses "move"
+        // when no move is actually needed) is harmless: SERIALIZABLE is
+        // always a safe superset of READ COMMITTED's guarantees for the
+        // rename path too, so no downgrade path is needed or attempted.
+        let guessed_parent_changed = existing.hierarchy.parent_id != req.parent_id;
+        let tx_config = if guessed_parent_changed {
+            TxConfig::serializable()
+        } else {
+            TxConfig::default()
+        };
 
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
 
-        db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+        let outcome = Self::attempt_update_group(
+            &db,
+            tx_config,
+            guessed_parent_changed,
+            &group_repo,
+            &type_repo,
+            &scope,
+            group_id,
+            &req,
+            &profile,
+        )
+        .await?;
+
+        match outcome {
+            UpdateGroupOutcome::Done(group) => Ok(group),
+            UpdateGroupOutcome::NeedsSerializable => {
+                debug!(
+                    group_id = %group_id,
+                    "update_group: parent-change hint was stale (a concurrent request moved \
+                     this group); retrying the whole operation under SERIALIZABLE"
+                );
+                match Self::attempt_update_group(
+                    &db,
+                    TxConfig::serializable(),
+                    true,
+                    &group_repo,
+                    &type_repo,
+                    &scope,
+                    group_id,
+                    &req,
+                    &profile,
+                )
+                .await?
+                {
+                    UpdateGroupOutcome::Done(group) => Ok(group),
+                    UpdateGroupOutcome::NeedsSerializable => Err(DomainError::database(
+                        "update_group_inner requested a SERIALIZABLE retry while already \
+                         running under SERIALIZABLE -- this should be unreachable",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Runs one attempt of `update_group_inner` inside a transaction
+    /// configured per `tx_config`/`serializable`.
+    ///
+    /// Factored out so `update_group` can call it twice: once optimistically
+    /// (possibly at a weaker-than-`SERIALIZABLE` isolation, for a same-parent
+    /// update), and, only if that attempt reports
+    /// `UpdateGroupOutcome::NeedsSerializable`, once more forcing
+    /// `TxConfig::serializable()`. `serializable` must accurately describe
+    /// whether `tx_config` is `TxConfig::serializable()` -- it is threaded
+    /// through to `update_group_inner`'s own race-closing check, not
+    /// re-derived from `tx_config` there.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt_update_group(
+        db: &Db,
+        tx_config: TxConfig,
+        serializable: bool,
+        group_repo: &Arc<GR>,
+        type_repo: &Arc<TR>,
+        scope: &toolkit_security::AccessScope,
+        group_id: Uuid,
+        req: &UpdateGroupRequest,
+        profile: &QueryProfile,
+    ) -> Result<UpdateGroupOutcome, DomainError> {
+        db.transaction_with_retry(tx_config, DomainError::db_err, |tx| {
             let req = req.clone();
             let scope = scope.clone();
             let profile = profile.clone();
@@ -294,6 +531,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     group_id,
                     &req,
                     &profile,
+                    serializable,
                 )
                 .await
             })
@@ -511,6 +749,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// maintenance) still run because this method calls the same
     /// `create_group_inner` as the public path; only the `PolicyEnforcer`
     /// gate is skipped.
+    ///
+    /// **`tenant_id` vs `req.tenant_id` (VHP-2162).** `tenant_id` is the
+    /// caller-trusted target tenant -- seeding already resolved it before
+    /// calling in (see `seeding::seed_groups`, which always passes
+    /// `req.tenant_id: None`). If `req.tenant_id` is *also* set and
+    /// disagrees with the `tenant_id` argument, that is treated as a caller
+    /// bug, not a preference to resolve silently: this is a trusted internal
+    /// path, so a disagreement most likely means a construction mistake
+    /// upstream, and quietly picking a winner (either one) would hide it.
+    /// Erroring is the safer choice here; an agreeing (equal) value is
+    /// accepted as a no-op.
     pub async fn create_group_unscoped(
         &self,
         req: CreateGroupRequest,
@@ -518,6 +767,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     ) -> Result<ResourceGroup, DomainError> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
+
+        let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
+
+        if let Some(req_tenant_id) = req.tenant_id
+            && req_tenant_id != tenant_id
+        {
+            return Err(DomainError::validation(format!(
+                "create_group_unscoped: req.tenant_id ({req_tenant_id}) disagrees with the \
+                 trusted tenant_id argument ({tenant_id}); this indicates a caller bug, not a \
+                 policy decision to make silently"
+            )));
+        }
 
         // Same RG-09 fix as `create_group`: validate metadata against the
         // GTS type schema (a cross-gear ClientHub call) before opening the
@@ -554,6 +816,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// **Metadata schema validation.** `create_group` already ran
     /// `validate_metadata_via_gts` before opening this transaction (RG-09):
     /// it's a cross-gear `ClientHub` call, not a DB read to make atomic.
+    ///
+    /// **`tenant_id` parameter (VHP-2162).** This is the already-resolved
+    /// *target* tenant, not necessarily the caller's own token tenant:
+    /// `create_group` folds an authorized `req.tenant_id` override into this
+    /// value (already AuthZ-gated against the caller's `AccessScope`)
+    /// before calling in; `create_group_unscoped` (seeding) passes its own
+    /// trusted tenant directly. Either way, this function treats it as
+    /// *the* tenant to enforce/persist -- it has no separate notion of
+    /// "the caller's own tenant".
     #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     async fn create_group_inner(
         group_repo: &GR,
@@ -620,10 +891,33 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // Skip tenant enforcement for tenant-typed groups — they intentionally
             // create a new tenant scope (tenant_id = group.id != parent.tenant_id).
             if !is_tenant_type && parent.tenant_id != tenant_id {
-                return Err(DomainError::validation(format!(
-                    "Child group tenant_id ({tenant_id}) must match parent tenant_id ({})",
-                    parent.tenant_id
-                )));
+                // VHP-2345: generic message -- do not interpolate the
+                // parent's tenant_id. The caller supplies `parent_id`
+                // directly, so echoing the foreign tenant_id back would
+                // turn this endpoint into a cross-tenant oracle: probe an
+                // arbitrary `parent_id` and learn both that the group
+                // exists and which tenant owns it. Mirrors
+                // `update_group_inner`'s cross-tenant parent-change
+                // message below. Real values stay in this debug log only.
+                //
+                // `tenant_id` here is the resolved *target* tenant
+                // (VHP-2162), which for the default (no explicit
+                // `CreateGroupRequest::tenant_id`) case is exactly the
+                // caller's own tenant -- so this also covers the
+                // conflict-with-parent rule for an explicit cross-tenant
+                // target: the parent's tenant must match the *requested*
+                // tenant, not just the caller's.
+                debug!(
+                    target_tenant_id = %tenant_id,
+                    parent_tenant_id = %parent.tenant_id,
+                    parent_id = %parent_id,
+                    "create_group rejected: parent belongs to a different tenant"
+                );
+                return Err(DomainError::validation(
+                    "Cannot create group under this parent; parent belongs to a different \
+                     tenant"
+                        .to_owned(),
+                ));
             }
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-5
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-3
@@ -748,7 +1042,20 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
     }
 
-    /// Inner logic for `update_group`, runs inside a SERIALIZABLE transaction.
+    /// Inner logic for `update_group`, runs inside the transaction opened by
+    /// `attempt_update_group` -- `SERIALIZABLE` when `serializable` is
+    /// `true`, otherwise `update_group`'s weaker default.
+    ///
+    /// **Isolation-mismatch guard (`serializable` parameter).** `serializable`
+    /// must describe the isolation level of the transaction `tx` is running
+    /// in (set by the caller, `attempt_update_group`) -- it is not derived
+    /// from `tx` itself, since `TxConfig` is not recoverable from an open
+    /// connection. It exists purely to let this function detect, from the
+    /// fresh `existing.parent_id` read just below, that a parent change is
+    /// actually required while running below `SERIALIZABLE` (the
+    /// pre-transaction hint in `update_group` was stale) and bail out via
+    /// `UpdateGroupOutcome::NeedsSerializable` before touching a single row.
+    /// See `update_group`'s isolation comment for the full rationale.
     ///
     /// **Type immutability.** A group's GTS type is fixed at creation —
     /// `UpdateGroupRequest` does not carry a `code` field. The existing
@@ -777,7 +1084,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: &UpdateGroupRequest,
         profile: &QueryProfile,
-    ) -> Result<ResourceGroup, DomainError> {
+        serializable: bool,
+    ) -> Result<UpdateGroupOutcome, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
         // DB: SELECT FROM resource_group WHERE id = {group_id} -- load existing group
         group_repo
@@ -865,6 +1173,27 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // `DomainError::invalid_parent_type` when the parent's type is not in
         // the moved subtree's `allowed_parent_types`).
         let parent_changed = existing.parent_id != req.parent_id;
+
+        // Race-closing guard (see this function's and `update_group`'s doc
+        // comments): `existing` above is a fresh, authoritative in-tx read,
+        // so `parent_changed` is always correct. What can be stale is the
+        // transaction's *isolation level*, chosen from a cheaper
+        // pre-transaction read in `update_group`. If a parent change is
+        // genuinely required (`parent_changed`) but this transaction is not
+        // running under SERIALIZABLE, the move branch below (cycle
+        // detection racing a concurrent create/move, closure-table rebuild)
+        // must not proceed here -- bail out with no writes made yet (every
+        // statement above this point is a read) so `update_group` can redo
+        // the whole operation under `TxConfig::serializable()`.
+        if parent_changed && !serializable {
+            debug!(
+                group_id = %group_id,
+                "update_group_inner: parent-change hint was stale under a non-serializable \
+                 transaction; requesting a SERIALIZABLE retry"
+            );
+            return Ok(UpdateGroupOutcome::NeedsSerializable);
+        }
+
         if parent_changed {
             // Delegate to move logic (cycle detection + closure rebuild).
             // Type stays the same, so use the resolved `rg_type` for parent
@@ -901,10 +1230,11 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
         let sys = toolkit_security::AccessScope::allow_all();
-        group_repo
+        let updated = group_repo
             .find_by_id(tx, &sys, group_id)
             .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))
+            .ok_or_else(|| DomainError::group_not_found(group_id))?;
+        Ok(UpdateGroupOutcome::Done(updated))
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
     }
 
@@ -1299,6 +1629,29 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         if name.is_empty() || name.chars().count() > 255 {
             return Err(DomainError::validation(
                 "Group name must be between 1 and 255 characters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject an explicit `tenant_id` on a tenant-typed group create
+    /// request (VHP-2162).
+    ///
+    /// A tenant-typed group's effective tenant is always its own generated
+    /// id (see `create_group_inner`'s `effective_tenant_id` derivation) --
+    /// never a caller-supplied value. Silently accepting `tenant_id` on such
+    /// a request would either be ignored (confusing) or, worse, be assumed
+    /// by the caller to have taken effect. Shared by `create_group` and
+    /// `create_group_unscoped` so both entry points enforce the same rule.
+    fn reject_tenant_id_on_tenant_type(
+        is_tenant: bool,
+        req_tenant_id: Option<Uuid>,
+    ) -> Result<(), DomainError> {
+        if is_tenant && req_tenant_id.is_some() {
+            return Err(DomainError::validation(
+                "tenant_id must not be set when creating a tenant-typed group: its tenant \
+                 scope is always the group's own id, never a caller-supplied value"
+                    .to_owned(),
             ));
         }
         Ok(())

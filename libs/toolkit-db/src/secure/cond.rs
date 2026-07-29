@@ -1,4 +1,4 @@
-use sea_orm::sea_query::{Alias, Query};
+use sea_orm::sea_query::{Alias, ExprTrait, Query};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, sea_query::Expr};
 
 use crate::secure::{AccessScope, ScopableEntity};
@@ -106,8 +106,66 @@ where
                 and_cond = and_cond.add(col.is_in(sea_values));
             }
             ScopeFilter::InGroup(gf) => {
-                // col IN (SELECT resource_id FROM resource_group_membership
-                //          WHERE group_id IN (...))
+                // CAST(col AS text) IN (SELECT resource_id FROM resource_group_membership
+                //                        WHERE group_id IN (...))
+                //
+                // VHP-2344 defect A: `resource_id` is TEXT (see resource-group's
+                // `m20260306_000001_initial.rs`) -- deliberately untyped because
+                // GTS resource IDs are not always UUIDs. PostgreSQL does not
+                // implicitly cast `uuid = text`, so comparing a `Uuid` resource
+                // column (the common case, e.g. `file.rs`'s `file_id`) against
+                // `resource_id` failed outright. Cast the ENTITY's column to
+                // text instead of casting `resource_id` to uuid: the reverse
+                // cast would throw on every row whose GTS type uses a
+                // non-UUID resource_id, which is exactly the set of rows this
+                // predicate must still be able to match for entities with a
+                // non-UUID resource_col. Casting a column that is already
+                // text-typed is a harmless no-op on both Postgres and SQLite.
+                //
+                // VHP-2344 defect B (deliberately NOT fixed here): the
+                // membership table's primary key is the triple `(group_id,
+                // gts_type_id, resource_id)`, but this subquery only filters
+                // on `group_id` -- two resources of different GTS types that
+                // happen to share the same `resource_id` string are
+                // indistinguishable here, so the predicate can in principle
+                // match a same-ID resource of a *different* GTS type than the
+                // one the group membership was recorded for.
+                //
+                // Disambiguating on `gts_type_id` would need the entity's GTS
+                // type at the point this condition is compiled. `ScopableEntity`
+                // does expose `type_col()`, but it resolves to a per-ROW
+                // column (see `file.rs`: `gts_file_type: String`, a GTS
+                // type-path that can vary per file, not a fixed value for the
+                // whole entity) -- so using it here would require a
+                // *correlated* subquery (an `EXISTS` referencing the outer
+                // row's `type_col()` and joining `gts_type.schema_id`) rather
+                // than the current uncorrelated `IN`, a materially bigger
+                // rewrite of every filter variant in this function. Worse,
+                // `type_col()` is declared by exactly one entity in the whole
+                // monorepo (`file.rs`), and file-storage's own database does
+                // not host `resource_group_membership`/`gts_type` at all --
+                // per `rg_tables`' own docs, those tables are canonical to the
+                // RG gear's database and not projected to domain services. So
+                // the one case the entity-local column could disambiguate is
+                // not reachable in practice, while every other scoped entity
+                // in the codebase declares `no_type` and has nothing to
+                // disambiguate with.
+                //
+                // The information that WOULD generically resolve this -- which
+                // GTS type the group-membership predicate concerns -- lives on
+                // the PDP/PEP wire contract instead: `InGroupPredicate` /
+                // `InGroupSubtreePredicate` (authz-resolver-sdk) and their
+                // mirrors `InGroupScopeFilter` / `InGroupSubtreeScopeFilter`
+                // (toolkit-security) carry only a property name and group/
+                // ancestor IDs, with no resource-type discriminator (see
+                // `tr-authz-plugin`'s `append_group_predicates`, which builds
+                // these predicates from request-context group IDs alone,
+                // agnostic of the resource kind being authorized). Threading
+                // a GTS type through would mean extending that public
+                // contract, which is out of scope for this fix (breaking
+                // `toolkit-security`'s public API is explicitly disallowed
+                // here). Left as a follow-up requiring a PDP/PEP contract
+                // change; tracked under VHP-2344.
                 let group_values = scope_values_to_sea_values(gf.group_ids());
                 let subquery = Query::select()
                     .column(Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID))
@@ -116,14 +174,22 @@ where
                         Expr::col(Alias::new(rg_tables::MEMBERSHIP_GROUP_ID)).is_in(group_values),
                     )
                     .to_owned();
-                and_cond = and_cond.add(col.into_expr().in_subquery(subquery));
+                and_cond = and_cond.add(
+                    col.into_expr()
+                        .cast_as(Alias::new("text"))
+                        .in_subquery(subquery),
+                );
             }
             ScopeFilter::InGroupSubtree(sf) => {
-                // col IN (SELECT resource_id FROM resource_group_membership
-                //          WHERE group_id IN (
-                //            SELECT descendant_id FROM resource_group_closure
-                //            WHERE ancestor_id IN (...)
-                //          ))
+                // CAST(col AS text) IN (SELECT resource_id FROM resource_group_membership
+                //                        WHERE group_id IN (
+                //                          SELECT descendant_id FROM resource_group_closure
+                //                          WHERE ancestor_id IN (...)
+                //                        ))
+                //
+                // Same `uuid = text` cast (defect A) and same un-fixed
+                // cross-GTS-type ambiguity (defect B) as `InGroup` above --
+                // see the extended comment there for the full rationale.
                 let ancestor_values = scope_values_to_sea_values(sf.ancestor_ids());
                 let closure_subquery = Query::select()
                     .column(Alias::new(rg_tables::CLOSURE_DESCENDANT_ID))
@@ -141,7 +207,11 @@ where
                             .in_subquery(closure_subquery),
                     )
                     .to_owned();
-                and_cond = and_cond.add(col.into_expr().in_subquery(membership_subquery));
+                and_cond = and_cond.add(
+                    col.into_expr()
+                        .cast_as(Alias::new("text"))
+                        .in_subquery(membership_subquery),
+                );
             }
             ScopeFilter::InTenantSubtree(sf) => {
                 // Respect-barriers (default), no descendant_status filter:
@@ -359,6 +429,20 @@ mod tests {
             cond_str.contains("resource_id"),
             "InGroup condition must join on resource_id, got: {cond_str}"
         );
+        // VHP-2344 defect A regression guard: the entity's resource column
+        // must be CAST to text before the IN-subquery comparison, since
+        // `resource_group_membership.resource_id` is TEXT and PostgreSQL
+        // does not implicitly cast `uuid = text`. This is a debug-print
+        // assertion only -- it cannot prove the SQL actually runs on
+        // PostgreSQL, which is why `secure_group_scope_postgres.rs`
+        // (gated on `--features integration,pg`) exists to execute it for
+        // real; this assertion just guards the query *shape* against a
+        // silent regression in the fast unit-test suite.
+        assert!(
+            cond_str.contains("func: Cast") && cond_str.contains(r#"Custom("text")"#),
+            "InGroup must CAST the entity column to text before comparing against \
+             resource_id, got: {cond_str}"
+        );
     }
 
     #[test]
@@ -537,6 +621,15 @@ mod tests {
         assert!(
             cond_str.contains("resource_id"),
             "InGroupSubtree condition must join on resource_id, got: {cond_str}"
+        );
+        // VHP-2344 defect A regression guard -- see the equivalent assertion
+        // in `test_in_group_filter_produces_subquery_condition` for the full
+        // rationale (real-Postgres proof lives in
+        // `secure_group_scope_postgres.rs`, `--features integration,pg`).
+        assert!(
+            cond_str.contains("func: Cast") && cond_str.contains(r#"Custom("text")"#),
+            "InGroupSubtree must CAST the entity column to text before comparing against \
+             resource_id, got: {cond_str}"
         );
     }
 

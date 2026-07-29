@@ -76,6 +76,17 @@ pub const GROUP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group.v1~");
 /// Canonical GTS resource type for a resource-group membership link.
 pub const GROUP_MEMBERSHIP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group_membership.v1~");
 
+/// Canonical GTS resource type for a GTS *type definition* itself (the
+/// `/types-registry/v1/types` CRUD surface).
+///
+/// This is the base schema id declared by [`ResourceGroupTypeV1`] above
+/// (`gts_id!("cf.core.rg.type.v1~")`), reused here as the PEP-evaluated
+/// resource type for every type-registry CRUD gate (VHP-2342). The name and
+/// the list/create/read/update/delete action vocabulary come from the
+/// expected-permissions table in `docs/DESIGN.md` (§ "Threats and
+/// Mitigations" / the table right below it) — not invented here.
+pub const TYPE_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.type.v1~");
+
 /// GTS type path for the tenant resource-group type.
 ///
 /// Any RG type whose code **starts with** this path is considered a tenant

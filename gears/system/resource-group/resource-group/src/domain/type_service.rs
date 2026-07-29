@@ -8,9 +8,12 @@
 
 use std::sync::Arc;
 
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
+use resource_group_sdk::TYPE_RESOURCE_TYPE;
 use resource_group_sdk::models::{CreateTypeRequest, ResourceGroupType, UpdateTypeRequest};
 use toolkit_db::secure::{DBRunner, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
+use toolkit_security::{SecurityContext, pep_properties};
 
 use tracing::{debug, warn};
 
@@ -20,24 +23,153 @@ use crate::domain::repo::TypeRepositoryTrait;
 #[allow(unused_imports)]
 use crate::domain::validation;
 
+/// `AuthZ` resource type descriptor for GTS type definitions.
+///
+/// `gts_type` is a platform-global table (see `m20260306_000001_initial.rs`
+/// — no `tenant_id` column, no `#[secure(tenant_col = ...)]` on the entity),
+/// so there is no column here for a PDP constraint to filter row-level
+/// access on: the gate below (`TypeService::gate`) always discards the
+/// `AccessScope` it computes and only cares whether compilation succeeded
+/// at all, i.e. whether the PDP said yes.
+///
+/// ## Why `supported_properties` still lists `OWNER_TENANT_ID` — do not
+/// ## "simplify" this back to an empty list
+///
+/// It was an empty list originally, on exactly the "nothing to filter on"
+/// reasoning above. That reasoning is correct about the *scope* being
+/// unused, but wrong about the consequence: it broke every legitimately
+/// *allowed* call, not just denied ones.
+///
+/// Every real `AuthZ` plugin in this repo attaches an unconditional
+/// baseline `In(OWNER_TENANT_ID, [tid])` constraint to **every** allow
+/// decision, for **every** resource, regardless of whether that resource
+/// even has a tenant column (see `static-authz-plugin`'s `Service::evaluate`
+/// — "Baseline `OWNER_TENANT_ID` clamp — the universal shape every PEP can
+/// bind" — and `tr-authz-plugin`'s mandatory `owner_tenant_id` property).
+/// `authz_resolver_sdk::pep::compiler::compile_to_access_scope` rejects any
+/// constraint whose predicate property is not in `supported_properties`
+/// ("unsupported property", fail-closed), and when *every* constraint on
+/// the response fails that check, the whole call fails with
+/// `Err(ConstraintCompileError::AllConstraintsFailed)` — fail-closed by
+/// design. With an empty `supported_properties` list, that is exactly what
+/// happened to the baseline clamp on every single call: `EnforcerError::
+/// CompileFailed` → `DomainError::InternalError` → HTTP 500, for every
+/// legitimately-allowed caller of any of the five gated methods below, not
+/// merely the denied ones. `tests/type_authz_test.rs`'s `TenantClampAuthZ`
+/// mock reproduces the real plugins' shape and its
+/// `all_five_actions_succeed_with_realistic_tenant_clamp_constraint` test
+/// caught this exact regression (failing with
+/// `AllConstraintsFailed { reason: "unsupported property: owner_tenant_id" }`
+/// before this fix); the previous `AllowAllNoConstraintsAuthZ` mock could
+/// not, because it never attaches a constraint in the first place.
+///
+/// Declaring `OWNER_TENANT_ID` here lets that baseline constraint compile
+/// normally. That the constraint is tenant-shaped and this table has no
+/// tenant column is harmless: `gate()` never reads the resulting
+/// `AccessScope`'s filters, only whether compilation succeeded. The
+/// compiled scope is *not* guaranteed to be `allow_all()` — a PDP that
+/// attaches the baseline `In(OWNER_TENANT_ID, ..)` clamp compiles to a
+/// constrained scope via `AccessScope::from_constraints`, exactly what
+/// `access_scope_with_realistic_tenant_clamp_constraint_succeeds` (see
+/// `tests/type_authz_test.rs`) exercises. Runtime safety comes from `gate()`
+/// unconditionally discarding whatever scope it gets back, constrained or
+/// not — `gts_type` has no tenant column, so there is nothing for such a
+/// filter to apply to — not from the scope somehow always compiling to
+/// `allow_all()`. The property list exists purely so the compiler doesn't
+/// reject the PDP's normal output before `gate()` gets to ignore it.
+///
+/// # Why every call site *also* uses `access_scope_with(.., require_constraints(false))`
+///
+/// This is a *different, still-live* case, not a substitute for the above:
+/// a PDP may separately permit with **zero** constraints at all
+/// (`decision: true, constraints: []` — see `AllowAllNoConstraintsAuthZ` in
+/// the tests), a legitimate response shape for a resource a policy doesn't
+/// otherwise care to scope. Under the plain [`PolicyEnforcer::access_scope`]
+/// default (`require_constraints = true`), *that* shape compiles to
+/// `Err(ConstraintCompileError::ConstraintsRequiredButAbsent)`
+/// (`EnforcerError::CompileFailed`), which also maps to
+/// `DomainError::InternalError` — a 500 — for an allowed caller.
+/// `tests/type_authz_test.rs::access_scope_denied_by_default_require_constraints`
+/// reproduces that failure; `access_scope_with_require_constraints_false_succeeds`
+/// shows the fix compiles the same response to `AccessScope::allow_all()`.
+/// `require_constraints(false)` is the API's documented escape hatch for
+/// exactly this "permission check only, no constraints required" shape (see
+/// `AccessRequest::require_constraints` doc comment; `mini-chat`'s
+/// `ModelService::list_models`/`get_model` use the identical pattern for
+/// its own global, non-tenant-scoped catalog). It only changes what happens
+/// when constraints are *absent*; declaring `OWNER_TENANT_ID` above is what
+/// lets a constraint that *is* present compile instead of being rejected as
+/// unsupported. Both are needed: a real PDP's permit may show up in either
+/// shape, and each is only handled by one of the two.
+pub const RG_TYPE_RESOURCE: ResourceType =
+    ResourceType::from_static(TYPE_RESOURCE_TYPE, &[pep_properties::OWNER_TENANT_ID]);
+
 // @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-service-crud:p1
 /// Service for GTS type lifecycle management.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Clone)]
 pub struct TypeService<TR: TypeRepositoryTrait> {
     db: Arc<DbProvider>,
+    enforcer: PolicyEnforcer,
     type_repo: Arc<TR>,
 }
 
 impl<TR: TypeRepositoryTrait> TypeService<TR> {
-    /// Create a new `TypeService` with the given database provider.
+    /// Create a new `TypeService` with the given database provider and
+    /// `PolicyEnforcer` for `AuthZ` enforcement on the type-registry CRUD
+    /// surface (VHP-2342).
     #[must_use]
-    pub fn new(db: Arc<DbProvider>, type_repo: Arc<TR>) -> Self {
-        Self { db, type_repo }
+    pub fn new(db: Arc<DbProvider>, enforcer: PolicyEnforcer, type_repo: Arc<TR>) -> Self {
+        Self {
+            db,
+            enforcer,
+            type_repo,
+        }
+    }
+
+    /// Permission-check-only `AuthZ` gate shared by every public type-CRUD
+    /// entry point. See [`RG_TYPE_RESOURCE`] for why its
+    /// `supported_properties` declares `OWNER_TENANT_ID` (so a real PDP's
+    /// baseline constraint compiles instead of failing closed) and why
+    /// `require_constraints(false)` is *also* still needed on top of that
+    /// (so a permit with zero constraints compiles too). The returned
+    /// `AccessScope` is intentionally discarded here: this resource has no
+    /// columns to filter on, so nothing downstream ever consults the
+    /// scope's constraints — only whether compilation succeeded, i.e.
+    /// whether the PDP allowed the call.
+    async fn gate(&self, ctx: &SecurityContext, action: &str) -> Result<(), DomainError> {
+        self.enforcer
+            .access_scope_with(
+                ctx,
+                &RG_TYPE_RESOURCE,
+                action,
+                None,
+                &AccessRequest::new().require_constraints(false),
+            )
+            .await
+            .map_err(DomainError::from)?;
+        Ok(())
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-create-type:p1
-    /// Create a new GTS type definition.
+    /// Create a new GTS type definition (`AuthZ`-gated: `create` on
+    /// [`RG_TYPE_RESOURCE`]).
+    pub async fn create_type(
+        &self,
+        ctx: &SecurityContext,
+        req: CreateTypeRequest,
+    ) -> Result<ResourceGroupType, DomainError> {
+        self.gate(ctx, "create").await?;
+        self.create_type_unscoped(req).await
+    }
+
+    /// Create a new GTS type definition without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler. Used by
+    /// [`crate::domain::seeding::seed_types`], which runs at gear init,
+    /// before any caller `SecurityContext` exists. Domain invariants
+    /// (placement invariant, parent/membership existence, metadata schema
+    /// validation) still run; only the `PolicyEnforcer` gate is skipped.
     ///
     /// The full INSERT-junction sequence (`type_repo.insert` →
     /// `insert_allowed_parent_types` → `insert_allowed_membership_types` →
@@ -46,7 +178,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     /// An SSI conflict between two concurrent creates of the same code
     /// (RG-03) then retries to a clean `TypeAlreadyExists` instead of a raw
     /// failure; the transaction also prevents a partial insert.
-    pub async fn create_type(
+    pub async fn create_type_unscoped(
         &self,
         req: CreateTypeRequest,
     ) -> Result<ResourceGroupType, DomainError> {
@@ -204,8 +336,24 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-11
     }
 
-    /// Get a GTS type definition by its code (GTS type path).
-    pub async fn get_type(&self, code: &str) -> Result<ResourceGroupType, DomainError> {
+    /// Get a GTS type definition by its code (GTS type path). `AuthZ`-gated:
+    /// `read` on [`RG_TYPE_RESOURCE`].
+    pub async fn get_type(
+        &self,
+        ctx: &SecurityContext,
+        code: &str,
+    ) -> Result<ResourceGroupType, DomainError> {
+        self.gate(ctx, "read").await?;
+        self.get_type_unscoped(code).await
+    }
+
+    /// Get a GTS type definition by its code without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler. Used by
+    /// [`crate::domain::seeding::seed_types`] (no caller `SecurityContext`
+    /// exists at gear-init time) and by [`crate::domain::rg_service::RgService`]
+    /// internals that need a plain lookup after their own gate already ran.
+    pub async fn get_type_unscoped(&self, code: &str) -> Result<ResourceGroupType, DomainError> {
         let conn = self.db.conn()?;
         self.type_repo
             .find_by_code(&conn, code)
@@ -214,7 +362,20 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     }
 
     /// List GTS type definitions with `OData` filtering and pagination.
+    /// `AuthZ`-gated: `list` on [`RG_TYPE_RESOURCE`].
     pub async fn list_types(
+        &self,
+        ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupType>, DomainError> {
+        self.gate(ctx, "list").await?;
+        self.list_types_unscoped(query).await
+    }
+
+    /// List GTS type definitions without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler.
+    pub async fn list_types_unscoped(
         &self,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupType>, DomainError> {
@@ -223,7 +384,25 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-update-type:p1
-    /// Update a GTS type definition (full replacement).
+    /// Update a GTS type definition (full replacement). `AuthZ`-gated:
+    /// `update` on [`RG_TYPE_RESOURCE`].
+    pub async fn update_type(
+        &self,
+        ctx: &SecurityContext,
+        code: &str,
+        req: UpdateTypeRequest,
+    ) -> Result<ResourceGroupType, DomainError> {
+        self.gate(ctx, "update").await?;
+        self.update_type_unscoped(code, req).await
+    }
+
+    /// Update a GTS type definition without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler. Used by
+    /// [`crate::domain::seeding::seed_types`] (no caller `SecurityContext`
+    /// exists at gear-init time). Domain invariants (placement invariant,
+    /// hierarchy safety check, parent/membership existence) still run; only
+    /// the `PolicyEnforcer` gate is skipped.
     ///
     /// The `delete_allowed_*` / `insert_allowed_*` / `update_type` sequence
     /// runs in one `SERIALIZABLE` transaction with bounded retry, same
@@ -231,7 +410,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     ///
     /// A failure on any step rolls back the partial junction rewrites, so a
     /// crash never leaves the registry pointing at half the new definition.
-    pub async fn update_type(
+    pub async fn update_type_unscoped(
         &self,
         code: &str,
         req: UpdateTypeRequest,
@@ -359,12 +538,21 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     }
 
     // @cpt-flow:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1
-    /// Delete a GTS type definition.
+    /// Delete a GTS type definition. `AuthZ`-gated: `delete` on
+    /// [`RG_TYPE_RESOURCE`].
+    pub async fn delete_type(&self, ctx: &SecurityContext, code: &str) -> Result<(), DomainError> {
+        self.gate(ctx, "delete").await?;
+        self.delete_type_unscoped(code).await
+    }
+
+    /// Delete a GTS type definition without `AuthZ` enforcement.
+    ///
+    /// **Internal API** — never expose this through a REST handler.
     ///
     /// Runs inside a `SERIALIZABLE` transaction with bounded retry (RG-02):
     /// a concurrent `create_group` referencing this type then conflicts with
     /// this read, and the retry gets a clean `ConflictActiveReferences`.
-    pub async fn delete_type(&self, code: &str) -> Result<(), DomainError> {
+    pub async fn delete_type_unscoped(&self, code: &str) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
         // Actor sends DELETE /api/types-registry/v1/types/{code}
         // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-delete-type:p1:inst-delete-type-1
@@ -469,34 +657,47 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
         // Compute removed parent types: old_allowed_parent_types - new_allowed_parent_types
-        let removed_parents: Vec<&String> = existing
+        let removed_parents: Vec<String> = existing
             .allowed_parent_types
             .iter()
             .filter(|p| !req.allowed_parent_types.contains(p))
+            .cloned()
             .collect();
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-1
 
         // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
-        for removed_parent in &removed_parents {
+        if !removed_parents.is_empty() {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
-            let parent_id = type_repo.resolve_id(conn, removed_parent).await?;
-            if let Some(parent_id) = parent_id {
-                let violations = type_repo
-                    .find_groups_using_parent_type(conn, type_id, parent_id)
-                    .await?;
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
+            // Batch: resolve every removed-parent path and find every
+            // violating group in one call (N+1 audit finding (b)) --
+            // was one `resolve_id` + one single-parent lookup *per*
+            // removed parent (slope 2.0: 1 gts_type + 1 resource_group
+            // SELECT per removed parent).
+            let violations = type_repo
+                .find_groups_violating_removed_parents(conn, type_id, &removed_parents)
+                .await?;
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2a
 
-                // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
-                if !violations.is_empty() {
-                    let names: Vec<String> =
-                        violations.iter().map(|(_, name)| name.clone()).collect();
-                    return Err(DomainError::allowed_parent_types_violation(format!(
-                        "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
-                        names.join(", ")
-                    )));
-                }
-                // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
+            // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
+            // Report the first removed parent (in `removed_parents` order)
+            // that has any violation -- same as the pre-batch loop, which
+            // iterated in that order and returned on the first violation
+            // it found.
+            if let Some(removed_parent) = removed_parents
+                .iter()
+                .find(|p| violations.iter().any(|(code, _, _)| code == *p))
+            {
+                let names: Vec<String> = violations
+                    .iter()
+                    .filter(|(code, _, _)| code == removed_parent)
+                    .map(|(_, _, name)| name.clone())
+                    .collect();
+                return Err(DomainError::allowed_parent_types_violation(format!(
+                    "Cannot remove allowed parent '{removed_parent}': groups using this parent relationship: {}",
+                    names.join(", ")
+                )));
             }
+            // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2b
         }
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-check-hierarchy-safety:p1:inst-hier-check-2
 

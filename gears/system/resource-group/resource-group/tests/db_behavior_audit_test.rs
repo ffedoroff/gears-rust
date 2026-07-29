@@ -78,7 +78,7 @@ async fn create_self_referencing_type(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -88,7 +88,7 @@ async fn create_self_referencing_type(
         .await
         .expect("create self-referencing type (initial)");
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -115,7 +115,7 @@ async fn create_type_with_memberships(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -198,7 +198,7 @@ fn count_in(stats: &BTreeMap<(QueryKind, String), usize>, kind: QueryKind, table
 #[tokio::test]
 async fn trace_create_root_group() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -243,7 +243,7 @@ async fn trace_create_root_group() {
 #[tokio::test]
 async fn trace_create_child_group_depth3() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service_with_profile(
         db.clone(),
         QueryProfile {
@@ -273,7 +273,7 @@ async fn trace_create_child_group_depth3() {
 #[tokio::test]
 async fn trace_update_group() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -313,7 +313,7 @@ async fn trace_update_group() {
 #[tokio::test]
 async fn trace_move_group() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -343,7 +343,7 @@ async fn trace_move_group() {
 #[tokio::test]
 async fn trace_force_delete_subtree() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -368,7 +368,7 @@ async fn trace_force_delete_subtree() {
 #[tokio::test]
 async fn trace_create_type() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
 
     rec.clear();
     let t = common::create_root_type(&type_svc, "newtype").await;
@@ -398,12 +398,12 @@ async fn trace_create_type() {
 #[tokio::test]
 async fn trace_update_type() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let t = common::create_root_type(&type_svc, "upd").await;
 
     rec.clear();
     let updated = type_svc
-        .update_type(
+        .update_type_unscoped(
             &t.code,
             UpdateTypeRequest {
                 can_be_root: true,
@@ -445,12 +445,12 @@ async fn trace_update_type() {
 #[tokio::test]
 async fn trace_delete_type() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let t = common::create_root_type(&type_svc, "del").await;
 
     rec.clear();
     type_svc
-        .delete_type(&t.code)
+        .delete_type_unscoped(&t.code)
         .await
         .expect("delete_type should succeed (no groups reference it)");
 
@@ -467,7 +467,7 @@ async fn trace_delete_type() {
 #[tokio::test]
 async fn trace_add_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -501,6 +501,49 @@ async fn trace_add_membership() {
          {membership_selects}:\n{}",
         rec.dump()
     );
+    // N+1 audit finding (a) fix: exactly 1 resource_group SELECT, not 2.
+    // Before this fix, `add_membership_in_tx` paid for the VHP-2341
+    // AuthZ tenant-scope gate (`group_repo.find_by_id`, a scoped SELECT
+    // resource_group + an unconditional `resolve_type_path` SELECT
+    // gts_type whose result the gate never used) *and* a separate
+    // `find_model_by_id` raw re-read of the same row -- 2 resource_group
+    // SELECTs + 1 wasted gts_type SELECT for what is logically one lookup.
+    // `find_model_by_id_scoped` now does the scope check and the raw read
+    // in a single scoped SELECT, with no `resolve_type_path` follow-up.
+    let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
+    assert_eq!(
+        rg_selects,
+        1,
+        "N+1 audit finding (a) regression: expected exactly 1 resource_group SELECT \
+         (find_model_by_id_scoped doing the gate + the raw read together), got \
+         {rg_selects}:\n{}",
+        rec.dump()
+    );
+    // Same fix, the other side of it: gts_type SELECTs drop from 4 to 3 --
+    // `resolve_id` for `resource_type` (1), `load_full_type_by_id`'s own
+    // id lookup (1), and its `allowed_membership_types` id->code batch
+    // resolution (1). The gate's `resolve_type_path` SELECT (the 4th, now
+    // eliminated) never contributed to any of those three.
+    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
+    assert_eq!(
+        type_selects,
+        3,
+        "N+1 audit finding (a) regression: expected exactly 3 gts_type SELECTs \
+         (resolve_id + load_full_type_by_id + allowed_membership_types batch, no \
+         gate-only resolve_type_path), got {type_selects}:\n{}",
+        rec.dump()
+    );
+    // Total statement count: 9, matching the pre-VHP-2341 baseline (the
+    // tenant gate is now free -- it rides along on find_model_by_id_scoped
+    // instead of adding 2 extra statements on top).
+    assert_eq!(
+        rec.total(),
+        9,
+        "N+1 audit finding (a) regression: expected 9 total statements (back to \
+         the pre-VHP-2341-gate baseline), got {}:\n{}",
+        rec.total(),
+        rec.dump()
+    );
 }
 
 /// `remove_membership`'s check-then-delete runs inside a SERIALIZABLE
@@ -508,7 +551,7 @@ async fn trace_add_membership() {
 #[tokio::test]
 async fn trace_remove_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let membership_svc = common::make_membership_service(db.clone());
     let tenant_id = Uuid::now_v7();
@@ -534,12 +577,108 @@ async fn trace_remove_membership() {
         "remove_membership must run its writes inside a transaction:\n{}",
         rec.dump()
     );
+    // VHP-2341 baseline: exactly 1 resource_group SELECT, where there were 0
+    // before that fix. `remove_membership_in_tx` never looked up the group
+    // at all pre-VHP-2341 (it went straight to `membership_repo` by
+    // composite key); the AuthZ tenant-scope gate adds exactly this one
+    // scoped SELECT, not a loop. Unchanged by the N+1 audit finding (a)
+    // fix below -- `find_by_id` already cost exactly 1 resource_group
+    // SELECT here (the wasted query it also made was against `gts_type`,
+    // asserted separately).
+    let rg_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group");
+    assert_eq!(
+        rg_selects,
+        1,
+        "VHP-2341 regression: expected exactly 1 resource_group SELECT (the \
+         AuthZ tenant-scope gate), got {rg_selects}:\n{}",
+        rec.dump()
+    );
+    // N+1 audit finding (a) fix: exactly 1 gts_type SELECT (from
+    // `resolve_id` for `resource_type`), not 2. Before this fix, the gate
+    // was `group_repo.find_by_id`, which -- on top of the resource_group
+    // SELECT above -- always paid for an unconditional `resolve_type_path`
+    // SELECT gts_type whose result the gate never used (this path doesn't
+    // need the group's type at all). `find_model_by_id_scoped` does the
+    // same gate with no such follow-up.
+    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
+    assert_eq!(
+        type_selects,
+        1,
+        "N+1 audit finding (a) regression: expected exactly 1 gts_type SELECT \
+         (resolve_id for resource_type only, no gate-only resolve_type_path), got \
+         {type_selects}:\n{}",
+        rec.dump()
+    );
+    // Total statement count: 4 (1 resource_group gate + 1 gts_type resolve +
+    // 1 resource_group_membership existence check + 1 DELETE), down from 5
+    // before the finding (a) fix removed the wasted gts_type SELECT.
+    assert_eq!(
+        rec.total(),
+        4,
+        "N+1 audit finding (a) regression: expected 4 total statements, got {}:\n{}",
+        rec.total(),
+        rec.dump()
+    );
+}
+
+/// `list_memberships`'s tenant scoping (VHP-2341) runs as a correlated EXISTS
+/// subquery embedded in the page's single `SELECT`, not a second round trip
+/// and not one subquery evaluation per row (the DB engine evaluates the
+/// EXISTS per candidate row server-side, inside one statement -- there is no
+/// N+1 at the client/statement level, which is what this audit suite
+/// measures).
+#[tokio::test]
+async fn trace_list_memberships() {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let membership_svc = common::make_membership_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let member_type = common::create_root_type(&type_svc, "mbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant_id).await;
+    for i in 0..5 {
+        membership_svc
+            .add_membership(&ctx, group.id, &member_type.code, &format!("res-{i}"))
+            .await
+            .expect("add_membership should succeed");
+    }
+
+    rec.clear();
+    let page = membership_svc
+        .list_memberships(&ctx, &toolkit_odata::ODataQuery::default())
+        .await
+        .expect("list_memberships should succeed");
+    assert_eq!(
+        page.items.len(),
+        5,
+        "all 5 seeded memberships must be listed"
+    );
+
+    snapshot_trace("list_memberships", &rec);
+    // VHP-2341 baseline: exactly 1 resource_group_membership SELECT for the
+    // whole page (the EXISTS subquery against resource_group lives inside
+    // that single statement's WHERE clause, so it doesn't add a
+    // resource_group_membership SELECT of its own, and -- crucially -- it
+    // does not scale with the number of rows in the page: 5 items, 1
+    // statement, not 5).
+    let membership_selects = count_in(&rec.stats(), QueryKind::Select, "resource_group_membership");
+    assert_eq!(
+        membership_selects,
+        1,
+        "VHP-2341 regression: expected exactly 1 resource_group_membership \
+         SELECT for the page (no N+1 from the per-row tenant-scope subquery), \
+         got {membership_selects}:\n{}",
+        rec.dump()
+    );
 }
 
 #[tokio::test]
 async fn trace_seeding() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
 
@@ -591,7 +730,7 @@ async fn scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth() {
     // secure_insert_many call (RG-06).
     async fn closure_inserts_for_new_child_at_depth(depth: usize) -> usize {
         let (db, rec) = common::test_db_with_recorder().await;
-        let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+        let type_svc = common::make_type_service(db.clone());
         let group_svc = make_group_service_with_profile(
             db.clone(),
             QueryProfile {
@@ -620,7 +759,7 @@ async fn scale_create_child_closure_inserts_do_not_grow_with_ancestor_depth() {
 
 async fn move_stats_for_subtree_size(n: usize) -> BTreeMap<(QueryKind, String), usize> {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -684,7 +823,7 @@ async fn scale_move_descendant_depth_selects_do_not_grow_with_subtree_size() {
 
 async fn junction_inserts_for_parent_count(n: usize) -> usize {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let mut parent_codes = Vec::with_capacity(n);
     for i in 0..n {
         let t = common::create_root_type(&type_svc, &format!("par{i}")).await;
@@ -693,7 +832,7 @@ async fn junction_inserts_for_parent_count(n: usize) -> usize {
 
     rec.clear();
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: format!(
                 "{}x.test.child.i{}.v1~",
                 gts_id!("cf.core.rg.type.v1~"),
@@ -725,7 +864,7 @@ async fn scale_create_type_junction_inserts_do_not_grow_with_parent_count() {
 
 async fn list_types_total_statements_for_page_size(n: usize) -> usize {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     // Self-referencing types (non-empty allowed_parent_types) so the batch
     // loader's junction-row and id->code resolution queries are actually
     // exercised for every row in the page, not skipped as trivially empty.
@@ -739,7 +878,7 @@ async fn list_types_total_statements_for_page_size(n: usize) -> usize {
         ..Default::default()
     };
     let page = type_svc
-        .list_types(&query)
+        .list_types_unscoped(&query)
         .await
         .expect("list_types should succeed");
     assert_eq!(page.items.len(), n, "page must contain all N created types");
@@ -764,12 +903,12 @@ async fn create_type_conflict_check_does_not_overfetch_junctions() {
     // resolve_id's existence check is a plain id lookup, with no junction
     // reads on either the happy or conflict path (RG-13).
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let t = common::create_root_type(&type_svc, "conflict").await;
 
     rec.clear();
     let result = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: t.code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -810,7 +949,7 @@ async fn create_type_conflict_check_does_not_overfetch_junctions() {
 
 async fn total_statements_for_force_delete(n: usize) -> usize {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -851,6 +990,177 @@ async fn scale_force_delete_statements_do_not_grow_with_subtree_size() {
     );
 }
 
+/// N+1 audit finding (b) guard: `gts_type` SELECTs for a `type in (...)`
+/// `$filter` on `list_groups`, with `n` values in the list. No groups of
+/// any of these types are created -- this isolates
+/// `resolve_type_filter_node`'s own query cost from `resolve_type_paths_batch`'s
+/// (which would otherwise also touch `gts_type` once per page, but is
+/// skipped entirely when the page is empty).
+async fn gts_type_selects_for_list_groups_type_in_filter(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let mut codes = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = common::create_root_type(&type_svc, &format!("infiltn{i}")).await;
+        codes.push(t.code);
+    }
+
+    rec.clear();
+    let quoted: Vec<String> = codes.iter().map(|c| format!("'{c}'")).collect();
+    let parsed = toolkit_odata::parse_filter_string(&format!("type in ({})", quoted.join(", ")))
+        .expect("parse type in-list filter");
+    let query = toolkit_odata::ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = group_svc
+        .list_groups(&ctx, &query)
+        .await
+        .expect("list_groups with a type in-list filter should succeed");
+    assert_eq!(
+        page.items.len(),
+        0,
+        "no groups were created of these types, only the types themselves"
+    );
+
+    count_in(&rec.stats(), QueryKind::Select, "gts_type")
+}
+
+#[tokio::test]
+async fn scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_value_count() {
+    // resolve_type_filter_node batches every literal in a `type in (...)`
+    // filter into one `WHERE schema_id IN (...)` query (N+1 audit finding
+    // (b)) instead of one `resolve_id` round trip per value (pre-fix:
+    // N=3 -> 4 gts_type SELECTs, N=20 -> 21, slope 1.0).
+    let small = gts_type_selects_for_list_groups_type_in_filter(3).await;
+    let large = gts_type_selects_for_list_groups_type_in_filter(20).await;
+    assert_eq!(
+        small, large,
+        "gts_type SELECT count for a `type in (...)` filter on list_groups must \
+         not scale with the number of values in the list (small={small} at N=3, \
+         large={large} at N=20)"
+    );
+}
+
+/// Same guard as the one above, but through `list_memberships`'s
+/// `resource_type in (...)` filter -- `MembershipRepository::list_memberships`
+/// calls the exact same `resolve_type_filter_node` (VHP-1954/VHP-1731), so
+/// this is a second call site for the same fix, not a second
+/// implementation of it.
+async fn gts_type_selects_for_list_memberships_resource_type_in_filter(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let membership_svc = common::make_membership_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let mut member_type_codes = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = common::create_root_type(&type_svc, &format!("mifiltn{i}")).await;
+        member_type_codes.push(t.code);
+    }
+    let grp_type = create_type_with_memberships(
+        &type_svc,
+        "mifiltgrp",
+        &member_type_codes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant_id).await;
+
+    rec.clear();
+    let quoted: Vec<String> = member_type_codes.iter().map(|c| format!("'{c}'")).collect();
+    let parsed =
+        toolkit_odata::parse_filter_string(&format!("resource_type in ({})", quoted.join(", ")))
+            .expect("parse resource_type in-list filter");
+    let query = toolkit_odata::ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = membership_svc
+        .list_memberships(&ctx, &query)
+        .await
+        .expect("list_memberships with a resource_type in-list filter should succeed");
+    assert_eq!(
+        page.items.len(),
+        0,
+        "no memberships were added -- {} exists only to make the group's type valid",
+        group.id
+    );
+
+    count_in(&rec.stats(), QueryKind::Select, "gts_type")
+}
+
+#[tokio::test]
+async fn scale_list_memberships_resource_type_in_filter_gts_type_selects_do_not_grow_with_value_count()
+ {
+    // Same fix as `scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_value_count`,
+    // exercised through the other call site of `resolve_type_filter_node`
+    // (N+1 audit finding (b): this path was affected by the same defect,
+    // and picked it up for free from the shared tree-walk generalization
+    // in fe2d609e).
+    let small = gts_type_selects_for_list_memberships_resource_type_in_filter(3).await;
+    let large = gts_type_selects_for_list_memberships_resource_type_in_filter(20).await;
+    assert_eq!(
+        small, large,
+        "gts_type SELECT count for a `resource_type in (...)` filter on \
+         list_memberships must not scale with the number of values in the list \
+         (small={small} at N=3, large={large} at N=20)"
+    );
+}
+
+/// N+1 audit finding (b) guard, second half: `update_type`'s total
+/// statement count when removing `n` allowed-parent-types at once, none of
+/// which are actually in use by any group (so the safety check runs to
+/// completion for all of them instead of early-returning on the first
+/// violation).
+async fn total_statements_for_update_type_removing_n_parents(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+
+    let mut parent_codes = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = common::create_root_type(&type_svc, &format!("rmpar{i}")).await;
+        parent_codes.push(t.code);
+    }
+    let parent_refs: Vec<&str> = parent_codes.iter().map(String::as_str).collect();
+    let child_type = common::create_child_type(&type_svc, "rmchild", &parent_refs, &[]).await;
+
+    rec.clear();
+    type_svc
+        .update_type_unscoped(
+            &child_type.code,
+            UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("update_type removing all N allowed parents should succeed (unused by any group)");
+    rec.total()
+}
+
+#[tokio::test]
+async fn scale_update_type_removed_parents_statements_do_not_grow_with_count() {
+    // check_hierarchy_safety batches the resolve + violating-group lookup
+    // for every removed parent type into a small constant number of
+    // queries (N+1 audit finding (b)) instead of one resolve_id + one
+    // single-parent lookup *per* removed parent (pre-fix: N=3 -> 16 total,
+    // N=20 -> 50, slope 2.0).
+    let small = total_statements_for_update_type_removing_n_parents(3).await;
+    let large = total_statements_for_update_type_removing_n_parents(20).await;
+    assert_eq!(
+        small, large,
+        "update_type's total statement count when removing N allowed parent \
+         types must not scale with N (small={small} at N=3, large={large} at N=20)"
+    );
+}
+
 // Section 3 -- negative controls: both rely on SERIALIZABLE + retry and
 // must show writes_outside_tx() == empty, proving the no-tx-write rule
 // doesn't flag these paths.
@@ -868,10 +1178,10 @@ fn unique_tenant_type_code() -> String {
 #[tokio::test]
 async fn negative_control_tenant_root_create_runs_in_tx() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_type = type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code: unique_tenant_type_code(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -898,7 +1208,7 @@ async fn negative_control_tenant_root_create_runs_in_tx() {
 #[tokio::test]
 async fn negative_control_width_limited_create_runs_in_tx() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service_with_profile(
         db.clone(),
         QueryProfile {
@@ -926,7 +1236,7 @@ async fn negative_control_width_limited_create_runs_in_tx() {
 #[tokio::test]
 async fn negative_control_read_paths_produce_no_write_statements() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -943,7 +1253,7 @@ async fn negative_control_read_paths_produce_no_write_statements() {
         .await
         .expect("list_groups should succeed");
     type_svc
-        .list_types(&toolkit_odata::ODataQuery::default())
+        .list_types_unscoped(&toolkit_odata::ODataQuery::default())
         .await
         .expect("list_types should succeed");
 

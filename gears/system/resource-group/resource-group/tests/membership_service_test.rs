@@ -8,8 +8,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use common::{create_root_type, make_ctx, make_group_service, make_membership_service, test_db};
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
@@ -38,7 +36,7 @@ async fn create_type_with_memberships(
         Uuid::now_v7().as_simple()
     );
     type_svc
-        .create_type(CreateTypeRequest {
+        .create_type_unscoped(CreateTypeRequest {
             code,
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -53,7 +51,7 @@ async fn create_type_with_memberships(
 #[tokio::test]
 async fn membership_add_happy_path() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -96,7 +94,7 @@ async fn membership_add_happy_path() {
 #[tokio::test]
 async fn membership_add_nonexistent_group() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
     let tenant = Uuid::now_v7();
@@ -119,7 +117,7 @@ async fn membership_add_nonexistent_group() {
 #[tokio::test]
 async fn membership_add_duplicate() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -155,7 +153,7 @@ async fn membership_add_duplicate() {
 #[tokio::test]
 async fn membership_add_unregistered_resource_type() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -192,7 +190,7 @@ async fn membership_add_unregistered_resource_type() {
 #[tokio::test]
 async fn membership_add_not_in_allowed_membership_types() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -226,7 +224,7 @@ async fn membership_add_not_in_allowed_membership_types() {
 #[tokio::test]
 async fn membership_add_tenant_incompatibility() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -261,11 +259,50 @@ async fn membership_add_tenant_incompatibility() {
     );
 }
 
+// TC-MBR-06b: VHP-2341 -- add_membership into a cross-tenant group is
+// rejected as if the group didn't exist (no existence leak across tenants).
+#[tokio::test]
+async fn membership_add_cross_tenant_group_not_found() {
+    let db = test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let member_type = create_root_type(&type_svc, "mbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+
+    // Tenant A creates a group.
+    let group_a =
+        common::create_root_group(&group_svc, &ctx_a, &grp_type.code, "GA", tenant_a).await;
+
+    // Tenant B tries to add a member into tenant A's group.
+    let err = mbr_svc
+        .add_membership(&ctx_b, group_a.id, &member_type.code, "res-xtenant")
+        .await
+        .expect_err("cross-tenant add_membership must fail");
+
+    assert!(
+        matches!(err, DomainError::GroupNotFound { id } if id == group_a.id),
+        "cross-tenant group must look not-found (not a distinguishable 'forbidden'), got: {err:?}"
+    );
+
+    // Tenant A can still add to its own group -- the gate isn't over-broad.
+    mbr_svc
+        .add_membership(&ctx_a, group_a.id, &member_type.code, "res-xtenant")
+        .await
+        .expect("same-tenant add_membership must still succeed");
+}
+
 // TC-MBR-07: Remove existing membership
 #[tokio::test]
 async fn membership_remove_existing() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -303,11 +340,64 @@ async fn membership_remove_existing() {
     );
 }
 
+// TC-MBR-07b: VHP-2341 -- remove_membership from a cross-tenant group is
+// rejected as if the group didn't exist, and the membership survives.
+#[tokio::test]
+async fn membership_remove_cross_tenant_group_not_found() {
+    let db = test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let member_type = create_root_type(&type_svc, "mbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let group_a =
+        common::create_root_group(&group_svc, &ctx_a, &grp_type.code, "GA", tenant_a).await;
+
+    mbr_svc
+        .add_membership(&ctx_a, group_a.id, &member_type.code, "res-xtenant-rm")
+        .await
+        .expect("tenant A adds its own membership");
+
+    // Tenant B tries to remove a member from tenant A's group.
+    let err = mbr_svc
+        .remove_membership(&ctx_b, group_a.id, &member_type.code, "res-xtenant-rm")
+        .await
+        .expect_err("cross-tenant remove_membership must fail");
+
+    assert!(
+        matches!(err, DomainError::GroupNotFound { id } if id == group_a.id),
+        "cross-tenant group must look not-found, got: {err:?}"
+    );
+
+    // The membership must still be there -- direct DB assertion.
+    let conn = db.conn().expect("db conn");
+    let scope = AccessScope::allow_all();
+    let rows = MbrEntity::find()
+        .filter(MbrColumn::GroupId.eq(group_a.id))
+        .filter(MbrColumn::ResourceId.eq("res-xtenant-rm"))
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
+        .await
+        .expect("query membership table");
+    assert_eq!(
+        rows.len(),
+        1,
+        "membership must survive a rejected cross-tenant remove"
+    );
+}
+
 // TC-MBR-08: Remove nonexistent membership
 #[tokio::test]
 async fn membership_remove_nonexistent() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -333,7 +423,7 @@ async fn membership_remove_nonexistent() {
 #[tokio::test]
 async fn membership_multiple_resource_types_same_group() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -369,7 +459,7 @@ async fn membership_multiple_resource_types_same_group() {
 #[tokio::test]
 async fn membership_first_always_allowed_tenant() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -391,7 +481,7 @@ async fn membership_first_always_allowed_tenant() {
 #[tokio::test]
 async fn membership_empty_resource_id() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -417,7 +507,7 @@ async fn membership_empty_resource_id() {
 #[tokio::test]
 async fn membership_remove_unregistered_resource_type() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -452,7 +542,7 @@ async fn membership_remove_unregistered_resource_type() {
 #[tokio::test]
 async fn membership_empty_allowed_membership_types_rejects_all() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -483,7 +573,7 @@ async fn membership_empty_allowed_membership_types_rejects_all() {
 #[tokio::test]
 async fn membership_same_resource_multiple_groups_same_tenant() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 
@@ -525,6 +615,68 @@ async fn membership_same_resource_multiple_groups_same_tenant() {
     assert!(group_ids.contains(&group2.id));
 }
 
+// TC-MBR-14b: VHP-2341 -- list_memberships is tenant-scoped: tenant A must
+// not see tenant B's membership rows, and must still see its own.
+#[tokio::test]
+async fn membership_list_is_tenant_scoped() {
+    let db = test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let member_type = create_root_type(&type_svc, "mbr").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+
+    let group_a =
+        common::create_root_group(&group_svc, &ctx_a, &grp_type.code, "GA", tenant_a).await;
+    let group_b =
+        common::create_root_group(&group_svc, &ctx_b, &grp_type.code, "GB", tenant_b).await;
+
+    mbr_svc
+        .add_membership(&ctx_a, group_a.id, &member_type.code, "res-a")
+        .await
+        .expect("tenant A adds its own membership");
+    mbr_svc
+        .add_membership(&ctx_b, group_b.id, &member_type.code, "res-b")
+        .await
+        .expect("tenant B adds its own membership");
+
+    let query = ODataQuery::default();
+
+    let page_a = mbr_svc
+        .list_memberships(&ctx_a, &query)
+        .await
+        .expect("tenant A lists memberships");
+    let ids_a: Vec<Uuid> = page_a.items.iter().map(|m| m.group_id).collect();
+    assert!(
+        ids_a.contains(&group_a.id),
+        "tenant A must see its own group"
+    );
+    assert!(
+        !ids_a.contains(&group_b.id),
+        "tenant A must NOT see tenant B's group, got: {ids_a:?}"
+    );
+
+    let page_b = mbr_svc
+        .list_memberships(&ctx_b, &query)
+        .await
+        .expect("tenant B lists memberships");
+    let ids_b: Vec<Uuid> = page_b.items.iter().map(|m| m.group_id).collect();
+    assert!(
+        ids_b.contains(&group_b.id),
+        "tenant B must see its own group"
+    );
+    assert!(
+        !ids_b.contains(&group_a.id),
+        "tenant B must NOT see tenant A's group, got: {ids_b:?}"
+    );
+}
+
 // TC-MBR-15: List memberships empty result
 #[tokio::test]
 async fn membership_list_empty() {
@@ -543,6 +695,66 @@ async fn membership_list_empty() {
     assert!(page.items.is_empty(), "should be empty with no memberships");
 }
 
+// =========================================================================
+// VHP-1731: `resource_type` $filter must resolve the GTS type path to its
+// SMALLINT surrogate id
+// =========================================================================
+//
+// `resource_type` is a GTS type-path string on the wire but stored as the
+// SMALLINT `gts_type_id` column. `list_memberships` used to hand the raw
+// string filter straight to `paginate_odata`, comparing it directly against
+// that SMALLINT column. On SQLite this is not an error -- SQLite's affinity
+// rules coerce the non-numeric string to `0` and compare leniently -- so the
+// filter silently matches nothing instead of failing loudly. That silent
+// empty page is exactly what this test pins; the real-Postgres half of the
+// same defect (a genuine DB type-mismatch error, the ticket's actual 500)
+// is covered separately in `pg_membership_filter_test.rs`
+// (`--features integration`).
+#[tokio::test]
+async fn membership_list_filters_by_resource_type() {
+    let db = test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant = Uuid::now_v7();
+    let ctx = make_ctx(tenant);
+
+    let type_a = create_root_type(&type_svc, "rtfa").await;
+    let type_b = create_root_type(&type_svc, "rtfb").await;
+    let grp_type =
+        create_type_with_memberships(&type_svc, "rtfgrp", &[&type_a.code, &type_b.code]).await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "RTF", tenant).await;
+
+    mbr_svc
+        .add_membership(&ctx, group.id, &type_a.code, "res-a")
+        .await
+        .expect("add type A membership");
+    mbr_svc
+        .add_membership(&ctx, group.id, &type_b.code, "res-b")
+        .await
+        .expect("add type B membership");
+
+    let parsed = toolkit_odata::parse_filter_string(&format!("resource_type eq '{}'", type_a.code))
+        .expect("parse resource_type filter");
+    let query = ODataQuery::new().with_filter(parsed.into_expr());
+
+    let page = mbr_svc
+        .list_memberships(&ctx, &query)
+        .await
+        .expect("list memberships filtered by resource_type");
+
+    assert_eq!(
+        page.items.len(),
+        1,
+        "resource_type filter must resolve the GTS path to its surrogate id \
+         and return exactly the matching membership: {:?}",
+        page.items
+    );
+    assert_eq!(page.items[0].resource_id, "res-a");
+    assert_eq!(page.items[0].resource_type, type_a.code);
+}
+
 /// `list_memberships_unscoped` returns membership rows with no caller context
 /// and no tenant scope — the AuthZ-bypassing read backing the in-process PDP
 /// membership contract. The caller supplies the OData filter (the PDP uses
@@ -551,7 +763,7 @@ async fn membership_list_empty() {
 #[tokio::test]
 async fn list_memberships_unscoped_returns_rows_without_ctx() {
     let db = test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
     let mbr_svc = make_membership_service(db.clone());
 

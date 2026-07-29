@@ -229,3 +229,45 @@ fn gts_type_path_trims_and_lowercases() {
     );
     assert_eq!(path.unwrap().as_str(), gts_id!("cf.core.rg.type.v1~"));
 }
+
+// -- CreateGroupRequest.tenant_id (VHP-2162) --
+
+/// Omitted `tenant_id` -> no `"tenantId"` key on the wire (backward
+/// compatibility: existing SDK callers that never set this field see no
+/// change in the request shape).
+#[test]
+fn create_group_request_tenant_id_absent_when_none() {
+    let req = CreateGroupRequest {
+        id: None,
+        code: gts_id!("cf.core.rg.type.v1~").to_owned(),
+        name: "Test".to_owned(),
+        parent_id: None,
+        tenant_id: None,
+        metadata: None,
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert!(
+        json.get("tenantId").is_none(),
+        "tenantId should be absent when None, got: {json}"
+    );
+}
+
+/// `tenant_id: Some(..)` round-trips through the camelCase wire key
+/// `"tenantId"`, consistent with this struct's `rename_all = "camelCase"`.
+#[test]
+fn create_group_request_tenant_id_round_trips_camel_case() {
+    let tenant_id = Uuid::new_v4();
+    let req = CreateGroupRequest {
+        id: None,
+        code: gts_id!("cf.core.rg.type.v1~").to_owned(),
+        name: "Test".to_owned(),
+        parent_id: None,
+        tenant_id: Some(tenant_id),
+        metadata: None,
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert_eq!(json["tenantId"], tenant_id.to_string());
+
+    let parsed: CreateGroupRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(parsed.tenant_id, Some(tenant_id));
+}

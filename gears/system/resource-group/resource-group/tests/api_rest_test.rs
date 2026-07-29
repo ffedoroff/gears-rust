@@ -22,7 +22,7 @@ use uuid::Uuid;
 use authz_resolver_sdk::{
     AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
     EvaluationResponseContext, PolicyEnforcer,
-    constraints::{Constraint, InPredicate, Predicate},
+    constraints::{Constraint, InPredicate, InTenantSubtreePredicate, Predicate},
 };
 use sea_orm_migration::MigratorTrait;
 use toolkit::api::OpenApiRegistry;
@@ -30,6 +30,7 @@ use toolkit::api::operation_builder::OperationSpec;
 use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
+use toolkit_odata::{CursorV1, SortDir};
 use toolkit_security::{SecurityContext, pep_properties};
 
 use resource_group::domain::group_service::{GroupService, QueryProfile};
@@ -134,15 +135,212 @@ fn make_enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(authz)
 }
 
-async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
+// ── Mock AuthZ: allow-all, no constraints (for `TypeService`) ──────────
+//
+// `gts_type` is a platform-global table (no `tenant_id` column), and
+// `TypeService`'s gate discards the `AccessScope` it computes regardless of
+// shape, so every gate call uses `require_constraints(false)` (VHP-2342) to
+// also accept this permit-with-zero-constraints PDP shape (`decision: true,
+// constraints: []`). This is *a* valid PDP response, not the only one --
+// real PDP plugins instead attach a baseline `In(OWNER_TENANT_ID)`
+// constraint on every allow decision, and since `RG_TYPE_RESOURCE` declares
+// `OWNER_TENANT_ID` as a supported property, the tenant-scoping
+// `AllowAllAuthZ` mock above works fine wired to the type routes too --
+// see `list_types_with_realistic_tenant_clamp_authz_succeeds` below, which
+// exercises exactly that.
+struct AllowAllNoConstraintsAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for AllowAllNoConstraintsAuthZ {
+    async fn evaluate(
+        &self,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+fn make_type_enforcer() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(AllowAllNoConstraintsAuthZ);
+    PolicyEnforcer::new(authz)
+}
+
+// ── Mock AuthZ: deny-all (for the type-registry gate rejection tests) ──
+
+struct DenyAllAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for DenyAllAuthZ {
+    async fn evaluate(
+        &self,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Ok(EvaluationResponse {
+            decision: false,
+            context: EvaluationResponseContext {
+                constraints: vec![],
+                deny_reason: Some(authz_resolver_sdk::models::DenyReason {
+                    error_code: "deny_all".to_owned(),
+                    details: Some("deny-all test enforcer".to_owned()),
+                }),
+            },
+        })
+    }
+}
+
+fn make_type_enforcer_deny() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(DenyAllAuthZ);
+    PolicyEnforcer::new(authz)
+}
+
+/// Build a fully-wired router. `type_enforcer` lets callers swap in a
+/// deny-all `PolicyEnforcer` for the type-registry routes while group/
+/// membership routes keep the normal allow-all-with-tenant-scoping mock.
+async fn build_test_router_with_type_enforcer(
+    type_enforcer: PolicyEnforcer,
+) -> (Router, Arc<TypeService<TypeRepository>>) {
     let db = test_db().await;
     let enforcer = make_enforcer();
 
-    let type_svc = Arc::new(TypeService::new(db.clone(), Arc::new(TypeRepository)));
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        type_enforcer,
+        Arc::new(TypeRepository),
+    ));
     let group_svc = Arc::new(GroupService::new(
         db.clone(),
         QueryProfile::default(),
         enforcer.clone(),
+        Arc::new(GroupRepository),
+        Arc::new(TypeRepository),
+        common::make_types_registry(),
+    ));
+    let membership_svc = Arc::new(MembershipService::new(
+        db,
+        enforcer,
+        Arc::new(GroupRepository),
+        Arc::new(TypeRepository),
+        Arc::new(MembershipRepository),
+    ));
+
+    let openapi = NoopOpenApiRegistry;
+    let router = resource_group::api::rest::routes::register_routes(
+        Router::new(),
+        &openapi,
+        type_svc.clone(),
+        group_svc,
+        membership_svc,
+    );
+
+    (router, type_svc)
+}
+
+async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
+    build_test_router_with_type_enforcer(make_type_enforcer()).await
+}
+
+/// Router wired with a deny-all enforcer for the type-registry routes only
+/// -- used by the VHP-2342 rejection tests below.
+async fn build_test_router_type_denied() -> (Router, Arc<TypeService<TypeRepository>>) {
+    build_test_router_with_type_enforcer(make_type_enforcer_deny()).await
+}
+
+// ── Mock AuthZ: target-tenant echo (VHP-2162) ───────────────────────────
+
+/// Permits any target tenant by echoing back whatever `owner_tenant_id`
+/// resource property the caller sent, as an `In` constraint.
+///
+/// Models "the policy grants access to this specific tenant" and, as a
+/// side effect, proves `GroupService::create_group` actually forwards the
+/// resolved target tenant to the PDP (VHP-2162): if it didn't, this mock
+/// would fall back to `Uuid::nil()` and the foreign-tenant-succeeds tests
+/// below would fail.
+struct TargetTenantAllowAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for TargetTenantAllowAuthZ {
+    async fn evaluate(
+        &self,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        let target = request
+            .resource
+            .properties
+            .get(pep_properties::OWNER_TENANT_ID)
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or(Uuid::nil());
+
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [target],
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// Permits, but the sole constraint is `InTenantSubtree` rooted at a
+/// caller-chosen tenant -- exercises VHP-2162's documented fail-closed
+/// limitation at the HTTP layer: even when the target tenant equals the
+/// constraint's own root, `AccessScope::contains_uuid` cannot resolve
+/// subtree membership for this filter variant, so the request is denied.
+struct InTenantSubtreeOnlyAuthZ {
+    root_tenant_id: Uuid,
+}
+
+#[async_trait]
+impl AuthZResolverClient for InTenantSubtreeOnlyAuthZ {
+    async fn evaluate(
+        &self,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::InTenantSubtree(InTenantSubtreePredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        self.root_tenant_id,
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// Router wired with a caller-supplied enforcer for the group routes only;
+/// the type-registry and membership routes keep the normal defaults.
+/// Mirrors `build_test_router_with_type_enforcer`, swapping which service
+/// gets the custom enforcer.
+async fn build_test_router_with_group_enforcer(
+    group_enforcer: PolicyEnforcer,
+) -> (Router, Arc<TypeService<TypeRepository>>) {
+    let db = test_db().await;
+    let enforcer = make_enforcer();
+
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        make_type_enforcer(),
+        Arc::new(TypeRepository),
+    ));
+    let group_svc = Arc::new(GroupService::new(
+        db.clone(),
+        QueryProfile::default(),
+        group_enforcer,
         Arc::new(GroupRepository),
         Arc::new(TypeRepository),
         common::make_types_registry(),
@@ -231,7 +429,7 @@ async fn create_type_duplicate_returns_409() {
 
     // Pre-create via service
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -285,7 +483,7 @@ async fn list_types_returns_200_with_page() {
     let code = rg_type_id!("test.list.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -312,7 +510,7 @@ async fn get_type_returns_200() {
     let code = rg_type_id!("test.get.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -360,7 +558,7 @@ async fn delete_type_returns_204() {
     let code = rg_type_id!("test.del.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -381,6 +579,131 @@ async fn delete_type_returns_204() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
+// ── Type CRUD AuthZ Tests (VHP-2342) ────────────────────────────────────
+//
+// Before this fix, all five `/types-registry/v1/types` routes were
+// `.authenticated()`-only: any caller with a valid JWT -- from any tenant --
+// could create/read/update/delete GTS type definitions. These five tests
+// wire the router with a deny-all `PolicyEnforcer` for the type routes
+// (`build_test_router_type_denied`) and assert the exact HTTP status the
+// `DomainError::AccessDenied` -> `CanonicalError` mapping produces
+// (`RgError::permission_denied()`, see `src/api/rest/error.rs`) --
+// `StatusCode::FORBIDDEN`. The companion `*_returns_2xx` tests above already
+// cover the allow path (the router's default enforcer is allow-all).
+
+#[tokio::test]
+async fn list_types_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request("GET", "/types-registry/v1/types", None, tenant_id);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn create_type_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+    let code = rg_type_id!("test.authz.create.{}.v1~", Uuid::now_v7().as_simple());
+
+    let req = json_request(
+        "POST",
+        "/types-registry/v1/types",
+        Some(serde_json::json!({
+            "code": code,
+            "can_be_root": true,
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn get_type_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+    // No type needs to exist: the AuthZ gate runs before the lookup, so a
+    // deny must short-circuit before a NotFound could ever surface.
+    let code = rg_type_id!("test.authz.get.{}.v1~", Uuid::now_v7().as_simple());
+    let encoded = code.replace('~', "%7E");
+
+    let req = json_request(
+        "GET",
+        &format!("/types-registry/v1/types/{encoded}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn update_type_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+    let code = rg_type_id!("test.authz.update.{}.v1~", Uuid::now_v7().as_simple());
+    let encoded = code.replace('~', "%7E");
+
+    let req = json_request(
+        "PUT",
+        &format!("/types-registry/v1/types/{encoded}"),
+        Some(serde_json::json!({
+            "can_be_root": true,
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn delete_type_denied_returns_403() {
+    let (router, _) = build_test_router_type_denied().await;
+    let tenant_id = Uuid::now_v7();
+    let code = rg_type_id!("test.authz.delete.{}.v1~", Uuid::now_v7().as_simple());
+    let encoded = code.replace('~', "%7E");
+
+    let req = json_request(
+        "DELETE",
+        &format!("/types-registry/v1/types/{encoded}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
+}
+
+/// HTTP-level regression proof for VHP-2342's actual defect (not just the
+/// artificial no-constraints mock the rest of this file's type routes are
+/// wired with by default). Wires the type-registry routes with
+/// `AllowAllAuthZ` -- the tenant-scoping mock that attaches a baseline
+/// `In(OWNER_TENANT_ID)` constraint on every allow decision, the same shape
+/// `static-authz-plugin`/`tr-authz-plugin` actually return -- and asserts a
+/// gated route still succeeds end to end at the wire level. Before
+/// `RG_TYPE_RESOURCE` declared `OWNER_TENANT_ID` as a supported property,
+/// this exact request failed with `DomainError::InternalError`
+/// (`AllConstraintsFailed`), which the `DomainError` -> `CanonicalError`
+/// mapping turns into `StatusCode::INTERNAL_SERVER_ERROR` -- a 500 for an
+/// allowed caller, not the 200 asserted here.
+#[tokio::test]
+async fn list_types_with_realistic_tenant_clamp_authz_succeeds() {
+    let (router, _) = build_test_router_with_type_enforcer(make_enforcer()).await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request("GET", "/types-registry/v1/types", None, tenant_id);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = response_body(resp).await;
+    assert_no_surrogate_ids(&body);
+}
+
 // ── Group CRUD Tests ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -390,7 +713,7 @@ async fn create_group_returns_201() {
     let type_code = rg_type_id!("test.grp.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: type_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -417,6 +740,400 @@ async fn create_group_returns_201() {
     assert_eq!(body["name"], "Test Group");
     assert!(body["id"].is_string());
     assert_eq!(body["hierarchy"]["tenant_id"], tenant_id.to_string());
+}
+
+/// VHP-2345: creating a group with an `id` that collides with an existing
+/// group's primary key must come back as a typed 409 `already_exists`, not
+/// a raw 500. VHP-2343's owner decision keeps client-supplied `id` accepted
+/// as-is on create — capture is not blocked by this fix.
+#[tokio::test]
+async fn create_group_duplicate_id_returns_409() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.grpdup.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let dup_id = Uuid::now_v7();
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "id": dup_id,
+            "type": type_code,
+            "name": "First"
+        })),
+        tenant_id,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_eq!(body["id"], dup_id.to_string());
+    assert_no_surrogate_ids(&body);
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "id": dup_id,
+            "type": type_code,
+            "name": "Second"
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let body = assert_problem_shape(resp, StatusCode::CONFLICT).await;
+    assert_eq!(body["context"]["resource_name"], dup_id.to_string());
+}
+
+// ── Group create: explicit target tenant (VHP-2162) ─────────────────────
+
+/// Omitted `tenant_id` in the request body is byte-for-byte the
+/// pre-VHP-2162 wire shape: the created group lands in the caller's own
+/// (JWT-derived) tenant.
+#[tokio::test]
+async fn rest_create_group_tenant_id_omitted_returns_201() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162a.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "Omitted"
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_eq!(body["hierarchy"]["tenant_id"], tenant_id.to_string());
+    assert_no_surrogate_ids(&body);
+}
+
+/// An explicit `tenant_id` equal to the caller's own tenant succeeds
+/// identically to omitting the field.
+#[tokio::test]
+async fn rest_create_group_tenant_id_same_as_caller_returns_201() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162b.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "SameTenant",
+            "tenant_id": tenant_id
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_eq!(body["hierarchy"]["tenant_id"], tenant_id.to_string());
+    assert_no_surrogate_ids(&body);
+}
+
+/// A foreign `tenant_id` covered by the compiled `AccessScope` succeeds --
+/// the platform-admin / onboarding use case VHP-2162 exists for.
+#[tokio::test]
+async fn rest_create_group_foreign_tenant_id_allowed_returns_201() {
+    let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
+        TargetTenantAllowAuthZ,
+    )))
+    .await;
+    let caller_tenant = Uuid::now_v7();
+    let target_tenant = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162c.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "ForeignAllowed",
+            "tenant_id": target_tenant
+        })),
+        caller_tenant,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_eq!(body["hierarchy"]["tenant_id"], target_tenant.to_string());
+    assert_no_surrogate_ids(&body);
+}
+
+/// A foreign `tenant_id` NOT covered by the compiled `AccessScope` (the
+/// realistic tenant-clamp shape every PDP plugin in this repo returns)
+/// comes back 404, matching the shape of "tenant doesn't exist" -- not 403,
+/// per the anti-oracle rule this mirrors from the VHP-2341 membership
+/// gates.
+#[tokio::test]
+async fn rest_create_group_foreign_tenant_id_denied_returns_404() {
+    let (router, type_svc) = build_test_router().await;
+    let caller_tenant = Uuid::now_v7();
+    let target_tenant = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162d.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "ForeignDenied",
+            "tenant_id": target_tenant
+        })),
+        caller_tenant,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
+}
+
+/// An `AccessScope` built only from an `InTenantSubtree` constraint is
+/// rejected fail-closed at the HTTP layer too, even when the target tenant
+/// is literally the constraint's own root (VHP-2162's documented
+/// limitation -- see `GroupService::create_group`'s doc comment).
+#[tokio::test]
+async fn rest_create_group_in_tenant_subtree_scope_returns_404() {
+    let caller_tenant = Uuid::now_v7();
+    let target_tenant = Uuid::now_v7();
+    let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
+        InTenantSubtreeOnlyAuthZ {
+            root_tenant_id: target_tenant,
+        },
+    )))
+    .await;
+    let type_code = rg_type_id!("test.vhp2162e.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "SubtreeDenied",
+            "tenant_id": target_tenant
+        })),
+        caller_tenant,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
+}
+
+/// A tenant-typed group's effective tenant is always its own generated id;
+/// an explicit `tenant_id` in the request body is a contradiction and
+/// comes back 400, not silently ignored.
+#[tokio::test]
+async fn rest_create_group_tenant_typed_with_explicit_tenant_id_returns_400() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let other_tenant = Uuid::now_v7();
+    let type_code = format!(
+        "{}test{}.v1~",
+        resource_group_sdk::TENANT_RG_TYPE_PATH,
+        Uuid::now_v7().as_simple()
+    );
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "TenantTypedConflict",
+            "tenant_id": other_tenant
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// An explicit `id` combined with a cross-tenant target is rejected (400)
+/// as a VHP-2343 stopgap, even under a policy that would otherwise permit
+/// the target tenant.
+#[tokio::test]
+async fn rest_create_group_explicit_id_with_foreign_tenant_returns_400() {
+    let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
+        TargetTenantAllowAuthZ,
+    )))
+    .await;
+    let caller_tenant = Uuid::now_v7();
+    let target_tenant = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162f.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "id": Uuid::now_v7(),
+            "type": type_code,
+            "name": "IdPlusForeignTenant",
+            "tenant_id": target_tenant
+        })),
+        caller_tenant,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// An explicit `tenant_id` conflicting with an explicit `parent_id`'s
+/// actual tenant is rejected (400), even under a policy that would
+/// otherwise permit the target tenant on its own.
+#[tokio::test]
+async fn rest_create_group_tenant_id_conflicts_with_parent_returns_400() {
+    let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
+        TargetTenantAllowAuthZ,
+    )))
+    .await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+
+    let root_type = rg_type_id!("test.vhp2162g.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: root_type.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+    let child_type = rg_type_id!("test.vhp2162g-child.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: child_type.clone(),
+            can_be_root: false,
+            allowed_parent_types: vec![root_type.clone()],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    // Root group is created in tenant_a (the mock permits any tenant).
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": root_type,
+            "name": "Root"
+        })),
+        tenant_a,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let root_body = response_body(resp).await;
+    let root_id = root_body["id"].as_str().unwrap();
+
+    // Child under `root_id` but targeting tenant_b explicitly -- conflict.
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": child_type,
+            "name": "Conflict",
+            "parent_id": root_id,
+            "tenant_id": tenant_b
+        })),
+        tenant_a,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+    let text = body.to_string();
+    assert!(
+        !text.contains(&tenant_a.to_string()) && !text.contains(&tenant_b.to_string()),
+        "problem body must not leak tenant ids (VHP-2345 style): {text}"
+    );
 }
 
 #[tokio::test]
@@ -507,6 +1224,65 @@ fn assert_no_surrogate_ids(json: &serde_json::Value) {
     );
 }
 
+// ── Helper: assert RFC 9457 Problem Details shape ───────────────────────
+//
+// Per `docs/toolkit_unified_system/12_unit_testing.md` ("Error Response
+// Shape (REST tests)"): every REST test that exercises an error response
+// MUST check the status code, that Content-Type contains
+// `application/problem+json`, that the body carries `status`/`title`/
+// `detail`, and that no `stack`/`trace`/`backtrace` leaks into the wire
+// body. Consumes the response (mirrors `response_body`) and hands back the
+// parsed JSON so callers can layer on endpoint-specific assertions (e.g.
+// `context.violations`).
+async fn assert_problem_shape(
+    resp: axum::http::Response<Body>,
+    expected_status: StatusCode,
+) -> serde_json::Value {
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .expect("Content-Type header must be present")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status, expected_status,
+        "unexpected status, got {status}: {body}"
+    );
+    assert!(
+        ct.contains("application/problem+json"),
+        "expected application/problem+json for {expected_status}, got: {ct}"
+    );
+    assert_eq!(
+        body["status"],
+        expected_status.as_u16(),
+        "Problem 'status' must match the HTTP status: {body}"
+    );
+    assert!(
+        body["title"].is_string(),
+        "Problem must have 'title': {body}"
+    );
+    assert!(
+        body["detail"].is_string(),
+        "Problem must have 'detail': {body}"
+    );
+    assert!(
+        body.get("stack").is_none(),
+        "no stack trace must leak into the response: {body}"
+    );
+    assert!(
+        body.get("trace").is_none(),
+        "no trace must leak into the response: {body}"
+    );
+    assert!(
+        body.get("backtrace").is_none(),
+        "no backtrace must leak into the response: {body}"
+    );
+    body
+}
+
 // =========================================================================
 // Section A: REST API endpoint tests (TC-REST-01..08)
 // =========================================================================
@@ -519,7 +1295,7 @@ async fn rest_put_type_returns_200() {
     let code = rg_type_id!("test.put.{}.v1~", Uuid::now_v7().as_simple());
 
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -582,7 +1358,7 @@ async fn rest_post_membership_returns_201() {
 
     let mt_code = rg_type_id!("test.mt2._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -594,7 +1370,7 @@ async fn rest_post_membership_returns_201() {
 
     let gt_code = rg_type_id!("test.gt2.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt_code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -612,6 +1388,7 @@ async fn rest_post_membership_returns_201() {
                 code: gt_code,
                 name: "G1".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -640,11 +1417,79 @@ async fn rest_post_membership_returns_201() {
     assert_no_surrogate_ids(&body);
 }
 
+/// VHP-2345 regression: a second `POST` of the same membership composite
+/// key must still come back as a typed 409 conflict, now that
+/// `MembershipRepository::insert` classifies the duplicate via
+/// `toolkit_db::secure::is_unique_violation` instead of a substring match
+/// on the driver's error text.
+#[tokio::test]
+async fn rest_post_membership_duplicate_returns_409() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let mt_code = rg_type_id!("test.mtdup._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: mt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let gt_code = rg_type_id!("test.gtdup.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: gt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code,
+                name: "G1".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+
+    let mt_encoded = mt_code.replace('~', "%7E");
+    let path = format!(
+        "/resource-group/v1/memberships/{}/{}/res-dup",
+        group.id, mt_encoded
+    );
+
+    let first = json_request("POST", &path, None, tenant_id);
+    let resp = router.clone().oneshot(first).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_no_surrogate_ids(&body);
+
+    let second = json_request("POST", &path, None, tenant_id);
+    let resp = router.oneshot(second).await.unwrap();
+    assert_problem_shape(resp, StatusCode::CONFLICT).await;
+}
+
 /// Helper: create a self-referencing root type (create, then update to allow self as parent).
 async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &str) -> String {
     let code = rg_type_id!("test.{}.{}.v1~", suffix, Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -654,7 +1499,7 @@ async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &s
         .await
         .unwrap();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -677,7 +1522,11 @@ async fn build_shared_router() -> (
 ) {
     let db = test_db().await;
     let enforcer = make_enforcer();
-    let type_svc = Arc::new(TypeService::new(db.clone(), Arc::new(TypeRepository)));
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        make_type_enforcer(),
+        Arc::new(TypeRepository),
+    ));
     let group_svc = Arc::new(GroupService::new(
         db.clone(),
         QueryProfile::default(),
@@ -712,7 +1561,7 @@ async fn rest_delete_membership_returns_204() {
 
     let mt = rg_type_id!("test.mtr._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -724,7 +1573,7 @@ async fn rest_delete_membership_returns_204() {
 
     let gt = rg_type_id!("test.gtr.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -742,6 +1591,7 @@ async fn rest_delete_membership_returns_204() {
                 code: gt,
                 name: "GDel".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -782,6 +1632,246 @@ async fn rest_get_memberships_returns_200() {
     assert!(body["items"].is_array());
 }
 
+// =========================================================================
+// VHP-2341: membership operations must respect the caller's tenant scope
+// =========================================================================
+
+/// VHP-2341: POST membership into a cross-tenant group returns 404 (looks
+/// not-found, not a distinguishable "forbidden").
+#[tokio::test]
+async fn rest_post_membership_cross_tenant_returns_404() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+
+    let mt_code = rg_type_id!("test.xmt._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: mt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let gt_code = rg_type_id!("test.xgt._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: gt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    // Tenant A creates the group.
+    let group = group_svc
+        .create_group(
+            &ctx_a,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code,
+                name: "GA".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_a,
+        )
+        .await
+        .unwrap();
+
+    // Tenant B tries to add a member into tenant A's group.
+    let mt_encoded = mt_code.replace('~', "%7E");
+    let req = json_request(
+        "POST",
+        &format!(
+            "/resource-group/v1/memberships/{}/{}/res-xtenant",
+            group.id, mt_encoded
+        ),
+        None,
+        tenant_b,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
+}
+
+/// VHP-2341: DELETE membership from a cross-tenant group returns 404, and
+/// the membership survives.
+#[tokio::test]
+async fn rest_delete_membership_cross_tenant_returns_404() {
+    let (router, type_svc, group_svc, membership_svc) = build_shared_router().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+
+    let mt_code = rg_type_id!("test.xmtr._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: mt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let gt_code = rg_type_id!("test.xgtr._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: gt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group = group_svc
+        .create_group(
+            &ctx_a,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code,
+                name: "GAR".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_a,
+        )
+        .await
+        .unwrap();
+
+    membership_svc
+        .add_membership(&ctx_a, group.id, &mt_code, "res-xtenant-del")
+        .await
+        .unwrap();
+
+    // Tenant B tries to delete a member from tenant A's group.
+    let mt_encoded = mt_code.replace('~', "%7E");
+    let req = json_request(
+        "DELETE",
+        &format!(
+            "/resource-group/v1/memberships/{}/{}/res-xtenant-del",
+            group.id, mt_encoded
+        ),
+        None,
+        tenant_b,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
+
+    // Tenant A must still see the membership -- the rejected cross-tenant
+    // delete must not have removed it.
+    let list_req = json_request("GET", "/resource-group/v1/memberships", None, tenant_a);
+    let list_resp = router.oneshot(list_req).await.unwrap();
+    let body = response_body(list_resp).await;
+    let items = body["items"].as_array().expect("items array");
+    assert!(
+        items.iter().any(|m| m["resource_id"] == "res-xtenant-del"),
+        "membership must survive a rejected cross-tenant delete, got: {items:?}"
+    );
+    assert_no_surrogate_ids(&body);
+}
+
+/// VHP-2341: GET memberships is tenant-scoped -- tenant A must not see
+/// tenant B's membership rows in the list response.
+#[tokio::test]
+async fn rest_get_memberships_is_tenant_scoped() {
+    let (router, type_svc, group_svc, membership_svc) = build_shared_router().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = make_ctx(tenant_a);
+    let ctx_b = make_ctx(tenant_b);
+
+    let mt_code = rg_type_id!("test.xlst._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: mt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let gt_code = rg_type_id!("test.xglst._.i{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: gt_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![mt_code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group_a = group_svc
+        .create_group(
+            &ctx_a,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code.clone(),
+                name: "GAList".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_a,
+        )
+        .await
+        .unwrap();
+    let group_b = group_svc
+        .create_group(
+            &ctx_b,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt_code,
+                name: "GBList".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_b,
+        )
+        .await
+        .unwrap();
+
+    membership_svc
+        .add_membership(&ctx_a, group_a.id, &mt_code, "res-list-a")
+        .await
+        .unwrap();
+    membership_svc
+        .add_membership(&ctx_b, group_b.id, &mt_code, "res-list-b")
+        .await
+        .unwrap();
+
+    let req = json_request("GET", "/resource-group/v1/memberships", None, tenant_a);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    let items = body["items"].as_array().expect("items array");
+    assert!(
+        items.iter().any(|m| m["resource_id"] == "res-list-a"),
+        "tenant A must see its own membership, got: {items:?}"
+    );
+    assert!(
+        !items.iter().any(|m| m["resource_id"] == "res-list-b"),
+        "tenant A must NOT see tenant B's membership, got: {items:?}"
+    );
+    assert_no_surrogate_ids(&body);
+}
+
 /// TC-REST-06: POST group with parent_id returns 201 with hierarchy.
 #[tokio::test]
 async fn rest_post_group_with_parent_returns_201() {
@@ -792,7 +1882,7 @@ async fn rest_post_group_with_parent_returns_201() {
     let root_type = rg_type_id!("test.rtp.{}.v1~", Uuid::now_v7().as_simple());
     // Create type first without self-reference, then update to allow self as parent
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: root_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -802,7 +1892,7 @@ async fn rest_post_group_with_parent_returns_201() {
         .await
         .unwrap();
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &root_type,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -822,6 +1912,7 @@ async fn rest_post_group_with_parent_returns_201() {
                 code: root_type.clone(),
                 name: "Parent".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -864,6 +1955,7 @@ async fn rest_delete_group_force_returns_204() {
                 code: rt.clone(),
                 name: "FParent".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -880,6 +1972,7 @@ async fn rest_delete_group_force_returns_204() {
                 code: rt,
                 name: "FChild".to_owned(),
                 parent_id: Some(parent.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -914,6 +2007,7 @@ async fn rest_get_group_hierarchy_returns_200() {
                 code: rt.clone(),
                 name: "HRoot".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -929,6 +2023,7 @@ async fn rest_get_group_hierarchy_returns_200() {
                 code: rt,
                 name: "HChild".to_owned(),
                 parent_id: Some(root.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -961,6 +2056,151 @@ async fn rest_get_group_hierarchy_returns_200() {
         );
         assert_no_surrogate_ids(item);
     }
+}
+
+// =========================================================================
+// VHP-1977: PUT re-parent cycle detection (REST-level regression coverage)
+// =========================================================================
+//
+// `move_group_internal_impl` (src/domain/group_service.rs) already detects
+// cycles via `is_descendant` and `update_group_inner` delegates to it when
+// `parent_id` changes on a PUT; the resulting `DomainError::CycleDetected`
+// is mapped to `RgError::failed_precondition()` with the `hierarchy`
+// precondition subject (src/api/rest/error.rs). Service-level coverage
+// already exists in `group_service_test.rs` (TC-GRP-06/07, via
+// `move_group`) and error-mapping coverage exists in `domain_unit_test.rs`
+// (`domain_to_problem_cycle_detected_is_400`), but neither one drives the
+// actual `PUT /resource-group/v1/groups/{id}` HTTP path. These two tests
+// close that gap.
+
+/// VHP-1977: PUT re-parent under own descendant returns 400 with a
+/// `hierarchy` precondition violation.
+#[tokio::test]
+async fn rest_update_group_reparent_under_descendant_returns_400_cycle() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let rt = create_self_ref_type(&type_svc, "cyc1").await;
+
+    let root = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: rt.clone(),
+                name: "CycRoot".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create root group");
+
+    let child = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: rt,
+                name: "CycChild".to_owned(),
+                parent_id: Some(root.id),
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create child group");
+
+    // PUT root with parent_id = its own child -- would create a cycle.
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", root.id),
+        Some(serde_json::json!({
+            "name": "CycRoot",
+            "parent_id": child.id,
+            "metadata": null
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+
+    let violations = body["context"]["violations"]
+        .as_array()
+        .expect("context.violations must be present");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one precondition violation: {body}"
+    );
+    assert_eq!(violations[0]["subject"], "hierarchy");
+    assert_eq!(violations[0]["type"], "STATE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "expected non-empty violation description: {body}"
+    );
+}
+
+/// VHP-1977: PUT self-parent returns 400 with a `hierarchy` precondition
+/// violation.
+#[tokio::test]
+async fn rest_update_group_self_parent_returns_400_cycle() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let rt = create_self_ref_type(&type_svc, "cyc2").await;
+
+    let root = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: rt,
+                name: "SelfRoot".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create root group");
+
+    // PUT root with parent_id = itself.
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", root.id),
+        Some(serde_json::json!({
+            "name": "SelfRoot",
+            "parent_id": root.id,
+            "metadata": null
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+
+    let violations = body["context"]["violations"]
+        .as_array()
+        .expect("context.violations must be present");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one precondition violation: {body}"
+    );
+    assert_eq!(violations[0]["subject"], "hierarchy");
+    assert_eq!(violations[0]["type"], "STATE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "expected non-empty violation description: {body}"
+    );
 }
 
 // =========================================================================
@@ -1011,7 +2251,7 @@ async fn rest_create_group_with_metadata() {
 
     let code = rg_type_id!("test.gm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1047,7 +2287,7 @@ async fn rest_group_response_omits_null_metadata() {
 
     let code = rg_type_id!("test.nm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1227,7 +2467,7 @@ async fn input_membership_non_gts_resource_type() {
 
     let rt = rg_type_id!("test.ngts.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: rt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1245,6 +2485,7 @@ async fn input_membership_non_gts_resource_type() {
                 code: rt,
                 name: "NGGroup".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1462,7 +2703,7 @@ async fn input_deser_group_empty_name_returns_400() {
 
     let code = rg_type_id!("test.en.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1564,7 +2805,7 @@ async fn gts_membership_post_tilde_encoded() {
 
     let mt = rg_type_id!("test.tmt._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1576,7 +2817,7 @@ async fn gts_membership_post_tilde_encoded() {
 
     let gt = rg_type_id!("test.tgt.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1594,6 +2835,7 @@ async fn gts_membership_post_tilde_encoded() {
                 code: gt,
                 name: "TildeGroup".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1624,7 +2866,7 @@ async fn gts_membership_delete_tilde_encoded() {
 
     let mt = rg_type_id!("test.tmd._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1636,7 +2878,7 @@ async fn gts_membership_delete_tilde_encoded() {
 
     let gt = rg_type_id!("test.tgd.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1654,6 +2896,7 @@ async fn gts_membership_delete_tilde_encoded() {
                 code: gt,
                 name: "TildeDelGrp".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1688,7 +2931,7 @@ async fn gts_put_type_tilde_encoded() {
 
     let code = rg_type_id!("test.tput.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1721,7 +2964,7 @@ async fn smallint_type_response_has_no_surrogate_ids() {
 
     let code = rg_type_id!("test.sid.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1755,7 +2998,7 @@ async fn smallint_group_response_has_no_surrogate_ids() {
 
     let code = rg_type_id!("test.gsid.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1792,7 +3035,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
 
     let mt = rg_type_id!("test.msid._.i{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: mt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1804,7 +3047,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
 
     let gt = rg_type_id!("test.gsidm.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: gt.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -1822,6 +3065,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
                 code: gt,
                 name: "MSIDGrp".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1865,6 +3109,7 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
                 code: rt.clone(),
                 name: "HSIDRoot".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1880,6 +3125,7 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
                 code: rt,
                 name: "HSIDChild".to_owned(),
                 parent_id: Some(root.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1942,7 +3188,7 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
     // --- 409 Conflict: duplicate type ---
     let code = rg_type_id!("test.errdup.{}.v1~", Uuid::now_v7().as_simple());
     type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -2151,4 +3397,268 @@ async fn rest_route_smoke_all_endpoints_registered() {
             "{method} {path} ({desc}) returned 405 -- route not registered"
         );
     }
+}
+
+// =========================================================================
+// VHP-1954: membership `$filter` client errors must be 400, not 500
+// =========================================================================
+//
+// `list_memberships` (`membership_repo.rs`) used to fold every failure out
+// of `paginate_odata` -- including caller-caused `$filter` rejections --
+// into `DomainError::database(..)`, a 500. The OData grammar only parses a
+// *bare* hex8-4-4-4-12 UUID literal (no surrounding quotes) as
+// `Value::Uuid`; the same literal wrapped in single quotes parses as
+// `Value::String`, which `convert_expr_to_filter_node::<MembershipFilterField>`
+// rejects with `FilterError::TypeMismatch` because `group_id`'s `FieldKind`
+// is `Uuid` -- exactly the shape the ticket's reporter hit (they quoted the
+// UUID; the e2e smoke test S10 does not, which is why it stayed green).
+
+/// VHP-1954: `$filter=group_id eq '<uuid>'` (quoted) must return 400, not
+/// 500 -- a caller mistake, not a backend fault.
+#[tokio::test]
+async fn rest_get_memberships_quoted_uuid_filter_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let some_uuid = Uuid::now_v7();
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/memberships\
+             ?%24filter=group_id%20eq%20%27{some_uuid}%27"
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// VHP-1954 regression guard: the wire-correct *bare* UUID
+/// `$filter=group_id eq <uuid>` (no quotes) must keep returning 200 --
+/// pinning that the 400 fix above doesn't also start rejecting the shape
+/// e2e smoke test S10 (and every well-formed client) actually sends.
+#[tokio::test]
+async fn rest_get_memberships_bare_uuid_filter_returns_200() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let some_uuid = Uuid::now_v7();
+
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/memberships?%24filter=group_id%20eq%20{some_uuid}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bare-UUID $filter regressed: {body}"
+    );
+    assert!(body["items"].is_array());
+    assert_no_surrogate_ids(&body);
+}
+
+// =========================================================================
+// Classifier coverage: `From<toolkit_odata::Error> for DomainError`
+// (`src/domain/error.rs`) must be exercised by an error that actually
+// originates *inside* `paginate_odata`, not by the `$filter` pre-validation
+// (`convert_expr_to_filter_node` / `resolve_type_filter_node`) that runs
+// before it in `list_memberships`. The quoted-UUID test above never reaches
+// the classifier: `MembershipFilterField::GroupId`'s `FieldKind::Uuid`
+// rejects the quoted literal at `convert_expr_to_filter_node`, well before
+// `paginate_odata` is ever called -- reverting the classifier's application
+// site (the `.map_err(DomainError::from)?` on `paginate_odata`'s result) to
+// the old blanket `.map_err(|e| DomainError::database(e.to_string()))`
+// leaves that test green. These two tests instead drive failures that
+// originate *inside* `paginate_odata_collect`: an unknown `$orderby` field,
+// and a cursor whose embedded filter hash disagrees with the request's
+// current `$filter`. Confirmed by mutation: reverting the classifier's
+// application site to the blanket `Database` mapping turns both red (500
+// instead of 400).
+// =========================================================================
+
+/// VHP-1954 classifier proof (1/2): `$orderby` on a field
+/// `MembershipFilterField` doesn't declare passes the extractor
+/// (`parse_orderby` only validates syntax, not field names -- see
+/// `libs/toolkit/src/api/odata.rs`) and fails *inside*
+/// `paginate_odata_collect`'s field-resolution loop with
+/// `ODataError::InvalidOrderByField` (`libs/toolkit-db/src/odata/sea_orm_filter.rs`).
+/// Must classify as a caller error (400), not a backend fault (500).
+#[tokio::test]
+async fn rest_get_memberships_unknown_orderby_field_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request(
+        "GET",
+        "/resource-group/v1/memberships?%24orderby=not_a_real_field%20asc",
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// VHP-1954 classifier proof (2/2): a cursor whose embedded filter hash
+/// (`cursor.f`) doesn't match the current request's `$filter` hash fails
+/// *inside* `paginate_odata_collect` with `ODataError::FilterMismatch` -- a
+/// client replaying a cursor minted under a different filter, not a
+/// backend fault. The cursor is hand-built (rather than round-tripped
+/// through a real `next_cursor`) so the mismatch is deterministic: `s`
+/// (`"-group_id"`) matches `list_memberships`' real tiebreaker, so it
+/// clears the orderby-field check first and the mismatch check is what
+/// actually fires; `f` is a value no real `$filter` string will ever hash
+/// to. The filter itself (`resource_id eq 'res-1'`) targets a field
+/// `TypeRepository::resolve_type_filter_node` passes through untouched, so
+/// nothing upstream of `paginate_odata` can reject it first.
+#[tokio::test]
+async fn rest_get_memberships_cursor_filter_mismatch_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+
+    let cursor = CursorV1 {
+        k: vec!["group_id".to_owned()],
+        o: SortDir::Desc,
+        s: "-group_id".to_owned(),
+        f: Some("mismatched-filter-hash".to_owned()),
+        d: "fwd".to_owned(),
+    };
+    let token = cursor.encode().expect("encode hand-built cursor");
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/memberships\
+             ?%24filter=resource_id%20eq%20%27res-1%27&cursor={token}"
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+// =========================================================================
+// list_groups `$filter=type` coverage (fe2d609e generalization follow-up)
+// =========================================================================
+//
+// `resolve_type_filter_node` moved from `GroupRepository` into
+// `TypeRepository` (generic over the filter-field enum) so `list_groups`
+// and `list_memberships` share one implementation. Independent review
+// found `list_groups`' own `type` `$filter` had no REST-level coverage at
+// all -- these mirror the membership `$filter` REST tests directly above
+// for the groups path.
+
+/// End-to-end HTTP coverage: `GET .../groups?$filter=type eq '<gts-path>'`
+/// must return exactly the groups of that type, not another type's groups
+/// also present for the same tenant -- proves the whole pipeline (URL/query
+/// decoding, `OData` parsing, JSON response), not just the repository call.
+#[tokio::test]
+async fn rest_list_groups_filters_by_type() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let type_a = type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: rg_type_id!("test.restgta.i{}.v1~", Uuid::now_v7().as_simple()),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+    let type_b = type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: rg_type_id!("test.restgtb.i{}.v1~", Uuid::now_v7().as_simple()),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group_a = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: type_a.code.clone(),
+                name: "RestTypeA".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+    group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: type_b.code.clone(),
+                name: "RestTypeB".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/groups?%24filter=type%20eq%20%27{}%27",
+            type_a.code
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "type filter request failed: {body}");
+
+    let items = body["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        1,
+        "type filter must return exactly the one group of type A, not type B's: {body}"
+    );
+    assert_eq!(items[0]["id"], group_a.id.to_string());
+    assert_eq!(items[0]["type"], type_a.code);
+    assert_no_surrogate_ids(&body);
+}
+
+/// Mirrors the membership `$filter` 400-not-500 guard above
+/// (`rest_get_memberships_quoted_uuid_filter_returns_400_not_500`) for
+/// groups: an unregistered GTS type path in `$filter=type eq '<path>'`
+/// must classify as a caller error (400), never a raw 500 -- and must not
+/// silently degrade to an empty 200 page either
+/// (`resolve_type_filter_node` raises "Unknown type in filter" before the
+/// value ever reaches the DB).
+#[tokio::test]
+async fn rest_list_groups_unknown_type_filter_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let bogus_type = rg_type_id!("test.restgtunknown.i{}.v1~", Uuid::now_v7().as_simple());
+
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups?%24filter=type%20eq%20%27{bogus_type}%27"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }

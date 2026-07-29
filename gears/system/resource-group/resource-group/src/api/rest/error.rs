@@ -49,6 +49,15 @@ impl From<DomainError> for CanonicalError {
                     .with_resource(id.to_string())
                     .create()
             }
+            // VHP-2162: a target tenant outside the caller's `create`
+            // AccessScope maps to `not_found`, not `permission_denied` --
+            // see `DomainError::TenantNotFound`'s doc for the anti-oracle
+            // rationale (mirrors the VHP-2341 membership gates below).
+            DomainError::TenantNotFound { tenant_id } => {
+                RgError::not_found(format!("Tenant '{tenant_id}' was not found"))
+                    .with_resource(tenant_id.to_string())
+                    .create()
+            }
             DomainError::MembershipNotFound { key } => {
                 RgError::not_found(format!("Membership '{key}' was not found"))
                     .with_resource(key)
@@ -59,6 +68,14 @@ impl From<DomainError> for CanonicalError {
             DomainError::TypeAlreadyExists { code } => {
                 RgError::already_exists(format!("GTS type with code '{code}' already exists"))
                     .with_resource(code)
+                    .create()
+            }
+            // VHP-2345: primary-key collision on `resource_group.id` (VHP-2343
+            // deliberately keeps client-supplied `id` accepted on create) —
+            // typed 409 instead of falling through to the `Database` (500) arm.
+            DomainError::GroupAlreadyExists { id } => {
+                RgError::already_exists(format!("Resource group with id '{id}' already exists"))
+                    .with_resource(id.to_string())
                     .create()
             }
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c

@@ -16,6 +16,20 @@ pub enum DomainError {
     #[error("Type already exists: {code}")]
     TypeAlreadyExists { code: String },
 
+    /// Duplicate resource-group `id` on create.
+    ///
+    /// Raised by `GroupRepository::insert` when the insert hits a
+    /// unique-constraint violation on `resource_group.id` — the caller
+    /// supplied (via `CreateGroupRequest::id`) or seeding replayed an `id`
+    /// that already exists. VHP-2343's owner decision keeps client-supplied
+    /// `id` on create as-is (no derived-id, no `id_seed` — that policy
+    /// question is out of scope here); this variant only turns the
+    /// resulting primary-key collision into a typed conflict instead of an
+    /// opaque `Database` (HTTP 500). Maps to canonical `already_exists`
+    /// (HTTP 409) with `id` as the `resource_name` (VHP-2345).
+    #[error("Group already exists: {id}")]
+    GroupAlreadyExists { id: uuid::Uuid },
+
     #[error("Validation failed: {message}")]
     Validation { message: String },
 
@@ -27,6 +41,23 @@ pub enum DomainError {
 
     #[error("Group not found: {id}")]
     GroupNotFound { id: uuid::Uuid },
+
+    /// Target tenant from an explicit `CreateGroupRequest::tenant_id` is
+    /// outside the caller's `create`-action `AccessScope` (VHP-2162).
+    ///
+    /// Deliberately mirrors `GroupNotFound`'s shape rather than
+    /// `AccessDenied`: a foreign tenant the caller has no grant for must be
+    /// indistinguishable from a tenant that does not exist at all. RG does
+    /// not own tenant data (that's Account Management's `tenants` /
+    /// `tenant_closure`), so it can never legitimately claim to know the
+    /// difference between "real tenant, no grant" and "no such tenant" --
+    /// the same anti-oracle principle the VHP-2341 membership gates
+    /// established (see `membership_service.rs`). Maps to canonical
+    /// `not_found` (HTTP 404). The echoed `tenant_id` is the caller's own
+    /// request payload, so echoing it back discloses nothing the caller did
+    /// not already know.
+    #[error("Tenant not found: {tenant_id}")]
+    TenantNotFound { tenant_id: uuid::Uuid },
 
     #[error("Membership not found: {key}")]
     MembershipNotFound { key: String },
@@ -119,6 +150,11 @@ impl DomainError {
         Self::TypeAlreadyExists { code: code.into() }
     }
 
+    #[must_use]
+    pub fn group_already_exists(id: uuid::Uuid) -> Self {
+        Self::GroupAlreadyExists { id }
+    }
+
     pub fn validation(message: impl Into<String>) -> Self {
         Self::Validation {
             message: message.into(),
@@ -140,6 +176,11 @@ impl DomainError {
     #[must_use]
     pub fn group_not_found(id: uuid::Uuid) -> Self {
         Self::GroupNotFound { id }
+    }
+
+    #[must_use]
+    pub fn tenant_not_found(tenant_id: uuid::Uuid) -> Self {
+        Self::TenantNotFound { tenant_id }
     }
 
     pub fn membership_not_found(key: impl Into<String>) -> Self {
@@ -230,6 +271,30 @@ impl From<toolkit_db::DbError> for DomainError {
         match e {
             toolkit_db::DbError::Sea(db_err) => DomainError::Database(db_err),
             other => DomainError::database(other.to_string()),
+        }
+    }
+}
+
+/// Classify an `OData` pagination/filter failure (`toolkit_odata::Error`,
+/// surfaced by `paginate_odata`) as caller-caused (-> `Validation`, HTTP
+/// 400) or a genuine backend failure (-> `Database`, HTTP 500).
+///
+/// Mirrors the split `toolkit_odata::problem_mapping`'s
+/// `From<Error> for CanonicalError` already applies to the `OData`-native
+/// error surface: every variant except `Db`/`ParsingUnavailable` originates
+/// from a client-supplied `$filter` / `$orderby` / cursor and is never a
+/// backend fault, so it must map to `Validation`, not `Database`.
+///
+/// Used by `MembershipRepository::list_memberships` (VHP-1954) so a
+/// malformed `$filter` (unknown field, type mismatch, bad `$orderby` field,
+/// stale cursor) surfaces as 400 instead of being folded into a blanket 500
+/// alongside actual DB failures.
+impl From<toolkit_odata::Error> for DomainError {
+    fn from(e: toolkit_odata::Error) -> Self {
+        use toolkit_odata::Error as OE;
+        match &e {
+            OE::Db(_) | OE::ParsingUnavailable(_) => DomainError::database(e.to_string()),
+            _ => DomainError::validation(e.to_string()),
         }
     }
 }

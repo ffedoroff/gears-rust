@@ -53,6 +53,179 @@ impl TypeRepository {
         Ok(result.map(|m| m.id))
     }
 
+    /// Resolve GTS type-path string values to SMALLINT surrogate IDs inside a
+    /// validated `FilterNode`, for whichever field represents a GTS type path
+    /// in the caller's filter-field enum (e.g. `GroupFilterField::Type`,
+    /// `MembershipFilterField::ResourceType`).
+    ///
+    /// Generic over the filter-field enum `F` so every repository that
+    /// filters on a GTS type path shares this tree walk instead of
+    /// reimplementing it per field enum --
+    /// `GroupRepository::list_groups` and
+    /// `MembershipRepository::list_memberships` each call this with their
+    /// own field variant (`type_field`).
+    ///
+    /// Runs as two in-memory tree walks around a single batch query
+    /// (N+1 audit finding (b)): `collect_type_filter_paths` gathers every
+    /// literal path referenced anywhere in the tree (a `type in (...)`
+    /// list contributes all of its values at once), `resolve_paths_for_filter`
+    /// resolves the whole set with one `WHERE schema_id IN (...)`, and
+    /// `substitute_type_filter_ids` rebuilds the tree from that map. A
+    /// `type in (...)` filter with N values used to cost N separate
+    /// `resolve_id` round trips (slope 1.0, confirmed by the audit); now
+    /// it costs exactly one query regardless of N.
+    ///
+    /// Must be called AFTER `convert_expr_to_filter_node` has already
+    /// validated the filter (so `type_field`'s kind is confirmed `String`).
+    pub async fn resolve_type_filter_node<F>(
+        db: &impl DBRunner,
+        node: &toolkit_odata::filter::FilterNode<F>,
+        type_field: F,
+    ) -> Result<toolkit_odata::filter::FilterNode<F>, DomainError>
+    where
+        F: toolkit_odata::filter::FilterField + Send + Sync,
+    {
+        let mut paths: Vec<String> = Vec::new();
+        Self::collect_type_filter_paths(node, type_field, &mut paths);
+
+        let id_by_path = Self::resolve_paths_for_filter(db, &paths).await?;
+
+        Ok(Self::substitute_type_filter_ids(
+            node,
+            type_field,
+            &id_by_path,
+        ))
+    }
+
+    /// First pass of `resolve_type_filter_node`: collect every literal GTS
+    /// type-path string that appears in a `Binary` or `InList` node for
+    /// `type_field`, anywhere in the tree. Pure in-memory walk, no I/O.
+    fn collect_type_filter_paths<F: toolkit_odata::filter::FilterField>(
+        node: &toolkit_odata::filter::FilterNode<F>,
+        type_field: F,
+        out: &mut Vec<String>,
+    ) {
+        use toolkit_odata::ast::Value as V;
+        use toolkit_odata::filter::FilterNode as FN;
+
+        match node {
+            FN::Binary {
+                field,
+                value: V::String(path),
+                ..
+            } if *field == type_field => out.push(path.clone()),
+            FN::InList { field, values } if *field == type_field => {
+                for v in values {
+                    if let V::String(path) = v {
+                        out.push(path.clone());
+                    }
+                }
+            }
+            FN::Composite { children, .. } => {
+                for child in children {
+                    Self::collect_type_filter_paths(child, type_field, out);
+                }
+            }
+            FN::Not(inner) => Self::collect_type_filter_paths(inner, type_field, out),
+            _ => {}
+        }
+    }
+
+    /// Second pass of `resolve_type_filter_node`: rebuild the tree with
+    /// every collected path substituted for its resolved surrogate ID.
+    /// Pure in-memory walk, no I/O -- `id_by_path` is assumed to already
+    /// contain every path `collect_type_filter_paths` found (guaranteed by
+    /// `resolve_paths_for_filter`, which errors out otherwise).
+    fn substitute_type_filter_ids<F: toolkit_odata::filter::FilterField>(
+        node: &toolkit_odata::filter::FilterNode<F>,
+        type_field: F,
+        id_by_path: &std::collections::HashMap<String, i16>,
+    ) -> toolkit_odata::filter::FilterNode<F> {
+        use toolkit_odata::ast::Value as V;
+        use toolkit_odata::filter::FilterNode as FN;
+
+        match node {
+            FN::Binary {
+                field,
+                op,
+                value: V::String(path),
+            } if *field == type_field => FN::Binary {
+                field: *field,
+                op: *op,
+                value: V::Number(id_by_path[path].into()),
+            },
+            FN::InList { field, values } if *field == type_field => {
+                let resolved = values
+                    .iter()
+                    .map(|v| match v {
+                        V::String(path) => V::Number(id_by_path[path].into()),
+                        other => other.clone(),
+                    })
+                    .collect();
+                FN::InList {
+                    field: *field,
+                    values: resolved,
+                }
+            }
+            FN::Composite { op, children } => FN::Composite {
+                op: *op,
+                children: children
+                    .iter()
+                    .map(|c| Self::substitute_type_filter_ids(c, type_field, id_by_path))
+                    .collect(),
+            },
+            FN::Not(inner) => FN::Not(Box::new(Self::substitute_type_filter_ids(
+                inner, type_field, id_by_path,
+            ))),
+            other => other.clone(),
+        }
+    }
+
+    /// Batch-resolve every GTS type path collected from a filter tree to its
+    /// surrogate SMALLINT ID with a single `WHERE schema_id IN (...)` query
+    /// (mirrors `resolve_ids`'s query shape). Reports the *first* unresolved
+    /// path in collection order as `DomainError::Validation` -- matching the
+    /// pre-batch code's per-literal error (which failed on the first literal
+    /// it walked to and never reached the rest), and keeping the "Unknown
+    /// type in filter" wording callers (and tests) match on.
+    async fn resolve_paths_for_filter(
+        db: &impl DBRunner,
+        paths: &[String],
+    ) -> Result<std::collections::HashMap<String, i16>, DomainError> {
+        use std::collections::{HashMap, HashSet};
+
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut seen: HashSet<&str> = HashSet::with_capacity(paths.len());
+        let mut unique: Vec<String> = Vec::with_capacity(paths.len());
+        for p in paths {
+            if seen.insert(p.as_str()) {
+                unique.push(p.clone());
+            }
+        }
+
+        let scope = system_scope();
+        let rows = GtsTypeEntity::find()
+            .filter(gts_type::Column::SchemaId.is_in(unique.clone()))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        let map: HashMap<String, i16> = rows.into_iter().map(|m| (m.schema_id, m.id)).collect();
+
+        if let Some(missing) = unique.iter().find(|p| !map.contains_key(p.as_str())) {
+            return Err(DomainError::validation(format!(
+                "Unknown type in filter: {missing}"
+            )));
+        }
+
+        Ok(map)
+    }
+
     /// Resolve allowed parent SMALLINT IDs to string paths.
     async fn load_allowed_parent_types(
         db: &impl DBRunner,
@@ -376,6 +549,18 @@ impl TypeRepositoryTrait for TypeRepository {
     /// `secure_insert` already returns the fully-populated `Model`,
     /// including the auto-generated SMALLINT id, so no separate re-read is
     /// needed to get it (RG-08).
+    ///
+    /// Classifies a unique-constraint violation on `schema_id` (the
+    /// migration's `UNIQUE(schema_id)`, independent of isolation level) into
+    /// the typed `TypeAlreadyExists` domain variant, symmetric with
+    /// `GroupRepository::insert`/`MembershipRepository::insert`. Before this,
+    /// `create_type_in_tx`'s pre-check (`resolve_id`) plus its SERIALIZABLE
+    /// transaction were the only thing standing between a duplicate `code`
+    /// and a raw, unclassified `DomainError::Database` -- the SSI abort+retry
+    /// papered over the missing mapping rather than the mapping making the
+    /// isolation level optional. This does not change when the error is
+    /// raised, only that it is now typed (and 409s on the REST layer)
+    /// regardless of what isolation level the caller happens to run under.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
@@ -392,7 +577,13 @@ impl TypeRepositoryTrait for TypeRepository {
 
         toolkit_db::secure::secure_insert::<GtsTypeEntity>(model, &scope, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))
+            .map_err(|e| {
+                if e.is_unique_violation() {
+                    DomainError::type_already_exists(schema_id)
+                } else {
+                    DomainError::database(e.to_string())
+                }
+            })
     }
 
     /// Insert allowed parent junction entries.
@@ -538,16 +729,47 @@ impl TypeRepositoryTrait for TypeRepository {
         Ok(count)
     }
 
-    /// Find resource groups that have a specific parent type and are of a given child type.
+    /// Batch replacement for a removed-allowed-parent-types sweep -- see the
+    /// trait doc comment for the full rationale (N+1 audit finding (b)).
     ///
-    /// Uses a batch lookup instead of N+1 individual parent queries.
-    async fn find_groups_using_parent_type<C: DBRunner>(
+    /// Three queries regardless of how many `parent_codes` are checked:
+    /// resolve every candidate path to its surrogate id, load every group
+    /// of `child_type_id` once, then batch-match those groups' actual
+    /// parents against every candidate parent-type id at once.
+    async fn find_groups_violating_removed_parents<C: DBRunner>(
         &self,
         db: &C,
         child_type_id: i16,
-        parent_type_id: i16,
-    ) -> Result<Vec<(uuid::Uuid, String)>, DomainError> {
+        parent_codes: &[String],
+    ) -> Result<Vec<(String, uuid::Uuid, String)>, DomainError> {
+        if parent_codes.is_empty() {
+            return Ok(Vec::new());
+        }
         let scope = system_scope();
+
+        // Resolve every candidate parent-type path in one query. A path
+        // that doesn't currently resolve to any gts_type row is silently
+        // dropped -- no group can reference a type that no longer exists.
+        let parent_types = GtsTypeEntity::find()
+            .filter(gts_type::Column::SchemaId.is_in(parent_codes.to_vec()))
+            .secure()
+            .scope_with(&scope)
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        if parent_types.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let code_by_id: std::collections::HashMap<i16, String> = parent_types
+            .iter()
+            .map(|t| (t.id, t.schema_id.clone()))
+            .collect();
+        let parent_type_ids: Vec<i16> = parent_types.iter().map(|t| t.id).collect();
+
+        // Groups of the child type being updated -- one query, independent
+        // of how many candidate parent types there are.
         let groups: Vec<rg_entity::Model> = ResourceGroupEntity::find()
             .filter(rg_entity::Column::GtsTypeId.eq(child_type_id))
             .secure()
@@ -556,37 +778,35 @@ impl TypeRepositoryTrait for TypeRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        // Collect all parent IDs in a single batch
         let parent_ids: Vec<uuid::Uuid> = groups.iter().filter_map(|g| g.parent_id).collect();
-
         if parent_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Batch-load all parent groups in a single query
+        // Which of those groups' actual parents are of one of the
+        // candidate parent types -- one query for every candidate at once,
+        // not one per candidate.
         let parents: Vec<rg_entity::Model> = ResourceGroupEntity::find()
             .filter(rg_entity::Column::Id.is_in(parent_ids))
-            .filter(rg_entity::Column::GtsTypeId.eq(parent_type_id))
+            .filter(rg_entity::Column::GtsTypeId.is_in(parent_type_ids))
             .secure()
             .scope_with(&scope)
             .all(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        let matching_parent_ids: std::collections::HashSet<uuid::Uuid> =
-            parents.into_iter().map(|p| p.id).collect();
+        let parent_type_by_id: std::collections::HashMap<uuid::Uuid, i16> =
+            parents.into_iter().map(|p| (p.id, p.gts_type_id)).collect();
 
-        // Filter child groups whose parent matched the target type
-        let violations = groups
+        Ok(groups
             .into_iter()
-            .filter(|g| {
-                g.parent_id
-                    .is_some_and(|pid| matching_parent_ids.contains(&pid))
+            .filter_map(|g| {
+                let pid = g.parent_id?;
+                let parent_type_id = *parent_type_by_id.get(&pid)?;
+                let code = code_by_id.get(&parent_type_id)?.clone();
+                Some((code, g.id, g.name))
             })
-            .map(|g| (g.id, g.name))
-            .collect();
-
-        Ok(violations)
+            .collect())
     }
 
     /// Find root groups (`parent_id` IS NULL) of a given type.

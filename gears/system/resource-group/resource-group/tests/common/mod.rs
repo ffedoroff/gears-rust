@@ -242,6 +242,41 @@ impl AuthZResolverClient for DenyAllAuthZ {
     }
 }
 
+// -- AllowAll-no-constraints AuthZ mock (for the `gts_type` global registry) --
+
+/// Enforcer that always permits and never attaches constraints.
+///
+/// `gts_type` is a platform-global table (no `tenant_id` column), and
+/// `TypeService`'s `RG_TYPE_RESOURCE` gate discards the `AccessScope` it
+/// gets back regardless of shape, so every gate call uses
+/// `require_constraints(false)` (VHP-2342) to also accept this
+/// permit-with-zero-constraints PDP shape (`decision: true, constraints:
+/// []`). This is *a* valid PDP response, not the only one: real PDP plugins
+/// (`static-authz-plugin`, `tr-authz-plugin`) instead attach a baseline
+/// `In(OWNER_TENANT_ID)` constraint on every allow decision -- the
+/// tenant-scoping `AllowAllAuthZ` mock above reproduces that shape and, since
+/// `RG_TYPE_RESOURCE` declares `OWNER_TENANT_ID` as a supported property, it
+/// works fine wired to `TypeService` too (see `tests/type_authz_test.rs`'s
+/// `TenantClampAuthZ` and `tests/api_rest_test.rs`'s realistic-mock test for
+/// the regression this previously-empty `supported_properties` list caused).
+struct AllowAllNoConstraintsAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for AllowAllNoConstraintsAuthZ {
+    async fn evaluate(
+        &self,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
 /// Build a `SecurityContext` for anonymous (nil tenant) -- matches `SecurityContext::anonymous()`.
 pub fn make_anon_ctx() -> SecurityContext {
     SecurityContext::anonymous()
@@ -311,9 +346,42 @@ pub fn make_enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(authz)
 }
 
+/// Build an allow-all-no-constraints `PolicyEnforcer` for `TypeService`
+/// (VHP-2342) -- see [`AllowAllNoConstraintsAuthZ`].
+pub fn make_type_enforcer() -> PolicyEnforcer {
+    let authz: Arc<dyn AuthZResolverClient> = Arc::new(AllowAllNoConstraintsAuthZ);
+    PolicyEnforcer::new(authz)
+}
+
+/// Build a deny-all `PolicyEnforcer`, for proving `TypeService`'s gate
+/// actually rejects when wired to a denying PDP (VHP-2342).
+pub fn make_type_enforcer_deny() -> PolicyEnforcer {
+    PolicyEnforcer::new(Arc::new(DenyAllAuthZ))
+}
+
+// -- Service construction helpers (TypeService) --
+
+/// Build a `TypeService` from a DB provider using the allow-all-no-constraints
+/// enforcer (VHP-2342). Fixture helpers below use the unscoped entry points,
+/// so this enforcer is a sane default rather than a load-bearing choice.
+pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
+    TypeService::new(db, make_type_enforcer(), Arc::new(TypeRepository))
+}
+
+/// Build a `TypeService` wired with the deny-all enforcer -- for tests that
+/// exercise the gated (`ctx`-taking) entry points and expect `AccessDenied`.
+pub fn make_type_service_deny(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
+    TypeService::new(db, make_type_enforcer_deny(), Arc::new(TypeRepository))
+}
+
 // -- Type helpers --
 
 /// Create a root type (can_be_root = true, no parents, no memberships).
+///
+/// Uses `create_type_unscoped`: these fixture helpers exist to set up types
+/// for tests that exercise *other* services (groups, memberships) and don't
+/// care about type-registry AuthZ, so bypassing the `PolicyEnforcer` gate
+/// keeps them independent of which enforcer `svc` happens to be wired with.
 pub async fn create_root_type(
     svc: &TypeService<TypeRepository>,
     suffix: &str,
@@ -328,7 +396,7 @@ pub async fn create_root_type(
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: true,
         allowed_parent_types: vec![],
@@ -340,6 +408,8 @@ pub async fn create_root_type(
 }
 
 /// Create a child type with specified allowed parents and memberships.
+///
+/// See [`create_root_type`] for why this uses `create_type_unscoped`.
 pub async fn create_child_type(
     svc: &TypeService<TypeRepository>,
     suffix: &str,
@@ -356,7 +426,7 @@ pub async fn create_child_type(
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
-    svc.create_type(CreateTypeRequest {
+    svc.create_type_unscoped(CreateTypeRequest {
         code,
         can_be_root: false,
         allowed_parent_types: parents.iter().map(|s| (*s).to_owned()).collect(),
@@ -384,6 +454,7 @@ pub async fn create_root_group(
             code: type_code.to_owned(),
             name: name.to_owned(),
             parent_id: None,
+            tenant_id: None,
             metadata: None,
         },
         tenant_id,
@@ -408,6 +479,7 @@ pub async fn create_child_group(
             code: type_code.to_owned(),
             name: name.to_owned(),
             parent_id: Some(parent_id),
+            tenant_id: None,
             metadata: None,
         },
         tenant_id,

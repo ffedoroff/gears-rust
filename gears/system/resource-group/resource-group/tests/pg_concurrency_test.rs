@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::QueryProfile;
+use resource_group::domain::repo::TypeRepositoryTrait;
 use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::resource_group::{
     Column as RgColumn, Entity as RgEntity,
@@ -70,6 +71,9 @@ use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
 use toolkit_security::AccessScope;
+use tracing::Instrument;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
 use uuid::Uuid;
 
 /// Ceiling on a winning transaction's duration. Deliberately far above any
@@ -384,16 +388,133 @@ fn describe_result<T>(r: &Result<T, DomainError>) -> String {
     }
 }
 
+/// Whether a `remove_membership` outcome is one of the two acceptable
+/// per-side shapes for a concurrent double-remove of the same row: it
+/// succeeded, or it was cleanly told the row is already gone. Used by
+/// [`concurrent_remove_same_membership_resolves_cleanly`].
+fn ok_or_clean_membership_not_found(r: &Result<(), DomainError>) -> bool {
+    matches!(r, Ok(()) | Err(DomainError::MembershipNotFound { .. }))
+}
+
 // RG-01: membership first-write race
+
+/// Captures `toolkit_db`'s retry-lifecycle `tracing` events (the existing
+/// per-attempt retry `WARN`, plus the budget-exhausted /
+/// not-recognized-as-retryable events) for
+/// [`membership_first_write_race_exactly_one_tenant_wins`], printing each
+/// one -- prefixed with the enclosing `race_task` span's `side`/`trial`
+/// fields -- via a `tracing_subscriber::fmt` layer.
+///
+/// # Why a hand-rolled subscriber, not the `tracing-test` crate
+///
+/// This repo's established way to capture `tracing` in an external
+/// integration-test crate (`tests/`) is to build a `tracing_subscriber`
+/// layer/subscriber by hand and install it with `tracing::subscriber::
+/// set_default` -- see `libs/toolkit/tests/panic_tracing_tests.rs`,
+/// `api-gateway`'s `tests/access_log_tests.rs`, and
+/// `libs/toolkit/src/api/canonical_error_layer.rs`'s tests. This reuses
+/// that pattern rather than the `tracing-test` crate's `#[traced_test]`
+/// macro (used elsewhere for spawned-task-heavy `src/` unit tests in
+/// `cluster`/`account-management`/`toolkit`) for one reason specific to
+/// this test: `tracing-test`'s env filter is an all-or-nothing per-crate
+/// choice (either `{this test crate}=trace`, or -- the `no-env-filter`
+/// feature that cross-crate capture here would require -- a blanket
+/// `"trace"` for *everything*). Against a real PostgreSQL, that blanket
+/// filter also captures SeaORM/sqlx's own per-query trace logging, turning
+/// a failure's output into a wall of raw SQL instead of a focused retry
+/// history. Filtering by target (`toolkit_db` only) avoids that.
+///
+/// # Why a global default
+///
+/// The two competing `add_membership` calls run as real `tokio::spawn`
+/// tasks, potentially on different worker threads of the
+/// `#[tokio::test(flavor = "multi_thread")]` runtime. A thread-local
+/// default (`tracing::subscriber::set_default`, what the precedents above
+/// use) only covers the thread that installs it; verified empirically that
+/// a spawned task on another worker thread is invisible to it. A *global*
+/// default (`tracing::subscriber::set_global_default`) is process-wide and
+/// does not have this gap.
+///
+/// # Why `println!`, not an explicit "dump on failure"
+///
+/// Nothing here decides whether to print based on the trial's outcome --
+/// every event matching the target filter is printed unconditionally,
+/// which keeps this diagnostic itself simple and unable to influence the
+/// test's result. `cargo`/`nextest` already capture a test's stdout and
+/// print it only when the test fails (verified empirically), so a passing
+/// run stays silent for free.
+fn install_retry_diagnostics() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_test_writer()
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                // Let every *span* register regardless of target -- this is
+                // a per-layer filter, and it gates span lifecycle
+                // callbacks (`on_new_span`/`on_enter`) the same way it
+                // gates events. Filtering spans by target here would mean
+                // this layer never learns the `race_task` span's
+                // `side`/`trial` fields (its target is the test crate, not
+                // `toolkit_db`), so an event's line would print with no
+                // context at all. Only *events* are filtered by target.
+                meta.is_span() || meta.target().starts_with("toolkit_db")
+            }));
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+        // Best-effort: a diagnostic aid must never be able to affect the
+        // test's outcome, so if a global default is somehow already
+        // installed, skip silently rather than panicking.
+        tracing::subscriber::set_global_default(subscriber).ok();
+    });
+}
+
+/// Spawns one side of the membership race, `.instrument()`-wrapped with a
+/// `race_task` span tagging `side`/`trial`.
+///
+/// Without this, a spawned task's `toolkit_db` retry events would carry no
+/// span context at all under a multi-thread runtime: `tracing`'s "current
+/// span" tracking is per-thread, and a plain (non-instrumented)
+/// `tokio::spawn`ed future may run on a worker thread that never entered
+/// any span (verified empirically). `.instrument` fixes this by re-entering
+/// the given span on every poll, regardless of which thread does the
+/// polling.
+fn spawn_race_task<F>(
+    side: &'static str,
+    trial: usize,
+    fut: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(fut.instrument(tracing::info_span!("race_task", side, trial)))
+}
 
 /// Two concurrent `add_membership` calls for the same resource in different
 /// tenants: exactly one must succeed, the loser getting a clean
 /// `TenantIncompatibility`, not a raw serialization failure (RG-01).
+///
+/// # Diagnosability
+///
+/// This is the scenario that once flaked with a raw serialization error
+/// escaping instead of being absorbed by `transaction_with_retry` (see
+/// `retry_backoff_delay`'s doc comment in `toolkit-db`'s `secure::db` for
+/// the diagnosis and the backoff fix). It didn't reproduce under extensive
+/// local testing, so if it flakes again, the goal is for the failure itself
+/// to answer "what happened" instead of leaving another guessing exercise.
+/// [`install_retry_diagnostics`] makes `toolkit_db`'s retry-lifecycle events
+/// visible; each spawned task's future below is wrapped in
+/// `.instrument(info_span!("race_task", side, trial))` so those events are
+/// tagged with which side and which of the `TRIALS` iterations they belong
+/// to -- without that, `tracing`'s per-thread "current span" tracking would
+/// not attribute a spawned task's events to any span at all (verified
+/// empirically).
 async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider<DbError>>) {
     // Repeated trials: the invariant must hold under real concurrent load,
     // not just one sample.
     const TRIALS: usize = 8;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    install_retry_diagnostics();
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let member_type = common::create_root_type(&type_svc, "pgmbrres").await;
@@ -406,7 +527,7 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
             Uuid::now_v7().as_simple()
         );
         type_svc
-            .create_type(resource_group_sdk::CreateTypeRequest {
+            .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
                 code,
                 can_be_root: true,
                 allowed_parent_types: vec![],
@@ -421,7 +542,7 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
     let mut correctly_rejected = 0usize; // one Ok + one Err(TenantIncompatibility)
     let mut unexpected = 0usize;
 
-    for _ in 0..TRIALS {
+    for trial in 0..TRIALS {
         let tenant_a = Uuid::now_v7();
         let tenant_b = Uuid::now_v7();
         let ctx_a = common::make_ctx(tenant_a);
@@ -444,11 +565,11 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
         let (rt1, rt2) = (member_type.code.clone(), member_type.code.clone());
         let (rid1, rid2) = (resource_id.clone(), resource_id.clone());
 
-        let t1 = tokio::spawn(async move {
+        let t1 = spawn_race_task("tenant_a", trial, async move {
             b1.wait().await;
             svc1.add_membership(&ctx_a, group_a.id, &rt1, &rid1).await
         });
-        let t2 = tokio::spawn(async move {
+        let t2 = spawn_race_task("tenant_b", trial, async move {
             b2.wait().await;
             svc2.add_membership(&ctx_b, group_b.id, &rt2, &rid2).await
         });
@@ -524,7 +645,7 @@ async fn membership_first_write_race_exactly_one_tenant_wins(db: &Arc<DBProvider
 /// error; FK `ON DELETE RESTRICT` backstops actual corruption regardless (RG-02).
 async fn delete_type_races_create_group_resolves_cleanly(db: &Arc<DBProvider<DbError>>) {
     const TRIALS: usize = 15;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let tenant_id = Uuid::now_v7();
 
     let mut corruption = 0usize; // both succeeded -- would be a real invariant violation
@@ -539,13 +660,13 @@ async fn delete_type_races_create_group_resolves_cleanly(db: &Arc<DBProvider<DbE
         // Fresh instances per task -- see the comment in
         // membership_first_write_race_exactly_one_tenant_wins about why
         // these services can't just be `.clone()`d.
-        let type_svc1 = TypeService::new(db.clone(), Arc::new(TypeRepository));
+        let type_svc1 = common::make_type_service(db.clone());
         let group_svc1 = common::make_group_service(db.clone());
         let (code1, code2) = (t.code.clone(), t.code.clone());
 
         let delete_task = tokio::spawn(async move {
             b1.wait().await;
-            type_svc1.delete_type(&code1).await
+            type_svc1.delete_type_unscoped(&code1).await
         });
         let create_task = tokio::spawn(async move {
             b2.wait().await;
@@ -556,6 +677,7 @@ async fn delete_type_races_create_group_resolves_cleanly(db: &Arc<DBProvider<DbE
                         code: code2,
                         name: "race".to_owned(),
                         parent_id: None,
+                        tenant_id: None,
                         metadata: None,
                     },
                     tenant_id,
@@ -630,8 +752,8 @@ async fn create_type_conflict_retried_yields_clean_already_exists_for_loser(
     );
     let barrier = Arc::new(Barrier::new(2));
     let (b1, b2) = (Arc::clone(&barrier), Arc::clone(&barrier));
-    let svc1 = TypeService::new(db.clone(), Arc::new(TypeRepository));
-    let svc2 = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let svc1 = common::make_type_service(db.clone());
+    let svc2 = common::make_type_service(db.clone());
     let (code1, code2) = (code.clone(), code.clone());
 
     let req = |code: String| resource_group_sdk::CreateTypeRequest {
@@ -644,11 +766,11 @@ async fn create_type_conflict_retried_yields_clean_already_exists_for_loser(
 
     let t1 = tokio::spawn(async move {
         b1.wait().await;
-        svc1.create_type(req(code1)).await
+        svc1.create_type_unscoped(req(code1)).await
     });
     let t2 = tokio::spawn(async move {
         b2.wait().await;
-        svc2.create_type(req(code2)).await
+        svc2.create_type_unscoped(req(code2)).await
     });
 
     let (r1, r2) = timed("create_type_conflict race", async { tokio::join!(t1, t2) }).await;
@@ -675,6 +797,129 @@ async fn create_type_conflict_retried_yields_clean_already_exists_for_loser(
     assert_hierarchy_invariants(db).await;
 }
 
+// rg-db-audit-transactions.md fix #1: real-Postgres coverage for
+// `TypeRepository::insert`'s unique-key classification path.
+
+/// `TypeRepository::insert` with a `schema_id` that collides with an
+/// already-inserted type's unique key must surface as a clean
+/// `DomainError::TypeAlreadyExists`, not a raw `Database`/500.
+///
+/// Deliberately sequential, not a race, and calls the repository directly
+/// rather than `TypeService::create_type_unscoped`: the point is not SSI
+/// contention (`create_type_conflict_retried_yields_clean_already_exists_for_loser`
+/// above already covers that) but exercising the actual SQLSTATE `23505`
+/// path of `toolkit_db::secure::is_unique_violation` against a real Postgres
+/// driver, on the exact call (`type_repo::insert`) that used to fall
+/// straight through to a raw `DomainError::Database` before this fix.
+/// Going through the service's `create_type_unscoped` would only exercise
+/// `create_type_in_tx`'s `resolve_id` pre-check, which already intercepts a
+/// same-process duplicate before `insert` is ever called a second time --
+/// see `type_repo_insert_duplicate_schema_id_returns_type_already_exists` in
+/// `type_service_test.rs` for the SQLite side of this same direct-repo test.
+async fn type_repo_insert_duplicate_on_postgres_yields_clean_already_exists(
+    db: &Arc<DBProvider<DbError>>,
+) {
+    let conn = db.conn().expect("db conn");
+    let code = format!(
+        "{}x.test.pgtyperepoins.i{}.v1~",
+        toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
+        Uuid::now_v7().as_simple()
+    );
+
+    TypeRepository
+        .insert(&conn, &code, None)
+        .await
+        .expect("first insert should succeed on Postgres");
+
+    let err = TypeRepository
+        .insert(&conn, &code, None)
+        .await
+        .expect_err("second insert with the same schema_id must be rejected on Postgres");
+
+    eprintln!("type_repo_insert_duplicate_on_postgres: error = {err}");
+    assert!(
+        matches!(err, DomainError::TypeAlreadyExists { code: ref c } if c == &code),
+        "the colliding insert must get a clean TypeAlreadyExists (proving the SQLSTATE \
+         23505 branch of is_unique_violation is reached on real Postgres), got: {err:?}"
+    );
+}
+
+// VHP-2345: real-Postgres coverage for the `resource_group.id` unique-key
+// classification path.
+
+/// `create_group` with an explicit `id` that collides with an already-inserted
+/// group's primary key must surface as a clean `DomainError::GroupAlreadyExists`,
+/// not a raw `Database`/500.
+///
+/// This is deliberately sequential, not a race: the point is not SSI
+/// contention (covered by the scenarios above) but exercising the actual
+/// SQLSTATE `23505` path of `ScopeError::is_unique_violation` /
+/// `toolkit_db::secure::is_unique_violation` against a real Postgres driver.
+/// SQLite's error text takes the string-fallback branch of the same
+/// classifier instead (see `domain_unit_test.rs` /
+/// `group_service_test.rs::group_create_duplicate_id_returns_typed_conflict`
+/// for that side); running this scenario here is the only way to prove the
+/// SQLSTATE-based fast path also lands on the same typed variant.
+async fn create_group_duplicate_id_on_postgres_yields_clean_already_exists(
+    db: &Arc<DBProvider<DbError>>,
+) {
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+
+    let root_type = common::create_root_type(&type_svc, "pgiddup").await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let dup_id = Uuid::now_v7();
+
+    let first = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: Some(dup_id),
+                code: root_type.code.clone(),
+                name: "First".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("first create with explicit id should succeed on Postgres");
+    assert_eq!(first.id, dup_id);
+
+    let err = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: Some(dup_id),
+                code: root_type.code,
+                name: "Second".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect_err("second create with the same id must be rejected on Postgres");
+
+    eprintln!("create_group_duplicate_id_on_postgres: error = {err}");
+    assert!(
+        matches!(err, DomainError::GroupAlreadyExists { id } if id == dup_id),
+        "the colliding create must get a clean GroupAlreadyExists (proving the \
+         SQLSTATE 23505 branch of is_unique_violation is reached on real Postgres), \
+         got: {err:?}"
+    );
+
+    assert_hierarchy_invariants(db).await;
+
+    group_svc
+        .delete_group(&ctx, dup_id, false)
+        .await
+        .expect("cleanup: delete the surviving group");
+}
+
 // Negative controls: SSI + retry works for hierarchy mutations
 
 fn unique_tenant_type_code() -> String {
@@ -689,11 +934,11 @@ fn unique_tenant_type_code() -> String {
 /// a clean `TenantRootAlreadyExists` -- proves `transaction_with_retry` +
 /// SERIALIZABLE protects the invariant under a real SSI conflict.
 async fn negative_control_tenant_root_race_exactly_one_succeeds(db: &Arc<DBProvider<DbError>>) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let tenant_type = type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: unique_tenant_type_code(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -723,6 +968,7 @@ async fn negative_control_tenant_root_race_exactly_one_succeeds(db: &Arc<DBProvi
                 code: code1,
                 name: "Tenant A".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_a,
@@ -738,6 +984,7 @@ async fn negative_control_tenant_root_race_exactly_one_succeeds(db: &Arc<DBProvi
                 code: code2,
                 name: "Tenant B".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_b,
@@ -809,7 +1056,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
         )
     }
 
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = width_limited_group_service(db.clone());
 
     let t = {
@@ -822,7 +1069,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
             Uuid::now_v7().as_simple()
         );
         type_svc
-            .create_type(resource_group_sdk::CreateTypeRequest {
+            .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
                 code,
                 can_be_root: true,
                 allowed_parent_types: vec![],
@@ -833,7 +1080,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
             .expect("create type (initial)")
     };
     let t = type_svc
-        .update_type(
+        .update_type_unscoped(
             &t.code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -865,6 +1112,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
                 code: code1,
                 name: "child-1".to_owned(),
                 parent_id: Some(root.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -880,6 +1128,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
                 code: code2,
                 name: "child-2".to_owned(),
                 parent_id: Some(root.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -917,9 +1166,197 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
         .expect("cleanup: force delete root + surviving child");
 }
 
-/// Runs the five scenarios above against one shared PostgreSQL database. The
-/// only grouped test touching the global `TENANT_RG_TYPE_PATH` invariant, so
-/// it runs safely concurrent with [`hierarchy_move_races`].
+// rg-db-audit-transactions.md fix #2: update_group's rename-only path
+// (no parent_id change) now opens its transaction at TxConfig::default()
+// instead of always paying for SERIALIZABLE.
+
+/// Two concurrent renames of the *same* group, no parent change on either
+/// side: both must succeed (a plain `UPDATE ... WHERE id = ?` on a single
+/// row has no predicate for a concurrent writer to invalidate -- see
+/// `update_group`'s isolation comment), the DB ends up with exactly one of
+/// the two names, and the hierarchy invariants stay intact.
+async fn concurrent_rename_same_group_both_succeed(db: &Arc<DBProvider<DbError>>) {
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = common::create_root_type(&type_svc, "pgrenrace").await;
+    let group = common::create_root_group(&group_svc, &ctx, &t.code, "Original", tenant_id).await;
+
+    let barrier = Arc::new(Barrier::new(2));
+    let (b1, b2) = (Arc::clone(&barrier), Arc::clone(&barrier));
+    // Fresh instances per task -- see the comment in
+    // membership_first_write_race_exactly_one_tenant_wins about why these
+    // services can't just be `.clone()`d.
+    let (svc1, svc2) = (
+        common::make_group_service(db.clone()),
+        common::make_group_service(db.clone()),
+    );
+    let (ctx1, ctx2) = (ctx.clone(), ctx.clone());
+    let group_id = group.id;
+
+    let t1 = tokio::spawn(async move {
+        b1.wait().await;
+        svc1.update_group(
+            &ctx1,
+            group_id,
+            resource_group_sdk::UpdateGroupRequest {
+                name: "RenamedByA".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+        )
+        .await
+    });
+    let t2 = tokio::spawn(async move {
+        b2.wait().await;
+        svc2.update_group(
+            &ctx2,
+            group_id,
+            resource_group_sdk::UpdateGroupRequest {
+                name: "RenamedByB".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+        )
+        .await
+    });
+
+    let (r1, r2) = timed("concurrent_rename_same_group trial", async {
+        tokio::join!(t1, t2)
+    })
+    .await;
+    let r1 = r1.expect("task 1 join");
+    let r2 = r2.expect("task 2 join");
+
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "both concurrent renames of the same group must succeed under the default \
+         (non-SERIALIZABLE) isolation -- a plain single-row UPDATE has nothing for either \
+         side to abort on: r1={r1:?} r2={r2:?}"
+    );
+
+    let final_group = group_svc
+        .get_group_unscoped(group_id)
+        .await
+        .expect("read back the group after both renames");
+    assert!(
+        final_group.name == "RenamedByA" || final_group.name == "RenamedByB",
+        "final name must be exactly one of the two concurrent renames (last-committed-wins), \
+         got: {:?}",
+        final_group.name
+    );
+
+    assert_hierarchy_invariants(db).await;
+
+    group_svc
+        .delete_group(&ctx, group_id, false)
+        .await
+        .expect("cleanup: delete the leaf group");
+}
+
+// rg-db-audit-transactions.md fix #3: remove_membership now opens its
+// transaction at TxConfig::default() instead of SERIALIZABLE ("for
+// symmetry" per ab073c7a, not a correctness requirement -- a delete by
+// exact composite primary key has no write-skew hazard).
+
+/// Two concurrent removes of the *same* membership row: neither may surface
+/// a raw/uncleared error. Both `Ok` (idempotent double-remove: PostgreSQL's
+/// READ COMMITTED "second updater ignores a row the first deleted" rule, see
+/// the PostgreSQL docs on concurrency control) and one `Ok` plus one clean
+/// `MembershipNotFound` (the loser's own composite-key existence check ran
+/// after the winner's commit) are acceptable outcomes of downgrading this
+/// transaction's isolation -- what must never happen is both failing, or
+/// either side surfacing a raw `DomainError::Database`.
+async fn concurrent_remove_same_membership_resolves_cleanly(db: &Arc<DBProvider<DbError>>) {
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+
+    let member_type = common::create_root_type(&type_svc, "pgmbrrmrace").await;
+    let grp_type = {
+        let code = format!(
+            "{}x.test.pgmbrrmgrp.i{}.v1~",
+            toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
+            Uuid::now_v7().as_simple()
+        );
+        type_svc
+            .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+                code,
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![member_type.code.clone()],
+                metadata_schema: None,
+            })
+            .await
+            .expect("create membership-holding type")
+    };
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G", tenant_id).await;
+
+    let resource_id = format!("pgrmrace-{}", Uuid::now_v7().as_simple());
+    let setup_svc = common::make_membership_service(db.clone());
+    setup_svc
+        .add_membership(&ctx, group.id, &member_type.code, &resource_id)
+        .await
+        .expect("add membership to be raced on removal");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let (b1, b2) = (Arc::clone(&barrier), Arc::clone(&barrier));
+    let (svc1, svc2) = (
+        common::make_membership_service(db.clone()),
+        common::make_membership_service(db.clone()),
+    );
+    let (ctx1, ctx2) = (ctx.clone(), ctx.clone());
+    let (rt1, rt2) = (member_type.code.clone(), member_type.code.clone());
+    let (rid1, rid2) = (resource_id.clone(), resource_id.clone());
+    let group_id = group.id;
+
+    let t1 = tokio::spawn(async move {
+        b1.wait().await;
+        svc1.remove_membership(&ctx1, group_id, &rt1, &rid1).await
+    });
+    let t2 = tokio::spawn(async move {
+        b2.wait().await;
+        svc2.remove_membership(&ctx2, group_id, &rt2, &rid2).await
+    });
+
+    let (r1, r2) = timed("concurrent_remove_same_membership trial", async {
+        tokio::join!(t1, t2)
+    })
+    .await;
+    let r1 = r1.expect("task 1 join");
+    let r2 = r2.expect("task 2 join");
+
+    // At least one side must have actually succeeded (both failing would
+    // mean the membership never got removed at all).
+    assert!(
+        ok_or_clean_membership_not_found(&r1)
+            && ok_or_clean_membership_not_found(&r2)
+            && (r1.is_ok() || r2.is_ok()),
+        "concurrent double-remove of the same membership must resolve to either both Ok \
+         (idempotent double-delete) or one Ok plus one clean MembershipNotFound, got: \
+         r1={} r2={}",
+        describe_result(&r1),
+        describe_result(&r2)
+    );
+
+    // Data invariant: the membership is gone either way, exactly once.
+    let remaining = distinct_tenant_ids_for_resource(db, &member_type.code, &resource_id).await;
+    assert!(
+        remaining.is_empty(),
+        "membership must be gone after the race regardless of which side \"won\": still \
+         linked from tenant(s) {remaining:?}"
+    );
+
+    assert_hierarchy_invariants(db).await;
+}
+
+/// Runs the eight scenarios above against one shared PostgreSQL database.
+/// The only grouped test touching the global `TENANT_RG_TYPE_PATH`
+/// invariant, so it runs safely concurrent with [`hierarchy_move_races`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn membership_and_type_races() {
     let pg = pg_fixture_or_skip!();
@@ -939,6 +1376,16 @@ async fn membership_and_type_races() {
     create_type_conflict_retried_yields_clean_already_exists_for_loser(&db).await;
 
     eprintln!(
+        "=== membership_and_type_races: type_repo_insert_duplicate_on_postgres_yields_clean_already_exists ==="
+    );
+    type_repo_insert_duplicate_on_postgres_yields_clean_already_exists(&db).await;
+
+    eprintln!(
+        "=== membership_and_type_races: create_group_duplicate_id_on_postgres_yields_clean_already_exists ==="
+    );
+    create_group_duplicate_id_on_postgres_yields_clean_already_exists(&db).await;
+
+    eprintln!(
         "=== membership_and_type_races: negative_control_tenant_root_race_exactly_one_succeeds ==="
     );
     negative_control_tenant_root_race_exactly_one_succeeds(&db).await;
@@ -947,6 +1394,14 @@ async fn membership_and_type_races() {
         "=== membership_and_type_races: negative_control_width_limited_race_exactly_one_succeeds ==="
     );
     negative_control_width_limited_race_exactly_one_succeeds(&db).await;
+
+    eprintln!("=== membership_and_type_races: concurrent_rename_same_group_both_succeed ===");
+    concurrent_rename_same_group_both_succeed(&db).await;
+
+    eprintln!(
+        "=== membership_and_type_races: concurrent_remove_same_membership_resolves_cleanly ==="
+    );
+    concurrent_remove_same_membership_resolves_cleanly(&db).await;
 }
 
 // Move-scenario races: none of the five scenarios above races two hierarchy
@@ -962,7 +1417,7 @@ async fn self_referencing_root_type(
 ) -> resource_group_sdk::ResourceGroupType {
     let t = common::create_root_type(type_svc, suffix).await;
     type_svc
-        .update_type(
+        .update_type_unscoped(
             &t.code,
             resource_group_sdk::UpdateTypeRequest {
                 can_be_root: true,
@@ -979,7 +1434,7 @@ async fn self_referencing_root_type(
 /// reads exactly the row the other rebuild writes, textbook write-skew. The
 /// retried loser must report `CycleDetected`, never an actual cycle.
 async fn move_a_to_b_races_move_b_to_a(db: &Arc<DBProvider<DbError>>) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let t = self_referencing_root_type(&type_svc, "pgmoveaabba").await;
 
@@ -1051,7 +1506,7 @@ async fn move_a_to_b_races_move_b_to_a(db: &Arc<DBProvider<DbError>>) {
 /// same instant, both touching overlapping closure rows for `L`. The moves
 /// are independent, so both must succeed once retry absorbs any conflict.
 async fn move_ancestor_races_move_descendant(db: &Arc<DBProvider<DbError>>) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let t = self_referencing_root_type(&type_svc, "pgmoveanc").await;
 
@@ -1125,7 +1580,7 @@ async fn move_ancestor_races_move_descendant(db: &Arc<DBProvider<DbError>>) {
 /// to `Q`, so `insert_ancestor_closure_rows` and `rebuild_subtree_closure`
 /// touch the same ancestor chain; `C` must end up with `P`'s final chain.
 async fn create_child_races_move_parent(db: &Arc<DBProvider<DbError>>) {
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let t = self_referencing_root_type(&type_svc, "pgcreatemove").await;
 
@@ -1151,6 +1606,7 @@ async fn create_child_races_move_parent(db: &Arc<DBProvider<DbError>>) {
                 code: code1,
                 name: "C".to_owned(),
                 parent_id: Some(p_id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1205,7 +1661,7 @@ async fn create_child_races_move_parent(db: &Arc<DBProvider<DbError>>) {
 /// resolves the race cleanly (`GroupNotFound`, or child cascaded too).
 async fn force_delete_races_create_child(db: &Arc<DBProvider<DbError>>) {
     const TRIALS: usize = 10;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let t = self_referencing_root_type(&type_svc, "pgfdelcreate").await;
     let tenant_id = Uuid::now_v7();
@@ -1241,6 +1697,7 @@ async fn force_delete_races_create_child(db: &Arc<DBProvider<DbError>>) {
                         code: code1,
                         name: "C".to_owned(),
                         parent_id: Some(g_id),
+                        tenant_id: None,
                         metadata: None,
                     },
                     tenant_id,
@@ -1304,14 +1761,14 @@ async fn force_delete_races_create_child(db: &Arc<DBProvider<DbError>>) {
 /// caller concurrently tries to `add_membership` to it.
 async fn force_delete_races_add_membership(db: &Arc<DBProvider<DbError>>) {
     const TRIALS: usize = 10;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
     let member_type = common::create_root_type(&type_svc, "pgfdelmbrres").await;
     let grp_type = type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: format!(
                 "{}x.test.pgfdelmbrgrp.i{}.v1~",
                 toolkit_gts::gts_id!("cf.core.rg.type.v1~"),

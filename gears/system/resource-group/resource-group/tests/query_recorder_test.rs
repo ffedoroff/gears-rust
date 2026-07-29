@@ -12,16 +12,12 @@
 
 mod common;
 
-use std::sync::Arc;
-
-use resource_group::domain::type_service::TypeService;
-use resource_group::infra::storage::type_repo::TypeRepository;
 use uuid::Uuid;
 
 #[tokio::test]
 async fn recorder_observes_statements_and_tags_tx_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = TypeService::new(db, Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db);
 
     // A plain read: TypeService::get_type runs on `self.db.conn()?` --
     // outside any transaction.
@@ -30,7 +26,7 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
         Uuid::now_v7().as_simple()
     );
     // NotFound is fine -- we only care that a SELECT ran.
-    type_svc.get_type(&code).await.ok();
+    type_svc.get_type_unscoped(&code).await.ok();
 
     let after_read = rec.total();
     assert!(
@@ -46,7 +42,7 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
     // A write wrapped in `db.transaction_with_retry(...)`: create_type's
     // INSERT statements must be tagged in_tx = true.
     let created = type_svc
-        .create_type(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
             code: code.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],

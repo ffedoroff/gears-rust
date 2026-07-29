@@ -32,6 +32,22 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<rg_entity::Model>, DomainError>;
 
+    /// Find the raw entity model by ID, filtered to `scope`.
+    ///
+    /// Same raw (no type-path resolution) read as `find_model_by_id`, but
+    /// tenant-scoped like `find_by_id` -- lets a caller that needs both an
+    /// `AccessScope` gate ("does this group exist and is it visible to the
+    /// caller's tenant?") and the raw model do both in one query instead of
+    /// `find_by_id` (which pays for an unconditional `resolve_type_path`
+    /// the gate never needed) followed by a second, separate
+    /// `find_model_by_id` (VHP-2341 audit finding (a): redundant-io).
+    async fn find_model_by_id_scoped<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError>;
+
     /// Return the id of *any* existing root group (`parent_id` IS NULL) whose
     /// `gts_type.schema_id` starts with the given prefix, or `None` when no
     /// such root exists. Used to enforce tenant-root uniqueness
@@ -279,12 +295,32 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
         type_id: i16,
     ) -> Result<u64, DomainError>;
 
-    async fn find_groups_using_parent_type<C: DBRunner>(
+    /// Batch replacement for a removed-allowed-parent-types sweep: resolves
+    /// every candidate parent-type path to its surrogate id and finds every
+    /// group of `child_type_id` whose direct parent is of one of those
+    /// types, in a small constant number of queries regardless of how many
+    /// paths are checked (was one `resolve_id` + one single-parent
+    /// violation lookup per candidate -- slope 2.0, N+1 audit finding (b)
+    /// -- see `check_hierarchy_safety`).
+    ///
+    /// A `parent_code` that doesn't currently resolve to any `gts_type` row
+    /// is silently skipped (mirrors the pre-batch code's per-item `if let
+    /// Some(parent_id) = ...` guard) -- reachable when the parent type was
+    /// deleted out from under a still-referencing junction row (junction
+    /// FKs declare `ON DELETE CASCADE`, but that cascade only fires when
+    /// the connection actually enforces FK constraints; the test suite's
+    /// `SQLite` connections don't turn that pragma on, see
+    /// `type_update_hierarchy_check_skips_deleted_parent`). A type that no
+    /// longer exists has no groups referencing it, so there's nothing to
+    /// check either way. Returns `(parent_code, group_id, group_name)`
+    /// triples so callers can attribute each violation back to the specific
+    /// removed-parent path that caused it.
+    async fn find_groups_violating_removed_parents<C: DBRunner>(
         &self,
         db: &C,
         child_type_id: i16,
-        parent_type_id: i16,
-    ) -> Result<Vec<(Uuid, String)>, DomainError>;
+        parent_codes: &[String],
+    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
 
     async fn find_root_groups_of_type<C: DBRunner>(
         &self,
@@ -307,9 +343,18 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
 
 #[async_trait]
 pub trait MembershipRepositoryTrait: Send + Sync + 'static {
+    /// List memberships, filtered to `scope`.
+    ///
+    /// `resource_group_membership` declares `#[secure(no_tenant, no_resource,
+    /// no_owner, no_type)]` (VHP-2341) -- `scope` cannot be applied directly
+    /// to it via `.scope_with()` (every constrained scope would resolve to
+    /// deny-all). Implementations must filter via the owning
+    /// `resource_group` row instead. Pass `AccessScope::allow_all()` for the
+    /// unscoped/system read path (see `MembershipService::list_memberships_unscoped`).
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError>;
 
