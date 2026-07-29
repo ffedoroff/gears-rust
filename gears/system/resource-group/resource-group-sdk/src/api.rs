@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-sdk-traits:p1
 //! SDK trait contracts for the resource-group gear.
 
 use async_trait::async_trait;
@@ -181,7 +180,6 @@ pub trait ResourceGroupClient: Send + Sync {
     ) -> Result<Page<ResourceGroupMembership>, CanonicalError>;
 }
 
-// @cpt-dod:cpt-cf-resource-group-dod-integration-auth-read-service:p1
 /// Narrow read-only trait for group data, used by in-process plugin consumers
 /// (`AuthZ` resolver plugin, tenant-resolver RG plugin, and an in-process
 /// `AuthZ` PDP).

@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-begin:cpt-cf-resource-group-dod-sdk-foundation-sdk-models:p1:inst-validation-full
 //! Shared domain validation utilities.
 
 use crate::domain::error::DomainError;
@@ -16,32 +15,22 @@ pub const RG_TYPE_PREFIX: &str = gts_id!("cf.core.rg.type.v1~");
 /// # Errors
 ///
 /// Returns [`DomainError`] if the code is empty, missing the required prefix, or exceeds 1024 chars.
-// @cpt-algo:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1
-// @cpt-algo:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1
 pub fn validate_type_code(code: &str) -> Result<(), DomainError> {
     let code = code.trim().to_lowercase();
     let code = code.as_str();
-    // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-1
     if code.is_empty() {
         return Err(DomainError::validation("Type code must not be empty"));
     }
-    // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-1
-    // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2
     if !code.starts_with(RG_TYPE_PREFIX) {
-        // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2a
         return Err(DomainError::validation(format!(
             "Type code must start with prefix '{RG_TYPE_PREFIX}', got: '{code}'"
         )));
-        // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2a
     }
-    // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2
-    // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-3
     if code.chars().count() > 1024 {
         return Err(DomainError::validation(
             "Type code must not exceed 1024 characters",
         ));
     }
-    // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-3
     Ok(())
 }
 
@@ -84,14 +73,12 @@ pub fn validate_membership_type_code(code: &str) -> Result<(), DomainError> {
 /// # Errors
 ///
 /// Returns [`DomainError`] if the value is not a valid JSON Schema.
-// @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
 pub fn validate_metadata_schema(schema: &serde_json::Value) -> Result<(), DomainError> {
     jsonschema::validator_for(schema).map_err(|e| {
         DomainError::validation(format!("metadata_schema is not a valid JSON Schema: {e}"))
     })?;
     Ok(())
 }
-// @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-7
 
 /// Validate a metadata JSON value against a raw JSON Schema.
 ///
@@ -192,4 +179,3 @@ pub async fn validate_metadata_via_gts(
     }
     Ok(())
 }
-// @cpt-end:cpt-cf-resource-group-dod-sdk-foundation-sdk-models:p1:inst-validation-full

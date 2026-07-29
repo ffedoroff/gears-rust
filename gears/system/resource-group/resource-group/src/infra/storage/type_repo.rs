@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-service-crud:p1
 //! Persistence layer for GTS type management.
 //!
 //! All surrogate SMALLINT ID resolution happens here. The domain and API layers

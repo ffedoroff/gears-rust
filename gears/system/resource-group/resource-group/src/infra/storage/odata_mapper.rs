@@ -1,6 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-29 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-rest-odata:p1
 //! Infrastructure layer mapping from type-safe `FilterNode` to `SeaORM` Conditions.
 //!
 //! This gear maps from DTO-level filter fields to `SeaORM` Column types.

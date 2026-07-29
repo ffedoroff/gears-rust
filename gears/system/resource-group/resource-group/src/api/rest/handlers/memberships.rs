@@ -1,7 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-begin:cpt-cf-resource-group-dod-membership-rest-handlers:p1:inst-full
-// @cpt-dod:cpt-cf-resource-group-dod-membership-rest-handlers:p1
 
 use std::sync::Arc;
 
@@ -51,7 +49,6 @@ pub async fn list_memberships(
         request_id = Empty,
     )
 )]
-// @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-1
 pub async fn add_membership(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteMembershipService>>,
@@ -74,7 +71,6 @@ pub async fn add_membership(
 
     Ok((StatusCode::CREATED, Json(dto)).into_response())
 }
-// @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-1
 
 /// Remove a membership link.
 #[tracing::instrument(
@@ -104,4 +100,3 @@ pub async fn remove_membership(
     .await?;
     Ok(no_content().into_response())
 }
-// @cpt-end:cpt-cf-resource-group-dod-membership-rest-handlers:p1:inst-full

@@ -1,6 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-rest-odata:p1
 //! REST API route definitions using `OperationBuilder`.
 
 use crate::api::rest::{dto, handlers};

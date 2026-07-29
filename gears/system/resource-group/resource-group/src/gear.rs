@@ -1,6 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-e2e-test-suite:p1
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -29,7 +28,6 @@ pub type ConcreteMembershipService =
     MembershipService<GroupRepository, TypeRepository, MembershipRepository>;
 pub type ConcreteRgService = RgService<GroupRepository, TypeRepository, MembershipRepository>;
 
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-gear-scaffold:p1
 /// Main gear struct for the resource-group gear.
 #[toolkit::gear(
     name = "resource-group",

@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-e2e-test-suite:p1
 #![allow(dead_code, clippy::expect_used, clippy::doc_markdown)]
 //! Shared test helpers for resource-group integration tests.
 //!

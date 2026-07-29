@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-sdk-errors:p1
 //! Resource Group SDK error surface — typed projection of
 //! [`CanonicalError`].
 //!

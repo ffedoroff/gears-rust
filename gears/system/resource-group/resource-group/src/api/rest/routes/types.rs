@@ -1,6 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-rest-handlers:p1
 use super::{dto, handlers};
 use axum::Router;
 use resource_group_sdk::odata::TypeFilterField;

@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-rest-odata:p1
 //! `OData` filter field definitions for group hierarchy queries.
 //!
 //! Hierarchy `$filter` fields: `hierarchy/depth` (eq, ne, gt, ge, lt, le),

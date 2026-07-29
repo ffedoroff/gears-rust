@@ -1,6 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-testing-rest-api:p1
-// @cpt-dod:cpt-cf-resource-group-dod-testing-integration-auth:p1
 #![allow(clippy::expect_used)]
 //! Integration tests: `PolicyEnforcer` + mock `AuthZ` plugin for resource-group.
 //!

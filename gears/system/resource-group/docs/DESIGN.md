@@ -1618,3 +1618,28 @@ Test pattern: seed hierarchy (e.g. `A → B → C → D`, `E → F`), spawn N co
 - **PRD**: [PRD.md](./PRD.md)
 - **Auth Architecture Context**: [docs/arch/authorization/DESIGN.md](../../../../docs/arch/authorization/DESIGN.md)
 - **RG Model Context**: [docs/arch/authorization/RESOURCE_GROUP_MODEL.md](../../../../docs/arch/authorization/RESOURCE_GROUP_MODEL.md)
+
+### 5.1 Removal of `@cpt-*` code markers (2026-07-29)
+
+The `@cpt-begin` / `@cpt-end` / `@cpt-dod` / `@cpt-flow` / `@cpt-algo` traceability
+markers were removed from this gear's code (`resource-group/src`,
+`resource-group/tests`, `resource-group-sdk/src` — 611 markers total) in a
+deliberate, owner-approved cleanup. This brings resource-group in line with
+the majority of platform gears (12 of 18), which already carry no code-level
+`@cpt-*` markers.
+
+**Reason**: the markers were never mechanically checked against the code they
+claimed to trace — only their presence was checked, not their accuracy. That
+produced false confirmations: 32 `@cpt-begin`/`@cpt-end` pairs wrapped nothing
+but explanatory comments (no executable code), and three spec steps were
+marked as implemented while the corresponding code was missing. Presence of a
+marker was therefore not evidence that the traced requirement was met.
+
+**Consequence**: `cf-studio` (see `.cf-studio/config/artifacts.toml`) scans
+code for `@cpt-*` markers to consider a spec's `to_code` CDSL instructions
+satisfied. With the markers gone, every `to_code` instruction in this gear's
+specs (`PRD.md`, this `DESIGN.md`, `docs/features/*.md`) will now show as
+unsatisfied. **This is expected and intentional** — the specs themselves were
+not changed as part of this cleanup (that is a separate decision), and the
+markers should not be re-added to "fix" the resulting gap without a fresh,
+explicit decision to reinstate code-level traceability for this gear.

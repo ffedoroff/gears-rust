@@ -1,6 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-gear-scaffold:p1
 use crate::api::rest::dto::{
     CreateGroupDto, CreateTypeDto, GroupDto, GroupWithDepthDto, MembershipDto, TypeDto,
     UpdateGroupDto, UpdateTypeDto,

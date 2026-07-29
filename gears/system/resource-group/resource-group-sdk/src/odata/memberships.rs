@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-rest-odata:p1
 //! `OData` filter field definitions for membership entities.
 //!
 //! Membership list `$filter` fields: `group_id` (eq, ne, in), `resource_type` (eq, ne, in),

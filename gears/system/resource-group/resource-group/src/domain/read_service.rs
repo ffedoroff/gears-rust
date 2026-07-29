@@ -1,17 +1,11 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-begin:cpt-cf-resource-group-dod-integration-auth-read-service:p1:inst-full
 //! Integration read service for external consumers (e.g., `AuthZ` plugin).
 //!
 //! Provides a thin adapter over `GroupService` implementing the SDK
 //! `ResourceGroupReadHierarchy` trait.
 
-// @cpt-dod:cpt-cf-resource-group-dod-integration-auth-read-service:p1
-// @cpt-flow:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1
-// @cpt-flow:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1
-// @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-1
 // Integration read request arrives via ResourceGroupReadHierarchy trait
-// @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-1
 
 use std::sync::Arc;
 
@@ -60,31 +54,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     }
 }
 
-// @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-2
-// @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-1
 // RG Gear resolves configured provider from gear config; AuthZ plugin
 // resolves `dyn ResourceGroupReadHierarchy` from `ClientHub` (registered in
 // `gear.rs::init`). The provider trait registered here is the routing point.
-// @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-1
-// @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-2
-// @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3
 // IF built-in provider configured (this is the built-in implementation)
-// @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3
-// @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-4
 // IF vendor-specific provider configured — currently no vendor provider is
 // wired in this monolith; vendor selection would replace the registered
 // `dyn ResourceGroupReadHierarchy` implementation at gear init. The
 // fallthrough is the built-in `RgReadService` below.
-// @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-4a
 // Resolve plugin instance by configured vendor via types-registry (scoped by
 // GTS instance ID) — performed at gear init when vendor config is present.
-// @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-4a
-// @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-4b
 // Delegate to ResourceGroupReadPluginClient with SecurityContext passthrough —
 // the SecurityContext threaded into trait methods (`_ctx` below) is the
 // passthrough vehicle when a vendor implementation is plugged in.
-// @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-4b
-// @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-4
 #[async_trait]
 impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
     ResourceGroupReadHierarchy for RgReadService<GR, TR, MR>
@@ -95,12 +77,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3a
-        // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-5
-        // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-2
-        // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-3
-        // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-4
-        // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-5
         // Bypass AuthZ — use unscoped method (AccessScope::allow_all).
         // AuthZ plugin is the caller; it cannot evaluate itself.
         // Plugin invokes `list_group_depth(system_ctx, group_id, query)`;
@@ -110,12 +86,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .get_group_descendants_unscoped(group_id, query)
             .await
             .map_err(CanonicalError::from)
-        // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-5
-        // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-4
-        // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-3
-        // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-read:p1:inst-plugin-read-2
-        // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-5
-        // @cpt-end:cpt-cf-resource-group-flow-integration-auth-plugin-routing:p1:inst-plugin-3a
     }
 
     async fn get_group_ancestors(
@@ -177,4 +147,3 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .map_err(CanonicalError::from)
     }
 }
-// @cpt-end:cpt-cf-resource-group-dod-integration-auth-read-service:p1:inst-full

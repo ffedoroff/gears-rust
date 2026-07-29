@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-testing-type-mgmt:p1
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 //! Phase 2 tests: Type management CRUD, metadata_schema internal storage logic,
 //! and GTS path <-> ID resolution.

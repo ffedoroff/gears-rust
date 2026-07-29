@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-testing-entity-hierarchy:p1
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 //! Phase 3 tests: Entity hierarchy operations.
 //!

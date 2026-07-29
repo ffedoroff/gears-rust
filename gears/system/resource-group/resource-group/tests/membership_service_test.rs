@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-testing-membership:p1
 #![allow(clippy::expect_used, clippy::doc_markdown)]
 //! Membership service integration tests (Phase 4).
 //!

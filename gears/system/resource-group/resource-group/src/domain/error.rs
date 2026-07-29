@@ -1,6 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1
-// @cpt-dod:cpt-cf-resource-group-dod-testing-error-conversions:p2
 //! Domain error types for the resource-group gear.
 
 use authz_resolver_sdk::pep::EnforcerError;

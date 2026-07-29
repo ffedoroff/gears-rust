@@ -1,7 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-begin:cpt-cf-resource-group-dod-sdk-foundation-sdk-models:p1:inst-full
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-sdk-models:p1
 //! SDK model types for the resource-group gear.
 //!
 //! These types form the public contract between the resource-group gear
@@ -15,7 +13,6 @@ use uuid::Uuid;
 
 // -- GtsTypePath value object --
 
-// @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-1
 /// Validated GTS type path value object.
 ///
 /// A GTS type path follows the pattern `gts.<segment>~(<segment>~)*` where
@@ -32,35 +29,21 @@ impl GtsTypePath {
     /// Returns an error if the string is empty or does not match the GTS
     /// type path format (including exceeding the 1024-char GTS ID limit).
     pub fn new(raw: impl Into<String>) -> Result<Self, String> {
-        // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-2
         let raw = raw.into();
         let s = raw.trim().to_lowercase();
-        // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-2
 
-        // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-3
         if s.is_empty() {
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-3a
             return Err("GTS type path must not be empty".to_owned());
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-3a
         }
-        // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-3
 
-        // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-4
         // Validate format using the canonical gts crate parser.
         // Each tilde-separated segment must be a valid GTS ID with 5+ tokens
         // (vendor.package.namespace.type.vMAJOR).
         if gts::GtsId::try_new(&s).is_err() {
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-4a
             return Err("Invalid GTS type path format".to_owned());
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-4a
         }
-        // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-4
 
-        // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-6
-        // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-7
         Ok(Self(s))
-        // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-7
-        // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-6
     }
 
     /// Return the inner string slice.
@@ -95,7 +78,6 @@ impl AsRef<str> for GtsTypePath {
         &self.0
     }
 }
-// @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-1
 
 // -- Type --
 
@@ -297,9 +279,6 @@ pub struct ResourceGroupMembership {
     pub resource_id: String,
 }
 
-// @cpt-dod:cpt-cf-resource-group-dod-testing-sdk-models:p1
 #[cfg(test)]
 #[path = "models_tests.rs"]
 mod models_tests;
-
-// @cpt-end:cpt-cf-resource-group-dod-sdk-foundation-sdk-models:p1:inst-full

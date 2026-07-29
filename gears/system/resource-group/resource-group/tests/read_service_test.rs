@@ -1,4 +1,3 @@
-// @cpt-dod:cpt-cf-resource-group-dod-testing-integration-auth:p1
 #![allow(clippy::expect_used, clippy::doc_markdown)]
 //! `RgReadService` integration tests for the membership reads.
 //!

@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-sdk-traits:p1
 use async_trait::async_trait;
 use resource_group_sdk::models::{
     ResourceGroup, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,

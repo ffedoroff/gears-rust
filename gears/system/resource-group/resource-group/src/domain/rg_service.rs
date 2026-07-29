@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-integration-auth-read-service:p1
 //! Unified service adapter implementing `ResourceGroupClient` for `ClientHub` registration.
 //!
 //! Delegates to `TypeService`, `GroupService`, and `MembershipService` to satisfy

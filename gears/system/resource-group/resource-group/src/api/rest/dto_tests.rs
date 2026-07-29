@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-testing-rest-api:p2
 use super::*;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 use uuid::Uuid;

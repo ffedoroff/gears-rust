@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-testing-rest-api:p1
 #![allow(clippy::expect_used)]
 //! Full-chain integration test with a real (`SQLite` in-memory) database.
 //!

@@ -1,7 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-begin:cpt-cf-resource-group-dod-entity-hier-entity-service:p1:inst-full
-// @cpt-dod:cpt-cf-resource-group-dod-testing-entity-hierarchy:p1
 //! Domain service for resource group entity management.
 //!
 //! Implements business rules: type validation, parent compatibility,
@@ -88,10 +86,6 @@ enum UpdateGroupOutcome {
     NeedsSerializable,
 }
 
-// @cpt-dod:cpt-cf-resource-group-dod-entity-hier-entity-service:p1
-// @cpt-dod:cpt-cf-resource-group-dod-integration-auth-tenant-scope:p1
-// @cpt-dod:cpt-cf-resource-group-dod-integration-auth-jwt:p1
-// @cpt-flow:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1
 /// Service for resource group entity lifecycle management.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Clone)]
@@ -126,7 +120,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         }
     }
 
-    // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-create-group:p1
     /// Create a new resource group.
     ///
     /// Runs inside a `SERIALIZABLE` transaction with bounded retry (max 3 attempts)
@@ -137,7 +130,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: CreateGroupRequest,
         tenant_id: Uuid,
     ) -> Result<ResourceGroup, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
         // Pre-validation (stateless, outside transaction)
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
@@ -254,28 +246,21 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 return Err(DomainError::tenant_not_found(target_tenant_id));
             }
         }
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
 
         // Validate metadata against the GTS type schema before opening the
         // transaction: a cross-gear `ClientHub` call with nothing to gain in-tx (RG-09).
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
         validation::validate_metadata_via_gts(
             req.metadata.as_ref(),
             &req.code,
             &*self.types_registry,
         )
         .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
 
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-2
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
             let profile = profile.clone();
@@ -294,10 +279,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             })
         })
         .await
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-11
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-9
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-10
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-2
     }
 
     /// Get a resource group by ID (AuthZ-scoped).
@@ -318,43 +299,31 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .ok_or_else(|| DomainError::group_not_found(group_id))
     }
 
-    // @cpt-algo:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1
     /// List resource groups with `OData` filtering and pagination (AuthZ-scoped).
     pub async fn list_groups(
         &self,
         ctx: &SecurityContext,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroup>, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3
         // IF request has JWT bearer token — the SecurityContext arrives here
         // already authenticated by the API Gateway / AuthNResolverClient.
-        // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3a
         // Authenticate via AuthNResolverClient → SecurityContext (performed
         // upstream by the API Gateway; `ctx` carries the resulting subject).
-        // @cpt-end:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3a
-        // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3b
         // Run PolicyEnforcer.access_scope() → AccessScope
         let scope = self
             .enforcer
             .access_scope(ctx, &RG_GROUP_RESOURCE, "list", None)
             .await
             .map_err(DomainError::from)?;
-        // @cpt-end:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3b
-        // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3c
         // RETURN JWT mode with SecurityContext + AccessScope (the AccessScope
         // is propagated to the data layer below).
         let conn = self.db.conn()?;
         self.group_repo.list_groups(&conn, &scope, query).await
-        // @cpt-end:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3c
-        // @cpt-end:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3
-        // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-4
         // ELSE → RETURN 401 Unauthorized (handled upstream by the API Gateway
         // before SecurityContext is constructed; an absent/invalid JWT never
         // reaches this service path).
-        // @cpt-end:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-4
     }
 
-    // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-update-group:p1
     /// Update a resource group (full replacement via PUT, AuthZ-scoped).
     ///
     /// Runs inside a transaction with bounded retry (max 3 attempts). The
@@ -368,7 +337,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         req: UpdateGroupRequest,
     ) -> Result<ResourceGroup, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id}
         // AuthZ gate: verify the caller can update this group (tenant check).
         let scope = self
@@ -382,7 +350,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // does not carry a `code` field — so there is nothing to validate
         // syntactically here besides the display name.
         Self::validate_name(&req.name)?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
 
         // Validate metadata against the GTS type schema before opening the
         // transaction: same rationale as `create_group` (RG-09). The same
@@ -390,7 +357,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // to pick the transaction's isolation level -- no extra query for
         // that. `conn` is scoped to this block so the pool connection is
         // released before the transaction (below) requests its own.
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
         let existing = {
             let conn = self.db.conn()?;
             let existing = self
@@ -406,7 +372,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await?;
             existing
         };
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
 
         // Pick the least-strict isolation level that stays correct for this
         // update. Per the DB-behavior audit
@@ -539,7 +504,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         .await
     }
 
-    // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-move-group:p1
     /// Move a group to a new parent (or make it a root).
     ///
     /// Runs inside a `SERIALIZABLE` transaction with bounded retry (max 3 attempts)
@@ -549,18 +513,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
     ) -> Result<ResourceGroup, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id} with new hierarchy.parent_id
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
         let profile = self.profile.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-2
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let profile = profile.clone();
             let group_repo = group_repo.clone();
@@ -578,13 +536,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             })
         })
         .await
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-13
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-11
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-12
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-2
     }
 
-    // @cpt-flow:cpt-cf-resource-group-flow-entity-hier-delete-group:p1
     /// Delete a resource group (AuthZ-scoped).
     ///
     /// Runs inside a `SERIALIZABLE` transaction with bounded retry (max 3 attempts)
@@ -595,7 +548,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         force: bool,
     ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-1
         // Actor sends DELETE /api/resource-group/v1/groups/{group_id}?force={true|false}
         // AuthZ gate: verify the caller can delete this group (tenant check).
         // Runs outside the transaction since AuthZ is idempotent.
@@ -604,7 +556,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .access_scope(ctx, &RG_GROUP_RESOURCE, "delete", Some(group_id))
             .await
             .map_err(DomainError::from)?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-1
 
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
@@ -834,14 +785,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         tenant_id: Uuid,
         profile: &QueryProfile,
     ) -> Result<ResourceGroup, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
         // Resolve type GTS path to surrogate ID; verify type exists.
         // find_by_code_with_id fetches id + type together in one query (RG-11).
         let (type_id, rg_type) = type_repo
             .find_by_code_with_id(tx, &req.code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(&req.code))?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
 
         // Determine effective tenant_id by code-prefix rule:
         // - code starts with TENANT_RG_TYPE_PATH → tenant_id = group.id (new scope)
@@ -850,19 +799,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let is_tenant_type = req.code.starts_with(TENANT_RG_TYPE_PATH);
         let effective_tenant_id = if is_tenant_type { group_id } else { tenant_id };
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4
         if let Some(parent_id) = req.parent_id {
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4a
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4b
             let parent = group_repo
                 .find_model_by_id(tx, parent_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(parent_id))?;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4b
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4a
 
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
             let parent_type_path = Self::resolve_type_path_from_id(tx, parent.gts_type_id).await?;
             if !rg_type.allowed_parent_types.contains(&parent_type_path) {
                 return Err(DomainError::invalid_parent_type(format!(
@@ -870,24 +812,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     req.code, parent_type_path
                 )));
             }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
 
-            // @cpt-algo:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1
-            // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-1
             // Extract caller effective tenant scope from SecurityContext.subject_tenant_id
             // (tenant_id is passed as parameter from caller's context)
-            // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-1
-            // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-2
             // IF caller is privileged platform-admin -> pass (but data invariants still checked)
             // (platform-admin bypass handled by middleware; data invariants enforced below)
-            // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-2
-            // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-3
             // Validate tenant compatibility (child must be same tenant as parent)
-            // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-4
             // IF membership write: validate target group's tenant_id is compatible
-            // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-4
-            // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-5
             // Skip tenant enforcement for tenant-typed groups — they intentionally
             // create a new tenant scope (tenant_id = group.id != parent.tenant_id).
             if !is_tenant_type && parent.tenant_id != tenant_id {
@@ -919,13 +850,8 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         .to_owned(),
                 ));
             }
-            // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-5
-            // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-3
-            // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-6
             // RETURN pass (tenant enforcement passed)
-            // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-6
 
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4e
             // Check query profile: depth limit
             if let Some(max_depth) = profile.max_depth {
                 let parent_depth = group_repo.get_depth(tx, parent_id).await?;
@@ -938,9 +864,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     )));
                 }
             }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4e
 
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4f
             // Check query profile: width limit
             if let Some(max_width) = profile.max_width {
                 let sibling_count = group_repo.count_children(tx, parent_id).await?;
@@ -950,10 +874,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     )));
                 }
             }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4f
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4
 
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-6
             // Insert group
             let _model = group_repo
                 .insert(
@@ -966,21 +887,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     effective_tenant_id,
                 )
                 .await?;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-6
 
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-7
             // Insert closure: self-row
             group_repo.insert_closure_self_row(tx, group_id).await?;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-7
 
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-8
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-8a
             // Insert ancestor closure rows from parent's ancestors with depth+1
             group_repo
                 .insert_ancestor_closure_rows(tx, group_id, parent_id)
                 .await?;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-8a
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-8
 
             let sys = toolkit_security::AccessScope::allow_all();
             group_repo
@@ -988,8 +902,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 .await?
                 .ok_or_else(|| DomainError::database("Insert succeeded but group not found"))
         } else {
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
             // Root group: validate can_be_root
             if !rg_type.can_be_root {
                 return Err(DomainError::invalid_parent_type(format!(
@@ -997,9 +909,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     req.code
                 )));
             }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
 
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5c
             // Tenant-root uniqueness: at most one tenant-type group may be a
             // forest root. `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`.
             if is_tenant_type
@@ -1015,8 +925,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     ),
                 ));
             }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5c
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
 
             // Insert group
             let _model = group_repo
@@ -1086,7 +994,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         profile: &QueryProfile,
         serializable: bool,
     ) -> Result<UpdateGroupOutcome, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
         // DB: SELECT FROM resource_group WHERE id = {group_id} -- load existing group
         group_repo
             .find_by_id(tx, scope, group_id)
@@ -1097,13 +1004,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .find_model_by_id(tx, group_id)
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-2
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-3
         // IF group not found -> RETURN NotFound (handled by ok_or_else above)
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-3
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4
         // IF type is changed — `UpdateGroupRequest` deliberately does not carry
         // a `code` field, so `gts_type_id` is reused unchanged below. The
         // structural-change validation that would run on a type change is
@@ -1114,7 +1017,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // Type is immutable on update — reuse the existing `gts_type_id` and
         // resolve the type definition for `move_group_internal_impl`'s
         // parent-compatibility check below.
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
         // Validate new type's allowed_parents permits current parent's type
         // (or the new type allows root if no parent). For the immutable-type
         // case this collapses into `move_group_internal_impl` running the
@@ -1125,7 +1027,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let rg_type = type_repo
             .load_full_type_by_id(tx, existing.gts_type_id)
             .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
 
         // Metadata-vs-schema validation (step 4e) already ran in
         // `update_group`, before this transaction opened -- see this
@@ -1157,17 +1058,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             }
         }
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4b
         // DB: SELECT gts_type_id FROM resource_group WHERE parent_id = {group_id}
         // — load children types (performed inside `move_group_internal_impl`'s
         // closure-table queries when a parent change occurs; type itself is
         // immutable here so a type-driven children rescan is unnecessary).
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4c
         // FOR EACH child: verify child's type includes new type in
         // allowed_parents (no-op for immutable-type updates; the move helper
         // runs the equivalent allowed_parent_types check against the new
         // parent on a parent change).
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4d
         // IF any child would become invalid → RETURN InvalidParentType with
         // child details (returned by `move_group_internal_impl` as
         // `DomainError::invalid_parent_type` when the parent's type is not in
@@ -1208,12 +1106,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             )
             .await?;
         }
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4d
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4c
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4b
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
         // Persist name/parent/metadata. `gts_type_id` is reused from the
         // existing row — type is immutable on update.
         let _model = group_repo
@@ -1226,16 +1119,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 req.metadata.as_ref(),
             )
             .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-5
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
         let sys = toolkit_security::AccessScope::allow_all();
         let updated = group_repo
             .find_by_id(tx, &sys, group_id)
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
         Ok(UpdateGroupOutcome::Done(updated))
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-6
     }
 
     /// Inner logic for `move_group`, runs inside a SERIALIZABLE transaction.
@@ -1247,7 +1137,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         new_parent_id: Option<Uuid>,
         profile: &QueryProfile,
     ) -> Result<ResourceGroup, DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-3
         // Load group and new parent in transaction
         let existing = group_repo
             .find_model_by_id(tx, group_id)
@@ -1259,23 +1148,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .find_by_code(tx, &type_path)
             .await?
             .ok_or_else(|| DomainError::type_not_found(&type_path))?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-3
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-4
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-5
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-6
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-7
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
         // Cycle detect, type compat, profile enforce, closure rebuild
         Self::move_group_internal_impl(group_repo, tx, group_id, new_parent_id, &rg_type, profile)
             .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-9
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-8
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-7
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-6
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-5
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-4
 
         // Cross-tenant moves are forbidden (`tenant_id` is immutable per the
         // gear-wide invariant). Reject the move when the new parent lives
@@ -1298,7 +1174,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             }
         }
 
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
         // Update parent_id on the group. Type and tenant_id are immutable —
         // both reuse the existing row's values.
         group_repo
@@ -1311,7 +1186,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 existing.metadata.as_ref(),
             )
             .await?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-10
 
         let sys = toolkit_security::AccessScope::allow_all();
         group_repo
@@ -1328,8 +1202,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         group_id: Uuid,
         force: bool,
     ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-2
-        // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-3
         // DB: SELECT FROM resource_group WHERE id = {group_id}
         group_repo
             .find_by_id(tx, scope, group_id)
@@ -1340,36 +1212,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .find_model_by_id(tx, group_id)
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-3
-        // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-2
 
         if force {
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5a
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5b
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5c
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5d
             // Force delete: cascade entire subtree + memberships + closure
             #[allow(clippy::let_and_return)]
             let result = Self::force_delete_subtree(group_repo, tx, group_id).await;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5d
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5c
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5b
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5a
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-5
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-7
             result
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-7
         } else {
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4
             // Non-force: check children and memberships
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4a
             let children = Self::get_direct_children(tx, group_id).await?;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4a
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4b
             let has_memberships = group_repo.has_memberships(tx, group_id).await?;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4b
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4c
             if !children.is_empty() {
                 return Err(DomainError::conflict_active_references(format!(
                     "Cannot delete group '{group_id}': has {} child group(s). Use force=true to cascade.",
@@ -1382,25 +1234,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     "Cannot delete group '{group_id}': has active memberships. Use force=true to cascade."
                 )));
             }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4c
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-4
 
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6a
             // Delete closure rows, then the group
             group_repo.delete_all_closure_rows(tx, group_id).await?;
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6a
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6b
             group_repo.delete_by_id(tx, group_id).await
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6b
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-6
         }
     }
 
     // -- Internal helpers --
 
-    // @cpt-algo:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1
-    // @cpt-algo:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1
     /// Internal move logic shared between `move_group` and `update_group`.
     ///
     /// Performs cycle detection, type compatibility checks, query profile
@@ -1416,11 +1258,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         profile: &QueryProfile,
     ) -> Result<(), DomainError> {
         if let Some(new_pid) = new_parent_id {
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-1
             // Cycle detection: self-parent check (covered by is_descendant via self-row)
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-1
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-2
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-3
             let is_desc = group_repo.is_descendant(conn, group_id, new_pid).await?;
             if is_desc {
                 debug!(group_id = %group_id, new_parent = %new_pid, "Cycle detected in move_group");
@@ -1428,8 +1266,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     "Cannot move group '{group_id}' under '{new_pid}': would create a cycle"
                 )));
             }
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-3
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-2
 
             // Validate parent type compatibility
             let parent = group_repo
@@ -1446,19 +1282,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 )));
             }
 
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-4
             // Cycle detection passed
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-4
 
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-1
             // Load profile config: max_depth (optional), max_width (optional)
             // (profile is passed as parameter with max_depth and max_width)
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-1
 
             // Check query profile: depth limit
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2
             if let Some(max_depth) = profile.max_depth {
-                // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
                 let parent_depth = group_repo.get_depth(conn, new_pid).await?;
                 // Check depth of deepest descendant of moved node.
                 // get_descendant_ids_with_depth returns id and depth
@@ -1472,8 +1302,6 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                     .max()
                     .unwrap_or(0);
                 let new_deepest = parent_depth + 1 + max_subtree_depth;
-                // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2a
-                // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
                 #[allow(clippy::cast_possible_wrap)]
                 if new_deepest >= max_depth as i32 {
                     debug!(group_id = %group_id, new_deepest, max_depth, "Depth limit exceeded on move");
@@ -1481,28 +1309,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                         "Depth limit exceeded: moving subtree would create depth {new_deepest}, max_depth is {max_depth}"
                     )));
                 }
-                // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2b
             }
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-2
 
             // Check query profile: width limit
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-3
             if let Some(max_width) = profile.max_width {
-                // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-3a
                 let sibling_count = group_repo.count_children(conn, new_pid).await?;
-                // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-3a
-                // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-3b
                 if sibling_count >= u64::from(max_width) {
                     return Err(DomainError::limit_violation(format!(
                         "Width limit exceeded: new parent already has {sibling_count} children, max_width is {max_width}"
                     )));
                 }
-                // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-3b
             }
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-3
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-4
             // Profile checks passed
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-4
         } else {
             // Moving to root: validate can_be_root + tenant-root uniqueness.
             if !rg_type.can_be_root {
@@ -1657,4 +1475,3 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         Ok(())
     }
 }
-// @cpt-end:cpt-cf-resource-group-dod-entity-hier-entity-service:p1:inst-full

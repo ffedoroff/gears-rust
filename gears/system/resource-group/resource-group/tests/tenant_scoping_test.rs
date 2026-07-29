@@ -1,5 +1,4 @@
 // Created: 2026-04-16 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-testing-rest-api:p1
 //! Integration tests: `AccessScope` tenant scoping for resource-group queries.
 //!
 //! Verifies that `AccessScope` constructed from `AuthZ` decisions correctly

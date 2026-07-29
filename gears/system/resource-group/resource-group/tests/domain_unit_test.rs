@@ -1008,7 +1008,6 @@ fn domain_to_problem_tenant_root_already_exists_is_409() {
     );
 }
 
-// @cpt-dod:cpt-cf-resource-group-dod-testing-error-conversions:p2
 // ── Error conversions: From<EnforcerError> -> DomainError ────────────────
 
 // TC-ERR-01: EnforcerError::Denied -> DomainError::AccessDenied

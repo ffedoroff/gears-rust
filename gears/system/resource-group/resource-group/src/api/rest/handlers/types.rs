@@ -1,6 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-rest-handlers:p1
 use std::sync::Arc;
 
 use axum::Extension;
@@ -46,7 +45,6 @@ pub async fn create_type(
     Extension(svc): Extension<Arc<ConcreteTypeService>>,
     Json(req_body): Json<CreateTypeDto>,
 ) -> ApiResult<impl IntoResponse> {
-    // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-1
     // Actor sends POST /api/types-registry/v1/types with type definition payload
     info!(
         code = %req_body.code,
@@ -54,7 +52,6 @@ pub async fn create_type(
     );
 
     let code = req_body.code.clone();
-    // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-create-type:p1:inst-create-type-1
     let rg_type = svc.create_type(&ctx, req_body.into()).await?;
     let dto = TypeDto::from(rg_type);
 
@@ -97,7 +94,6 @@ pub async fn update_type(
     Path(code): Path<String>,
     Json(req_body): Json<UpdateTypeDto>,
 ) -> ApiResult<Json<TypeDto>> {
-    // @cpt-begin:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-1
     // Actor sends PUT /api/types-registry/v1/types/{code} with updated definition
     info!(
         code = %code,
@@ -105,7 +101,6 @@ pub async fn update_type(
     );
 
     let rg_type = svc.update_type(&ctx, &code, req_body.into()).await?;
-    // @cpt-end:cpt-cf-resource-group-flow-type-mgmt-update-type:p1:inst-update-type-1
     Ok(Json(TypeDto::from(rg_type)))
 }
 

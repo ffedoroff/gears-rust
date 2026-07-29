@@ -1,6 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-dod:cpt-cf-resource-group-dod-entity-hier-rest-handlers:p1
 use std::sync::Arc;
 
 use axum::Extension;
@@ -27,27 +26,16 @@ pub struct DeleteGroupQuery {
     fields(request_id = Empty)
 )]
 pub async fn list_groups(
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-1
     // Actor sends request to RG REST endpoint with JWT bearer token (any RG
     // REST endpoint terminates here once routed by axum).
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-2
     // API Gateway: authenticate JWT via AuthNResolverClient → SecurityContext
     // {subject_id, subject_tenant_id} (extracted as Extension below).
     Extension(ctx): Extension<SecurityContext>,
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-2
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-1
     Extension(svc): Extension<Arc<ConcreteGroupService>>,
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<GroupDto>>> {
     info!("Listing resource groups");
 
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-3
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-4
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-5
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-6
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-7
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-8
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-9
     // RG Gateway delegates to GroupService.list_groups, which (jwt-3..9):
     //   3) calls PolicyEnforcer.access_scope(ctx, RG_GROUP_RESOURCE, action)
     //   4) PolicyEnforcer → AuthZResolverClient.evaluate(EvaluationRequest)
@@ -58,19 +46,10 @@ pub async fn list_groups(
     //   8) AccessScope is applied via SecureORM (WHERE tenant_id IN (...))
     //   9) RG Service executes query with SQL predicates and returns results
     let page = svc.list_groups(&ctx, &query).await?;
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-9
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-8
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-7
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-6
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-5
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-4
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-3
     let dto_page = page.map_items(GroupDto::from);
 
-    // @cpt-begin:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-10
     // RETURN response to actor
     Ok(Json(dto_page))
-    // @cpt-end:cpt-cf-resource-group-flow-integration-auth-jwt-request:p1:inst-jwt-10
 }
 
 /// Create a new resource group.

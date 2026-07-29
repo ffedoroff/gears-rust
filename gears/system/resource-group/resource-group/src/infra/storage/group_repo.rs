@@ -1,6 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
-// @cpt-begin:cpt-cf-resource-group-dod-entity-hier-hierarchy-engine:p1:inst-full
 //! Persistence layer for resource group entity management.
 //!
 //! All surrogate SMALLINT ID resolution happens here. The domain and API layers
@@ -41,7 +40,6 @@ fn system_scope() -> AccessScope {
     AccessScope::allow_all()
 }
 
-// @cpt-dod:cpt-cf-resource-group-dod-entity-hier-hierarchy-engine:p1
 /// Repository for resource group persistence operations.
 pub struct GroupRepository;
 
@@ -915,7 +913,6 @@ impl GroupRepositoryTrait for GroupRepository {
         Ok(())
     }
 
-    // @cpt-algo:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1
     /// Rebuild closure rows for a subtree after a move: deletes old ancestor
     /// paths and inserts new ones via `secure_insert_many` (RG-04).
     async fn rebuild_subtree_closure<C: DBRunner>(
@@ -924,7 +921,6 @@ impl GroupRepositoryTrait for GroupRepository {
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
     ) -> Result<(), DomainError> {
-        // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-1
         // Collect subtree: SELECT descendant_id FROM resource_group_closure WHERE ancestor_id = group_id
         let scope = system_scope();
         let subtree_rows = ClosureEntity::find()
@@ -940,9 +936,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .iter()
             .map(|r| (r.descendant_id, r.depth))
             .collect();
-        // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-1
 
-        // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
         // Delete affected paths: DELETE FROM resource_group_closure
         // WHERE descendant_id IN (subtree) AND ancestor_id NOT IN (subtree)
         let subtree_set: std::collections::HashSet<Uuid> = subtree_ids.iter().copied().collect();
@@ -983,9 +977,7 @@ impl GroupRepositoryTrait for GroupRepository {
                 .await
                 .map_err(|e| DomainError::database(e.to_string()))?;
         }
-        // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
 
-        // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
         // Compute new ancestor paths from new parent
         if let Some(parent_id) = new_parent_id {
             let parent_ancestors = ClosureEntity::find()
@@ -995,14 +987,10 @@ impl GroupRepositoryTrait for GroupRepository {
                 .all(db)
                 .await
                 .map_err(|e| DomainError::database(e.to_string()))?;
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
 
-            // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
             let mut new_rows: Vec<closure_entity::ActiveModel> = Vec::new();
             for ancestor_row in &parent_ancestors {
-                // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
                 for &desc_id in &subtree_ids {
-                    // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
                     let internal_depth = subtree_internal.get(&desc_id).copied().unwrap_or(0);
                     let new_depth = ancestor_row.depth + 1 + internal_depth;
                     new_rows.push(closure_entity::ActiveModel {
@@ -1010,9 +998,7 @@ impl GroupRepositoryTrait for GroupRepository {
                         descendant_id: Set(desc_id),
                         depth: Set(new_depth),
                     });
-                    // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a1
                 }
-                // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4a
             }
 
             // Sent as one multi-row INSERT, not one secure_insert per
@@ -1021,13 +1007,10 @@ impl GroupRepositoryTrait for GroupRepository {
             toolkit_db::secure::secure_insert_many::<ClosureEntity>(new_rows, &scope, db)
                 .await
                 .map_err(|e| DomainError::database(e.to_string()))?;
-            // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
         }
 
-        // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
         // RETURN: closure rows updated within transaction — commit handled by caller
         Ok(())
-        // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
     }
 
     /// Check if a group has any memberships.
@@ -1206,4 +1189,3 @@ impl TypeFilter {
         }
     }
 }
-// @cpt-end:cpt-cf-resource-group-dod-entity-hier-hierarchy-engine:p1:inst-full
