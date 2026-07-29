@@ -19,6 +19,27 @@
 //! observe this, since they never send the SQL to a real backend. This
 //! suite does, against a `testcontainers` PostgreSQL.
 //!
+//! **Why a Rust `testcontainers` test, not pytest E2E:** this is a
+//! deliberate, written-down deviation from
+//! `docs/toolkit_unified_system/12_unit_testing.md` (which routes
+//! PostgreSQL-specific behavior to E2E) and `13_e2e_testing.md` (which
+//! defines E2E as pytest against a running `cf-gears-server`). Precedent:
+//! resource-group's PR #4269 established this pattern -- real Postgres via
+//! `testcontainers`, in Rust, for a dialect-specific bug a pytest-over-HTTP
+//! test could only see as an opaque 500 -- with `pg_concurrency_test.rs`
+//! plus the `test-rg-pg` `Makefile` target and its CI step; this file
+//! follows the same shape for `toolkit-db`'s own `secure` module, alongside
+//! this crate's pre-existing `pg`+`integration` suite (`make test-pg`,
+//! already wired into CI). It stays out of the default suite (gated behind
+//! `#![cfg(all(feature = "integration", feature = "pg"))]`), so it does not
+//! violate the unit-testing guide's speed requirement. And it gives a
+//! diagnosis pytest cannot: if `InGroup`/`InGroupSubtree` ever regress, the
+//! failure carries PostgreSQL's actual rejected-SQL text ("operator does
+//! not exist: uuid = text") directly, not just the HTTP 500 a client of
+//! whichever gear owns the scoped entity (e.g. file-storage) would see. See
+//! resource-group's `docs/db-behavior-audit.md` for the fuller writeup of
+//! this decision.
+//!
 //! Run via:
 //! ```sh
 //! cargo nextest run -p cf-gears-toolkit-db --features integration,pg \

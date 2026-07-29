@@ -18,6 +18,25 @@
 //! module docs for the full rationale behind the container-lifetime /
 //! `RG_PG_REQUIRE_DOCKER` pattern duplicated below).
 //!
+//! **Why a Rust `testcontainers` test, not pytest E2E:** this is a
+//! deliberate, written-down deviation from
+//! `docs/toolkit_unified_system/12_unit_testing.md` (which routes
+//! PostgreSQL-specific behavior to E2E) and `13_e2e_testing.md` (which
+//! defines E2E as pytest against a running `cf-gears-server`). Precedent:
+//! PR #4269 established this pattern first, with `pg_concurrency_test.rs`
+//! plus the `test-rg-pg` `Makefile` target and its dedicated CI step -- this
+//! suite and `pg_group_filter_test.rs` follow the same shape. It stays out
+//! of the default suite (gated behind `#![cfg(feature = "integration")]`,
+//! run only via `make test-rg-pg` / CI's `integration` job), so it does not
+//! violate the unit-testing guide's speed requirement. And it gives a
+//! diagnosis pytest cannot: if this filter ever regresses, the failure
+//! carries PostgreSQL's actual rejected-SQL text ("operator does not exist:
+//! smallint = text", via `DomainError::Database`), not just an HTTP status
+//! code -- a pytest client hitting the same regression through the REST
+//! layer would only ever see a 500 with no indication of the actual type
+//! mismatch. See `docs/db-behavior-audit.md` for the fuller writeup of this
+//! decision.
+//!
 //! Run via:
 //! ```sh
 //! cargo nextest run -p cf-gears-resource-group --features integration --test pg_membership_filter_test
