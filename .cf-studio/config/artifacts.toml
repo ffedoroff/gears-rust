@@ -56,6 +56,12 @@ patterns = [
 ]
 
 [[ignore]]
+reason = "Ignore resource-group features — code traceability markers were deliberately removed from this gear's code (see gears/system/resource-group/docs/DESIGN.md, section on @cpt-* marker removal), so the to_code requirements carried by the FEATURE identifier kinds (dod/flow/algo/state) can no longer be satisfied. The features documents themselves are kept intact and unabridged; they are simply no longer machine-checked against code. PRD/DESIGN/ADR/DECOMPOSITION remain validated via autodetect."
+patterns = [
+  "gears/system/resource-group/docs/features/*",
+]
+
+[[ignore]]
 reason = "Ignore legacy (pre-CFS) ADR files in oagw/docs root — converted copies live under docs/ADR/."
 patterns = ["gears/system/oagw/docs/adr-*.md"]
 

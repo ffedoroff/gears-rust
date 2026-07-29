@@ -37,6 +37,7 @@
   - [4.1 Database Size Analysis & Production Projections](#41-database-size-analysis--production-projections)
   - [4.2 Testing Architecture](#42-testing-architecture)
 - [5. Traceability](#5-traceability)
+  - [5.1 Removal of `@cpt-*` code markers (2026-07-29)](#51-removal-of-cpt--code-markers-2026-07-29)
 
 <!-- /toc -->
 
@@ -1643,3 +1644,16 @@ unsatisfied. **This is expected and intentional** — the specs themselves were
 not changed as part of this cleanup (that is a separate decision), and the
 markers should not be re-added to "fix" the resulting gap without a fresh,
 explicit decision to reinstate code-level traceability for this gear.
+
+**Studio validation**: because the `dod` identifier kind is both `required` and
+`to_code` for FEATURE artifacts (`studio-kit-gears/constraints.toml`), a FEATURE
+document cannot satisfy validation without code markers — removing the
+identifiers from the specs would violate `required`, and keeping them violates
+`to_code`. `docs/features/*` is therefore excluded from Constructor Studio
+validation via a single `[[ignore]]` entry in `.cf-studio/config/artifacts.toml`,
+mirroring what `oagw` already does for the same reason. The feature documents
+themselves are kept complete and unabridged — every flow, algorithm, step and
+acceptance criterion, along with its identifier, stays in place for human
+readers; only the machine cross-check against code is gone. `PRD.md`, this
+`DESIGN.md`, `ADR/` and `DECOMPOSITION.md` remain fully validated, and
+`cfs validate` reports zero errors for the gear.
