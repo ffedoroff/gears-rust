@@ -1444,13 +1444,19 @@ fn static_rule_passes_no_external_call_inside_group_service_tx() {
 // (checked toolkit_db::ConnectOpts in full), so it gets no test here.
 
 #[test]
-#[ignore = "contract drift: DESIGN.md (S4.x, concurrency testing) promises an \
-            exhausted SERIALIZABLE retry maps to ServiceUnavailable (503) with a \
-            retry-after hint; DomainError::Database has no dedicated variant for \
-            'retry exhausted' (vs. any other DB error) and always maps to \
-            Internal (500) via CanonicalError::internal(...) in api/rest/error.rs, \
-            whose own comment already acknowledges the gap. Deferred -- see \
-            docs/db-behavior-audit.md."]
+#[ignore = "open contract question, not a drift: DESIGN.md used to promise that \
+            an exhausted SERIALIZABLE retry maps to ServiceUnavailable (503) with \
+            a retry-after hint, and has since been corrected to describe what the \
+            code does -- DomainError::Database has no dedicated variant for 'retry \
+            exhausted' (vs. any other DB error) and always maps to Internal (500) \
+            via CanonicalError::internal(...) in api/rest/error.rs. So nothing is \
+            out of sync today; what remains open is whether exhaustion deserves a \
+            distinct status at all. That decision is entangled with the wider \
+            taxonomy question (the platform guide requires fail-closed 403 for an \
+            unreachable PDP, the code returns 500), so it is deferred to an \
+            error-taxonomy pass rather than settled here. This test pins the \
+            desired behaviour so it starts passing the day the decision lands -- \
+            see docs/db-behavior-audit.md."]
 fn contract_drift_exhausted_retry_should_map_to_service_unavailable() {
     // Representative shape of what transaction_with_retry returns after
     // exhausting retries against a real SERIALIZABLE conflict; modeled on

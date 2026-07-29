@@ -1,5 +1,18 @@
 # DB behavior audit — resource-group
 
+
+<!-- toc -->
+
+- [What was found](#what-was-found)
+  - [Findings added after this report](#findings-added-after-this-report)
+- [How it was found](#how-it-was-found)
+- [Deviation from the unit/E2E testing guide](#deviation-from-the-unite2e-testing-guide)
+- [Running this audit on another module](#running-this-audit-on-another-module)
+- [What this does not cover](#what-this-does-not-cover)
+- [Deferred](#deferred)
+
+<!-- /toc -->
+
 <!-- Created: 2026-07-27 by Constructor Tech -->
 
 What a systematic audit of this gear's database behavior found, how it was
@@ -43,6 +56,20 @@ RG-11 through RG-15 were **not** in the original problem statement — the
 detector found them. RG-15 is the one worth remembering: it was found by a
 *negative control*, a test written to confirm that a correctly-retried path
 behaves correctly. It did not.
+
+### Findings added after this report
+
+The table above is the first pass. A second N+1 pass and the VHP-2341 tenant-scope
+work added two findings that code comments reference by letter rather than by
+`RG-NN`, so a reader arriving from the code will not find them above:
+
+| ID | Kind | Where | Status |
+|----|------|-------|--------|
+| (a) | redundant-io | `group_repo.rs` `find_model_by_id_scoped` — the membership tenant gate needed a scoped single-row read; reusing the unscoped `find_model_by_id` plus a separate scope check would have cost an extra statement per call (`repo.rs`, `membership_service.rs`) | Fixed |
+| (b) | n-plus-one | `type_repo.rs` — one `resolve_id` per value while resolving a type filter, and one violation lookup per candidate parent in the hierarchy safety check (slope 2.0) | Fixed: `collect_type_filter_paths` + a single `WHERE schema_id IN (...)`, and `find_groups_violating_removed_parents` |
+
+Either give these `RG-16`/`RG-17` numbers or keep this table; what must not happen
+is a code comment pointing at an audit that does not mention the finding.
 
 ## How it was found
 
@@ -166,7 +193,12 @@ The point of the exercise. Nothing needs copying: the recorder lives in
 - **Isolation level.** `SET TRANSACTION ISOLATION LEVEL` also bypasses the
   metric callback, so the recorder cannot tell `SERIALIZABLE` from
   `READ COMMITTED`. Downgrading a write path's isolation would pass every rule
-  here.
+  here. This blind spot was exercised after the audit: two write paths were
+  lowered to the backend default, and an independent review later found a
+  lost-update race between the group update and the group move that the rules
+  here could not have caught. Isolation belongs to the concurrency suite, not
+  to statement counting — and a concurrency suite only covers the pairs it
+  enumerates, so a new write path needs a new pair.
 - **Predicate correctness.** The trace shows a `WHERE tenant_id = ?` is
   present, not that the bound value is the right one. That is the AccessScope
   suite's job.
@@ -188,10 +220,18 @@ The point of the exercise. Nothing needs copying: the recorder lives in
 - **RG-08's `update` re-read** — `update_many` returns only a row count, so
   removing the follow-up read means restructuring the write to a read-then-
   `ActiveModel::update` shape, trading one extra read for another.
-- **Two contract drifts**, both pinned as executable `#[ignore]`d tests rather
-  than silently accepted: DESIGN.md promises an exhausted retry maps to
-  `ServiceUnavailable` (503) where the code returns `Internal` (500), and
-  promises a 5s transaction timeout that `TxConfig` has no mechanism for. Both
-  are contract changes, not remediation.
-- **Backoff with jitter, statement/lock timeouts, single-snapshot hierarchy
-  reads, `EXPLAIN` verification** — all identified, none in this pass.
+- **Two contract questions**, both pinned as executable `#[ignore]`d tests rather
+  than silently accepted. They were written as drifts against DESIGN.md; since
+  then DESIGN.md has been corrected to describe what the code actually does, so
+  what remains is the open question of what the contract *should* be: whether an
+  exhausted retry deserves a dedicated status (the code returns 500 through
+  `Internal`, and there is no `ServiceUnavailable` variant to return), and
+  whether a transaction timeout should exist at all (`TxConfig` has no
+  mechanism). The first is entangled with a wider question — the platform guide
+  requires fail-closed 403 for an unreachable PDP, DESIGN said 503, the code
+  returns 500 — so it belongs to an error-taxonomy pass, not to this one.
+- **Statement/lock timeouts, single-snapshot hierarchy reads, `EXPLAIN`
+  verification** — identified, not addressed in this pass. Backoff was on this
+  list and has since been implemented: jittered exponential, base 2 ms, factor
+  5, capped at 100 ms, in `toolkit-db`'s retry helper. The immediate-retry loop
+  it replaced turned contention into a thundering herd.
