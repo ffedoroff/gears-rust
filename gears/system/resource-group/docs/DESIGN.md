@@ -337,6 +337,29 @@ graph TD
     I --> J[(SQL DB)]
 ```
 
+#### The unscoped surface
+
+Two families of methods bypass the `PolicyEnforcer`, and they are not equivalent.
+
+**Read path — by design, and load-bearing.** The five methods behind `ResourceGroupReadHierarchy` resolve with
+`AccessScope::allow_all()` and ignore the `SecurityContext` they are handed. This is what breaks the AuthZ ↔ RG cycle: a
+consumer of this trait *is* the PDP (or resolves tenants on its behalf) and cannot re-enter the enforcer without
+recursing. The consequence is that the caller owns tenant scoping — it must supply its own `OData` filter — and that
+these methods do no existence preflight, so an unknown group id yields an empty page rather than a not-found error.
+
+Note the hazard this creates: five of these method signatures are identical to gated methods on
+`ResourceGroupClient` (`get_group`, `list_groups`, `list_memberships`, `get_group_descendants`,
+`get_group_ancestors`). Which trait a consumer resolves from `ClientHub` decides whether authorization applies, and
+nothing at the call site distinguishes the two.
+
+**Write path — seeding only, and currently unreachable.** `create_group_unscoped`, `create_type_unscoped`,
+`update_type_unscoped`, `add_membership_unscoped` and the `*_unscoped` reads used alongside them exist for the seeding
+functions. They skip the `PolicyEnforcer` but enforce every domain invariant — placement, parent and membership
+existence, metadata validation, cycle and limit checks. `SecurityContext::anonymous()` was rejected as the alternative
+because it would make seeding depend on whether anonymous subjects are permitted, which fails in locked-down
+deployments. None of these has a production caller today: `seed_types` / `seed_groups` / `seed_memberships` are invoked
+only from tests, so the write-side unscoped surface is reachable from nothing that ships.
+
 AuthZ plugin depends only on the narrow `ResourceGroupReadHierarchy` trait (hierarchy-only). All other consumers (domain clients, general consumers) use `ResourceGroupClient` (full CRUD including reads).
 
 
@@ -1225,12 +1248,18 @@ Ownership-graph tenant enforcement:
 | duplicate type              | `TypeAlreadyExists`        |
 | second tenant-type root rejected | `TenantRootAlreadyExists` (409 Conflict) — enforces `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness` |
 | invalid parent type         | `InvalidParentType`        |
-| type update violates existing hierarchy | `AllowedParentsViolation` |
+| type update violates existing hierarchy | `AllowedParentTypesViolation` |
 | cycle attempt               | `CycleDetected`            |
 | active references on delete | `ConflictActiveReferences` (response body MUST include list of blocking entities — children and/or memberships — so the caller can display what prevents deletion) |
 | depth/width violation       | `LimitViolation`           |
-| tenant-incompatible parent/child/membership write | `TenantIncompatibility` |
-| second tenant-type root rejected | `TenantRootAlreadyExists` (HTTP 409 Conflict) |
+| tenant-incompatible parent/child/membership write | `TenantIncompatibility` (membership path only; a cross-tenant
+parent on create/update/move is a plain `Validation` with a generic message) |
+| duplicate caller-supplied group `id` | `GroupAlreadyExists` (409 `already_exists`, resource name = the id). A caller may
+supply `id` on create; a collision is a typed conflict rather than a raw database error, so monitoring can tell it apart
+from a flaky write |
+| target tenant not reachable by the caller | `TenantNotFound` → **404**, deliberately not 403. RG does not own tenant
+data and must not disclose which foreign tenants exist, so an unreachable target is indistinguishable from an absent one.
+The same rule governs the message text: no foreign `tenant_id` is ever interpolated into an error |
 | infra timeout/unavailable   | `Database` / `InternalError` → 500 |
 | unexpected failure          | `Internal`                 |
 
@@ -1637,10 +1666,13 @@ Hierarchy mutations (`create/move/delete`) use `SERIALIZABLE` isolation with bou
 
 **Serialization retry policy**:
 
-- max retries: 3 (configurable)
-- backoff: none (immediate retry — serialization conflicts resolve within microseconds)
+- max attempts: 3 (`DEFAULT_TX_RETRY_ATTEMPTS`). "Configurable" only via `transaction_with_retry_max`, which RG does not
+  call — the gear always takes the default
+- backoff: jittered exponential — base 2 ms, factor 5, capped at 100 ms (`RETRY_BACKOFF_MAX`), full jitter. Not "none":
+  an immediate-retry loop was replaced because it converts contention into a thundering herd
 - on exhaustion: the last error is returned as `Database` → 500; there is no `ServiceUnavailable` variant and no retry-after hint. The give-up is diagnosable from the log instead: `ERROR "transaction retry budget exhausted"` carries `attempt`/`max_attempts`/`backend`/`phase`/`sql_err`, and a contention error the classifier did not recognise is reported separately as `WARN "transaction failed with a database error not recognized as retryable"` — the two call for different responses (raise the budget vs. widen the classifier). The 503-on-exhaustion drift is tracked by an executable `#[ignore]` test, see `db-behavior-audit.md`
-- transaction timeout: 5s (configurable)
+- transaction timeout: **not implemented** — there is no statement or lock timeout. Tracked as a known drift by an
+  executable `#[ignore]` test, see `db-behavior-audit.md`
 
 **Concurrency test pattern** (E2E test level — requires real PostgreSQL for SERIALIZABLE isolation):
 

@@ -22,6 +22,7 @@
   - [Type Input Validation](#type-input-validation)
   - [Hierarchy Safety Check for Type Update](#hierarchy-safety-check-for-type-update)
   - [Type Seeding](#type-seeding)
+  - [Type Registry Authorization](#type-registry-authorization)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Type Service CRUD](#type-service-crud)
@@ -222,6 +223,36 @@ Types define the structural rules for the resource group hierarchy — which par
    3. [x] - `p1` - **IF** type exists AND definition differs → update type via update flow - `inst-seed-2c`
    4. [x] - `p1` - **IF** type does not exist → create type via create flow - `inst-seed-2d`
 3. [x] - `p1` - **RETURN** seed result: {created: N, updated: N, unchanged: N} - `inst-seed-3`
+
+### Type Registry Authorization
+
+All five type-registry operations are gated by the `PolicyEnforcer`. A caller needs a PDP permission for the matching
+action on the resource `gts.cf.core.rg.type.v1~`:
+
+| Operation | Action |
+|-----------|--------|
+| `createType` | `create` |
+| `getType` | `read` |
+| `listTypes` | `list` |
+| `updateType` | `update` |
+| `deleteType` | `delete` |
+
+Three properties of this gate are not obvious and matter for anyone extending it:
+
+- **No exception for in-process callers.** The `ClientHub` adapter registered as `dyn ResourceGroupClient` calls the same
+  gated entry points as the REST handlers. A gear that registers or manages GTS types — at any point in its lifecycle —
+  needs a matching policy rule for its `subject_type`; being a platform-internal caller earns nothing.
+- **The resulting `AccessScope` is deliberately discarded.** `gts_type` is a global table with no tenant column, so there
+  is nothing to filter; the gate is a permission check only. This is the one place where "apply `AccessScope` to every
+  query" does not hold.
+- **The resource descriptor must still declare `owner_tenant_id`, and the call must set `require_constraints(false)`.**
+  Real PDP plugins attach a baseline tenant clamp to every decision. A descriptor that supports no properties makes that
+  constraint fail to compile, and a permitted caller would receive 500 instead of a result; a permit carrying no
+  constraints at all needs the second flag for the same reason. Both failure modes are compilation failures, not denials,
+  and both surface as 500 rather than 403.
+
+Seeding does not go through the gate: it uses the dedicated `*_unscoped` entry points (see `Type Data Seeding`), which
+skip the `PolicyEnforcer` while still enforcing every domain invariant.
 
 ## 4. States (CDSL)
 

@@ -111,9 +111,12 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 - Depth or width limit exceeded → LimitViolation
 
 **Steps**:
-1. [x] - `p1` - Actor sends POST /api/resource-group/v1/groups with {type, name, metadata, hierarchy: {parent_id, tenant_id}} - `inst-create-group-1`
+1. [x] - `p1` - Actor sends POST /resource-group/v1/groups with a **flat** body `{id?, type, name, parent_id?, tenant_id?, metadata?}`. The nested `hierarchy` object exists only in responses; a request shaped that way is rejected - `inst-create-group-1`
 2. [x] - `p1` - DB: BEGIN transaction (SERIALIZABLE isolation) - `inst-create-group-2`
 3. [x] - `p1` - Resolve type GTS path to surrogate ID; verify type exists - `inst-create-group-3`
+   1. [x] - `p1` - Resolve the target tenant: `tenant_id` from the request when present, otherwise the caller's own tenant from the `SecurityContext`. An explicit `tenant_id` on a **tenant-typed** group is a contradiction and is rejected — such a group's effective tenant is always its own `id` - `inst-create-group-3a`
+   2. [x] - `p1` - **IF** an explicit `id` and a foreign `tenant_id` are supplied together → **RETURN** Validation (400). Combining caller-chosen identity with a caller-chosen tenant is refused until identifier ownership is settled - `inst-create-group-3b`
+   3. [x] - `p1` - Verify the target tenant against the compiled `AccessScope` from the `create` decision: the scope must either be unconstrained or contain the target. Otherwise **RETURN** TenantNotFound → **404**, not 403 — RG does not own tenant data and must not disclose which foreign tenants exist. A scope expressed as `InTenantSubtree` fails closed here, because membership of a subtree cannot be decided from the predicate alone - `inst-create-group-3c`
 4. [x] - `p1` - **IF** parent_id is provided - `inst-create-group-4`
    1. [x] - `p1` - DB: SELECT id, gts_type_id, tenant_id FROM resource_group WHERE id = {parent_id} — load parent in tx - `inst-create-group-4a`
    2. [x] - `p1` - **IF** parent not found → **RETURN** NotFound - `inst-create-group-4b`
