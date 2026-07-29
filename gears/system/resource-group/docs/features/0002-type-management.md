@@ -331,11 +331,11 @@ Extend `domain_unit_test.rs` with FROM-direction error conversions:
 - [x] Creating type with duplicate schema_id returns `TypeAlreadyExists` (409)
 - [x] Creating type with invalid GTS type path format returns validation error (400) with field details
 - [x] Creating type without `can_be_root` and without `allowed_parent_types` returns validation error (placement invariant)
-- [x] Updating type to remove allowed_parent that is in use by existing groups returns `AllowedParentTypesViolation` (409)
-- [x] Updating type to set `can_be_root=false` when root groups exist returns `AllowedParentTypesViolation` (409)
+- [x] Updating type to remove allowed_parent that is in use by existing groups returns `AllowedParentTypesViolation` (400, precondition subject `allowed_parents`)
+- [x] Updating type to set `can_be_root=false` when root groups exist returns `AllowedParentTypesViolation` (400, precondition subject `allowed_parents`)
 - [x] Updating type to add new allowed_parent succeeds when no existing groups violate new rules
 - [x] Deleting unused type succeeds (204) and removes junction table entries via CASCADE
-- [x] Deleting type with existing groups returns `ConflictActiveReferences` (409) with response body including entity count so the caller can display what prevents deletion
+- [x] Deleting type with existing groups returns `ConflictActiveReferences` (400, precondition subject `active_references`) with response body including entity count so the caller can display what prevents deletion
 - [x] Type seeding creates missing types, updates changed types, skips unchanged types (idempotent)
 - [x] List types endpoint supports OData `$filter` on `code` field with `eq`, `ne`, `in` operators
 - [x] All REST responses use GTS type paths — no SMALLINT surrogate IDs exposed

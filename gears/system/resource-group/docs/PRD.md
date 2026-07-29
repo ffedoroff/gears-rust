@@ -578,7 +578,7 @@ List endpoints **MUST** support:
 - Cursor-based pagination per platform Cursor Pagination Spec (DNA/REST/QUERYING.md):
   - `limit` — page size (1..200, default 25)
   - `cursor` — opaque token from previous response for next/previous page
-- Ordering is undefined but consistent — the server guarantees deterministic, stable order across pages within a pagination session, but does not commit to a specific sort order in the public contract. No `$orderby` support.
+- Without `$orderby` the server guarantees deterministic, stable order across pages within a pagination session but does not commit to a specific sort order in the public contract. `$orderby` is supported on the flat list endpoints; it cannot be combined with `cursor`.
 
 #### Group List with Hierarchy Depth
 
@@ -611,7 +611,7 @@ The same public read contract must remain stable across provider strategies:
 
 In `ownership-graph` profile, integration read responses match REST API schemas:
 
-- hierarchy reads (`list_group_depth(ctx, group_id, query)`) return `Page<ResourceGroupWithDepth>` (matches REST `GET /groups/{group_id}/hierarchy`) — includes `tenant_id` per group
+- hierarchy reads (`get_group_descendants(ctx, group_id, query)` and `get_group_ancestors(ctx, group_id, query)`) return `Page<ResourceGroupWithDepth>` (matching REST `GET /groups/{group_id}/descendants` and `.../ancestors`) — includes `tenant_id` per group
 - membership reads (`list_memberships(ctx, query)`) return `Page<ResourceGroupMembership>` (matches REST `GET /memberships`) — no `tenant_id`; callers derive tenant scope from group data obtained via hierarchy reads
 - integration read methods accept caller `SecurityContext`; RG passes it through to selected provider path (for plugin path, pass-through is unchanged)
 - in AuthZ query path, caller `SecurityContext.subject_tenant_id` is mandatory and used to resolve effective tenant scope for tenant-scoped reads and compiled SQL predicates

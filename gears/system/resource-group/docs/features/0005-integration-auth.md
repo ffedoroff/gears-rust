@@ -86,14 +86,14 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 **Error Scenarios**:
 - Invalid JWT → 401 Unauthorized
 - Insufficient permissions → 403 Forbidden
-- AuthZ service unavailable → 503
+- AuthZ service unavailable → 500 (`EvaluationFailed` → `InternalError`; no `ServiceUnavailable` variant exists — see `DESIGN.md`, AuthZ dependency resilience)
 
 **Steps**:
 1. [x] - `p1` - Actor sends request to any RG REST endpoint with JWT bearer token - `inst-jwt-1`
 2. [x] - `p1` - API Gateway: authenticate JWT via AuthNResolverClient → SecurityContext {subject_id, subject_tenant_id} - `inst-jwt-2`
 3. [x] - `p1` - RG Gateway: call PolicyEnforcer.access_scope(ctx, resource_type, action) - `inst-jwt-3`
 4. [x] - `p1` - PolicyEnforcer → AuthZ Resolver: evaluate(EvaluationRequest) - `inst-jwt-4`
-5. [x] - `p1` - AuthZ plugin internally: call ResourceGroupReadHierarchy.list_group_depth() for tenant hierarchy resolution (in-process via `ClientHub` — bypasses AuthZ to break the circular dependency; the MTLS transport variant is `p2` — deferred, not implemented yet) - `inst-jwt-5`
+5. [x] - `p1` - AuthZ plugin internally: call ResourceGroupReadHierarchy.get_group_descendants() for tenant hierarchy resolution (in-process via `ClientHub` — bypasses AuthZ to break the circular dependency; the MTLS transport variant is `p2` — deferred, not implemented yet) - `inst-jwt-5`
 6. [x] - `p1` - AuthZ plugin: produce constraints (e.g., owner_tenant_id IN (...)) - `inst-jwt-6`
 7. [x] - `p1` - PolicyEnforcer: compile_to_access_scope() → AccessScope - `inst-jwt-7`
 8. [x] - `p1` - RG Gateway: apply AccessScope via SecureORM (WHERE tenant_id IN (...)) to query - `inst-jwt-8`
@@ -115,7 +115,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 
 **Steps**:
 1. [x] - `p1` - AuthZ plugin resolves `dyn ResourceGroupReadHierarchy` from `ClientHub` - `inst-plugin-read-1`
-2. [x] - `p1` - Plugin invokes `list_group_depth(system_ctx, group_id, query)` - `inst-plugin-read-2`
+2. [x] - `p1` - Plugin invokes `get_group_descendants(system_ctx, group_id, query)` - `inst-plugin-read-2`
 3. [x] - `p1` - `RgReadService` delegates to `GroupService` unscoped read methods (`AccessScope::allow_all()`) — no AuthZ evaluation - `inst-plugin-read-3`
 4. [x] - `p1` - `GroupService` executes the closure-table query against the RG database - `inst-plugin-read-4`
 5. [x] - `p1` - **RETURN** `Page<ResourceGroupWithDepth>` — hierarchy rows with `tenant_id` per group and `metadata` (including `self_managed`); the same narrow trait also exposes `get_group`, `list_groups`, and `list_memberships` for single-group and membership reads, all resolved unscoped (bypassing `PolicyEnforcer`) - `inst-plugin-read-5`
@@ -148,7 +148,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 6. [ ] - `p2` - Check endpoint against allowed_endpoints allowlist (method + path) - `inst-mtls-6`
 7. [ ] - `p2` - **IF** endpoint not in allowlist → **RETURN** 403 Forbidden - `inst-mtls-7`
 8. [ ] - `p2` - Create system SecurityContext (no AuthZ evaluation — trusted system principal) - `inst-mtls-8`
-9. [ ] - `p2` - RG Hierarchy Service: execute list_group_depth(system_ctx, group_id, query) directly - `inst-mtls-9`
+9. [ ] - `p2` - RG Hierarchy Service: execute get_group_descendants(system_ctx, group_id, query) directly - `inst-mtls-9`
 10. [ ] - `p2` - **RETURN** Page<ResourceGroupWithDepth> — hierarchy data with tenant_id per group, metadata including `self_managed` - `inst-mtls-10`
 
 ### Plugin Gateway Routing
@@ -167,7 +167,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
    1. [x] - `p1` - Route to local persistence path: execute query against RG database - `inst-plugin-3a`
 4. [x] - `p1` - **IF** vendor-specific provider configured - `inst-plugin-4`
    1. [x] - `p1` - Resolve plugin instance by configured vendor via types-registry (scoped by GTS instance ID) - `inst-plugin-4a`
-   2. [x] - `p1` - Delegate to ResourceGroupReadPluginClient with SecurityContext passthrough - `inst-plugin-4b`
+   2. [x] - `p1` - Delegate to the registered `dyn ResourceGroupReadHierarchy` implementation with SecurityContext passthrough (there is no separate `ResourceGroupReadPluginClient` trait — the two-tier split was collapsed) - `inst-plugin-4b`
 5. [x] - `p1` - **RETURN** results from selected provider - `inst-plugin-5`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -228,7 +228,7 @@ Not applicable. This feature configures authentication routing and integration r
 The system **MUST** implement an Integration Read Service that exposes `ResourceGroupReadHierarchy` via ClientHub for in-process plugin consumers (AuthZ resolver plugin, tenant-resolver RG plugin, in-process AuthZ PDP).
 
 **Required behavior**:
-- Expose `list_group_depth(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>` with hierarchy data including `tenant_id` per group and `metadata` (including `self_managed` for applicable types)
+- Expose `get_group_descendants(ctx, group_id, query)` and `get_group_ancestors(...)` returning `Page<ResourceGroupWithDepth>` with hierarchy data including `tenant_id` per group and `metadata` (including `self_managed` for applicable types)
 - Expose `get_group(ctx, id)` returning a single `ResourceGroup` for PDP scope-existence checks (`/tenants/{t}/resourceGroups/{rg}`); the consumer reads the group and compares `tenant_id` itself
 - Expose `list_memberships(ctx, query)` returning `Page<ResourceGroupMembership>` for PDP group-membership resolution; the caller MUST supply a subject-scoped filter (`resource_id eq '<subject_id>'`)
 - Expose `list_groups(ctx, query)` for flat OData-filtered batch reads (`id in (…)`)
@@ -324,7 +324,7 @@ In-source `#[cfg(test)]` tests covering auth-mode decision and tenant-scope enfo
 
 ## 6. Acceptance Criteria
 
-- [x] AuthZ plugin resolves `dyn ResourceGroupReadHierarchy` from ClientHub and successfully calls `list_group_depth`
+- [x] AuthZ plugin resolves `dyn ResourceGroupReadHierarchy` from ClientHub and successfully calls `get_group_descendants` / `get_group_ancestors`
 - [x] In-process PDP resolves `dyn ResourceGroupReadHierarchy` and calls `get_group(ctx, id)` for scope-existence checks, resolved unscoped (no `PolicyEnforcer` re-entry)
 - [x] In-process PDP calls `list_memberships(ctx, query)` with a subject-scoped filter (`resource_id eq '<subject_id>'`) for group-membership resolution, resolved unscoped
 - [x] Integration read responses include `tenant_id` per group and `metadata` (including `self_managed`) but no AuthZ decision fields
@@ -374,7 +374,7 @@ In-source `#[cfg(test)]` tests covering auth-mode decision and tenant-scope enfo
 
 | TC | Scenario | Assert |
 |----|----------|--------|
-| TC-READ-01 | `list_group_depth` response | Contains `tenant_id` and `metadata` per group; no AuthZ decision fields |
+| TC-READ-01 | `get_group_descendants` response | Contains `tenant_id` and `metadata` per group; no AuthZ decision fields |
 | TC-READ-02 | Plugin gateway with built-in provider configured | Routes to local persistence path |
 | TC-READ-03 | Plugin gateway with vendor-specific provider configured | Delegates to the vendor's `dyn ResourceGroupReadHierarchy` implementation |
 

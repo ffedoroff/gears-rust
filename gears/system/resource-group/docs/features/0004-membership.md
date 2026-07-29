@@ -257,7 +257,7 @@ All acceptance criteria from feature 0004 are covered by automated tests:
 - [x] Adding membership with unregistered resource_type GTS path returns validation error (400)
 - [x] Adding membership with resource_type not in group type's allowed_membership_types returns validation error (400)
 - [x] Multiple resource types can coexist in the same group: `(G1, User, U1)` and `(G1, Document, D1)` both succeed
-- [x] Adding membership for resource already linked in incompatible tenant returns `TenantIncompatibility` (409)
+- [x] Adding membership for resource already linked in incompatible tenant returns `TenantIncompatibility` (400, precondition subject `tenant`)
 - [x] Removing existing membership returns 204 No Content
 - [x] Removing nonexistent membership returns `NotFound` (404)
 - [x] List memberships with `$filter=group_id eq 'G1'` returns all memberships for group G1

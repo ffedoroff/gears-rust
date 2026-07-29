@@ -299,7 +299,7 @@ extracted to remove.
 1. [x] - `p1` - Load profile config: max_depth (optional), max_width (optional) - `inst-profile-1`
 2. [x] - `p1` - **IF** the destination is a parent group **AND** max_depth is enabled (not null) - `inst-profile-2`
    1. [x] - `p1` - Compute resulting depth: depth of new parent + 1 + max descendant depth in subtree (for move) or 0 (for create) - `inst-profile-2a`
-   2. [x] - `p1` - **IF** resulting depth > max_depth → **RETURN** LimitViolation: DepthLimitExceeded with current depth and limit - `inst-profile-2b`
+   2. [x] - `p1` - **IF** resulting depth >= max_depth → **RETURN** LimitViolation with the resulting depth and the limit. `max_depth` is an **exclusive** bound: with `max_depth = 10` the deepest admissible group sits at depth 9 - `inst-profile-2b`
 3. [x] - `p1` - **IF** max_width is enabled (not null) - `inst-profile-3`
    1. [x] - `p1` - **IF** the destination is a parent group: DB: SELECT COUNT(*) FROM resource_group WHERE parent_id = {parent_id} — current sibling count - `inst-profile-3a`
    2. [x] - `p1` - **ELSE** (the destination is the root, i.e. a move with `parent_id: null`): DB: SELECT COUNT(*) FROM resource_group WHERE parent_id IS NULL AND tenant_id = {group.tenant_id} AND id <> {group_id} — the moved group's prospective root-level siblings, scoped to its own tenant so one tenant's forest never constrains another's, and excluding the group itself so a no-op re-root does not trip the limit - `inst-profile-3c`
@@ -450,16 +450,16 @@ REST-level tests for endpoints not covered by existing `api_rest_test.rs`:
 
 - [x] Root group (can_be_root=true, no parent) is created with self-referencing closure row (depth=0)
 - [x] Child group is created with closure rows linking to all ancestors at correct depths
-- [x] Creating group with parent of incompatible type returns `InvalidParentType` (409)
+- [x] Creating group with parent of incompatible type returns `InvalidParentType` (400, field violation on `parent_type`)
 - [x] Creating group with nonexistent parent returns `NotFound` (404)
 - [x] Creating root group when type has can_be_root=false returns validation error (400)
 - [x] Moving group to new parent rebuilds closure paths transactionally for entire subtree
-- [x] Moving group under its own descendant returns `CycleDetected` (409)
-- [x] Moving group under itself (self-parent) returns `CycleDetected` (409)
-- [x] Moving group to incompatible parent type returns `InvalidParentType` (409)
+- [x] Moving group under its own descendant returns `CycleDetected` (400, precondition subject `hierarchy`)
+- [x] Moving group under itself (self-parent) returns `CycleDetected` (400, precondition subject `hierarchy`)
+- [x] Moving group to incompatible parent type returns `InvalidParentType` (400, field violation on `parent_type`)
 - [x] Updating group type validates both parent and children compatibility
 - [x] Deleting leaf group (no children, no memberships) succeeds (204) and removes closure rows
-- [x] Deleting group with children without force returns `ConflictActiveReferences` (409) with response body listing blocking entities (children count/IDs and membership count) so the caller can display what prevents deletion
+- [x] Deleting group with children without force returns `ConflictActiveReferences` (400, precondition subject `active_references`) with response body listing blocking entities (children count/IDs and membership count) so the caller can display what prevents deletion
 - [x] Force delete removes entire subtree including memberships and closure rows
 - [x] Hierarchy endpoint returns ancestors (negative depth) and descendants (positive depth) with correct relative distances
 - [x] OData `$filter` on `hierarchy/depth` supports eq, ne, gt, ge, lt, le operators

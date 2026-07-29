@@ -114,13 +114,13 @@ Not applicable. This feature provides SDK contracts and gear infrastructure with
    1. [x] - `p1` - `Validation` -> 400 Bad Request, type "validation", field-level details - `inst-err-map-2a`
    2. [x] - `p1` - `NotFound` -> 404 Not Found, type "not-found", entity identifier in detail - `inst-err-map-2b`
    3. [x] - `p1` - `TypeAlreadyExists` -> 409 Conflict, type "type-already-exists", conflicting code in detail - `inst-err-map-2c`
-   4. [x] - `p1` - `InvalidParentType` -> 409 Conflict, type "invalid-parent-type", type mismatch in detail - `inst-err-map-2d`
-   5. [x] - `p1` - `AllowedParentsViolation` -> 409 Conflict, type "allowed-parents-violation", violating groups in detail - `inst-err-map-2e`
-   6. [x] - `p1` - `CycleDetected` -> 409 Conflict, type "cycle-detected", involved node IDs in detail - `inst-err-map-2f`
-   7. [x] - `p1` - `ConflictActiveReferences` -> 409 Conflict, type "active-references", reference count in detail - `inst-err-map-2g`
-   8. [x] - `p1` - `LimitViolation` -> 409 Conflict, type "limit-violation", limit name and values in detail - `inst-err-map-2h`
-   9. [x] - `p1` - `TenantIncompatibility` -> 409 Conflict, type "tenant-incompatibility", tenant IDs in detail - `inst-err-map-2i`
-   10. [x] - `p1` - `ServiceUnavailable` -> 503 Service Unavailable, type "service-unavailable" - `inst-err-map-2j`
+   4. [x] - `p1` - `InvalidParentType` -> 400 Bad Request via `invalid_argument`, with a **field violation** on `parent_type` (`field::PARENT_TYPE_FIELD` / `field::INVALID_PARENT_TYPE`) - `inst-err-map-2d`
+   5. [x] - `p1` - `AllowedParentTypesViolation` -> 400 Bad Request via `failed_precondition`, precondition subject `allowed_parents`, violating group names in the description - `inst-err-map-2e`
+   6. [x] - `p1` - `CycleDetected` -> 400 Bad Request via `failed_precondition`, precondition subject `hierarchy` - `inst-err-map-2f`
+   7. [x] - `p1` - `ConflictActiveReferences` -> 400 Bad Request via `failed_precondition`, precondition subject `active_references` - `inst-err-map-2g`
+   8. [x] - `p1` - `LimitViolation` -> 400 Bad Request via `failed_precondition`, precondition subject `limit` - `inst-err-map-2h`
+   9. [x] - `p1` - `TenantIncompatibility` -> 400 Bad Request via `failed_precondition`, precondition subject `tenant`. **All five `failed_precondition` families share one wire `type` (`STATE`)**, so a consumer distinguishes them by the discriminator is `precondition.violations[0].subject`, not by the problem type. 409 is reserved for identity collisions (`already_exists`) - `inst-err-map-2i`
+   10. [x] - `p1` - Infrastructure failures (database errors, an unreachable `AuthZ` Resolver) have **no** dedicated variant: they fall through to the `Database`/`InternalError` arms and surface as 500. There is no 503 produced by this mapper - `inst-err-map-2j`
    11. [x] - `p1` - `Internal` -> 500 Internal Server Error, type "internal", no internal details exposed - `inst-err-map-2k`
 3. [x] - `p1` - Construct Problem response with `type`, `title`, `status`, `detail` fields - `inst-err-map-3`
 4. [x] - `p1` - **RETURN** Problem response - `inst-err-map-4`
@@ -162,14 +162,14 @@ The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs`
 The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs` that represent the stable public interface for all RG operations.
 
 **Required traits**:
-- `ResourceGroupClient` — full CRUD trait: type management (`create_type`, `get_type`, `list_types`, `update_type`, `delete_type`), group management (`create_group`, `get_group`, `list_groups`, `update_group`, `delete_group`, `list_group_depth`), membership management (`add_membership`, `remove_membership`, `list_memberships`). All methods accept `SecurityContext` as first argument.
-- `ResourceGroupReadHierarchy` — narrow hierarchy-only read trait: `list_group_depth(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>`. Used exclusively by AuthZ plugin.
-- `ResourceGroupReadPluginClient` — extends `ResourceGroupReadHierarchy` with `list_memberships`. Used for vendor-specific plugin gateway routing.
+- `ResourceGroupClient` — full CRUD trait: type management (`create_type`, `get_type`, `list_types`, `update_type`, `delete_type`), group management (`create_group`, `get_group`, `list_groups`, `update_group`, `delete_group`, `get_group_descendants`, `get_group_ancestors`), membership management (`add_membership`, `remove_membership`, `list_memberships`). All methods accept `SecurityContext` as first argument.
+- `ResourceGroupReadHierarchy` — narrow read trait carrying five methods: `get_group_descendants`, `get_group_ancestors`, `list_groups`, `get_group` and `list_memberships`, all resolved unscoped. Its consumers are the tenant-resolver RG plugin and an in-process AuthZ PDP.
+- The earlier two-tier split — a separate `ResourceGroupReadPluginClient` extending `ResourceGroupReadHierarchy` with `list_memberships` — was collapsed and does not exist. `list_memberships` and `get_group` live directly on `ResourceGroupReadHierarchy`; see `DESIGN.md`.
 
 **Constraints**: `cpt-cf-resource-group-constraint-no-authz-decision`, `cpt-cf-resource-group-constraint-no-sql-filter-generation`
 
 **Touches**:
-- Entities: `ResourceGroupClient`, `ResourceGroupReadHierarchy`, `ResourceGroupReadPluginClient`
+- Entities: `ResourceGroupClient`, `ResourceGroupReadHierarchy`
 
 ### SDK Error Taxonomy
 
@@ -177,7 +177,7 @@ The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs
 
 The system **MUST** define `ResourceGroupError` enum in `resource-group-sdk/src/error.rs` covering all deterministic failure categories.
 
-**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentsViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `ServiceUnavailable`, `Internal`.
+**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentsViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `Internal`.
 
 Each variant **MUST** carry structured context (field details for Validation, entity identifier for NotFound, conflicting code for TypeAlreadyExists, etc.) sufficient for the error mapping algorithm to produce informative Problem responses.
 
@@ -200,7 +200,7 @@ Each persistence adapter (type, group, closure, membership) **MUST** be defined 
 - `gts_type_allowed_parent` — composite PK `(type_id, parent_type_id)` with CASCADE FK
 - `gts_type_allowed_membership` — composite PK `(type_id, membership_type_id)` with CASCADE FK
 - `resource_group` — UUID PK, `parent_id` FK (self-referential), `gts_type_id` FK, `name`, `metadata` (JSONB nullable), `tenant_id`, timestamps. Indexes: `(parent_id)`, `(name)`, `(gts_type_id, id)`, `(tenant_id)`
-- `resource_group_membership` — unique `(group_id, gts_type_id, resource_id)`, FK group_id → resource_group, FK gts_type_id → gts_type, `created_at`. Index: `(gts_type_id, resource_id)`
+- `resource_group_membership` — PRIMARY KEY `(group_id, gts_type_id, resource_id)` (this composite PK is what enforces uniqueness), FK group_id → resource_group, FK gts_type_id → gts_type, `created_at`. Index: `(gts_type_id, resource_id)`
 - `resource_group_closure` — composite PK `(ancestor_id, descendant_id)`, `depth` INTEGER, FK both → resource_group. Indexes: `(descendant_id)`, `(ancestor_id, depth)`
 
 **Constraints**: `cpt-cf-resource-group-constraint-db-agnostic`, `cpt-cf-resource-group-constraint-surrogate-ids-internal`
@@ -237,7 +237,7 @@ The system **MUST** wire OperationBuilder-based REST API routing with OData `$fi
 **Required infrastructure**:
 - OperationBuilder endpoint registration for types (under `/api/types-registry/v1/`), groups and memberships (under `/api/resource-group/v1/`)
 - OData `$filter` parser supporting field-specific operators: `eq`, `ne`, `in` for string/UUID fields; `eq`, `ne`, `gt`, `ge`, `lt`, `le` for integer fields; nested path syntax (`hierarchy/parent_id`, `hierarchy/depth`)
-- Cursor-based pagination: `limit` (1..200, default 25), `cursor` (opaque token). Ordering is undefined but consistent — no `$orderby` support.
+- Cursor-based pagination: `limit` (1..200, default 25), `cursor` (opaque token). `$orderby` **is** supported on the flat list endpoints and is mutually exclusive with `cursor` (400 otherwise); an unknown sort field is a 400. Without it the order is unspecified but stable.
 - DomainError → Problem (RFC-9457) error response mapping wired into all endpoint handlers via OperationBuilder error hooks
 - Path-based API versioning: `/api/resource-group/v1/` for groups and memberships, `/api/types-registry/v1/` for types
 

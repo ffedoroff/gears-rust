@@ -79,7 +79,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         // Bypass AuthZ — use unscoped method (AccessScope::allow_all).
         // AuthZ plugin is the caller; it cannot evaluate itself.
-        // Plugin invokes `list_group_depth(system_ctx, group_id, query)`;
+        // Plugin invokes `get_group_descendants(system_ctx, group_id, query)`;
         // RgReadService delegates to GroupService unscoped read methods which
         // execute the closure-table query and return `Page<ResourceGroupWithDepth>`.
         self.group_service

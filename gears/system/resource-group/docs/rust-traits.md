@@ -189,7 +189,8 @@ pub trait ResourceGroupClient: Send + Sync {
     async fn delete_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<(), ResourceGroupError>;
 
     // ── Hierarchy ───────────────────────────────────────────────────
-    async fn list_group_depth(&self, ctx: &SecurityContext, group_id: Uuid, query: ListQuery) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
+    async fn get_group_descendants(&self, ctx: &SecurityContext, group_id: Uuid, query: &ODataQuery) -> Result<Page<ResourceGroupWithDepth>, CanonicalError>;
+    async fn get_group_ancestors(&self, ctx: &SecurityContext, group_id: Uuid, query: &ODataQuery) -> Result<Page<ResourceGroupWithDepth>, CanonicalError>;
 
     // ── Membership lifecycle ────────────────────────────────────────
     async fn add_membership(&self, ctx: &SecurityContext, request: AddMembershipRequest) -> Result<ResourceGroupMembership, ResourceGroupError>;

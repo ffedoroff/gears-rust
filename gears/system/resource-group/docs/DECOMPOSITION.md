@@ -42,10 +42,10 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 - **Depends On**: None
 
 - **Scope**:
-  - SDK crate (`resource-group-sdk`): `models.rs` (ResourceGroupType, ResourceGroup, ResourceGroupWithDepth, ResourceGroupMembership, Page, PageInfo, GtsTypePath), `api.rs` (ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupReadPluginClient traits), `error.rs` (ResourceGroupError taxonomy)
+  - SDK crate (`resource-group-sdk`): `models.rs` (ResourceGroupType, ResourceGroup, ResourceGroupWithDepth, ResourceGroupMembership, Page, PageInfo, GtsTypePath), `api.rs` (ResourceGroupClient, ResourceGroupReadHierarchy traits), `error.rs` (ResourceGroupError taxonomy)
   - Gear scaffold: `#[toolkit::gear]` annotated gear, ClientHub registration for `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`
   - Persistence adapter: SeaORM entity definitions for all 6 tables (gts_type, gts_type_allowed_parent, gts_type_allowed_membership, resource_group, resource_group_membership, resource_group_closure), DB migration scripts
-  - Error mapping: DomainError to Problem (RFC-9457) mapping for all deterministic error categories (Validation, NotFound, TypeAlreadyExists, InvalidParentType, CycleDetected, ConflictActiveReferences, LimitViolation, TenantIncompatibility, ServiceUnavailable, Internal)
+  - Error mapping: DomainError to Problem (RFC-9457) mapping for all deterministic error categories (Validation, NotFound, TypeAlreadyExists, InvalidParentType, CycleDetected, ConflictActiveReferences, LimitViolation, TenantIncompatibility, Internal)
   - REST infrastructure: OperationBuilder wiring, OData `$filter` parsing, cursor-based pagination helpers
   - GtsTypePath value object with format validation (`^gts\.[a-z_]...~$`)
   - gear initialization phasing (SystemCapability → ready) for circular dependency resolution with AuthZ
@@ -305,7 +305,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 
 - **Scope**:
   - Integration read service: expose `ResourceGroupReadHierarchy` via ClientHub for AuthZ plugin consumption, returning hierarchy data without policy or SQL semantics
-  - Plugin gateway routing: built-in provider (local persistence path) vs vendor-specific provider (resolve plugin instance by configured vendor, delegate to `ResourceGroupReadPluginClient`) with SecurityContext passthrough
+  - Plugin gateway routing: built-in provider (local persistence path) vs vendor-specific provider (a vendor backend replaces the registered `dyn ResourceGroupReadHierarchy` implementation at gear init) with SecurityContext passthrough
   - JWT authentication: standard AuthZ evaluation via `PolicyEnforcer.access_scope()` on all REST endpoints, `AccessScope` applied via SecureORM for tenant-scoped queries
   - MTLS authentication _(p2 — deferred, not implemented yet)_: client certificate verification against trusted CA bundle, endpoint allowlist (only `GET /groups/{group_id}/hierarchy`), AuthZ bypass for trusted system principals, system SecurityContext creation
   - MTLS configuration _(p2 — deferred, not implemented yet)_: `ca_cert`, `allowed_clients` (by certificate CN), `allowed_endpoints` (method + path pairs)
