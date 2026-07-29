@@ -243,7 +243,8 @@ pub struct CreateGroupRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Request body for updating a resource group (full replacement via PUT).
+/// Request body for updating a resource group's ordinary attributes
+/// (full replacement via PUT).
 ///
 /// **The group's type is immutable after creation.** A group cannot be
 /// converted between tenant-typed and non-tenant-typed (or between any two
@@ -251,17 +252,27 @@ pub struct CreateGroupRequest {
 /// `type` / `code` field. To change semantics, delete the old group and
 /// create a new one. See `UpdateTypeRequest` for changing the *definition*
 /// of an existing GTS type — that's a different concern.
+///
+/// **The group's position in the hierarchy is not part of this payload.**
+/// Re-parenting is a structural mutation — it runs cycle detection, depth /
+/// width invariant checks and a closure-table rebuild — so it is a separate
+/// operation: [`ResourceGroupClient::move_group`](crate::ResourceGroupClient::move_group),
+/// exposed over REST as `POST /resource-group/v1/groups/{group_id}/move`.
+/// What is left here are the group's ordinary fields, and this request
+/// replaces all of them.
+///
+/// Both fields are therefore mandatory *on the wire*: the REST DTO
+/// (`UpdateGroupDto`) rejects a payload that omits `name` or `metadata` with
+/// a 400 `problem+json` rather than silently clearing the stored value.
+/// `metadata: None` here means "clear the metadata", never "leave it as it
+/// was" — that distinction is resolved at the REST boundary before this
+/// struct is built.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateGroupRequest {
     /// Display name (1..255 characters).
     pub name: String,
-    /// Parent group ID (`null` for root groups). Reparenting is allowed only
-    /// within the same tenant scope; cross-tenant moves are rejected by the
-    /// service layer. Send explicit `null` to move a group to root — an
-    /// omitted key is rejected as a malformed payload.
-    pub parent_id: Option<Uuid>,
-    /// Type-specific metadata (`null` to clear).
+    /// Type-specific metadata. `None` clears the stored metadata.
     pub metadata: Option<serde_json::Value>,
 }
 

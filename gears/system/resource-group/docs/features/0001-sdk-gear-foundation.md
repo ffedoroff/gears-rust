@@ -217,7 +217,7 @@ The system **MUST** provide an RG gear annotated with `#[toolkit::gear]` that re
 **Required behavior**:
 - Phase 1 (SystemCapability): register `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub. REST/gRPC endpoints NOT yet accepting traffic.
 - Phase 2 (ready): start accepting REST/gRPC traffic. Write operations can now call `PolicyEnforcer` → `AuthZResolverClient` (available since AuthZ init in Phase 1).
-- ClientHub registration: single `RgService` implementation registered as both `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`.
+- ClientHub registration: single `ResourceGroupLocalClient` implementation registered as both `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`.
 - Query profile configuration loaded from gear config (`max_depth`, `max_width`).
 
 **Implements**:
@@ -226,7 +226,7 @@ The system **MUST** provide an RG gear annotated with `#[toolkit::gear]` that re
 **Constraints**: `cpt-cf-resource-group-constraint-no-authz-decision`
 
 **Touches**:
-- Entities: `RgGear`, `RgService`
+- Entities: `RgGear`, `ResourceGroupLocalClient`
 
 ### REST and OData Infrastructure
 

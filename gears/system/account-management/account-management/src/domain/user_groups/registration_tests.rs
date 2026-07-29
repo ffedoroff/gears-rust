@@ -359,6 +359,17 @@ impl ResourceGroupClient for FakeRgClient {
     ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
+    // Structural counterpart of `update_group`. Implemented explicitly (the
+    // trait offers no default) so a fake can never silently absorb a
+    // re-parent — the mistake `delete_group_cascade`'s default impl made.
+    async fn move_group(
+        &self,
+        _ctx: &SecurityContext,
+        _id: Uuid,
+        _new_parent_id: Option<Uuid>,
+    ) -> Result<ResourceGroup, CanonicalError> {
+        unreachable!()
+    }
     async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
         unreachable!()
     }
@@ -733,6 +744,14 @@ async fn container_update_type_transport_error_returns_service_unavailable() {
             request: UpdateGroupRequest,
         ) -> Result<ResourceGroup, CanonicalError> {
             self.delegate.update_group(ctx, id, request).await
+        }
+        async fn move_group(
+            &self,
+            ctx: &SecurityContext,
+            id: Uuid,
+            new_parent_id: Option<Uuid>,
+        ) -> Result<ResourceGroup, CanonicalError> {
+            self.delegate.move_group(ctx, id, new_parent_id).await
         }
         async fn delete_group(
             &self,

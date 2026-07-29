@@ -146,6 +146,21 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         parent_id: Uuid,
     ) -> Result<u64, DomainError>;
 
+    /// Count root groups (`parent_id IS NULL`) belonging to one tenant,
+    /// excluding a single group id.
+    ///
+    /// The root-level counterpart of [`Self::count_children`]: it answers
+    /// "how many siblings would this group have if it became a root?", which
+    /// is what `max_width` means at depth 0. Scoped to `tenant_id` so one
+    /// tenant's forest shape never constrains another's, and `exclude_id`
+    /// keeps a no-op move of an already-root group from counting itself.
+    async fn count_root_siblings<C: DBRunner>(
+        &self,
+        db: &C,
+        tenant_id: Uuid,
+        exclude_id: Uuid,
+    ) -> Result<u64, DomainError>;
+
     async fn is_descendant<C: DBRunner>(
         &self,
         db: &C,

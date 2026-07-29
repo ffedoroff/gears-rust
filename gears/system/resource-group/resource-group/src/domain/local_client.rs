@@ -1,5 +1,5 @@
 // Created: 2026-04-16 by Constructor Tech
-//! Unified service adapter implementing `ResourceGroupClient` for `ClientHub` registration.
+//! Local client adapter implementing `ResourceGroupClient` for `ClientHub` registration.
 //!
 //! Delegates to `TypeService`, `GroupService`, and `MembershipService` to satisfy
 //! the full SDK trait contract.
@@ -22,10 +22,10 @@ use crate::domain::membership_service::MembershipService;
 use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeRepositoryTrait};
 use crate::domain::type_service::TypeService;
 
-/// Unified adapter registered with `ClientHub` as `dyn ResourceGroupClient`.
+/// Local client adapter registered with `ClientHub` as `dyn ResourceGroupClient`.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[allow(clippy::struct_field_names)]
-pub struct RgService<
+pub struct ResourceGroupLocalClient<
     GR: GroupRepositoryTrait,
     TR: TypeRepositoryTrait,
     MR: MembershipRepositoryTrait,
@@ -36,9 +36,9 @@ pub struct RgService<
 }
 
 impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
-    RgService<GR, TR, MR>
+    ResourceGroupLocalClient<GR, TR, MR>
 {
-    /// Create a new `RgService`.
+    /// Create a new `ResourceGroupLocalClient`.
     #[must_use]
     pub fn new(
         type_service: Arc<TypeService<TR>>,
@@ -55,7 +55,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 
 #[async_trait]
 impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
-    ResourceGroupClient for RgService<GR, TR, MR>
+    ResourceGroupClient for ResourceGroupLocalClient<GR, TR, MR>
 {
     // -- Type lifecycle --
 
@@ -155,6 +155,24 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     ) -> Result<ResourceGroup, CanonicalError> {
         self.group_service
             .update_group(ctx, id, request)
+            .await
+            .map_err(CanonicalError::from)
+    }
+
+    async fn move_group(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+        new_parent_id: Option<Uuid>,
+    ) -> Result<ResourceGroup, CanonicalError> {
+        // Forwards to the AuthZ-gated `GroupService::move_group`, which runs
+        // the whole structural mutation (cycle detection, parent-type
+        // compatibility, depth/width limits, tenant-root uniqueness, the
+        // cross-tenant re-parent ban and the closure rebuild) inside one
+        // SERIALIZABLE transaction with bounded retry. Mirrors the REST
+        // `POST /groups/{group_id}/move` path exactly.
+        self.group_service
+            .move_group(ctx, id, new_parent_id)
             .await
             .map_err(CanonicalError::from)
     }

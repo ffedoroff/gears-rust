@@ -1203,7 +1203,6 @@ async fn concurrent_rename_same_group_both_succeed(db: &Arc<DBProvider<DbError>>
             group_id,
             resource_group_sdk::UpdateGroupRequest {
                 name: "RenamedByA".to_owned(),
-                parent_id: None,
                 metadata: None,
             },
         )
@@ -1216,7 +1215,6 @@ async fn concurrent_rename_same_group_both_succeed(db: &Arc<DBProvider<DbError>>
             group_id,
             resource_group_sdk::UpdateGroupRequest {
                 name: "RenamedByB".to_owned(),
-                parent_id: None,
                 metadata: None,
             },
         )
@@ -1451,11 +1449,11 @@ async fn move_a_to_b_races_move_b_to_a(db: &Arc<DBProvider<DbError>>) {
 
     let t1 = tokio::spawn(async move {
         b1.wait().await;
-        svc1.move_group(a_id, Some(b_id)).await
+        svc1.move_group_unscoped(a_id, Some(b_id)).await
     });
     let t2 = tokio::spawn(async move {
         b2.wait().await;
-        svc2.move_group(b_id, Some(a_id)).await
+        svc2.move_group_unscoped(b_id, Some(a_id)).await
     });
 
     let (r1, r2) = timed("move_a_to_b_races_move_b_to_a", async {
@@ -1526,11 +1524,11 @@ async fn move_ancestor_races_move_descendant(db: &Arc<DBProvider<DbError>>) {
 
     let move_m_task = tokio::spawn(async move {
         b1.wait().await;
-        svc1.move_group(m_id, Some(r2_id)).await
+        svc1.move_group_unscoped(m_id, Some(r2_id)).await
     });
     let move_leaf_task = tokio::spawn(async move {
         b2.wait().await;
-        svc2.move_group(l_id, Some(r3_id)).await
+        svc2.move_group_unscoped(l_id, Some(r3_id)).await
     });
 
     let (move_m_res, move_leaf_res) = timed("move_ancestor_races_move_descendant", async {
@@ -1615,7 +1613,7 @@ async fn create_child_races_move_parent(db: &Arc<DBProvider<DbError>>) {
     });
     let move_task = tokio::spawn(async move {
         b2.wait().await;
-        svc2.move_group(p_id, Some(q_id)).await
+        svc2.move_group_unscoped(p_id, Some(q_id)).await
     });
 
     let (create_res, move_res) = timed("create_child_races_move_parent", async {

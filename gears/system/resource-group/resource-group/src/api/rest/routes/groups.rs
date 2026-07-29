@@ -78,11 +78,18 @@ pub(super) fn register_group_routes(mut router: Router, openapi: &dyn OpenApiReg
         .error_500(openapi)
         .register(router, openapi);
 
-    // PUT /resource-group/v1/groups/{group_id} - Update a group
+    // PUT /resource-group/v1/groups/{group_id} - Update a group's attributes
     router = OperationBuilder::put("/resource-group/v1/groups/{group_id}")
         .operation_id("resource_group.update_group")
         .summary("Update resource group")
-        .description("Update a resource group (full replacement via PUT, including parent move)")
+        .description(
+            "Replace a resource group's ordinary attributes: `name` and `metadata`. Both keys \
+             are required -- an omitted key is a 400, not \"keep the stored value\"; send \
+             `\"metadata\": null` to clear the metadata. The group's `type` is immutable and \
+             its parent is not part of this payload: use POST \
+             /resource-group/v1/groups/{group_id}/move to re-parent a group. Unknown fields \
+             are rejected.",
+        )
         .tag(API_TAG)
         .authenticated()
         .no_license_required()
@@ -93,6 +100,42 @@ pub(super) fn register_group_routes(mut router: Router, openapi: &dyn OpenApiReg
             openapi,
             http::StatusCode::OK,
             "Updated resource group",
+        )
+        .error_400(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    // POST /resource-group/v1/groups/{group_id}/move - Move a group (subtree)
+    //
+    // An action endpoint rather than a field on PUT: re-parenting is a
+    // structural mutation (cycle detection, depth/width invariants,
+    // closure-table rebuild under SERIALIZABLE), not an ordinary column
+    // write. Shape follows the platform's two existing action endpoints,
+    // `POST /bss-ledger/v1/approvals/{approval_id}/cancel` and
+    // `POST /usage-collector/v1/records/{id}/deactivate`.
+    router = OperationBuilder::post("/resource-group/v1/groups/{group_id}/move")
+        .operation_id("resource_group.move_group")
+        .summary("Move resource group to a new parent")
+        .description(
+            "Atomically move a resource group -- and its entire subtree -- to a new parent, or \
+             to the forest root. `parent_id` is required: an explicit `null` means \"make this \
+             group a root\", while omitting the key is a 400. Cycle detection, parent-type \
+             compatibility, depth/width limits, tenant-root uniqueness and the closure-table \
+             rebuild all run inside one SERIALIZABLE transaction, so the group is never left \
+             detached from both parents. Cross-tenant moves are rejected.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("group_id", "Group UUID")
+        .json_request::<dto::MoveGroupDto>(openapi, "Move destination")
+        .handler(handlers::move_group)
+        .json_response_with_schema::<dto::GroupDto>(
+            openapi,
+            http::StatusCode::OK,
+            "Moved resource group",
         )
         .error_400(openapi)
         .error_404(openapi)

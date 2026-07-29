@@ -14,9 +14,9 @@ use tracing::info;
 
 use crate::api::rest::routes;
 use crate::domain::group_service::{GroupService, QueryProfile};
+use crate::domain::local_client::ResourceGroupLocalClient;
 use crate::domain::membership_service::MembershipService;
 use crate::domain::read_service::RgReadService;
-use crate::domain::rg_service::RgService;
 use crate::domain::type_service::TypeService;
 use crate::infra::storage::group_repo::GroupRepository;
 use crate::infra::storage::membership_repo::MembershipRepository;
@@ -26,7 +26,8 @@ pub type ConcreteTypeService = TypeService<TypeRepository>;
 pub type ConcreteGroupService = GroupService<GroupRepository, TypeRepository>;
 pub type ConcreteMembershipService =
     MembershipService<GroupRepository, TypeRepository, MembershipRepository>;
-pub type ConcreteRgService = RgService<GroupRepository, TypeRepository, MembershipRepository>;
+pub type ConcreteResourceGroupLocalClient =
+    ResourceGroupLocalClient<GroupRepository, TypeRepository, MembershipRepository>;
 
 /// Main gear struct for the resource-group gear.
 #[toolkit::gear(
@@ -125,7 +126,7 @@ impl Gear for ResourceGroup {
             .ok_or_else(|| anyhow::anyhow!("{} group_service not initialized", Self::MODULE_NAME))?
             .clone();
 
-        let rg_client: Arc<dyn ResourceGroupClient> = Arc::new(RgService::new(
+        let rg_client: Arc<dyn ResourceGroupClient> = Arc::new(ResourceGroupLocalClient::new(
             type_svc,
             group_svc.clone(),
             membership_service.clone(),

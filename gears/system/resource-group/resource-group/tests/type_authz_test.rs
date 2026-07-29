@@ -34,11 +34,11 @@
 //! 4. `seed_types` (and the `*_unscoped` methods it calls) still works with
 //!    no `SecurityContext` at all -- even wired to a deny-all enforcer that
 //!    would reject every gated call.
-//! 5. `RgService` -- the `dyn ResourceGroupClient` adapter registered in
+//! 5. `ResourceGroupLocalClient` -- the `dyn ResourceGroupClient` adapter registered in
 //!    `ClientHub` -- is gated exactly like `TypeService`'s direct entry
 //!    points, with no exception for any caller shape:
-//!    `rg_service_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant`
-//!    drives all five type methods through `RgService` with a deny-all
+//!    `local_client_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant`
+//!    drives all five type methods through `ResourceGroupLocalClient` with a deny-all
 //!    enforcer and an `am.system`-shaped, nil-tenant `SecurityContext`
 //!    (account-management's gear-init actor,
 //!    `system_actor.rs::for_gear_init`) and asserts every one comes back
@@ -71,7 +71,7 @@ use authz_resolver_sdk::{
 use toolkit_security::{SecurityContext, pep_properties};
 
 use resource_group::domain::error::DomainError;
-use resource_group::domain::rg_service::RgService;
+use resource_group::domain::local_client::ResourceGroupLocalClient;
 use resource_group::domain::seeding::seed_types;
 use resource_group::domain::type_service::{RG_TYPE_RESOURCE, TypeService};
 use resource_group::infra::storage::type_repo::TypeRepository;
@@ -567,11 +567,11 @@ async fn seed_types_succeeds_with_deny_all_enforcer() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 5. RgService (the ClientHub `dyn ResourceGroupClient` adapter) is gated
+// 5. ResourceGroupLocalClient (the ClientHub `dyn ResourceGroupClient` adapter) is gated
 //    -- no in-process bypass exists for its five type methods.
 // ═══════════════════════════════════════════════════════════════════════
 
-/// `RgService`'s five type-lifecycle methods must be denied when the
+/// `ResourceGroupLocalClient`'s five type-lifecycle methods must be denied when the
 /// `TypeService` they delegate to is wired to a deny-all enforcer -- even
 /// for a nil-tenant, `am.system`-shaped `SecurityContext`, the exact shape
 /// account-management's gear-init actor uses
@@ -595,9 +595,9 @@ async fn seed_types_succeeds_with_deny_all_enforcer() {
 /// that is a policy or plugin problem to solve on those layers -- not a
 /// reason to reintroduce an unscoped path here.
 #[tokio::test]
-async fn rg_service_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant() {
+async fn local_client_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant() {
     let db = common::test_db().await;
-    let rg_service = RgService::new(
+    let local_client = ResourceGroupLocalClient::new(
         Arc::new(common::make_type_service_deny(db.clone())),
         Arc::new(common::make_group_service_deny(db.clone())),
         Arc::new(common::make_membership_service_deny(db)),
@@ -614,7 +614,7 @@ async fn rg_service_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant
 
     let code = unique_code("rggated");
 
-    let err = rg_service
+    let err = local_client
         .create_type(
             &ctx,
             CreateTypeRequest {
@@ -626,34 +626,38 @@ async fn rg_service_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant
             },
         )
         .await
-        .expect_err("RgService::create_type must be denied by the gate, not bypass it");
+        .expect_err(
+            "ResourceGroupLocalClient::create_type must be denied by the gate, not bypass it",
+        );
     assert_eq!(
         err.status_code(),
         403,
         "expected PermissionDenied (403): {err:?}"
     );
 
-    let err = rg_service
+    let err = local_client
         .get_type(&ctx, &code)
         .await
-        .expect_err("RgService::get_type must be denied by the gate, not bypass it");
+        .expect_err("ResourceGroupLocalClient::get_type must be denied by the gate, not bypass it");
     assert_eq!(
         err.status_code(),
         403,
         "expected PermissionDenied (403): {err:?}"
     );
 
-    let err = rg_service
+    let err = local_client
         .list_types(&ctx, &toolkit_odata::ODataQuery::default())
         .await
-        .expect_err("RgService::list_types must be denied by the gate, not bypass it");
+        .expect_err(
+            "ResourceGroupLocalClient::list_types must be denied by the gate, not bypass it",
+        );
     assert_eq!(
         err.status_code(),
         403,
         "expected PermissionDenied (403): {err:?}"
     );
 
-    let err = rg_service
+    let err = local_client
         .update_type(
             &ctx,
             &code,
@@ -665,17 +669,18 @@ async fn rg_service_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant
             },
         )
         .await
-        .expect_err("RgService::update_type must be denied by the gate, not bypass it");
+        .expect_err(
+            "ResourceGroupLocalClient::update_type must be denied by the gate, not bypass it",
+        );
     assert_eq!(
         err.status_code(),
         403,
         "expected PermissionDenied (403): {err:?}"
     );
 
-    let err = rg_service
-        .delete_type(&ctx, &code)
-        .await
-        .expect_err("RgService::delete_type must be denied by the gate, not bypass it");
+    let err = local_client.delete_type(&ctx, &code).await.expect_err(
+        "ResourceGroupLocalClient::delete_type must be denied by the gate, not bypass it",
+    );
     assert_eq!(
         err.status_code(),
         403,

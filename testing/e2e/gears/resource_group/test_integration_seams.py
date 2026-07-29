@@ -62,12 +62,20 @@ async def test_route_smoke_all_endpoints(
         r = await c.get(f"{_types(rg_base_url)}/{type_code}", headers=h)
         assert r.status_code not in (404, 405), f"GET /types/{{code}}: {r.status_code}"
 
-        # PUT /types/{code} -- update type, not exercised elsewhere
+        # PUT /types/{code} -- update type, not exercised elsewhere.
+        # A full replacement: every replaceable field must be present, and
+        # `code` must NOT be (it is the identity, taken from the path, and the
+        # body rejects unknown fields).
         r = await c.put(
             f"{_types(rg_base_url)}/{type_code}", headers=h,
-            json={"code": type_code, "can_be_root": True},
+            json={
+                "can_be_root": True,
+                "allowed_parent_types": [],
+                "allowed_membership_types": [],
+                "metadata_schema": None,
+            },
         )
-        assert r.status_code not in (404, 405), f"PUT /types/{{code}}: {r.status_code}"
+        assert r.status_code == 200, f"PUT /types/{{code}}: {r.status_code} {r.text}"
 
         # DELETE /types/{code} -- delete type, not exercised elsewhere
         del_type = await create_type("s1del")
@@ -311,9 +319,11 @@ async def test_move_closure_rebuild(
 ):
     """Seam: Closure table DELETE + re-INSERT on parent change.
 
-    The move runs DELETE FROM closure WHERE descendant IN (subtree) then
-    INSERT INTO...SELECT new paths. Verifies the subtree is detached from
-    the old root and reattached to the new root with correct depths.
+    Driven through POST /groups/{id}/move -- the dedicated structural
+    operation. The move runs DELETE FROM closure WHERE descendant IN (subtree)
+    then INSERT INTO...SELECT new paths. Verifies the subtree is detached from
+    the old root and reattached to the new root with correct depths, and that
+    the strict PUT no longer accepts the structural field.
     Backend-agnostic.
     """
     root_type = await create_type("s6root")
@@ -330,13 +340,43 @@ async def test_move_closure_rebuild(
     root_b = await create_group(root_type["code"], "S6 Root B")
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-        # Move child subtree from root_a to root_b
+        # Move child subtree from root_a to root_b.
+        #
+        # Moving is its own operation: POST /groups/{id}/move with a mandatory
+        # `parent_id`. It used to be a field on PUT, where this very request
+        # also carried `type` -- silently discarded, because a group's type is
+        # immutable -- and returned 200 anyway. The move body rejects unknown
+        # fields, so that mistake is now impossible to make quietly.
+        r = await c.post(
+            f"{_groups(rg_base_url)}/{child['id']}/move",
+            headers=rg_headers,
+            json={"parent_id": root_b["id"]},
+        )
+        assert r.status_code == 200, f"Move failed: {r.status_code} {r.text}"
+        assert r.json()["hierarchy"]["parent_id"] == root_b["id"]
+
+        # PUT no longer accepts `parent_id` (nor the immutable `type`): a
+        # client still sending the pre-split payload gets an explicit 400
+        # instead of a silently-dropped mutation.
         r = await c.put(
             f"{_groups(rg_base_url)}/{child['id']}",
             headers=rg_headers,
-            json={"type": child_type["code"], "name": "S6 Child", "parent_id": root_b["id"]},
+            json={"name": "S6 Child", "parent_id": root_a["id"], "metadata": None},
         )
-        assert r.status_code == 200, f"Move failed: {r.status_code} {r.text}"
+        assert r.status_code == 400, (
+            f"PUT with parent_id must be rejected: {r.status_code} {r.text}"
+        )
+
+        # ...and PUT without `metadata` is a 400 too, rather than a 200 that
+        # silently erases the stored metadata.
+        r = await c.put(
+            f"{_groups(rg_base_url)}/{child['id']}",
+            headers=rg_headers,
+            json={"name": "S6 Child"},
+        )
+        assert r.status_code == 400, (
+            f"PUT without metadata must be rejected: {r.status_code} {r.text}"
+        )
 
         # root_a hierarchy: only root_a remains
         r = await c.get(

@@ -8,6 +8,57 @@ use resource_group_sdk::models::{
 };
 use uuid::Uuid;
 
+use crate::domain::error::DomainError;
+
+/// Serde helper distinguishing an **omitted** key (`None`) from an explicit
+/// JSON `null` (`Some(None)`) and from a value (`Some(Some(v))`). Pair with
+/// `#[serde(default, deserialize_with = "double_option")]`.
+///
+/// Needed because `#[schema(required)]` is a *utoipa* attribute: it makes the
+/// generated `OpenAPI` document advertise the field as required, but has no
+/// effect on serde, which happily deserializes a missing `Option<T>` into
+/// `None`. Without this helper "the client omitted `metadata`" and "the
+/// client sent `metadata: null`" are the same value — which is exactly how
+/// an omitted key came to silently erase stored metadata (`group_repo.rs`
+/// writes the column unconditionally).
+///
+/// The full-replacement DTOs below use it the other way round from a PATCH:
+/// they do not *accept* an omitted key, they **detect** it in order to reject
+/// the request with a 400 `problem+json`. Mirrors the same helper in
+/// account-management's `api::rest::dto`, which uses it for PATCH semantics.
+///
+/// `serde_with::rust::double_option` would do the same job, but `serde_with`
+/// is not a dependency of this crate.
+#[allow(clippy::option_option)]
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
+/// Reject an omitted required key on a full-replacement (`PUT`) payload.
+///
+/// Deliberately implemented *after* deserialization rather than by making
+/// the field non-`Option` in serde: RG handlers extract bodies with
+/// `axum::Json` (via `toolkit::api::canonical_prelude`), whose rejection is
+/// a bare `text/plain` 400/422 that never passes through
+/// `canonical_error_middleware` — it only rewrites responses that already
+/// carry `application/problem+json`. Routing the check through
+/// `DomainError::validation` instead puts it on the same
+/// `From<DomainError> for CanonicalError` ladder as every other 400 in this
+/// gear, so the client gets RFC-9457 as
+/// `docs/toolkit_unified_system/04_rest_operation_builder.md` requires.
+fn require_key<T>(value: Option<T>, field: &str, hint: &str) -> Result<T, DomainError> {
+    value.ok_or_else(|| {
+        DomainError::validation(format!(
+            "'{field}' is required: this endpoint performs a full replacement, so an omitted \
+             key cannot be distinguished from a request to keep the stored value. {hint}"
+        ))
+    })
+}
+
 /// REST DTO for GTS type representation.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request, response)]
@@ -49,11 +100,19 @@ pub struct CreateTypeDto {
 
 /// REST DTO for updating a GTS type (full replacement via PUT).
 ///
-/// Every replaceable field is **required** so an omitted field cannot be
-/// confused with "preserve previous value". Nullable fields
-/// (`metadata_schema`) must be sent explicitly as `null` to clear them.
+/// The type registry is a document resource: a type definition is replaced as
+/// a whole, so strict full replacement is the correct shape for it (baseline
+/// rule B1.1). Every replaceable field is therefore **required** and an
+/// omitted key is an error, not "preserve previous value" — `metadata_schema`
+/// must be sent explicitly as `null` to clear it.
+///
+/// `deny_unknown_fields` locks the wire envelope, so a client that sends
+/// `code` (the type's identity, taken from the path and immutable) gets an
+/// explicit 400 instead of a silently-dropped field.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::option_option)]
 pub struct UpdateTypeDto {
     /// Whether groups of this type can be root nodes.
     pub can_be_root: bool,
@@ -61,9 +120,12 @@ pub struct UpdateTypeDto {
     pub allowed_parent_types: Vec<String>,
     /// GTS type paths of allowed membership resource types.
     pub allowed_membership_types: Vec<String>,
-    /// JSON Schema for instance metadata (`null` to clear).
-    #[schema(required)]
-    pub metadata_schema: Option<serde_json::Value>,
+    /// JSON Schema for instance metadata. Required: send `null` to clear it.
+    /// An omitted key is rejected — it used to silently erase the stored
+    /// schema (`type_service.rs` writes the column unconditionally).
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(required, value_type = Option<serde_json::Value>)]
+    pub metadata_schema: Option<Option<serde_json::Value>>,
 }
 
 // -- Conversions --
@@ -92,14 +154,20 @@ impl From<CreateTypeDto> for CreateTypeRequest {
     }
 }
 
-impl From<UpdateTypeDto> for UpdateTypeRequest {
-    fn from(dto: UpdateTypeDto) -> Self {
-        Self {
+impl TryFrom<UpdateTypeDto> for UpdateTypeRequest {
+    type Error = DomainError;
+
+    fn try_from(dto: UpdateTypeDto) -> Result<Self, Self::Error> {
+        Ok(Self {
             can_be_root: dto.can_be_root,
             allowed_parent_types: dto.allowed_parent_types,
             allowed_membership_types: dto.allowed_membership_types,
-            metadata_schema: dto.metadata_schema,
-        }
+            metadata_schema: require_key(
+                dto.metadata_schema,
+                "metadata_schema",
+                "Send \"metadata_schema\": null to clear the stored JSON Schema.",
+            )?,
+        })
     }
 }
 
@@ -198,29 +266,75 @@ pub struct CreateGroupDto {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// REST DTO for updating a resource group (full replacement via PUT).
+/// REST DTO for updating a resource group's ordinary attributes (full
+/// replacement via PUT).
 ///
 /// **The group's GTS type is immutable after creation.** The payload
 /// deliberately does not carry a `type` field — to change a group's type,
 /// delete the existing group and create a new one. See the SDK
 /// `UpdateGroupRequest` doc for the full rationale.
 ///
-/// Every replaceable field is **required** so an omitted field cannot be
-/// confused with "preserve previous value". Nullable fields (`parent_id`,
-/// `metadata`) must be sent explicitly as `null` to clear them — for
-/// example, moving a group to root requires `"parent_id": null`, not an
-/// omitted key.
+/// **The group's parent is not here either.** Re-parenting is a structural
+/// mutation — cycle detection, depth/width invariants, closure-table rebuild —
+/// so it has its own operation: `POST /groups/{group_id}/move` with
+/// [`MoveGroupDto`]. What is left on this resource is `name` and `metadata`,
+/// two ordinary fields, and this payload replaces both.
+///
+/// Both fields are **required**. An omitted key is a 400, not "preserve the
+/// previous value": for `metadata` the two are genuinely indistinguishable to
+/// serde, and treating an omission as `null` is what used to erase stored
+/// metadata. Send `"metadata": null` to clear it deliberately.
+///
+/// `deny_unknown_fields` locks the wire envelope, so a client that tries to
+/// change the immutable `type`, or that still sends `parent_id` expecting the
+/// pre-split move-via-PUT behaviour, gets an explicit 400 instead of a
+/// silently-discarded mutation.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::option_option)]
 pub struct UpdateGroupDto {
-    /// Display name (1..255 characters).
-    pub name: String,
-    /// Parent group ID (`null` for root groups).
-    #[schema(required)]
-    pub parent_id: Option<Uuid>,
-    /// Type-specific metadata (`null` to clear).
-    #[schema(required)]
-    pub metadata: Option<serde_json::Value>,
+    /// Display name (1..255 characters). Required.
+    #[schema(required, value_type = String)]
+    pub name: Option<String>,
+    /// Type-specific metadata. Required: send `null` to clear it.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(required, value_type = Option<serde_json::Value>)]
+    pub metadata: Option<Option<serde_json::Value>>,
+}
+
+/// REST DTO for the group move operation
+/// (`POST /groups/{group_id}/move`).
+///
+/// `parent_id` is **mandatory**, and an explicit `null` is its most important
+/// value: `null` means "make this group a root", an omitted key means the
+/// caller did not say where to move the group and is a 400. Collapsing those
+/// two into one value is the defect this operation was split out to remove,
+/// so the distinction is enforced here rather than assumed.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::option_option)]
+pub struct MoveGroupDto {
+    /// New parent group ID, or `null` to move the group to the forest root.
+    /// The key itself must be present.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(required, value_type = Option<Uuid>)]
+    pub parent_id: Option<Option<Uuid>>,
+}
+
+impl MoveGroupDto {
+    /// Resolve the requested destination: `Ok(None)` means "move to root",
+    /// `Ok(Some(id))` means "move under `id`". An omitted `parent_id` key is
+    /// rejected.
+    pub fn into_new_parent_id(self) -> Result<Option<Uuid>, DomainError> {
+        require_key(
+            self.parent_id,
+            "parent_id",
+            "Send \"parent_id\": null to move the group to the root, or a group UUID to move it \
+             under that group.",
+        )
+    }
 }
 
 // -- Group conversions --
@@ -269,13 +383,22 @@ impl From<CreateGroupDto> for CreateGroupRequest {
     }
 }
 
-impl From<UpdateGroupDto> for UpdateGroupRequest {
-    fn from(dto: UpdateGroupDto) -> Self {
-        Self {
-            name: dto.name,
-            parent_id: dto.parent_id,
-            metadata: dto.metadata,
-        }
+impl TryFrom<UpdateGroupDto> for UpdateGroupRequest {
+    type Error = DomainError;
+
+    fn try_from(dto: UpdateGroupDto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: require_key(
+                dto.name,
+                "name",
+                "Send the group's display name; PUT replaces it.",
+            )?,
+            metadata: require_key(
+                dto.metadata,
+                "metadata",
+                "Send \"metadata\": null to clear the stored metadata.",
+            )?,
+        })
     }
 }
 

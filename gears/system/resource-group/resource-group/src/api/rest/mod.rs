@@ -2,5 +2,6 @@
 // Updated: 2026-04-28 by Constructor Tech
 pub mod dto;
 pub mod error;
+pub mod extract;
 pub mod handlers;
 pub mod routes;

@@ -807,6 +807,33 @@ impl GroupRepositoryTrait for GroupRepository {
         Ok(count)
     }
 
+    /// Count root groups of one tenant, excluding a single group id.
+    ///
+    /// Bypasses the caller's `AccessScope` for the same reason
+    /// `count_children` does — this is an invariant check on the stored
+    /// forest, and an under-count caused by a narrow caller scope would let
+    /// the limit be exceeded. The tenant restriction here is a *domain*
+    /// predicate (the root level belongs to a tenant), not an authorization
+    /// one.
+    async fn count_root_siblings<C: DBRunner>(
+        &self,
+        db: &C,
+        tenant_id: Uuid,
+        exclude_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        let scope = system_scope();
+        let count = ResourceGroupEntity::find()
+            .filter(rg_entity::Column::ParentId.is_null())
+            .filter(rg_entity::Column::TenantId.eq(tenant_id))
+            .filter(rg_entity::Column::Id.ne(exclude_id))
+            .secure()
+            .scope_with(&scope)
+            .count(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(count)
+    }
+
     /// Check if a group is a descendant of another group (for cycle detection).
     async fn is_descendant<C: DBRunner>(
         &self,

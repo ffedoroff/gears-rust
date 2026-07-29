@@ -1500,6 +1500,17 @@ mod cleanup {
         ) -> Result<ResourceGroup, CanonicalError> {
             unreachable!()
         }
+        // Structural counterpart of `update_group`. Implemented explicitly
+        // (the trait offers no default) so a fake can never silently absorb
+        // a re-parent.
+        async fn move_group(
+            &self,
+            _ctx: &SecurityContext,
+            _id: Uuid,
+            _new_parent_id: Option<Uuid>,
+        ) -> Result<ResourceGroup, CanonicalError> {
+            unreachable!()
+        }
         async fn delete_group(
             &self,
             _ctx: &SecurityContext,

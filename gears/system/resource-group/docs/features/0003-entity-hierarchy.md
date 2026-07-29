@@ -139,27 +139,42 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 
 **Actor**: `cpt-cf-resource-group-actor-tenant-administrator`
 
+Replaces a group's **ordinary attributes** only: `name` and `metadata`. Neither the
+group's GTS type nor its position in the hierarchy is reachable from here — the type is
+immutable after creation, and re-parenting is [Move Group](#move-group-subtree), a
+separate operation. The request body is a strict full replacement: both keys are
+mandatory, and an omitted key is a 400, not "keep the stored value" (see
+`DESIGN.md` § API Baseline Decisions, B1.1/B1.3).
+
 **Success Scenarios**:
-- Group name, metadata, or type updated successfully
-- On type change: children's types validated against new type
+- Group name and metadata replaced successfully
+- The group's `parent_id`, `gts_type_id` and `tenant_id` are carried over unchanged
 
 **Error Scenarios**:
-- Group not found → NotFound
-- New type's allowed_parents does not include current parent → InvalidParentType
-- Children's types do not include new type in their allowed_parents → InvalidParentType
+- Group not found, or outside the caller's tenant scope → NotFound
+- `name` or `metadata` key absent from the body → Validation (400, `problem+json`)
+- Unknown field in the body — notably `parent_id` (the pre-split move-via-PUT shape) or the immutable `type` → Validation (400)
+- `metadata` does not satisfy the type's `metadata_schema` → Validation
 
 **Steps**:
-1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with {name, type, metadata} - `inst-update-group-1`
-2. [x] - `p1` - DB: SELECT FROM resource_group WHERE id = {group_id} — load existing group - `inst-update-group-2`
-3. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-update-group-3`
-4. [x] - `p1` - **IF** type is changed - `inst-update-group-4`
-   1. [x] - `p1` - Validate new type's allowed_parents permits current parent's type (or new type allows root if no parent) - `inst-update-group-4a`
-   2. [x] - `p1` - DB: SELECT gts_type_id FROM resource_group WHERE parent_id = {group_id} — load children types - `inst-update-group-4b`
-   3. [x] - `p1` - **FOR EACH** child: verify child's type includes new type in allowed_parents - `inst-update-group-4c`
-   4. [x] - `p1` - **IF** any child would become invalid → **RETURN** InvalidParentType with child details - `inst-update-group-4d`
-5. [x] - `p1` - **IF** metadata provided AND type has metadata_schema → validate metadata against the chained GTS type schema via `TypesRegistryClient` / `gts` crate. **IF** invalid → **RETURN** Validation error - `inst-update-group-4e`
-6. [x] - `p1` - DB: UPDATE resource_group SET name, gts_type_id, metadata, updated_at — apply changes - `inst-update-group-5`
-7. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
+1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with {name, metadata} - `inst-update-group-1`
+2. [x] - `p1` - Reject the body unless every replaceable key is present and no unknown key is: `metadata` is tri-state on the wire (`double_option`), so an omitted key is distinguishable from an explicit `null` and only `null` clears the stored value - `inst-update-group-1a`
+3. [x] - `p1` - AuthZ gate: `PolicyEnforcer.access_scope(ctx, group, "update", group_id)` → AccessScope - `inst-update-group-1b`
+4. [x] - `p1` - DB: SELECT FROM resource_group WHERE id = {group_id} (AccessScope-filtered) — load existing group - `inst-update-group-2`
+5. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-update-group-3`
+6. [x] - `p1` - **IF** metadata provided AND type has metadata_schema → validate metadata against the chained GTS type schema via `TypesRegistryClient` / `gts` crate. **IF** invalid → **RETURN** Validation error. Runs *before* the transaction opens — it is a cross-gear `ClientHub` call, not a DB read to make atomic (RG-09) - `inst-update-group-4e`
+7. [x] - `p1` - DB: BEGIN transaction at the backend default isolation. A single-row write by primary key has no cross-row predicate for a concurrent writer to invalidate, so `SERIALIZABLE` is not required here — unlike Move Group (`rg-db-audit-transactions.md`, recommendation #3) - `inst-update-group-4f`
+8. [x] - `p1` - DB: UPDATE resource_group SET name, metadata, updated_at — `parent_id` and `gts_type_id` are re-supplied from the row just read, because the repository writes every column unconditionally - `inst-update-group-5`
+9. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
+
+**Removed steps.** The former sub-steps `inst-update-group-4`, `4a`–`4d` covered a `type`
+change and the children-revalidation it implied. The SDK request has carried no `code`
+field since the type became immutable, so those branches were already unreachable; they
+are dropped rather than left marked as implemented. The parent-change branch that used to
+live in this flow — together with its isolation-level guess and the
+`UpdateGroupOutcome::NeedsSerializable` restart protocol that closed the race on that
+guess — moved wholesale into Move Group, where the level is unconditional and no guess
+exists.
 
 ### Move Group (Subtree)
 
@@ -167,31 +182,45 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 
 **Actor**: `cpt-cf-resource-group-actor-tenant-administrator`
 
+The gear's only structural mutation of an existing group, and its own REST operation:
+`POST /api/resource-group/v1/groups/{group_id}/move` with body `{ "parent_id":
+<uuid|null> }`. `parent_id` is **mandatory**; an explicit `null` means "make this group a
+root", and an omitted key is a 400 — collapsing the two is the defect this operation was
+extracted to remove.
+
 **Success Scenarios**:
-- Group and its entire subtree moved to new parent with closure paths rebuilt transactionally
+- Group and its entire subtree moved to a new parent with closure paths rebuilt transactionally
+- Group promoted to a root (`parent_id: null`), with the root-level invariants enforced
+- The group's `name`, `metadata`, `gts_type_id` and `tenant_id` are untouched by the move
 
 **Error Scenarios**:
-- Group not found → NotFound
+- `parent_id` key absent from the body → Validation (400, `problem+json`)
+- Group not found, or outside the caller's tenant scope → NotFound (never a permission error, which would confirm existence)
 - New parent not found → NotFound
+- New parent belongs to a different tenant → Validation. The message never echoes the foreign `tenant_id`, and this check runs *before* the type-compatibility check, whose message would otherwise disclose the foreign parent's GTS type path
 - New parent is a descendant of group → CycleDetected
 - Self-parent attempt → CycleDetected
-- Parent type incompatible → InvalidParentType
-- Depth or width limit exceeded at new position → LimitViolation
+- Parent type incompatible, or (moving to root) the type has `can_be_root = false` → InvalidParentType
+- Depth or width limit exceeded at the new position → LimitViolation
+- Moving a tenant-typed group to root when a tenant root already exists → TenantRootAlreadyExists
 
 **Steps**:
-1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with new hierarchy.parent_id - `inst-move-group-1`
-2. [x] - `p1` - DB: BEGIN transaction (SERIALIZABLE isolation) - `inst-move-group-2`
-3. [x] - `p1` - Load group and new parent in transaction - `inst-move-group-3`
-4. [x] - `p1` - **IF** new_parent_id == group_id → **RETURN** CycleDetected (self-parent) - `inst-move-group-4`
-5. [x] - `p1` - Invoke cycle detection: check new parent is NOT in subtree of group - `inst-move-group-5`
-6. [x] - `p1` - **IF** cycle detected → **RETURN** CycleDetected with involved node IDs - `inst-move-group-6`
-7. [x] - `p1` - Validate parent type compatibility for group's type against new parent's type - `inst-move-group-7`
-8. [x] - `p1` - Invoke query profile enforcement: check depth at new position - `inst-move-group-8`
-9. [x] - `p1` - Invoke closure rebuild algorithm for subtree under group - `inst-move-group-9`
-10. [x] - `p1` - DB: UPDATE resource_group SET parent_id = {new_parent_id}, updated_at = now() - `inst-move-group-10`
-11. [x] - `p1` - DB: COMMIT - `inst-move-group-11`
-12. [x] - `p1` - **IF** serialization conflict → rollback and retry (bounded retry policy) - `inst-move-group-12`
-13. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-move-group-13`
+1. [x] - `p1` - Actor sends POST /api/resource-group/v1/groups/{group_id}/move with {parent_id} - `inst-move-group-1`
+2. [x] - `p1` - Reject the body unless the `parent_id` key is present (tri-state on the wire, `double_option`) and no unknown key is - `inst-move-group-1a`
+3. [x] - `p1` - AuthZ gate: `PolicyEnforcer.access_scope(ctx, group, "update", group_id)` → AccessScope. Same action as Update Group — splitting the REST operation must not widen what a caller may do - `inst-move-group-1b`
+4. [x] - `p1` - DB: BEGIN transaction (SERIALIZABLE isolation) - `inst-move-group-2`
+5. [x] - `p1` - Load group (AccessScope-filtered, then unscoped for the full row) and, when a new parent was requested, the new parent — all in transaction - `inst-move-group-3`
+6. [x] - `p1` - **IF** the new parent's `tenant_id` differs from the group's → **RETURN** Validation (generic message, no tenant ids) - `inst-move-group-3a`
+7. [x] - `p1` - **IF** new_parent_id == group_id → **RETURN** CycleDetected (self-parent; covered by the descendant check via the closure self-row) - `inst-move-group-4`
+8. [x] - `p1` - Invoke cycle detection: check new parent is NOT in subtree of group - `inst-move-group-5`
+9. [x] - `p1` - **IF** cycle detected → **RETURN** CycleDetected with involved node IDs - `inst-move-group-6`
+10. [x] - `p1` - Validate parent type compatibility for group's type against new parent's type; when moving to root, validate `can_be_root` and tenant-root uniqueness instead - `inst-move-group-7`
+11. [x] - `p1` - Invoke query profile enforcement. **Both branches** are covered: under a new parent, `max_depth` (deepest node of the moved subtree at its new position) and `max_width` (children of the new parent); moving to root, `max_width` against the *tenant's* root level, excluding the moved group itself. `max_depth` is deliberately **not** re-checked on the root branch: promoting a subtree moves its deepest node from `old_parent_depth + 1 + subtree_depth` to `0 + subtree_depth`, so the depth reached can only decrease - `inst-move-group-8`
+12. [x] - `p1` - Invoke closure rebuild algorithm for subtree under group - `inst-move-group-9`
+13. [x] - `p1` - DB: UPDATE resource_group SET parent_id = {new_parent_id}, updated_at = now() - `inst-move-group-10`
+14. [x] - `p1` - DB: COMMIT - `inst-move-group-11`
+15. [x] - `p1` - **IF** serialization conflict → rollback and retry (bounded retry policy) - `inst-move-group-12`
+16. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-move-group-13`
 
 ### Delete Group
 
@@ -262,19 +291,22 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-algo-entity-hier-enforce-query-profile`
 
-**Input**: Operation context (create/move), current group position, profile config (max_depth, max_width)
+**Input**: Operation context (create/move), the requested destination (a new parent, or the root), current group position, profile config (max_depth, max_width)
 
 **Output**: Pass or LimitViolation (DepthLimitExceeded / WidthLimitExceeded)
 
 **Steps**:
 1. [x] - `p1` - Load profile config: max_depth (optional), max_width (optional) - `inst-profile-1`
-2. [x] - `p1` - **IF** max_depth is enabled (not null) - `inst-profile-2`
+2. [x] - `p1` - **IF** the destination is a parent group **AND** max_depth is enabled (not null) - `inst-profile-2`
    1. [x] - `p1` - Compute resulting depth: depth of new parent + 1 + max descendant depth in subtree (for move) or 0 (for create) - `inst-profile-2a`
    2. [x] - `p1` - **IF** resulting depth > max_depth → **RETURN** LimitViolation: DepthLimitExceeded with current depth and limit - `inst-profile-2b`
 3. [x] - `p1` - **IF** max_width is enabled (not null) - `inst-profile-3`
-   1. [x] - `p1` - DB: SELECT COUNT(*) FROM resource_group WHERE parent_id = {parent_id} — current sibling count - `inst-profile-3a`
-   2. [x] - `p1` - **IF** sibling_count + 1 > max_width → **RETURN** LimitViolation: WidthLimitExceeded with current width and limit - `inst-profile-3b`
+   1. [x] - `p1` - **IF** the destination is a parent group: DB: SELECT COUNT(*) FROM resource_group WHERE parent_id = {parent_id} — current sibling count - `inst-profile-3a`
+   2. [x] - `p1` - **ELSE** (the destination is the root, i.e. a move with `parent_id: null`): DB: SELECT COUNT(*) FROM resource_group WHERE parent_id IS NULL AND tenant_id = {group.tenant_id} AND id <> {group_id} — the moved group's prospective root-level siblings, scoped to its own tenant so one tenant's forest never constrains another's, and excluding the group itself so a no-op re-root does not trip the limit - `inst-profile-3c`
+   3. [x] - `p1` - **IF** sibling_count + 1 > max_width → **RETURN** LimitViolation: WidthLimitExceeded with current width and limit - `inst-profile-3b`
 4. [x] - `p1` - **RETURN** pass - `inst-profile-4`
+
+**Why max_depth has no root branch.** Promoting a subtree to the root moves its deepest node from `old_parent_depth + 1 + subtree_depth` to `0 + subtree_depth`. Since `old_parent_depth >= 0`, the depth reached can only decrease, so a check there could fire only on a tree that already violated `max_depth` — rejecting the operation that repairs the violation. This is a deliberate asymmetry, not the pre-split gap in which the *whole* profile (both `max_depth` and `max_width`) was skipped on a move to root.
 
 ### Group Data Seeding
 
@@ -359,7 +391,8 @@ The system **MUST** implement REST endpoint handlers for group management under 
 - `GET /groups` — list groups with OData `$filter` (fields: `type`, `hierarchy/parent_id`, `tenant_id`, `id`, `name`; operators: `eq`, `ne`, `in`) and cursor-based pagination
 - `POST /groups` — create group, return 201 Created
 - `GET /groups/{group_id}` — get group by UUID, return 404 if not found
-- `PUT /groups/{group_id}` — update group (name, type, metadata) or move group (hierarchy.parent_id), return 200 OK
+- `PUT /groups/{group_id}` — replace the group's ordinary attributes (`name`, `metadata`), return 200 OK. Both keys required; unknown fields (including `parent_id` and the immutable `type`) rejected with 400
+- `POST /groups/{group_id}/move` — move the group and its subtree to a new parent, or to the root; body `{ "parent_id": <uuid|null> }` with the key mandatory, return 200 OK
 - `DELETE /groups/{group_id}?force={true|false}` — delete group, return 204 No Content
 - `GET /groups/{group_id}/hierarchy` — hierarchy depth traversal with OData `$filter` on `hierarchy/depth` and `type`, cursor-based pagination
 
@@ -658,7 +691,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **Assert**: `DomainError::TypeNotFound`
 
 #### TC-GRP-29: Move child to root (detach from parent) - happy path [P1]
-- Child under parent, move with new_parent_id=None, type allows can_be_root=true
+- Child under parent, `POST /groups/{id}/move` with an explicit `{"parent_id": null}` (service level: `move_group(ctx, id, None)`), type allows can_be_root=true
 - **Assert**: Success, parent_id=None, closure rebuilt (old ancestor rows removed, self-row only)
 
 #### TC-GRP-30: Move child to root when can_be_root=false [P1]
@@ -673,6 +706,18 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 #### TC-GRP-33: max_width enforcement on move [P2]
 - Move group under parent that already has max_width children
 - **Assert**: `DomainError::LimitViolation("Width limit exceeded")`
+
+#### TC-GRP-33a: max_width enforcement on move **to root** [P1]
+- QueryProfile { max_width: Some(1) }. Tenant already has one root; move its child to root.
+- **Assert**: `DomainError::LimitViolation("Width limit exceeded")`. Before the update/move split this branch performed no profile check at all and the move silently succeeded.
+
+#### TC-GRP-33b: root-level width is counted per tenant [P1]
+- Tenant A has a root; tenant B has a root plus a child. With max_width = 1, promoting B's child is refused because of *B's* root — the message reports 1, not 2, and names no other tenant. With max_width = 2 the same promotion succeeds.
+- **Assert**: the count is tenant-local and never disclosed across the tenant boundary
+
+#### TC-GRP-33c: re-rooting the only root is not a width breach [P2]
+- QueryProfile { max_width: Some(1) }. Move the tenant's single root to root.
+- **Assert**: Success — the moved group is excluded from its own sibling count, mirroring the tenant-root-uniqueness exclusion
 
 #### TC-GRP-34: Delete nonexistent group [P2]
 - **Assert**: `DomainError::GroupNotFound`
@@ -1191,7 +1236,7 @@ Every test that creates, moves, or deletes groups **MUST** query the closure tab
 | Operation | Required DB Assertions |
 |-----------|----------------------|
 | **Create group** | `parent_id`, `gts_type_id`, `tenant_id`, `name`, `metadata` match request. |
-| **Update name/metadata** | `name` and `metadata` changed. `parent_id`, `gts_type_id` **unchanged**. |
+| **Update name/metadata** | `name` and `metadata` changed. `parent_id`, `gts_type_id` **unchanged** — re-supplied from the stored row, since the repository writes every column. |
 | **Move group** | `parent_id` updated. `gts_type_id`, `name`, `tenant_id` **unchanged**. |
 | **Update type** | `gts_type_id` changed. `parent_id`, `name` **unchanged**. |
 
@@ -1330,7 +1375,7 @@ GET /groups/{child.id}/hierarchy    → 200
 POST root_A → child
 POST root_B
 
-PUT /groups/{child.id} {parent_id: root_B.id}    → 200
+POST /groups/{child.id}/move {parent_id: root_B.id} → 200
 
 GET /groups/{root_B.id}/hierarchy    → 200
   assert child in items with depth == 1            (closure rebuilt on PG)

@@ -287,7 +287,6 @@ async fn trace_update_group() {
             root.id,
             UpdateGroupRequest {
                 name: "Root Renamed".to_owned(),
-                parent_id: None,
                 metadata: None,
             },
         )
@@ -327,7 +326,7 @@ async fn trace_move_group() {
 
     rec.clear();
     let result = group_svc
-        .move_group(moved, Some(target_parent.id))
+        .move_group_unscoped(moved, Some(target_parent.id))
         .await
         .expect("move_group should succeed");
     assert_eq!(result.hierarchy.parent_id, Some(target_parent.id));
@@ -773,7 +772,7 @@ async fn move_stats_for_subtree_size(n: usize) -> BTreeMap<(QueryKind, String), 
 
     rec.clear();
     group_svc
-        .move_group(moved, Some(target_parent.id))
+        .move_group_unscoped(moved, Some(target_parent.id))
         .await
         .expect("move_group should succeed");
     rec.stats()

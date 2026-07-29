@@ -93,12 +93,55 @@ pub trait ResourceGroupClient: Send + Sync {
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroup>, CanonicalError>;
 
-    /// Update a resource group (full replacement).
+    /// Update a resource group's ordinary attributes (full replacement).
+    ///
+    /// Replaces `name` and `metadata`. It does **not** move the group: the
+    /// group's position in the hierarchy is changed with
+    /// [`Self::move_group`], because re-parenting is a structural mutation
+    /// (cycle detection, depth/width invariants, closure-table rebuild) and
+    /// not an ordinary column write.
     async fn update_group(
         &self,
         ctx: &SecurityContext,
         id: Uuid,
         request: UpdateGroupRequest,
+    ) -> Result<ResourceGroup, CanonicalError>;
+
+    /// Move a resource group — and its entire subtree — to a new parent, or
+    /// to the forest root when `new_parent_id` is `None`.
+    ///
+    /// This is the atomic structural counterpart of [`Self::update_group`]
+    /// (baseline rule B1.3): the whole operation — cycle detection, parent
+    /// type compatibility, depth / width limits, tenant-root uniqueness and
+    /// the closure-table rebuild — runs inside a single `SERIALIZABLE`
+    /// transaction with bounded retry, so the group is never left detached
+    /// from both the old and the new parent.
+    ///
+    /// `new_parent_id` is deliberately an explicit `Option`, not an
+    /// "optional argument": `None` *means* "make this group a root", it never
+    /// means "leave the parent alone". Callers that do not want to move a
+    /// group must not call this method.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` — the group, or the requested new parent, does not exist
+    ///   (or is outside the caller's tenant scope, which is deliberately
+    ///   indistinguishable).
+    /// - `FailedPrecondition` (`Subject::Hierarchy`) — the requested parent is
+    ///   the group itself or one of its descendants (would create a cycle).
+    /// - `InvalidArgument` — the group's GTS type does not allow the new
+    ///   parent's type, or (for a move to root) the type has
+    ///   `can_be_root = false`.
+    /// - `FailedPrecondition` (`Subject::Limit`) — the move would breach the
+    ///   configured `max_depth` / `max_width`.
+    /// - `AlreadyExists` — the move would create a second tenant-type root.
+    /// - `InvalidArgument` — the new parent belongs to a different tenant.
+    ///   The message never echoes the foreign tenant id.
+    async fn move_group(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+        new_parent_id: Option<Uuid>,
     ) -> Result<ResourceGroup, CanonicalError>;
 
     /// Delete a resource group (non-cascade).
@@ -121,7 +164,7 @@ pub trait ResourceGroupClient: Send + Sync {
     /// and surface `FailedPrecondition` (`Subject::ActiveReferences`) to the caller as 409.
     ///
     /// Default impl delegates to the non-cascade variant so existing
-    /// implementers (production `RgService`, test fakes) compile without
+    /// implementers (production `ResourceGroupLocalClient`, test fakes) compile
     /// breakage; implementations that genuinely support cascade SHOULD
     /// override this to call into their REST-side `force=true` path.
     /// Implementations that cannot cascade (e.g. inert test fakes) are

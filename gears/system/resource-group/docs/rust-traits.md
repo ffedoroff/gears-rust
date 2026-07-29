@@ -102,11 +102,14 @@ pub struct CreateGroupRequest {
 }
 
 /// Matches REST `UpdateGroupRequest` schema.
+///
+/// Ordinary attributes only. The group's `type` is immutable after creation
+/// and its `parent_id` is not part of this payload — re-parenting is
+/// `move_group`, a separate operation (see `DESIGN.md` § API Baseline
+/// Decisions, B1.1/B1.3).
 #[derive(Debug, Clone)]
 pub struct UpdateGroupRequest {
-    pub r#type: String,
     pub name: String,
-    pub parent_id: Option<Uuid>,
     #[serde(flatten)]
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
@@ -178,6 +181,11 @@ pub trait ResourceGroupClient: Send + Sync {
     async fn get_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<ResourceGroup, ResourceGroupError>;
     async fn list_groups(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroup>, ResourceGroupError>;
     async fn update_group(&self, ctx: &SecurityContext, group_id: Uuid, request: UpdateGroupRequest) -> Result<ResourceGroup, ResourceGroupError>;
+    /// Structural counterpart of `update_group`: move the group and its subtree
+    /// to `new_parent_id`, or to the root when it is `None`. Atomic
+    /// (SERIALIZABLE + bounded retry). `None` always means "become a root",
+    /// never "leave the parent alone".
+    async fn move_group(&self, ctx: &SecurityContext, group_id: Uuid, new_parent_id: Option<Uuid>) -> Result<ResourceGroup, ResourceGroupError>;
     async fn delete_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<(), ResourceGroupError>;
 
     // ── Hierarchy ───────────────────────────────────────────────────
@@ -261,7 +269,7 @@ implementing a distinct plugin trait.
 Single implementation, two registrations:
 
 ```rust
-let svc: Arc<RgService> = Arc::new(RgService::new(/* ... */));
+let svc: Arc<ResourceGroupLocalClient> = Arc::new(ResourceGroupLocalClient::new(/* ... */));
 
 // Full read+write client: hub.get::<dyn ResourceGroupClient>()
 hub.register::<dyn ResourceGroupClient>(svc.clone());
@@ -310,5 +318,5 @@ let group = rg
 
 | Trait | Methods | Consumers | ClientHub key |
 |-------|---------|-----------|---------------|
-| `ResourceGroupClient` | 14 (full CRUD: types, groups, memberships, hierarchy) | Domain services, Apps, Admins | `dyn ResourceGroupClient` |
+| `ResourceGroupClient` | 15 (full CRUD: types, groups, memberships, hierarchy, plus the `move_group` structural operation) | Domain services, Apps, Admins | `dyn ResourceGroupClient` |
 | `ResourceGroupReadHierarchy` | 5 (`get_group_descendants`, `get_group_ancestors`, `list_groups`, `get_group`, `list_memberships`; all unscoped / PEP-bypassing) | AuthZ resolver plugin, tenant-resolver RG plugin, in-process AuthZ PDP | `dyn ResourceGroupReadHierarchy` |

@@ -10,7 +10,7 @@ use tracing::field::Empty;
 
 use toolkit::api::canonical_prelude::*;
 
-use super::{CreateTypeDto, SecurityContext, TypeDto, UpdateTypeDto, info};
+use super::{CreateTypeDto, SecurityContext, StrictJson, TypeDto, UpdateTypeDto, info};
 use crate::gear::ConcreteTypeService;
 
 /// List GTS types with optional `OData` filtering and pagination.
@@ -43,7 +43,7 @@ pub async fn create_type(
     uri: Uri,
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteTypeService>>,
-    Json(req_body): Json<CreateTypeDto>,
+    StrictJson(req_body): StrictJson<CreateTypeDto>,
 ) -> ApiResult<impl IntoResponse> {
     // Actor sends POST /api/types-registry/v1/types with type definition payload
     info!(
@@ -92,7 +92,7 @@ pub async fn update_type(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteTypeService>>,
     Path(code): Path<String>,
-    Json(req_body): Json<UpdateTypeDto>,
+    StrictJson(req_body): StrictJson<UpdateTypeDto>,
 ) -> ApiResult<Json<TypeDto>> {
     // Actor sends PUT /api/types-registry/v1/types/{code} with updated definition
     info!(
@@ -100,7 +100,10 @@ pub async fn update_type(
         "Updating GTS type"
     );
 
-    let rg_type = svc.update_type(&ctx, &code, req_body.into()).await?;
+    // `try_into` is where an omitted `metadata_schema` key becomes a 400
+    // `problem+json` instead of silently erasing the stored JSON Schema —
+    // see `UpdateTypeDto`'s doc comment.
+    let rg_type = svc.update_type(&ctx, &code, req_body.try_into()?).await?;
     Ok(Json(TypeDto::from(rg_type)))
 }
 

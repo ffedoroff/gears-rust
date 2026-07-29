@@ -305,7 +305,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     ///
     /// **Internal API** — never expose this through a REST handler. Used by
     /// [`crate::domain::seeding::seed_types`] (no caller `SecurityContext`
-    /// exists at gear-init time) and by [`crate::domain::rg_service::RgService`]
+    /// exists at gear-init time) and by [`crate::domain::local_client::ResourceGroupLocalClient`]
     /// internals that need a plain lookup after their own gate already ran.
     pub async fn get_type_unscoped(&self, code: &str) -> Result<ResourceGroupType, DomainError> {
         let conn = self.db.conn()?;

@@ -1,10 +1,11 @@
 // Created: 2026-04-16 by Constructor Tech
 // Updated: 2026-04-28 by Constructor Tech
 use crate::api::rest::dto::{
-    CreateGroupDto, CreateTypeDto, GroupDto, GroupWithDepthDto, MembershipDto, TypeDto,
-    UpdateGroupDto, UpdateTypeDto,
+    CreateGroupDto, CreateTypeDto, GroupDto, GroupWithDepthDto, MembershipDto, MoveGroupDto,
+    TypeDto, UpdateGroupDto, UpdateTypeDto,
 };
 
+use crate::api::rest::extract::StrictJson;
 use toolkit_security::SecurityContext;
 use tracing::{debug, info};
 
@@ -18,6 +19,7 @@ pub(crate) use groups::get_group;
 pub(crate) use groups::get_group_ancestors;
 pub(crate) use groups::get_group_descendants;
 pub(crate) use groups::list_groups;
+pub(crate) use groups::move_group;
 pub(crate) use groups::update_group;
 pub(crate) use memberships::add_membership;
 pub(crate) use memberships::list_memberships;

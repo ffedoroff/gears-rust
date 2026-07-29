@@ -655,7 +655,10 @@ async fn update_type_denied_returns_403() {
         Some(serde_json::json!({
             "can_be_root": true,
             "allowed_parent_types": [],
-            "allowed_membership_types": []
+            "allowed_membership_types": [],
+            // Required: PUT is a full replacement, so an omitted
+            // `metadata_schema` is a 400, not "keep the stored schema".
+            "metadata_schema": null
         })),
         tenant_id,
     );
@@ -1368,7 +1371,10 @@ async fn rest_put_type_returns_200() {
         Some(serde_json::json!({
             "can_be_root": true,
             "allowed_parent_types": [],
-            "allowed_membership_types": []
+            "allowed_membership_types": [],
+            // Required: PUT is a full replacement, so an omitted
+            // `metadata_schema` is a 400, not "keep the stored schema".
+            "metadata_schema": null
         })),
         tenant_id,
     );
@@ -1396,7 +1402,10 @@ async fn rest_put_type_not_found_returns_404() {
         Some(serde_json::json!({
             "can_be_root": true,
             "allowed_parent_types": [],
-            "allowed_membership_types": []
+            "allowed_membership_types": [],
+            // Required: PUT is a full replacement, so an omitted
+            // `metadata_schema` is a 400, not "keep the stored schema".
+            "metadata_schema": null
         })),
         tenant_id,
     );
@@ -2115,24 +2124,28 @@ async fn rest_get_group_hierarchy_returns_200() {
 }
 
 // =========================================================================
-// VHP-1977: PUT re-parent cycle detection (REST-level regression coverage)
+// VHP-1977: re-parent cycle detection (REST-level regression coverage)
 // =========================================================================
 //
-// `move_group_internal_impl` (src/domain/group_service.rs) already detects
-// cycles via `is_descendant` and `update_group_inner` delegates to it when
-// `parent_id` changes on a PUT; the resulting `DomainError::CycleDetected`
-// is mapped to `RgError::failed_precondition()` with the `hierarchy`
-// precondition subject (src/api/rest/error.rs). Service-level coverage
-// already exists in `group_service_test.rs` (TC-GRP-06/07, via
-// `move_group`) and error-mapping coverage exists in `domain_unit_test.rs`
+// `move_group_internal_impl` (src/domain/group_service.rs) detects cycles via
+// `is_descendant`; the resulting `DomainError::CycleDetected` is mapped to
+// `RgError::failed_precondition()` with the `hierarchy` precondition subject
+// (src/api/rest/error.rs). Service-level coverage already exists in
+// `group_service_test.rs` (TC-GRP-06/07, via `move_group_unscoped`) and
+// error-mapping coverage exists in `domain_unit_test.rs`
 // (`domain_to_problem_cycle_detected_is_400`), but neither one drives the
-// actual `PUT /resource-group/v1/groups/{id}` HTTP path. These two tests
-// close that gap.
+// actual HTTP path. These two tests close that gap.
+//
+// They now drive `POST /resource-group/v1/groups/{id}/move` rather than
+// `PUT /resource-group/v1/groups/{id}`: re-parenting was split out of the
+// update payload, so a `parent_id` in a PUT body is a rejected unknown field
+// (see `rest_update_group_rejects_parent_id_field`) and can no longer reach
+// cycle detection at all.
 
-/// VHP-1977: PUT re-parent under own descendant returns 400 with a
+/// VHP-1977: moving a group under its own descendant returns 400 with a
 /// `hierarchy` precondition violation.
 #[tokio::test]
-async fn rest_update_group_reparent_under_descendant_returns_400_cycle() {
+async fn rest_move_group_under_descendant_returns_400_cycle() {
     let (router, type_svc, group_svc, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
@@ -2171,15 +2184,11 @@ async fn rest_update_group_reparent_under_descendant_returns_400_cycle() {
         .await
         .expect("create child group");
 
-    // PUT root with parent_id = its own child -- would create a cycle.
+    // Move root under its own child -- would create a cycle.
     let req = json_request(
-        "PUT",
-        &format!("/resource-group/v1/groups/{}", root.id),
-        Some(serde_json::json!({
-            "name": "CycRoot",
-            "parent_id": child.id,
-            "metadata": null
-        })),
+        "POST",
+        &format!("/resource-group/v1/groups/{}/move", root.id),
+        Some(serde_json::json!({ "parent_id": child.id })),
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
@@ -2202,10 +2211,10 @@ async fn rest_update_group_reparent_under_descendant_returns_400_cycle() {
     );
 }
 
-/// VHP-1977: PUT self-parent returns 400 with a `hierarchy` precondition
-/// violation.
+/// VHP-1977: moving a group under itself returns 400 with a `hierarchy`
+/// precondition violation.
 #[tokio::test]
-async fn rest_update_group_self_parent_returns_400_cycle() {
+async fn rest_move_group_self_parent_returns_400_cycle() {
     let (router, type_svc, group_svc, _) = build_shared_router().await;
     let tenant_id = Uuid::now_v7();
     let ctx = make_ctx(tenant_id);
@@ -2228,15 +2237,11 @@ async fn rest_update_group_self_parent_returns_400_cycle() {
         .await
         .expect("create root group");
 
-    // PUT root with parent_id = itself.
+    // Move root under itself.
     let req = json_request(
-        "PUT",
-        &format!("/resource-group/v1/groups/{}", root.id),
-        Some(serde_json::json!({
-            "name": "SelfRoot",
-            "parent_id": root.id,
-            "metadata": null
-        })),
+        "POST",
+        &format!("/resource-group/v1/groups/{}/move", root.id),
+        Some(serde_json::json!({ "parent_id": root.id })),
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
@@ -2591,7 +2596,7 @@ async fn input_membership_empty_resource_type() {
     );
 }
 
-/// TC-DESER-01: Create type with `code: 123` (number not string) returns 400/422.
+/// TC-DESER-01: Create type with `code: 123` (number not string) returns 400 `problem+json`.
 #[tokio::test]
 async fn input_deser_type_code_number_returns_error() {
     let (router, _) = build_test_router().await;
@@ -2609,14 +2614,10 @@ async fn input_deser_type_code_number_returns_error() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    assert!(
-        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "Expected 400 or 422 for number code, got {status}"
-    );
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
-/// TC-DESER-02: Create type with `can_be_root: "yes"` (string not bool) returns 400/422.
+/// TC-DESER-02: Create type with `can_be_root: "yes"` (string not bool) returns 400 `problem+json`.
 #[tokio::test]
 async fn input_deser_type_can_be_root_string_returns_error() {
     let (router, _) = build_test_router().await;
@@ -2634,14 +2635,10 @@ async fn input_deser_type_can_be_root_string_returns_error() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    assert!(
-        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "Expected 400 or 422 for string can_be_root, got {status}"
-    );
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
-/// TC-DESER-03: Create type missing `can_be_root` returns 400/422.
+/// TC-DESER-03: Create type missing `can_be_root` returns 400 `problem+json`.
 #[tokio::test]
 async fn input_deser_type_missing_can_be_root_returns_error() {
     let (router, _) = build_test_router().await;
@@ -2656,14 +2653,13 @@ async fn input_deser_type_missing_can_be_root_returns_error() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    assert!(
-        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "Expected 400 or 422 for missing can_be_root, got {status}"
-    );
+    // A missing required field is a caller error like any other, so it must be
+    // RFC-9457, not axum's bare `text/plain` 422. Request bodies in this gear
+    // are extracted with `api::rest::extract::StrictJson` for exactly this.
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
-/// TC-DESER-04: Create group missing `type` field returns 400/422.
+/// TC-DESER-04: Create group missing `type` field returns 400 `problem+json`.
 #[tokio::test]
 async fn input_deser_group_missing_type_returns_error() {
     let (router, _, _, _) = build_shared_router().await;
@@ -2678,14 +2674,10 @@ async fn input_deser_group_missing_type_returns_error() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    assert!(
-        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "Expected 400 or 422 for missing type, got {status}"
-    );
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
-/// TC-DESER-05: Create group with `parent_id: "not-a-uuid"` returns 400/422.
+/// TC-DESER-05: Create group with `parent_id: "not-a-uuid"` returns 400 `problem+json`.
 #[tokio::test]
 async fn input_deser_group_invalid_parent_uuid_returns_error() {
     let (router, _, _, _) = build_shared_router().await;
@@ -2702,14 +2694,10 @@ async fn input_deser_group_invalid_parent_uuid_returns_error() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    assert!(
-        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "Expected 400 or 422 for invalid parent_id, got {status}"
-    );
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
-/// TC-DESER-06: Malformed JSON body returns 400.
+/// TC-DESER-06: Malformed JSON body returns 400 `problem+json`.
 #[tokio::test]
 async fn input_deser_malformed_json_returns_400() {
     let (router, _) = build_test_router().await;
@@ -2725,10 +2713,10 @@ async fn input_deser_malformed_json_returns_400() {
     req.extensions_mut().insert(ctx);
 
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
-/// TC-DESER-07: Empty body when expected returns 400/422.
+/// TC-DESER-07: Empty body when expected returns 400 `problem+json`.
 #[tokio::test]
 async fn input_deser_empty_body_returns_error() {
     let (router, _) = build_test_router().await;
@@ -2744,11 +2732,7 @@ async fn input_deser_empty_body_returns_error() {
     req.extensions_mut().insert(ctx);
 
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    assert!(
-        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "Expected 400 or 422 for empty body, got {status}"
-    );
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
 /// TC-DESER-08: Create group with empty name returns 400.
@@ -3004,7 +2988,10 @@ async fn gts_put_type_tilde_encoded() {
         Some(serde_json::json!({
             "can_be_root": true,
             "allowed_parent_types": [],
-            "allowed_membership_types": []
+            "allowed_membership_types": [],
+            // Required: PUT is a full replacement, so an omitted
+            // `metadata_schema` is a 400, not "keep the stored schema".
+            "metadata_schema": null
         })),
         tenant_id,
     );
@@ -3374,7 +3361,7 @@ async fn rest_route_smoke_all_endpoints_registered() {
             false,
             "delete type",
         ),
-        // Groups: 7 endpoints
+        // Groups: 8 endpoints
         (
             "GET",
             "/resource-group/v1/groups".to_owned(),
@@ -3398,6 +3385,12 @@ async fn rest_route_smoke_all_endpoints_registered() {
             format!("/resource-group/v1/groups/{fake_id}"),
             true,
             "update group",
+        ),
+        (
+            "POST",
+            format!("/resource-group/v1/groups/{fake_id}/move"),
+            true,
+            "move group",
         ),
         (
             "DELETE",
@@ -3717,4 +3710,634 @@ async fn rest_list_groups_unknown_type_filter_returns_400_not_500() {
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+// =========================================================================
+// Split of "update" and "move": strict PUT + POST /move
+// =========================================================================
+//
+// `PUT /groups/{id}` used to carry `parent_id` and to perform the parent
+// move as part of a "full replacement". Two defects lived in that shape:
+//
+//  1. `metadata` was written unconditionally by `group_repo.rs`'s `update`,
+//     and serde cannot distinguish an omitted `Option` key from an explicit
+//     `null` -- so a client that sent only `{"name": ...}` silently erased
+//     the group's stored metadata and got a 200 for it. `#[schema(required)]`
+//     did not prevent this: it is a utoipa annotation with no effect on
+//     deserialization.
+//  2. The structural operation (cycle detection, depth/width invariants,
+//     closure-table rebuild) was reachable only by re-sending the entire
+//     resource, and "move to root" was expressed as an easily-mistyped
+//     `"parent_id": null`.
+//
+// The tests below pin the new contract from the wire side: PUT rejects an
+// incomplete or over-complete body with RFC-9457, and the move lives at
+// `POST /groups/{id}/move` where `parent_id` is mandatory and explicit
+// `null` is the documented way to say "make this a root".
+
+/// Type + group fixture: a self-referencing type (so a group of it may be a
+/// root *and* a child of its own type) with one root and one child under it.
+async fn seed_root_and_child(
+    type_svc: &TypeService<TypeRepository>,
+    group_svc: &GroupService<GroupRepository, TypeRepository>,
+    tenant_id: Uuid,
+    suffix: &str,
+) -> (
+    String,
+    resource_group_sdk::ResourceGroup,
+    resource_group_sdk::ResourceGroup,
+) {
+    let ctx = make_ctx(tenant_id);
+    let code = create_self_ref_type(type_svc, suffix).await;
+
+    let root = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: code.clone(),
+                name: "Root".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create root group");
+
+    let child = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: code.clone(),
+                name: "Child".to_owned(),
+                parent_id: Some(root.id),
+                tenant_id: None,
+                metadata: Some(serde_json::json!({"keep": "me"})),
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create child group");
+
+    (code, root, child)
+}
+
+/// The headline defect: `PUT` without `metadata` used to return 200 and
+/// silently erase the stored metadata. It must now be a 400 `problem+json`,
+/// and the stored metadata must still be there afterwards.
+#[tokio::test]
+async fn rest_update_group_without_metadata_returns_400_and_keeps_metadata() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let (_code, _root, child) =
+        seed_root_and_child(&type_svc, &group_svc, tenant_id, "strictmeta").await;
+
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", child.id),
+        Some(serde_json::json!({ "name": "Renamed" })),
+        tenant_id,
+    );
+    let body = assert_problem_shape(
+        router.clone().oneshot(req).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("metadata")),
+        "the 400 must name the missing key: {body}"
+    );
+
+    // The write must not have happened: metadata (and the name) intact.
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups/{}", child.id),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after = response_body(resp).await;
+    assert_eq!(
+        after["metadata"],
+        serde_json::json!({"keep": "me"}),
+        "metadata must survive a rejected PUT: {after}"
+    );
+    assert_eq!(after["name"], "Child", "name must not change: {after}");
+}
+
+/// `PUT` without `name` is equally a 400 `problem+json` -- `name` is
+/// non-nullable, so both an omitted key and an explicit `null` are rejected.
+#[tokio::test]
+async fn rest_update_group_without_name_returns_400() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let (_code, _root, child) =
+        seed_root_and_child(&type_svc, &group_svc, tenant_id, "strictname").await;
+
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", child.id),
+        Some(serde_json::json!({ "metadata": null })),
+        tenant_id,
+    );
+    let body = assert_problem_shape(
+        router.clone().oneshot(req).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        body["detail"].as_str().is_some_and(|d| d.contains("name")),
+        "the 400 must name the missing key: {body}"
+    );
+
+    // Explicit `null` for a non-nullable field is the same rejection.
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", child.id),
+        Some(serde_json::json!({ "name": null, "metadata": null })),
+        tenant_id,
+    );
+    assert_problem_shape(router.oneshot(req).await.unwrap(), StatusCode::BAD_REQUEST).await;
+}
+
+/// A client still sending `parent_id` in the PUT body -- the pre-split
+/// move-via-PUT shape -- gets an explicit 400 for the unknown field rather
+/// than a silently-ignored re-parent.
+#[tokio::test]
+async fn rest_update_group_rejects_parent_id_field() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let (_code, root, child) =
+        seed_root_and_child(&type_svc, &group_svc, tenant_id, "putparent").await;
+
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", child.id),
+        Some(serde_json::json!({
+            "name": "Child",
+            "parent_id": null,
+            "metadata": null
+        })),
+        tenant_id,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "`parent_id` is no longer part of the update payload; the body must be rejected"
+    );
+
+    // And the group is still where it was.
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups/{}", child.id),
+        None,
+        tenant_id,
+    );
+    let after = response_body(router.oneshot(req).await.unwrap()).await;
+    assert_eq!(after["hierarchy"]["parent_id"], serde_json::json!(root.id));
+}
+
+/// A well-formed `PUT` still succeeds -- and, crucially, does **not** move
+/// the group. `GroupRepository::update` writes every column of the row, so
+/// `update_group_inner` has to carry `parent_id` over from the stored row;
+/// this is the regression test for that read-back.
+#[tokio::test]
+async fn rest_update_group_preserves_parent() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let (_code, root, child) =
+        seed_root_and_child(&type_svc, &group_svc, tenant_id, "putkeepsparent").await;
+
+    let req = json_request(
+        "PUT",
+        &format!("/resource-group/v1/groups/{}", child.id),
+        Some(serde_json::json!({
+            "name": "Renamed",
+            "metadata": { "replaced": true }
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "PUT failed: {body}");
+    assert_eq!(body["name"], "Renamed");
+    assert_eq!(body["metadata"], serde_json::json!({"replaced": true}));
+    assert_eq!(
+        body["hierarchy"]["parent_id"],
+        serde_json::json!(root.id),
+        "PUT must not re-parent the group: {body}"
+    );
+}
+
+/// `POST /move` with an explicit `"parent_id": null` promotes the group to a
+/// root and rebuilds the closure table: the group's only ancestor row is
+/// itself, and it disappears from its former parent's descendants.
+#[tokio::test]
+async fn rest_move_group_to_root_returns_200_and_rebuilds_closure() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    // `create_self_ref_type` sets `can_be_root: true`, which is what makes
+    // the promotion legal.
+    let (_code, root, child) =
+        seed_root_and_child(&type_svc, &group_svc, tenant_id, "movetoroot").await;
+
+    let req = json_request(
+        "POST",
+        &format!("/resource-group/v1/groups/{}/move", child.id),
+        Some(serde_json::json!({ "parent_id": null })),
+        tenant_id,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "move to root failed: {body}");
+    assert!(
+        body["hierarchy"]["parent_id"].is_null(),
+        "moved group must be a root: {body}"
+    );
+    // A move leaves the ordinary attributes alone.
+    assert_eq!(body["name"], "Child");
+    assert_eq!(body["metadata"], serde_json::json!({"keep": "me"}));
+
+    // Closure rebuilt: the group's ancestors are now itself only...
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups/{}/ancestors", child.id),
+        None,
+        tenant_id,
+    );
+    let anc = response_body(router.clone().oneshot(req).await.unwrap()).await;
+    let anc_ids: Vec<&str> = anc["items"]
+        .as_array()
+        .expect("ancestors items")
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        anc_ids,
+        vec![child.id.to_string().as_str()],
+        "ancestors must be self only: {anc}"
+    );
+
+    // ...and it is gone from the old parent's descendants.
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups/{}/descendants", root.id),
+        None,
+        tenant_id,
+    );
+    let desc = response_body(router.oneshot(req).await.unwrap()).await;
+    let desc_ids: Vec<&str> = desc["items"]
+        .as_array()
+        .expect("descendants items")
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        desc_ids,
+        vec![root.id.to_string().as_str()],
+        "old parent must have no descendants left: {desc}"
+    );
+}
+
+/// `POST /move` with `"parent_id": null` for a type whose `can_be_root` is
+/// false is a 400 with an `InvalidParentType` field violation. This is the
+/// check that a move to root used to reach; the *limit* checks it used to
+/// skip are covered at service level in `group_service_test.rs`.
+#[tokio::test]
+async fn rest_move_group_to_root_denied_when_type_cannot_be_root() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let root_code = rg_type_id!("test.mvnrroot.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: root_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create root type");
+    let child_code = rg_type_id!("test.mvnrchild.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: child_code.clone(),
+            can_be_root: false,
+            allowed_parent_types: vec![root_code.clone()],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create non-root child type");
+
+    let root = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: root_code,
+                name: "Root".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create root group");
+    let child = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: child_code,
+                name: "Child".to_owned(),
+                parent_id: Some(root.id),
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create child group");
+
+    let req = json_request(
+        "POST",
+        &format!("/resource-group/v1/groups/{}/move", child.id),
+        Some(serde_json::json!({ "parent_id": null })),
+        tenant_id,
+    );
+    let body =
+        assert_problem_shape(router.oneshot(req).await.unwrap(), StatusCode::BAD_REQUEST).await;
+
+    let violations = body["context"]["field_violations"]
+        .as_array()
+        .expect("context.field_violations must be present");
+    assert_eq!(violations[0]["field"], "parent_type");
+    assert_eq!(violations[0]["reason"], "INVALID_PARENT_TYPE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("cannot be a root group")),
+        "expected the can_be_root explanation: {body}"
+    );
+}
+
+/// `POST /move` with **no** `parent_id` key is a 400 `problem+json`. This is
+/// the distinction the whole split exists to preserve: an omitted key is not
+/// a synonym for `null`, because `null` is a destructive instruction ("become
+/// a root") and must be typed out deliberately.
+#[tokio::test]
+async fn rest_move_group_without_parent_id_key_returns_400() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let (_code, root, child) =
+        seed_root_and_child(&type_svc, &group_svc, tenant_id, "movenokey").await;
+
+    let req = json_request(
+        "POST",
+        &format!("/resource-group/v1/groups/{}/move", child.id),
+        Some(serde_json::json!({})),
+        tenant_id,
+    );
+    let body = assert_problem_shape(
+        router.clone().oneshot(req).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("parent_id")),
+        "the 400 must name the missing key: {body}"
+    );
+
+    // Nothing moved.
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups/{}", child.id),
+        None,
+        tenant_id,
+    );
+    let after = response_body(router.oneshot(req).await.unwrap()).await;
+    assert_eq!(after["hierarchy"]["parent_id"], serde_json::json!(root.id));
+}
+
+/// `POST /move` targeting a parent in another tenant is refused, and the
+/// refusal must not disclose the foreign tenant's id (VHP-2345 anti-oracle:
+/// the caller supplies `parent_id` directly, so echoing the owning tenant
+/// back would turn this endpoint into a cross-tenant probe).
+#[tokio::test]
+async fn rest_move_group_cross_tenant_parent_denied_without_leaking_tenant() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let code = create_self_ref_type(&type_svc, "movextenant").await;
+
+    let group_a = group_svc
+        .create_group(
+            &make_ctx(tenant_a),
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: code.clone(),
+                name: "A root".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_a,
+        )
+        .await
+        .expect("create tenant A group");
+    let group_b = group_svc
+        .create_group(
+            &make_ctx(tenant_b),
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code,
+                name: "B root".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_b,
+        )
+        .await
+        .expect("create tenant B group");
+
+    // Tenant B tries to hang its own group under tenant A's group.
+    let req = json_request(
+        "POST",
+        &format!("/resource-group/v1/groups/{}/move", group_b.id),
+        Some(serde_json::json!({ "parent_id": group_a.id })),
+        tenant_b,
+    );
+    let body = assert_problem_shape(
+        router.clone().oneshot(req).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let text = body.to_string();
+    assert!(
+        !text.contains(&tenant_a.to_string()),
+        "the refusal must not disclose the foreign tenant id: {body}"
+    );
+
+    // Tenant B's group is untouched, and tenant A's tree gained nothing.
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups/{}", group_b.id),
+        None,
+        tenant_b,
+    );
+    let after = response_body(router.clone().oneshot(req).await.unwrap()).await;
+    assert!(after["hierarchy"]["parent_id"].is_null());
+
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups/{}/descendants", group_a.id),
+        None,
+        tenant_a,
+    );
+    let desc = response_body(router.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        desc["items"].as_array().expect("items").len(),
+        1,
+        "tenant A must still see only its own group: {desc}"
+    );
+}
+
+/// `POST /move` on a group in another tenant is a 404 -- the caller-scoped
+/// read runs before anything else, so a group the caller cannot see is
+/// indistinguishable from a group that does not exist.
+#[tokio::test]
+async fn rest_move_group_foreign_group_returns_404() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let (_code, _root, child) =
+        seed_root_and_child(&type_svc, &group_svc, tenant_a, "movexowner").await;
+
+    let req = json_request(
+        "POST",
+        &format!("/resource-group/v1/groups/{}/move", child.id),
+        Some(serde_json::json!({ "parent_id": null })),
+        tenant_b,
+    );
+    assert_problem_shape(router.oneshot(req).await.unwrap(), StatusCode::NOT_FOUND).await;
+}
+
+/// `PUT /types/{code}` without `metadata_schema` used to return 200 and
+/// silently erase the stored JSON Schema (`type_service.rs` writes the
+/// column unconditionally). It must now be a 400 `problem+json`, with the
+/// stored schema intact.
+#[tokio::test]
+async fn rest_update_type_without_metadata_schema_returns_400() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let code = rg_type_id!("test.strictschema.{}.v1~", Uuid::now_v7().as_simple());
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "region": { "type": "string" } }
+    });
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: Some(schema.clone()),
+        })
+        .await
+        .expect("create type with a metadata schema");
+
+    let encoded = code.replace('~', "%7E");
+    let req = json_request(
+        "PUT",
+        &format!("/types-registry/v1/types/{encoded}"),
+        Some(serde_json::json!({
+            "can_be_root": true,
+            "allowed_parent_types": [],
+            "allowed_membership_types": []
+        })),
+        tenant_id,
+    );
+    let body = assert_problem_shape(
+        router.clone().oneshot(req).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("metadata_schema")),
+        "the 400 must name the missing key: {body}"
+    );
+
+    // The schema survived the rejected PUT.
+    let req = json_request(
+        "GET",
+        &format!("/types-registry/v1/types/{encoded}"),
+        None,
+        tenant_id,
+    );
+    let after = response_body(router.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        after["metadata_schema"], schema,
+        "metadata_schema must survive a rejected PUT: {after}"
+    );
+}
+
+/// `PUT /types/{code}` rejects unknown fields, so a client that re-sends the
+/// immutable `code` in the body gets an explicit 400 instead of having it
+/// silently discarded.
+#[tokio::test]
+async fn rest_update_type_rejects_unknown_field() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let code = rg_type_id!("test.strictunknown.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create type");
+
+    let encoded = code.replace('~', "%7E");
+    let req = json_request(
+        "PUT",
+        &format!("/types-registry/v1/types/{encoded}"),
+        Some(serde_json::json!({
+            "code": code,
+            "can_be_root": true,
+            "allowed_parent_types": [],
+            "allowed_membership_types": [],
+            "metadata_schema": null
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "`code` is taken from the path and is immutable; sending it must be rejected"
+    );
 }

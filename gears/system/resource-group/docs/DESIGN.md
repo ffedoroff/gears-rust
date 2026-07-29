@@ -438,7 +438,8 @@ Boundaries:
 | `get_type` | `ResourceGroupType` | get type by code |
 | `list_types` | `Page<ResourceGroupType>` | list types with OData query |
 | `delete_type` | `()` | delete type |
-| `create_group` / `update_group` | `ResourceGroup` | group lifecycle |
+| `create_group` / `update_group` | `ResourceGroup` | group lifecycle. `update_group` replaces the group's *ordinary* attributes (`name`, `metadata`) only |
+| `move_group` | `ResourceGroup` | move a group and its subtree to a new parent, or to the root (`new_parent_id: None`) — the structural operation, separate from `update_group` |
 | `get_group` | `ResourceGroup` | get group by ID |
 | `list_groups` | `Page<ResourceGroup>` | list groups with OData query |
 | `delete_group` | `()` | delete group (non-cascade; cascade only via REST) |
@@ -490,7 +491,8 @@ Base path: `/api/resource-group/v1` (groups, memberships), `/api/types-registry/
 | GET | resource-group | `/groups` | `listGroups` | List groups with OData query |
 | POST | resource-group | `/groups` | `createGroup` | Create group. Tenant defaults to `SecurityContext` effective tenant scope; an optional explicit `tenant_id` in the request targets a different tenant, accepted only when the caller's `create`-action `AccessScope` covers that tenant (VHP-2162; platform-admin / onboarding use case). A scope built only from an `InTenantSubtree` constraint cannot be verified this way (no DB-backed tenant-hierarchy lookup in this gear) and is therefore rejected fail-closed. Rejected outright for tenant-typed groups, whose tenant is always the group's own id. |
 | GET | resource-group | `/groups/{group_id}` | `getGroup` | Get group by ID |
-| PUT | resource-group | `/groups/{group_id}` | `updateGroup` | Full replace of group (including parent move) |
+| PUT | resource-group | `/groups/{group_id}` | `updateGroup` | Full replace of the group's ordinary attributes: `name` and `metadata`. Both keys are required — an omitted key is a 400, not "keep the stored value". Does **not** move the group and rejects unknown fields (including `parent_id` and the immutable `type`) |
+| POST | resource-group | `/groups/{group_id}/move` | `moveGroup` | Move the group and its entire subtree to a new parent, or to the root. Body `{ "parent_id": <uuid\|null> }`; the key is mandatory and an explicit `null` means "become a root". Atomic: cycle detection, parent-type compatibility, depth/width limits, tenant-root uniqueness and the closure rebuild all run in one `SERIALIZABLE` transaction |
 | DELETE | resource-group | `/groups/{group_id}` | `deleteGroup` | Delete group (optional `?force=true`) |
 | GET | resource-group | `/groups/{group_id}/hierarchy` | `listGroupHierarchy` | Traverse hierarchy from reference group with relative depth |
 | GET | resource-group | `/memberships` | `listMemberships` | List memberships with OData query |
@@ -545,7 +547,7 @@ Integration read trait hierarchy (defined in `resource-group-sdk/src/api.rs`):
 
 > The previously planned two-tier split — a separate `ResourceGroupReadPluginClient` extending `ResourceGroupReadHierarchy` with `list_memberships` — was collapsed. `list_memberships` and `get_group` now live directly on `ResourceGroupReadHierarchy`, and the vendor-specific plugin gateway resolves `dyn ResourceGroupReadHierarchy`. A vendor backend replaces the registered `ResourceGroupReadHierarchy` implementation at gear init rather than implementing a distinct plugin trait.
 
-ClientHub registration: single implementation (`RgService`), registered as both `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`. AuthZ plugin resolves `dyn ResourceGroupReadHierarchy`, general consumers resolve `dyn ResourceGroupClient`.
+ClientHub registration: single implementation (`ResourceGroupLocalClient`), registered as both `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`. AuthZ plugin resolves `dyn ResourceGroupReadHierarchy`, general consumers resolve `dyn ResourceGroupClient`.
 
 Plugin gateway routing notes:
 
@@ -703,7 +705,9 @@ sequenceDiagram
 
 **ID**: `cpt-cf-resource-group-seq-move-subtree`
 
-Tenant Administrator moves a resource group (and its entire subtree) to a new parent within the same tenant via REST API `PUT /groups/{group_id}`. Other callers — Instance Administrator (REST API) and Apps (`ResourceGroupClient` SDK) — follow the same internal flow.
+Tenant Administrator moves a resource group (and its entire subtree) to a new parent within the same tenant via REST API `POST /groups/{group_id}/move`. Other callers — Instance Administrator (REST API) and Apps (`ResourceGroupClient::move_group` SDK) — follow the same internal flow.
+
+The move is deliberately **not** expressible through `PUT /groups/{group_id}`: see [B1.1 / B1.3 decision](#b11--b13-group-update-vs-group-move) below.
 
 ```mermaid
 sequenceDiagram
@@ -1248,7 +1252,7 @@ RG relies on database-level performance rather than application-level caching:
 - **Application-tier horizontal scaling**: RG is a stateless service with no in-process caches, sessions, or local state. Multiple RG instances can run behind the platform load balancer without session affinity. Scaling the application tier is a simple matter of increasing replica count — the platform orchestration layer handles load distribution. All coordination is delegated to PostgreSQL (SERIALIZABLE transactions for write consistency, connection pool for concurrency control).
 - **Query cost protection**: all list endpoints enforce `limit` (max 200 per page). Unbounded hierarchy traversals are bounded by `max_depth` query profile. Database-level query timeout (statement_timeout) is configured at the connection pool level per platform defaults. API-layer rate limiting is handled by the API gateway — RG does not implement its own throttling.
 - **Closure write amplification bounds**: subtree move operations update `O(N × D)` closure rows where N = subtree size and D = depth. With `max_depth = 10` and typical organizational hierarchies (width >> depth), expected subtree sizes for move operations are under 10K nodes. For larger subtrees, SERIALIZABLE isolation + bounded retry (max 3) prevents runaway transactions. No hard cap on subtree size is enforced — `max_depth` and `max_width` provide indirect bounds.
-- **Optimistic concurrency**: v1 uses last-write-wins semantics for `PUT /groups/{id}`. ETag-based optimistic concurrency control is a candidate for future versions if concurrent update conflicts become a production concern.
+- **Optimistic concurrency**: v1 uses last-write-wins semantics for `PUT /groups/{id}` (the group's ordinary attributes). `POST /groups/{id}/move` is not last-write-wins in the same sense: it re-reads the hierarchy inside its own `SERIALIZABLE` transaction, so two racing moves either serialize or one is rejected deterministically (`CycleDetected` / limit violation) rather than silently overwriting each other. ETag-based optimistic concurrency control is a candidate for future versions if concurrent update conflicts become a production concern.
 - **Latency budget** (target p95 < 250 ms for hierarchy queries, default profile `max_depth = 10`):
 
 | Layer | Budget | Notes |
@@ -1286,6 +1290,7 @@ RG relies on database-level performance rather than application-level caching:
 | `gts.cf.core.rg.group.v1~` | `create` | `createGroup` | POST | `/groups` | JWT |
 | `gts.cf.core.rg.group.v1~` | `read` | `getGroup` | GET | `/groups/{group_id}` | JWT |
 | `gts.cf.core.rg.group.v1~` | `update` | `updateGroup` | PUT | `/groups/{group_id}` | JWT |
+| `gts.cf.core.rg.group.v1~` | `update` | `moveGroup` | POST | `/groups/{group_id}/move` | JWT |
 | `gts.cf.core.rg.group.v1~` | `delete` | `deleteGroup` | DELETE | `/groups/{group_id}` | JWT |
 | `gts.cf.core.rg.group.v1~` | `read` | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | JWT |
 | _(AuthZ bypassed)_ | — | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | MTLS |
@@ -1299,7 +1304,7 @@ Notes:
   - The AuthZ plugin reads hierarchy in-process via `ResourceGroupReadHierarchy` registered in `ClientHub` and **bypasses `PolicyEnforcer` invocation** on those reads (`AccessScope::allow_all()`); the plugin still produces AuthZ tenant/subtree constraints from the returned hierarchy — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
   - MTLS-authenticated requests (AuthZ plugin only) **also** bypass `PolicyEnforcer` entirely — `p2`, **deferred / not implemented yet**, planned for the future microservice split — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
   - `listGroupHierarchy` shares `resource_group` + `read` permission with `getGroup` — both are group read operations; the AuthZ policy may differentiate them if needed.
-  - The `gts.cf.core.rg.type.v1~` row above applies **without exception**, including to the in-process `ClientHub` path: `RgService`'s `create_type`/`get_type`/`list_types`/`update_type`/`delete_type` — the implementation registered as `dyn ResourceGroupClient` and resolved by other gears in the same binary — call `TypeService`'s gated entry points, exactly like the REST handlers do, and run through `PolicyEnforcer` the same way. There is no separate unscoped path for in-process callers (an earlier revision briefly introduced one and was reverted — see the git history around VHP-2342). Any consumer that registers or manages GTS types — at gear init or otherwise — **must have a matching AuthZ policy rule** for its `subject_type`; RG will not admit it on the strength of being a platform-internal caller. **Known limitation:** account-management registers its GTS user-group types at gear init (`account-management/src/domain/system_actor.rs::for_gear_init` → `build_inner(None)`) under a system actor whose `SecurityContext` carries `subject_tenant_id = Uuid::nil()`, and `static-authz-plugin` denies any nil-tenant request unconditionally (`gears/system/authz-resolver/plugins/static-authz-plugin/src/domain/service.rs`, `tid == Uuid::default()`). On a dev stack running `static-authz-plugin`, this means AM's gear-init type registration fails closed today, until the policy layer or the plugin is taught to admit this system actor. This is accepted as the cost of not carving out an unscoped in-process path; it is not something RG papers over.
+  - The `gts.cf.core.rg.type.v1~` row above applies **without exception**, including to the in-process `ClientHub` path: `ResourceGroupLocalClient`'s `create_type`/`get_type`/`list_types`/`update_type`/`delete_type` — the implementation registered as `dyn ResourceGroupClient` and resolved by other gears in the same binary — call `TypeService`'s gated entry points, exactly like the REST handlers do, and run through `PolicyEnforcer` the same way. There is no separate unscoped path for in-process callers (an earlier revision briefly introduced one and was reverted — see the git history around VHP-2342). Any consumer that registers or manages GTS types — at gear init or otherwise — **must have a matching AuthZ policy rule** for its `subject_type`; RG will not admit it on the strength of being a platform-internal caller. **Known limitation:** account-management registers its GTS user-group types at gear init (`account-management/src/domain/system_actor.rs::for_gear_init` → `build_inner(None)`) under a system actor whose `SecurityContext` carries `subject_tenant_id = Uuid::nil()`, and `static-authz-plugin` denies any nil-tenant request unconditionally (`gears/system/authz-resolver/plugins/static-authz-plugin/src/domain/service.rs`, `tid == Uuid::default()`). On a dev stack running `static-authz-plugin`, this means AM's gear-init type registration fails closed today, until the policy layer or the plugin is taught to admit this system actor. This is accepted as the cost of not carving out an unscoped in-process path; it is not something RG papers over.
 
 ### Reliability Architecture
 
@@ -1341,6 +1346,32 @@ Rationale:
 - Phase 2 aligns the URL namespace early to avoid breaking changes for API consumers when storage migration occurs in Phase 3
 - Phase 3 separates concerns: Types Registry owns GTS schema catalog and validation, RG owns hierarchy topology rules — neither duplicates the other's domain
 - Saga between TR and RG enables each gear to evolve its storage independently while maintaining cross-gear referential integrity
+
+### API Baseline Decisions
+
+Answers to [`docs/toolkit_unified_system/15_gear_api_baseline.md`](../../../../docs/toolkit_unified_system/15_gear_api_baseline.md) items that require a recorded decision rather than a code change.
+
+#### B1.1 / B1.3: group update vs group move
+
+**B1.1** (partial update) and **B1.3** (atomic move) are answered together, because for this resource they are the same question.
+
+A group has three mutable-looking fields — `name`, `parent`, `metadata` — which is why the original single `PUT` looked like a B1.1 violation ("changing one field forces the client to know, and resend, the rest"). But `parent` was never an ordinary field. Assigning it triggers cycle detection over the closure table, `allowed_parent_types` compatibility, `max_depth` / `max_width` enforcement, tenant-root uniqueness, the cross-tenant re-parent ban, and a `DELETE`+`INSERT` rebuild of every closure row in the moved subtree — all of which must be atomic with the write. Bundling that into a "replace the resource" verb had two consequences:
+
+- the operation could not be requested without also resending `name` and `metadata`, and vice versa: a rename had to carry the group's structural position, so a client that got `parent_id` wrong (or omitted it, which serde cannot distinguish from `null`) silently *moved* the group while trying to rename it;
+- the write path had to *guess*, before opening its transaction, whether a given `PUT` was a rename or a move in order to pick an isolation level, and carry a restart protocol for when the guess was wrong.
+
+**Decision.** The structural operation was extracted to `POST /groups/{group_id}/move` (B1.3: atomic, single `SERIALIZABLE` transaction with bounded retry, never "detach then attach"). What remains on `PUT /groups/{group_id}` is `name` + `metadata` — two ordinary fields of comparable weight, with no cross-field validation between them.
+
+**There is deliberately no `PATCH` for groups, and B1.1 is satisfied without one.** B1.1's own text carves this out: the test "is not which verb is present but whether changing one field forces the client to know, and resend, the rest". After the split the only thing a client is forced to resend is the other one of `name` / `metadata`, both of which it already has from the `GET` it must perform anyway to know the group exists. Adding `PATCH` would buy a client nothing it cannot express, while re-introducing exactly the ambiguity that caused the original defect: an omitted key that means "leave alone" is one refactor away from an omitted key that means "clear". This gear keeps one verb per resource, matching the platform convention that no resource in the repository exposes both (the type registry is `PUT`-only for the same reason — a type definition is a document).
+
+**Strictness is the other half of the decision.** Because `PUT` is a full replacement, an omitted key must be an error, not an implicit `null`:
+
+- `UpdateGroupDto` (`name`, `metadata`) and `UpdateTypeDto` (`metadata_schema`) require every replaceable key. `metadata` / `metadata_schema` are tri-state on the wire (`double_option`), so "omitted" is distinguishable from "explicit `null`" and only the latter clears the stored value. Previously an omitted key deserialized to `None` and the repository wrote the column unconditionally — a `PUT` carrying only `name` erased a group's metadata and returned 200.
+- `MoveGroupDto` requires `parent_id` for the same reason, inverted: `null` is the *destructive* value there ("become a root"), so it must be typed out rather than arrived at by omission.
+- All three carry `deny_unknown_fields`, so a client that sends the immutable `type`, or the pre-split `parent_id`, is told instead of having the field dropped.
+- These three request bodies are extracted with `api::rest::extract::StrictJson` rather than `axum::Json`, so a serde rejection is a 400 RFC-9457 `problem+json` document instead of axum's bare `text/plain` 422 — otherwise the strictness would be invisible to a conforming client (see `04_rest_operation_builder.md`).
+
+**B1.2** (create/read shape agreement) remains open and unaddressed by this change: `parent_id` is still accepted flat on create and returned nested under `hierarchy` on read.
 
 ### Known Technical Debt
 
@@ -1531,7 +1562,11 @@ API tests verify HTTP-level behavior: request/response shapes, status codes, ODa
 | List types — OData filter | `GET /types?$filter=code eq 'tenant'` | 200 OK, filtered result set |
 | Create group — with parent | `POST /groups` | 201 Created, closure rows created |
 | Create group — invalid parent type | `POST /groups` | 400/409, Problem JSON with `InvalidParentType` |
-| Move group — cycle | `PUT /groups/{id}` (parent = descendant) | 409, `CycleDetected` |
+| Move group — cycle | `POST /groups/{id}/move` (parent = descendant) | 400 with a `hierarchy` precondition violation (`CycleDetected`) |
+| Move group — to root | `POST /groups/{id}/move` with `{"parent_id": null}` | 200, group detached, closure rebuilt |
+| Move group — missing key | `POST /groups/{id}/move` with `{}` | 400 — an omitted `parent_id` is not a synonym for `null` |
+| Update group — omitted `metadata` | `PUT /groups/{id}` with `{"name": …}` only | 400; stored metadata unchanged |
+| Update group — `parent_id` in body | `PUT /groups/{id}` with `parent_id` | 400 (unknown field) |
 | Delete group — has children, no force | `DELETE /groups/{id}` | 409, `ConflictActiveReferences` |
 | Delete group — force cascade | `DELETE /groups/{id}?force=true` | 204 No Content, subtree + memberships removed |
 | List group hierarchy — depth filter | `GET /groups/{id}/hierarchy?$filter=hierarchy/depth ge 0` | 200 OK, descendants with `depth` field |

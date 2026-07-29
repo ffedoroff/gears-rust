@@ -10,7 +10,10 @@ use tracing::field::Empty;
 
 use toolkit::api::canonical_prelude::*;
 
-use super::{CreateGroupDto, GroupDto, GroupWithDepthDto, SecurityContext, UpdateGroupDto, info};
+use super::{
+    CreateGroupDto, GroupDto, GroupWithDepthDto, MoveGroupDto, SecurityContext, StrictJson,
+    UpdateGroupDto, info,
+};
 use crate::gear::ConcreteGroupService;
 
 /// Query parameters for delete endpoint.
@@ -64,7 +67,7 @@ pub async fn create_group(
     uri: Uri,
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteGroupService>>,
-    Json(req_body): Json<CreateGroupDto>,
+    StrictJson(req_body): StrictJson<CreateGroupDto>,
 ) -> ApiResult<impl IntoResponse> {
     info!(
         name = %req_body.name,
@@ -103,7 +106,9 @@ pub async fn get_group(
     Ok(Json(GroupDto::from(group)))
 }
 
-/// Update a resource group (full replacement via PUT).
+/// Update a resource group's ordinary attributes (full replacement via PUT).
+///
+/// Does not move the group — see [`move_group`].
 #[tracing::instrument(
     skip(svc, req_body, ctx),
     fields(
@@ -115,14 +120,53 @@ pub async fn update_group(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteGroupService>>,
     Path(group_id): Path<uuid::Uuid>,
-    Json(req_body): Json<UpdateGroupDto>,
+    StrictJson(req_body): StrictJson<UpdateGroupDto>,
 ) -> ApiResult<Json<GroupDto>> {
     info!(
         group_id = %group_id,
         "Updating resource group"
     );
 
-    let group = svc.update_group(&ctx, group_id, req_body.into()).await?;
+    // `try_into` is where an omitted `name` / `metadata` key becomes a 400
+    // `problem+json`: `UpdateGroupDto` deserializes them as tri-state so the
+    // omission is observable here rather than collapsing into `null` and
+    // erasing stored data. See `UpdateGroupDto`'s doc comment.
+    let group = svc
+        .update_group(&ctx, group_id, req_body.try_into()?)
+        .await?;
+    Ok(Json(GroupDto::from(group)))
+}
+
+/// Move a resource group (and its subtree) to a new parent, or to the root.
+///
+/// A separate operation from [`update_group`] because re-parenting is a
+/// structural mutation: cycle detection, parent-type compatibility, depth /
+/// width limits, tenant-root uniqueness and a closure-table rebuild, all
+/// inside one `SERIALIZABLE` transaction.
+#[tracing::instrument(
+    skip(svc, req_body, ctx),
+    fields(
+        group.id = %group_id,
+        request_id = Empty,
+    )
+)]
+pub async fn move_group(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteGroupService>>,
+    Path(group_id): Path<uuid::Uuid>,
+    StrictJson(req_body): StrictJson<MoveGroupDto>,
+) -> ApiResult<Json<GroupDto>> {
+    // An absent `parent_id` key is rejected here (400 `problem+json`); an
+    // explicit `null` resolves to `None`, i.e. "move to root".
+    let new_parent_id = req_body.into_new_parent_id()?;
+
+    info!(
+        group_id = %group_id,
+        to_root = new_parent_id.is_none(),
+        "Moving resource group"
+    );
+
+    let group = svc.move_group(&ctx, group_id, new_parent_id).await?;
     Ok(Json(GroupDto::from(group)))
 }
 

@@ -479,7 +479,7 @@ async fn group_move_closure_rebuild() {
 
     // Move child (and its subtree) from root1 to root2
     let moved = group_svc
-        .move_group(child.id, Some(root2.id))
+        .move_group_unscoped(child.id, Some(root2.id))
         .await
         .expect("move group");
 
@@ -545,7 +545,7 @@ async fn group_move_under_descendant_cycle() {
 
     // Try to move root under its child
     let err = group_svc
-        .move_group(root.id, Some(child.id))
+        .move_group_unscoped(root.id, Some(child.id))
         .await
         .unwrap_err();
 
@@ -569,7 +569,7 @@ async fn group_move_self_parent_cycle() {
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
     let err = group_svc
-        .move_group(root.id, Some(root.id))
+        .move_group_unscoped(root.id, Some(root.id))
         .await
         .unwrap_err();
 
@@ -609,7 +609,7 @@ async fn group_move_incompatible_parent_type() {
 
     // Move child to root_b (incompatible)
     let err = group_svc
-        .move_group(child.id, Some(root_b.id))
+        .move_group_unscoped(child.id, Some(root_b.id))
         .await
         .unwrap_err();
 
@@ -654,7 +654,7 @@ async fn group_move_child_to_root() {
 
     // Move child to root (detach from parent)
     let moved = group_svc
-        .move_group(child.id, None)
+        .move_group_unscoped(child.id, None)
         .await
         .expect("move to root");
 
@@ -690,7 +690,10 @@ async fn group_move_to_root_cannot_be_root() {
     )
     .await;
 
-    let err = group_svc.move_group(child.id, None).await.unwrap_err();
+    let err = group_svc
+        .move_group_unscoped(child.id, None)
+        .await
+        .unwrap_err();
 
     assert!(
         matches!(err, DomainError::InvalidParentType { ref message } if message.contains("cannot be a root group")),
@@ -705,7 +708,7 @@ async fn group_move_nonexistent() {
     let group_svc = common::make_group_service(db.clone());
 
     let err = group_svc
-        .move_group(Uuid::now_v7(), None)
+        .move_group_unscoped(Uuid::now_v7(), None)
         .await
         .unwrap_err();
 
@@ -729,7 +732,7 @@ async fn group_move_to_nonexistent_parent() {
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
     let err = group_svc
-        .move_group(root.id, Some(Uuid::now_v7()))
+        .move_group_unscoped(root.id, Some(Uuid::now_v7()))
         .await
         .unwrap_err();
 
@@ -781,7 +784,7 @@ async fn group_move_max_width_exceeded() {
         common::create_root_group(&group_svc, &ctx, &child_code, "Standalone", tenant_id).await;
 
     let err = group_svc
-        .move_group(standalone.id, Some(root1.id))
+        .move_group_unscoped(standalone.id, Some(root1.id))
         .await
         .unwrap_err();
 
@@ -819,7 +822,6 @@ async fn group_update_name_and_metadata() {
             root.id,
             UpdateGroupRequest {
                 name: "NewName".to_owned(),
-                parent_id: None,
                 metadata: Some(new_meta.clone()),
             },
         )
@@ -1424,7 +1426,7 @@ async fn group_move_max_depth_exceeded() {
     // But standalone's type (sub_code) must allow child_type as parent.
     // Actually sub_code allows child_type as parent, so the move is type-compatible.
     let err = group_svc
-        .move_group(standalone.id, Some(child.id))
+        .move_group_unscoped(standalone.id, Some(child.id))
         .await
         .unwrap_err();
 
@@ -1745,7 +1747,6 @@ async fn group_metadata_update_replaces_entirely() {
             group.id,
             UpdateGroupRequest {
                 name: "ReplaceMe".to_owned(),
-                parent_id: None,
                 metadata: Some(new_meta.clone()),
             },
         )
@@ -1807,7 +1808,6 @@ async fn group_metadata_none_to_some() {
             group.id,
             UpdateGroupRequest {
                 name: "NoMeta".to_owned(),
-                parent_id: None,
                 metadata: Some(meta.clone()),
             },
         )
@@ -1852,7 +1852,6 @@ async fn group_metadata_some_to_none() {
             group.id,
             UpdateGroupRequest {
                 name: "WithMeta".to_owned(),
-                parent_id: None,
                 metadata: None,
             },
         )
@@ -2682,21 +2681,16 @@ async fn tenant_root_update_to_second_root_rejected() {
         .await
         .expect("sub-tenant under root");
 
-    // Attempt to promote child to a root (parent_id = None) — must deny,
-    // the tenant root already exists. For a tenant-type sub-tenant the
-    // effective tenant_id equals its own id (derived by code-prefix), so the
-    // caller's scope must target that tenant to pass the AuthZ pre-check.
+    // Attempt to promote child to a root (`parent_id = None`) — must deny,
+    // the tenant root already exists. This now goes through `move_group`
+    // rather than `update_group`: promoting a group to a root is a structural
+    // mutation, and `UpdateGroupRequest` no longer carries `parent_id`. For a
+    // tenant-type sub-tenant the effective tenant_id equals its own id
+    // (derived by code-prefix), so the caller's scope must target that tenant
+    // to pass the AuthZ pre-check.
     let child_ctx = common::make_ctx(child.hierarchy.tenant_id);
     let err = group_svc
-        .update_group(
-            &child_ctx,
-            child.id,
-            UpdateGroupRequest {
-                name: child.name.clone(),
-                parent_id: None,
-                metadata: None,
-            },
-        )
+        .move_group(&child_ctx, child.id, None)
         .await
         .expect_err("promoting sub-tenant to a second root must fail");
     assert!(
@@ -2742,7 +2736,6 @@ async fn tenant_root_self_update_allowed() {
             root.id,
             UpdateGroupRequest {
                 name: "RootB".to_owned(),
-                parent_id: None,
                 metadata: None,
             },
         )
@@ -3055,4 +3048,270 @@ async fn group_list_filter_unknown_type_returns_validation_error() {
         matches!(&err, DomainError::Validation { message } if message.contains("Unknown type")),
         "expected a Validation error naming the unknown type, got: {err:?}"
     );
+}
+
+// =========================================================================
+// Move-to-root: the query profile now applies to both branches
+// =========================================================================
+//
+// `move_group_internal_impl` used to keep the whole query profile inside its
+// `Some(new_parent)` arm, so a move to root skipped `max_depth`/`max_width`
+// entirely. The root arm now enforces what is meaningful for it: `can_be_root`
+// (already there), tenant-root uniqueness (already there), and the width of
+// the tenant's root level (new). `max_depth` is deliberately *not* checked --
+// promoting a subtree can only reduce the deepest depth it reaches, so a check
+// there could only fire on a tree that already violated the limit. See the
+// function's doc comment.
+
+/// A type that may be both a root and a child of itself, so the same group can
+/// legally sit at either position and the *limit* is what decides.
+async fn create_self_ref_type(
+    type_svc: &TypeService<TypeRepository>,
+    suffix: &str,
+) -> CreateTypeRequest {
+    let code = format!(
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{suffix}{}.v1~",
+        Uuid::now_v7().as_simple()
+    );
+    let req = CreateTypeRequest {
+        code: code.clone(),
+        can_be_root: true,
+        allowed_parent_types: vec![],
+        allowed_membership_types: vec![],
+        metadata_schema: None,
+    };
+    type_svc
+        .create_type_unscoped(req.clone())
+        .await
+        .expect("create self-referencing type");
+    type_svc
+        .update_type_unscoped(
+            &code,
+            resource_group_sdk::UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![code.clone()],
+                allowed_membership_types: vec![],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("make the type self-referencing");
+    req
+}
+
+/// `max_width` is now enforced when a group is promoted to a root: with
+/// `max_width = 1` and one root already present in the tenant, detaching a
+/// child must be refused. Before the split this check did not exist on the
+/// root branch at all and the move silently succeeded.
+#[tokio::test]
+async fn group_move_to_root_max_width_exceeded() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let profile = QueryProfile {
+        max_depth: None,
+        max_width: Some(1),
+    };
+    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = create_self_ref_type(&type_svc, "mvrootwidth").await;
+    let root = common::create_root_group(&group_svc, &ctx, &t.code, "Root", tenant_id).await;
+    let child =
+        common::create_child_group(&group_svc, &ctx, &t.code, root.id, "Child", tenant_id).await;
+
+    // The tenant already has one root (`root`), so promoting `child` would
+    // make two -- one more than `max_width` allows at the root level.
+    let err = group_svc
+        .move_group(&ctx, child.id, None)
+        .await
+        .expect_err("promoting a second root must breach max_width");
+    assert!(
+        matches!(err, DomainError::LimitViolation { ref message } if message.contains("Width limit exceeded")),
+        "expected LimitViolation with 'Width limit exceeded', got: {err:?}"
+    );
+
+    // Nothing moved.
+    let after = group_svc
+        .get_group(&ctx, child.id)
+        .await
+        .expect("child still readable");
+    assert_eq!(after.hierarchy.parent_id, Some(root.id));
+}
+
+/// The root-level width count is scoped to the moved group's own tenant: a
+/// foreign tenant's roots must not consume this tenant's budget (and the
+/// rejection message must never disclose a cross-tenant total).
+#[tokio::test]
+async fn group_move_to_root_width_counts_only_own_tenant() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let profile = QueryProfile {
+        max_depth: None,
+        max_width: Some(1),
+    };
+    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let ctx_b = common::make_ctx(tenant_b);
+
+    let t = create_self_ref_type(&type_svc, "mvrootwidthtenant").await;
+    // Tenant A fills its own root level.
+    common::create_root_group(&group_svc, &ctx_a, &t.code, "A root", tenant_a).await;
+
+    // Tenant B has a root plus a child; the child's promotion is what we test.
+    let b_root = common::create_root_group(&group_svc, &ctx_b, &t.code, "B root", tenant_b).await;
+    let b_child =
+        common::create_child_group(&group_svc, &ctx_b, &t.code, b_root.id, "B child", tenant_b)
+            .await;
+
+    // Still refused -- but because of tenant B's own root, not tenant A's.
+    let err = group_svc
+        .move_group(&ctx_b, b_child.id, None)
+        .await
+        .expect_err("tenant B's own root fills its budget");
+    let DomainError::LimitViolation { message } = &err else {
+        panic!("expected LimitViolation, got: {err:?}");
+    };
+    assert!(
+        message.contains("1 root group"),
+        "the count must be tenant-local (1, not 2): {message}"
+    );
+    assert!(
+        !message.contains(&tenant_a.to_string()),
+        "the message must not disclose another tenant: {message}"
+    );
+
+    // Remove tenant B's own root and the promotion becomes legal, proving the
+    // count is not global.
+    group_svc
+        .delete_group(&ctx_b, b_child.id, true)
+        .await
+        .expect("detach the child by deleting it");
+    let b_child2 = common::create_child_group(
+        &group_svc,
+        &ctx_b,
+        &t.code,
+        b_root.id,
+        "B child 2",
+        tenant_b,
+    )
+    .await;
+    group_svc
+        .delete_group(&ctx_b, b_root.id, false)
+        .await
+        .expect_err("root still has a child");
+    // Move the child out first is impossible while the root exists, so assert
+    // the boundary the other way round: with max_width = 2 the promotion that
+    // just failed succeeds, i.e. the earlier refusal was the limit talking.
+    let permissive = make_group_service_with_profile(
+        db.clone(),
+        QueryProfile {
+            max_depth: None,
+            max_width: Some(2),
+        },
+    );
+    let moved = permissive
+        .move_group(&ctx_b, b_child2.id, None)
+        .await
+        .expect("with max_width = 2 the tenant may have a second root");
+    assert_eq!(moved.hierarchy.parent_id, None);
+}
+
+/// A no-op "move to root" of a group that is already a root must not trip the
+/// width limit on itself: the moved group is excluded from the sibling count,
+/// mirroring the tenant-root-uniqueness exclusion right above it.
+#[tokio::test]
+async fn group_move_already_root_to_root_is_allowed_at_max_width() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let profile = QueryProfile {
+        max_depth: None,
+        max_width: Some(1),
+    };
+    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = create_self_ref_type(&type_svc, "mvrootnoop").await;
+    let root = common::create_root_group(&group_svc, &ctx, &t.code, "Only root", tenant_id).await;
+
+    let moved = group_svc
+        .move_group(&ctx, root.id, None)
+        .await
+        .expect("re-rooting the only root is a no-op, not a limit breach");
+    assert_eq!(moved.hierarchy.parent_id, None);
+    assert_eq!(moved.name, "Only root");
+}
+
+/// `move_group` is AuthZ-gated exactly like `update_group`: a group outside the
+/// caller's tenant scope is reported as not-found, and nothing is written.
+#[tokio::test]
+async fn group_move_cross_tenant_group_is_not_found() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let ctx_b = common::make_ctx(tenant_b);
+
+    let t = create_self_ref_type(&type_svc, "mvauthz").await;
+    let root = common::create_root_group(&group_svc, &ctx_a, &t.code, "A root", tenant_a).await;
+    let child =
+        common::create_child_group(&group_svc, &ctx_a, &t.code, root.id, "A child", tenant_a).await;
+
+    let err = group_svc
+        .move_group(&ctx_b, child.id, None)
+        .await
+        .expect_err("tenant B must not move tenant A's group");
+    assert!(
+        matches!(err, DomainError::GroupNotFound { .. }),
+        "expected GroupNotFound (not a permission error, which would confirm existence), got: {err:?}"
+    );
+
+    let after = group_svc
+        .get_group(&ctx_a, child.id)
+        .await
+        .expect("tenant A still sees its group");
+    assert_eq!(after.hierarchy.parent_id, Some(root.id));
+}
+
+/// `move_group` rejects a new parent in another tenant without echoing that
+/// tenant's id, and the closure table is left untouched.
+#[tokio::test]
+async fn group_move_cross_tenant_parent_rejected_without_leak() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let ctx_b = common::make_ctx(tenant_b);
+
+    let t = create_self_ref_type(&type_svc, "mvxtenantparent").await;
+    let a_root = common::create_root_group(&group_svc, &ctx_a, &t.code, "A root", tenant_a).await;
+    let b_root = common::create_root_group(&group_svc, &ctx_b, &t.code, "B root", tenant_b).await;
+
+    let err = group_svc
+        .move_group(&ctx_b, b_root.id, Some(a_root.id))
+        .await
+        .expect_err("cross-tenant re-parent must be rejected");
+    let DomainError::Validation { message } = &err else {
+        panic!("expected Validation, got: {err:?}");
+    };
+    assert!(
+        !message.contains(&tenant_a.to_string()),
+        "the refusal must not disclose the foreign tenant id: {message}"
+    );
+    assert!(
+        message.contains("different tenant"),
+        "expected the cross-tenant explanation: {message}"
+    );
+
+    // Closure untouched on both sides.
+    let conn = db.conn().expect("conn");
+    common::assert_closure_rows(&conn, b_root.id, &[(b_root.id, 0)]).await;
+    common::assert_closure_rows(&conn, a_root.id, &[(a_root.id, 0)]).await;
 }
