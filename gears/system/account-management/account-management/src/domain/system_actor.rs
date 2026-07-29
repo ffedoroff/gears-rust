@@ -41,11 +41,14 @@
 //!
 //! # Today's call sites
 //!
-//! * [`for_gear_init`] — RG type-schema registration from
-//!   `gear::init`. Platform-scoped (no tenant binding).
 //! * [`for_bootstrap`] — `provision_tenant` / compensation
 //!   `deprovision_tenant` on the platform root inside the bootstrap
-//!   saga and its step-3 compensator.
+//!   saga and its step-3 compensator, **and** the RG type-schema
+//!   registration that runs right after the saga in
+//!   `AccountManagementGear::serve`.
+//! * [`for_gear_init`] — fallback subject for that same RG type-schema
+//!   registration when the deployment configures no platform root to
+//!   scope to. Platform-scoped (no tenant binding).
 //! * [`for_provisioning_reaper`] — `deprovision_tenant` calls from
 //!   the provisioning-reaper batch on rows stuck in retry.
 //! * [`for_retention_sweep`] — `deprovision_tenant` from the
@@ -96,9 +99,20 @@ fn build_inner(scope_tenant: Option<Uuid>) -> SecurityContext {
         .expect("AM_SYSTEM_ACTOR_UUID + tenant_id are always present")
 }
 
-/// gear init — RG type-schema registration. Platform-scoped (no
-/// tenant binding; the registration is a workspace-wide operation
-/// that pre-dates any tenant).
+/// RG type-schema registration with **no** platform root to scope to
+/// (`account-management.bootstrap` absent or invalid). Platform-scoped:
+/// the registration is a workspace-wide operation that pre-dates any
+/// tenant, and without a bootstrap section there is no tenant row it
+/// could legitimately name.
+///
+/// Historical name: this used to be the only subject for the
+/// registration, back when the registration itself ran in
+/// `Gear::init`. It runs in `serve` now
+/// ([`crate::gear::AccountManagementGear::run_user_group_type_registration`]),
+/// under [`for_bootstrap`] whenever a root id is configured, because a
+/// nil tenant is denied outright by any tenant-clamping PDP
+/// (`static-authz-plugin` rejects `Uuid::default()`). Callers on this
+/// path are expected to log why they could not supply a tenant.
 #[must_use]
 pub(crate) fn for_gear_init() -> SecurityContext {
     tracing::info!(
@@ -112,6 +126,11 @@ pub(crate) fn for_gear_init() -> SecurityContext {
 /// Bootstrap saga — `provision_tenant` on the platform root and its
 /// compensation `deprovision_tenant` paths (steps 2 and 3 of the
 /// saga). `root_id` is the platform-root tenant id.
+///
+/// Also the subject for the user-group RG type-schema registration that
+/// `AccountManagementGear::serve` runs immediately after the saga: RG's
+/// type surface is `AuthZ`-gated, and a tenant-clamping PDP needs a real
+/// tenant on the subject to derive a scope at all.
 #[must_use]
 pub(crate) fn for_bootstrap(root_id: Uuid) -> SecurityContext {
     tracing::info!(

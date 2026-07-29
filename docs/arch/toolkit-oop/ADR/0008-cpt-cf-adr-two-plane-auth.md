@@ -252,7 +252,11 @@ These already-shipped in-process surfaces reuse the tenant `SecurityContext` for
 tenant-scoped-vs-non-tenant criterion splits them:
 
 * **account-management `for_gear_init`** (`domain/system_actor.rs`) — registers a *global* RG type (workspace-wide, nil
-  tenant). Genuinely non-tenant → migrate to `PlatformSecurityContext`.
+  tenant). Genuinely non-tenant → migrate to `PlatformSecurityContext`. *Status:* that registration has since moved out of
+  `Gear::init` (an `AuthZ`-gated call cannot succeed before the `post_init` barrier makes the PDP plugin resolvable) into
+  `AccountManagementGear::serve`, and now runs under `for_bootstrap(root_id)` on the tenant plane, because a
+  tenant-clamping PDP denies a nil tenant outright. `for_gear_init` remains only as the no-platform-root fallback. The
+  question of whether a workspace-global registration belongs on the platform plane is unchanged by that move.
 * **account-management tenant-bound factories** (`for_bootstrap`, `for_provisioning_reaper`, `for_retention_sweep`,
   `for_user_groups_cascade`) — operate on a specific tenant (including the platform root). These are *tenant-scoped* →
   they belong on the **tenant plane** with a real tenant `SecurityContext` (S2S client-credentials), **not**

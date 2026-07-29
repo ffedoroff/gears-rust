@@ -3,8 +3,12 @@
 //! Delegates all user-group state to the Resource Group gear.
 //! AM owns two thin touchpoints:
 //!
-//! 1. Idempotent registration of **two** chained RG type schemas
-//!    during gear init ([`register_user_group_types`]):
+//! 1. Idempotent registration of **two** chained RG type schemas at
+//!    gear startup ([`register_user_group_types`]) — in
+//!    `AccountManagementGear::serve`, after the bootstrap saga and
+//!    before the gear signals ready, NOT in `Gear::init`: the call is
+//!    `AuthZ`-gated and the PDP plugin is unresolvable for the whole
+//!    init phase:
 //!
 //!    - [`USER_MEMBERSHIP_TYPE`] -- the AM-user member handle. A
 //!      type-registry-only entry; AM users live in AM's tables +

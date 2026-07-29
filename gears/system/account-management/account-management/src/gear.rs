@@ -2,10 +2,16 @@
 //! and tenant relations.
 //!
 //! Lifecycle:
-//! - `init`: validates config and constructs services; idempotent.
-//! - `serve`: runs the bootstrap saga, then retention/reaper/integrity/conversion
-//!   ticks under one shared cancel-token. A panic in any tick cancels the rest
-//!   so the runtime sees an abort, not a clean shutdown.
+//! - `init`: validates config and constructs services; idempotent. Does **no**
+//!   cross-gear call that goes through an `AuthZ` gate — the PDP plugin is not
+//!   resolvable during the init phase (see
+//!   [`AccountManagementGear::run_user_group_type_registration`]).
+//! - `serve`: runs the bootstrap saga, then registers the user-group RG types,
+//!   then retention/reaper/integrity/conversion ticks under one shared
+//!   cancel-token. A panic in any tick cancels the rest so the runtime sees an
+//!   abort, not a clean shutdown. Both pre-tick phases run before
+//!   `ready.notify()`, so nothing observes AM as `Running` until the platform
+//!   root row exists and the RG type registrations have landed.
 //!
 //! Hard dep on tenant-resolver: the in-crate `tr_plugin` publishes the TR
 //! contract from AM's local DB to avoid a cross-gear read fan-out. Trade-off:
@@ -125,6 +131,13 @@ pub struct AccountManagementGear {
     /// `Arc<dyn TenantRepo>` projection would lose the concrete type
     /// the coordinator needs to call `repo.provider()`).
     repo: OnceLock<Arc<TenantRepoImpl>>,
+    /// Resource Group client resolved in `init()` and published here so
+    /// `serve()` can run the user-group RG type registration
+    /// ([`Self::run_user_group_type_registration`]) without re-resolving
+    /// it from `ClientHub`. The registration cannot happen in `init`
+    /// itself — RG's type surface is `AuthZ`-gated and the PDP plugin is
+    /// unresolvable for the whole init phase; see that method's docs.
+    rg_client: OnceLock<Arc<dyn resource_group_sdk::ResourceGroupClient + Send + Sync>>,
 }
 
 impl Default for AccountManagementGear {
@@ -137,6 +150,7 @@ impl Default for AccountManagementGear {
             pending_hard_delete_hooks: Mutex::new(Vec::new()),
             bootstrap_params: Mutex::new(None),
             repo: OnceLock::new(),
+            rg_client: OnceLock::new(),
         }
     }
 }
@@ -166,6 +180,107 @@ impl AccountManagementGear {
             pending.push(hook);
         }
     }
+
+    /// FEATURE 2.6 — idempotent user-group RG type registration, phase 2
+    /// of [`Self::serve`].
+    ///
+    /// # Why this lives in `serve` and not in `init`
+    ///
+    /// The registration calls RG's type surface through
+    /// `ResourceGroupClient`. That surface is `AuthZ`-gated with **no**
+    /// in-process exemption — resource-group `DESIGN.md` pins the gate as
+    /// applying "without exception, including the in-process `ClientHub`
+    /// path", and a short-lived bypass for exactly this caller was
+    /// reverted on purpose. The gate consults the `AuthZ` resolver, which
+    /// resolves its PDP plugin by looking the plugin instance up in
+    /// types-registry.
+    ///
+    /// types-registry keeps runtime registrations in a private staging
+    /// store and only publishes them to the readable one in
+    /// `SystemCapability::post_init` — a barrier phase the host runtime
+    /// executes strictly after `init()` has returned for **every** gear
+    /// (`run_init_phase()` then `run_post_init_phase()`). During any
+    /// gear's `init`, therefore, the catalogue reads empty, PDP
+    /// resolution fails with `PluginNotFound`, and the gate fails closed
+    /// with `service_unavailable`. That is structural, not a race: no
+    /// init ordering and no policy change can make an `AuthZ`-gated call
+    /// succeed from the init phase. `serve` runs in the start phase,
+    /// after post-init, where the PDP resolves normally.
+    ///
+    /// # Why the actor is scoped to the platform-root tenant
+    ///
+    /// Real PDPs clamp every allow decision to the caller's tenant and
+    /// refuse to derive a scope for a nil one — `static-authz-plugin`
+    /// denies `Uuid::default()` outright and otherwise attaches a
+    /// baseline `In(OWNER_TENANT_ID, [tid])` constraint. So the previous
+    /// nil-tenant `system_actor::for_gear_init()` subject was itself a
+    /// fail-closed trigger, the opposite of what its old comment
+    /// claimed. Running after the bootstrap saga means the platform-root
+    /// row exists, so `system_actor::for_bootstrap(root_id)` names a
+    /// real, auditable, tenant-bound subject whose clamp compiles
+    /// (`RG_TYPE_RESOURCE` declares `OWNER_TENANT_ID` in
+    /// `supported_properties`) and is then discarded by RG's `gate()` —
+    /// `gts_type` is platform-global and has no tenant column.
+    ///
+    /// Deployments without a configured `bootstrap` section have no
+    /// platform root to scope to; those fall back to the nil-tenant
+    /// actor with a warning, and stay as fail-closed against a
+    /// tenant-clamping PDP as they were before this moved out of `init`.
+    ///
+    /// # Ordering guarantee retained
+    ///
+    /// The registration still completes before `ready.notify()`, so the
+    /// types exist before anything can observe AM as `Running`. An `Err`
+    /// returned here aborts `serve` before the ready signal: AM stays in
+    /// `Starting` forever, never ticks, and the runtime logs the
+    /// lifecycle-task error. `register_user_group_types` is idempotent by
+    /// construction (`get_type` → create/update), so re-running it on
+    /// every start is safe.
+    // @cpt-begin:cpt-cf-account-management-flow-user-groups-rg-type-registration:p1:inst-flow-rgreg-invoke-algo
+    async fn run_user_group_type_registration(
+        &self,
+        bootstrap_root_id: Option<uuid::Uuid>,
+    ) -> anyhow::Result<()> {
+        use crate::domain::user_groups::registration::RegistrationError;
+
+        let rg_client = self.rg_client.get().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "account-management: serve invoked before the resource-group client was \
+                 published in init"
+            )
+        })?;
+
+        let sys_ctx = if let Some(root_id) = bootstrap_root_id {
+            crate::domain::system_actor::for_bootstrap(root_id)
+        } else {
+            tracing::warn!(
+                target: "am.user_groups",
+                "no platform-root tenant configured (`account-management.bootstrap` \
+                 absent or invalid): registering the user-group RG types under the \
+                 nil-tenant system actor, which a tenant-clamping PDP such as \
+                 static-authz-plugin denies"
+            );
+            crate::domain::system_actor::for_gear_init()
+        };
+
+        match crate::domain::user_groups::register_user_group_types(&rg_client, &sys_ctx).await {
+            Ok(outcome) => {
+                info!(
+                    target: "am.user_groups",
+                    ?outcome,
+                    "user-groups RG type registrations completed (member handle + container)"
+                );
+                Ok(())
+            }
+            Err(RegistrationError::ServiceUnavailable(detail)) => Err(anyhow::anyhow!(
+                "user-groups RG type registration failed (service_unavailable): {detail}"
+            )),
+            Err(RegistrationError::DivergentSchema(detail)) => Err(anyhow::anyhow!(
+                "user-groups RG type registration failed (divergent_schema): {detail}"
+            )),
+        }
+    }
+    // @cpt-end:cpt-cf-account-management-flow-user-groups-rg-type-registration:p1:inst-flow-rgreg-invoke-algo
 
     /// Lifecycle entry. Spawns retention/reaper/integrity/conversion ticks
     /// under a shared child token of `cancel`; a panic in one task cancels
@@ -197,9 +312,24 @@ impl AccountManagementGear {
         // row exists before the loops observe the platform" is
         // preserved — loops are not spawned until after this resolves.
         let bootstrap_params = self.bootstrap_params.lock().take();
+        // Snapshot the platform-root id *before* the saga consumes the
+        // params: phase 2 mints its system actor scoped to that tenant.
+        // Reading it here leaves the saga's own semantics untouched (it
+        // still owns and consumes the whole `BootstrapParams`).
+        let bootstrap_root_id = bootstrap_params.as_ref().map(|p| p.config.root_id);
         if let Some(params) = bootstrap_params {
             run_bootstrap_saga(params, cancel.child_token()).await?;
         }
+
+        // Phase 2: user-group RG type registration. Ordered after the
+        // saga — that is the step that materializes the platform-root
+        // tenant row whose id scopes the registration's system actor —
+        // and before `ready.notify()` below, so the types exist before
+        // anything can observe AM as `Running`. A non-strict saga
+        // failure still leaves the configured root id usable as the
+        // subject's tenant; see `run_user_group_type_registration`.
+        self.run_user_group_type_registration(bootstrap_root_id)
+            .await?;
 
         let retention_tick = svc.retention_tick();
         let reaper_tick = svc.reaper_tick();
@@ -761,39 +891,13 @@ impl Gear for AccountManagementGear {
             PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy]);
         info!("authz-resolver client resolved from client hub; PolicyEnforcer wired");
 
-        // FEATURE 2.6 — idempotent user-group RG type registration.
-        // Must complete before the gear signals ready so the type
-        // is guaranteed to exist for any consumer that resolves AM's
-        // `Running` state. Failure aborts init.
-        // @cpt-begin:cpt-cf-account-management-flow-user-groups-rg-type-registration:p1:inst-flow-rgreg-invoke-algo
-        {
-            use crate::domain::user_groups::registration::RegistrationError;
-            // System-actor context: stable subject UUID across processes
-            // so a future RG-side authz tightening that rejects anonymous
-            // does not regress gear init into permanent fail-closed.
-            let sys_ctx = crate::domain::system_actor::for_gear_init();
-            match crate::domain::user_groups::register_user_group_types(&rg_client, &sys_ctx).await
-            {
-                Ok(outcome) => {
-                    info!(
-                        target: "am.user_groups",
-                        ?outcome,
-                        "user-groups RG type registrations completed (member handle + container)"
-                    );
-                }
-                Err(RegistrationError::ServiceUnavailable(detail)) => {
-                    return Err(anyhow::anyhow!(
-                        "user-groups RG type registration failed (service_unavailable): {detail}"
-                    ));
-                }
-                Err(RegistrationError::DivergentSchema(detail)) => {
-                    return Err(anyhow::anyhow!(
-                        "user-groups RG type registration failed (divergent_schema): {detail}"
-                    ));
-                }
-            }
-        }
-        // @cpt-end:cpt-cf-account-management-flow-user-groups-rg-type-registration:p1:inst-flow-rgreg-invoke-algo
+        // FEATURE 2.6 — the user-group RG type registration itself does
+        // NOT happen here. It is an `AuthZ`-gated cross-gear call, and
+        // the PDP plugin is structurally unresolvable for the whole init
+        // phase, so it runs as phase 2 of `serve` instead — still before
+        // the gear signals ready. See
+        // [`Self::run_user_group_type_registration`] for the full
+        // rationale; `init` only publishes the client it needs.
 
         // FEATURE 2.6 — register the cascade cleanup hook so
         // tenant hard-delete removes the tenant's user-group subtree
@@ -1168,6 +1272,16 @@ impl Gear for AccountManagementGear {
         self.repo.set(Arc::clone(&repo)).map_err(|_| {
             anyhow::anyhow!(
                 "{} gear already initialized (repo handle)",
+                Self::MODULE_NAME
+            )
+        })?;
+        // Publish the resolved Resource Group client so `serve()` can run
+        // the user-group RG type registration (phase 2) without a second
+        // `ClientHub` lookup. The registration is deliberately NOT done
+        // here — see `Self::run_user_group_type_registration`.
+        self.rg_client.set(Arc::clone(&rg_client)).map_err(|_| {
+            anyhow::anyhow!(
+                "{} gear already initialized (resource-group client handle)",
                 Self::MODULE_NAME
             )
         })?;

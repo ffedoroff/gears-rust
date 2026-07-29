@@ -1,13 +1,9 @@
 # GENERATED — do not edit by hand.
 #
-# Source:     platform-openapi.json (local run, outside the repository) (produced by `make openapi` from the running server)
+# Source:     docs/api/api.json (produced by `make openapi` from the running server)
 # Registry:   config/openapi-gears.yaml (entry `resource-group`)
 # Preamble:   gears/system/resource-group/docs/openapi.preamble.yaml
 # Regenerate: make openapi-gears
-#
-# NOTE: generated from a source other than docs/api/api.json — that document could not be
-# regenerated at the time (see the gear's DESIGN / open issues). Re-run `make openapi` followed by
-# `make openapi-gears` once the platform document can be produced from the full gear set.
 
 openapi: 3.1.0
 info:
@@ -46,8 +42,28 @@ info:
     ## Groups and memberships
 
     Groups form a hierarchy maintained by a closure table. A group's type is **immutable after
-    creation** — `PUT /groups/{group_id}` carries `name`, `parent_id` and `metadata` only; send an
-    explicit `null` to clear `parent_id` or `metadata`.
+    creation**, and so is its position as far as `PUT` is concerned: updating a group and moving a
+    group are two operations.
+
+    `PUT /groups/{group_id}` replaces the group's ordinary attributes — `name` and `metadata`,
+    nothing else. It is a strict full replacement: **both keys are required**, and an omitted key is
+    a 400, not "keep the stored value". Send `"metadata": null` to clear the metadata deliberately.
+    Unknown fields are rejected, so a body carrying the immutable `type`, or `parent_id`, gets an
+    explicit 400 rather than having the field silently dropped.
+
+    `POST /groups/{group_id}/move` moves a group **and its entire subtree** to a new parent, or to
+    the forest root. The body is `{"parent_id": <uuid|null>}` and the key is mandatory: an explicit
+    `null` means "make this group a root", while omitting it is a 400 — `null` is the destructive
+    value here, so it has to be typed out rather than arrived at by omission. The whole operation is
+    atomic: cycle detection, parent-type compatibility (`can_be_root` when moving to root), the
+    `max_depth`/`max_width` limits, tenant-root uniqueness and the closure-table rebuild all run
+    inside one `SERIALIZABLE` transaction, so a group is never left detached from both the old and
+    the new parent. Cross-tenant moves are rejected, and the rejection never names the other
+    tenant. The response is the updated group; `name` and `metadata` are untouched by a move.
+
+    `PUT /types/{code}` is strict in the same way: every replaceable field is required (send
+    `"metadata_schema": null` to clear the schema), and `code` — the type's identity, taken from the
+    path — is rejected in the body.
 
     Group responses nest `parent_id` and `tenant_id` inside a `hierarchy` object and carry no
     timestamps. `depth` appears only on the hierarchy endpoints, which are two separate routes:
@@ -94,64 +110,65 @@ tags:
     requires a PDP permission on `gts.cf.core.rg.type.v1~`.'
 - name: groups
   description: Resource groups in a hierarchy. `parent_id` and `tenant_id` are nested under `hierarchy`;
-    the group's type is immutable after creation.
+    the group's type is immutable after creation. Updating a group's attributes (`PUT`) and moving it
+    in the hierarchy (`POST .../move`) are separate operations.
 - name: memberships
   description: Links resources to groups, keyed by `(group_id, resource_type, resource_id)`. Responses
     carry no `tenant_id` — tenant scope is derived from the referenced group.
 paths:
   /resource-group/v1/groups:
     get:
-      tags:
-      - Resource Groups
-      summary: List resource groups
       description: Retrieve a paginated list of resource groups with OData filtering
       operationId: resource_group.list_groups
       parameters:
-      - name: limit
+      - description: Maximum number of groups to return
         in: query
-        description: Maximum number of groups to return
+        name: limit
         required: false
         schema:
           type: integer
-      - name: cursor
+      - description: Cursor for pagination
         in: query
-        description: Cursor for pagination
+        name: cursor
         required: false
         schema:
           type: string
-      - name: $filter
-        in: query
-        description: |-
+      - description: |-
           OData v4 filter expression
           - type: eq|ne|contains|startswith|endswith|in
           - hierarchy/parent_id: eq|ne|in
           - tenant_id: eq|ne|in
           - id: eq|ne|in
           - name: eq|ne|contains|startswith|endswith|in
+        in: query
+        name: $filter
         required: false
         schema:
           type: string
       responses:
         '200':
-          description: Paginated list of resource groups
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Page_GroupDto'
+          description: Paginated list of resource groups
         '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: List resource groups
+      tags:
+      - Resource Groups
       x-odata-filter:
         allowedFields:
           hierarchy/parent_id:
@@ -181,161 +198,65 @@ paths:
           - endswith
           - in
     post:
-      tags:
-      - Resource Groups
-      summary: Create a new resource group
       description: Create a new resource group with the provided type, name, and optional parent
       operationId: resource_group.create_group
       requestBody:
-        description: Group creation data
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateGroupDto'
+        description: Group creation data
         required: true
       responses:
         '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupDto'
           description: Created resource group
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GroupDto'
         '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Conflict
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: Create a new resource group
+      tags:
+      - Resource Groups
   /resource-group/v1/groups/{group_id}:
-    get:
-      tags:
-      - Resource Groups
-      summary: Get resource group by ID
-      description: Retrieve a specific resource group by its UUID
-      operationId: resource_group.get_group
-      parameters:
-      - name: group_id
-        in: path
-        description: Group UUID
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Resource group found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GroupDto'
-        '400':
-          description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '404':
-          description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '500':
-          description: Internal Server Error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-      security:
-      - bearerAuth: []
-    put:
-      tags:
-      - Resource Groups
-      summary: Update resource group
-      description: Update a resource group (full replacement via PUT, including parent move)
-      operationId: resource_group.update_group
-      parameters:
-      - name: group_id
-        in: path
-        description: Group UUID
-        required: true
-        schema:
-          type: string
-      requestBody:
-        description: Group update data
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/UpdateGroupDto'
-        required: true
-      responses:
-        '200':
-          description: Updated resource group
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GroupDto'
-        '400':
-          description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '404':
-          description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '409':
-          description: Conflict
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '500':
-          description: Internal Server Error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-      security:
-      - bearerAuth: []
     delete:
-      tags:
-      - Resource Groups
-      summary: Delete resource group
       description: Delete a resource group. Use ?force=true to cascade delete subtree and memberships.
       operationId: resource_group.delete_group
       parameters:
-      - name: group_id
+      - description: Group UUID
         in: path
-        description: Group UUID
+        name: group_id
         required: true
         schema:
           type: string
-      - name: force
+      - description: Force cascade delete of subtree and memberships
         in: query
-        description: Force cascade delete of subtree and memberships
+        name: force
         required: false
         schema:
           type: boolean
@@ -343,93 +264,192 @@ paths:
         '204':
           description: Group deleted successfully
         '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Conflict
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
-  /resource-group/v1/groups/{group_id}/ancestors:
-    get:
+      summary: Delete resource group
       tags:
       - Resource Groups
-      summary: Get group ancestors
-      description: Get ancestors of a reference group (depth <= 0) with OData filtering
-      operationId: resource_group.get_group_ancestors
+    get:
+      description: Retrieve a specific resource group by its UUID
+      operationId: resource_group.get_group
       parameters:
-      - name: group_id
+      - description: Group UUID
         in: path
-        description: Reference group UUID
+        name: group_id
         required: true
         schema:
           type: string
-      - name: limit
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupDto'
+          description: Resource group found
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+      security:
+      - bearerAuth: []
+      summary: Get resource group by ID
+      tags:
+      - Resource Groups
+    put:
+      description: 'Replace a resource group''s ordinary attributes: `name` and `metadata`. Both keys
+        are required -- an omitted key is a 400, not "keep the stored value"; send `"metadata": null`
+        to clear the metadata. The group''s `type` is immutable and its parent is not part of this payload:
+        use POST /resource-group/v1/groups/{group_id}/move to re-parent a group. Unknown fields are rejected.'
+      operationId: resource_group.update_group
+      parameters:
+      - description: Group UUID
+        in: path
+        name: group_id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGroupDto'
+        description: Group update data
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupDto'
+          description: Updated resource group
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+      security:
+      - bearerAuth: []
+      summary: Update resource group
+      tags:
+      - Resource Groups
+  /resource-group/v1/groups/{group_id}/ancestors:
+    get:
+      description: Get ancestors of a reference group (depth <= 0) with OData filtering
+      operationId: resource_group.get_group_ancestors
+      parameters:
+      - description: Reference group UUID
+        in: path
+        name: group_id
+        required: true
+        schema:
+          type: string
+      - description: Maximum entries to return
         in: query
-        description: Maximum entries to return
+        name: limit
         required: false
         schema:
           type: integer
-      - name: cursor
+      - description: Cursor for pagination
         in: query
-        description: Cursor for pagination
+        name: cursor
         required: false
         schema:
           type: string
-      - name: $filter
-        in: query
-        description: |-
+      - description: |-
           OData v4 filter expression
           - hierarchy/depth: eq|ne|gt|ge|lt|le|in
           - type: eq|ne|contains|startswith|endswith|in
+        in: query
+        name: $filter
         required: false
         schema:
           type: string
       responses:
         '200':
-          description: Paginated ancestors with relative depth
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Page_GroupWithDepthDto'
+          description: Paginated ancestors with relative depth
         '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: Get group ancestors
+      tags:
+      - Resource Groups
       x-odata-filter:
         allowedFields:
           hierarchy/depth:
@@ -449,66 +469,66 @@ paths:
           - in
   /resource-group/v1/groups/{group_id}/descendants:
     get:
-      tags:
-      - Resource Groups
-      summary: Get group descendants
       description: Get descendants of a reference group (depth >= 0) with OData filtering
       operationId: resource_group.get_group_descendants
       parameters:
-      - name: group_id
+      - description: Reference group UUID
         in: path
-        description: Reference group UUID
+        name: group_id
         required: true
         schema:
           type: string
-      - name: limit
+      - description: Maximum entries to return
         in: query
-        description: Maximum entries to return
+        name: limit
         required: false
         schema:
           type: integer
-      - name: cursor
+      - description: Cursor for pagination
         in: query
-        description: Cursor for pagination
+        name: cursor
         required: false
         schema:
           type: string
-      - name: $filter
-        in: query
-        description: |-
+      - description: |-
           OData v4 filter expression
           - hierarchy/depth: eq|ne|gt|ge|lt|le|in
           - type: eq|ne|contains|startswith|endswith|in
+        in: query
+        name: $filter
         required: false
         schema:
           type: string
       responses:
         '200':
-          description: Paginated descendants with relative depth
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Page_GroupWithDepthDto'
+          description: Paginated descendants with relative depth
         '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: Get group descendants
+      tags:
+      - Resource Groups
       x-odata-filter:
         allowedFields:
           hierarchy/depth:
@@ -526,58 +546,116 @@ paths:
           - startswith
           - endswith
           - in
+  /resource-group/v1/groups/{group_id}/move:
+    post:
+      description: 'Atomically move a resource group -- and its entire subtree -- to a new parent, or
+        to the forest root. `parent_id` is required: an explicit `null` means "make this group a root",
+        while omitting the key is a 400. Cycle detection, parent-type compatibility, depth/width limits,
+        tenant-root uniqueness and the closure-table rebuild all run inside one SERIALIZABLE transaction,
+        so the group is never left detached from both parents. Cross-tenant moves are rejected.'
+      operationId: resource_group.move_group
+      parameters:
+      - description: Group UUID
+        in: path
+        name: group_id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveGroupDto'
+        description: Move destination
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupDto'
+          description: Moved resource group
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+      security:
+      - bearerAuth: []
+      summary: Move resource group to a new parent
+      tags:
+      - Resource Groups
   /resource-group/v1/memberships:
     get:
-      tags:
-      - Resource Group Memberships
-      summary: List memberships
       description: Retrieve a paginated list of memberships with OData filtering on group_id, resource_type,
         resource_id
       operationId: resource_group.list_memberships
       parameters:
-      - name: limit
+      - description: Maximum number of memberships to return
         in: query
-        description: Maximum number of memberships to return
+        name: limit
         required: false
         schema:
           type: integer
-      - name: cursor
+      - description: Cursor for pagination
         in: query
-        description: Cursor for pagination
+        name: cursor
         required: false
         schema:
           type: string
-      - name: $filter
-        in: query
-        description: |-
+      - description: |-
           OData v4 filter expression
           - group_id: eq|ne|in
           - resource_type: eq|ne|contains|startswith|endswith|in
           - resource_id: eq|ne|contains|startswith|endswith|in
+        in: query
+        name: $filter
         required: false
         schema:
           type: string
       responses:
         '200':
-          description: Paginated list of memberships
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Page_MembershipDto'
+          description: Paginated list of memberships
         '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: List memberships
+      tags:
+      - Resource Group Memberships
       x-odata-filter:
         allowedFields:
           group_id:
@@ -599,159 +677,159 @@ paths:
           - endswith
           - in
   /resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}:
-    post:
-      tags:
-      - Resource Group Memberships
-      summary: Add membership
-      description: Add a membership link between a resource group and a resource
-      operationId: resource_group.add_membership
-      parameters:
-      - name: group_id
-        in: path
-        description: Group UUID
-        required: true
-        schema:
-          type: string
-      - name: resource_type
-        in: path
-        description: GTS type path of the resource type
-        required: true
-        schema:
-          type: string
-      - name: resource_id
-        in: path
-        description: Resource identifier
-        required: true
-        schema:
-          type: string
-      responses:
-        '201':
-          description: Membership created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MembershipDto'
-        '400':
-          description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '404':
-          description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '409':
-          description: Conflict
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '500':
-          description: Internal Server Error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-      security:
-      - bearerAuth: []
     delete:
-      tags:
-      - Resource Group Memberships
-      summary: Remove membership
       description: Remove a membership link between a resource group and a resource
       operationId: resource_group.remove_membership
       parameters:
-      - name: group_id
+      - description: Group UUID
         in: path
-        description: Group UUID
+        name: group_id
         required: true
         schema:
           type: string
-      - name: resource_type
+      - description: GTS type path of the resource type
         in: path
-        description: GTS type path of the resource type
+        name: resource_type
         required: true
         schema:
           type: string
-      - name: resource_id
+      - description: Resource identifier
         in: path
-        description: Resource identifier
+        name: resource_id
         required: true
         schema:
           type: string
       responses:
         '204':
-          description: Membership removed successfully
           content:
             application/json:
               schema:
                 type: object
+          description: Membership removed successfully
         '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: Remove membership
+      tags:
+      - Resource Group Memberships
+    post:
+      description: Add a membership link between a resource group and a resource
+      operationId: resource_group.add_membership
+      parameters:
+      - description: Group UUID
+        in: path
+        name: group_id
+        required: true
+        schema:
+          type: string
+      - description: GTS type path of the resource type
+        in: path
+        name: resource_type
+        required: true
+        schema:
+          type: string
+      - description: Resource identifier
+        in: path
+        name: resource_id
+        required: true
+        schema:
+          type: string
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MembershipDto'
+          description: Membership created
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+      security:
+      - bearerAuth: []
+      summary: Add membership
+      tags:
+      - Resource Group Memberships
   /types-registry/v1/types:
     get:
-      tags:
-      - Resource Group Types
-      summary: List GTS types
       description: Retrieve a list of GTS resource group type definitions with OData filtering
       operationId: resource_group.list_types
       parameters:
-      - name: limit
+      - description: Maximum number of types to return
         in: query
-        description: Maximum number of types to return
+        name: limit
         required: false
         schema:
           type: integer
-      - name: cursor
+      - description: Cursor for pagination
         in: query
-        description: Cursor for pagination
+        name: cursor
         required: false
         schema:
           type: string
-      - name: $filter
-        in: query
-        description: |-
+      - description: |-
           OData v4 filter expression
           - code: eq|ne|contains|startswith|endswith|in
+        in: query
+        name: $filter
         required: false
         schema:
           type: string
       responses:
         '200':
-          description: List of GTS types
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Page_TypeDto'
+          description: List of GTS types
         '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: List GTS types
+      tags:
+      - Resource Group Types
       x-odata-filter:
         allowedFields:
           code:
@@ -762,204 +840,196 @@ paths:
           - endswith
           - in
     post:
-      tags:
-      - Resource Group Types
-      summary: Create a new GTS type
       description: Create a new GTS resource group type definition
       operationId: resource_group.create_type
       requestBody:
-        description: Type creation data
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateTypeDto'
+        description: Type creation data
         required: true
       responses:
         '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TypeDto'
           description: Created type
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TypeDto'
         '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Conflict
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: Create a new GTS type
+      tags:
+      - Resource Group Types
   /types-registry/v1/types/{code}:
-    get:
-      tags:
-      - Resource Group Types
-      summary: Get GTS type by code
-      description: Retrieve a specific GTS type definition by its GTS type path
-      operationId: resource_group.get_type
-      parameters:
-      - name: code
-        in: path
-        description: GTS type path
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Type found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TypeDto'
-        '404':
-          description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '500':
-          description: Internal Server Error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-      security:
-      - bearerAuth: []
-    put:
-      tags:
-      - Resource Group Types
-      summary: Update GTS type
-      description: Update a GTS resource group type definition (full replacement)
-      operationId: resource_group.update_type
-      parameters:
-      - name: code
-        in: path
-        description: GTS type path
-        required: true
-        schema:
-          type: string
-      requestBody:
-        description: Type update data
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/UpdateTypeDto'
-        required: true
-      responses:
-        '200':
-          description: Updated type
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TypeDto'
-        '400':
-          description: Bad Request
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '404':
-          description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '409':
-          description: Conflict
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '500':
-          description: Internal Server Error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-      security:
-      - bearerAuth: []
     delete:
-      tags:
-      - Resource Group Types
-      summary: Delete GTS type
       description: Delete a GTS resource group type definition
       operationId: resource_group.delete_type
       parameters:
-      - name: code
+      - description: GTS type path
         in: path
-        description: GTS type path
+        name: code
         required: true
         schema:
           type: string
       responses:
         '204':
-          description: Type deleted successfully
           content:
             application/json:
               schema:
                 type: object
+          description: Type deleted successfully
         '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Not Found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
           description: Conflict
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
         '500':
-          description: Internal Server Error
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
       security:
       - bearerAuth: []
+      summary: Delete GTS type
+      tags:
+      - Resource Group Types
+    get:
+      description: Retrieve a specific GTS type definition by its GTS type path
+      operationId: resource_group.get_type
+      parameters:
+      - description: GTS type path
+        in: path
+        name: code
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TypeDto'
+          description: Type found
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+      security:
+      - bearerAuth: []
+      summary: Get GTS type by code
+      tags:
+      - Resource Group Types
+    put:
+      description: Update a GTS resource group type definition (full replacement)
+      operationId: resource_group.update_type
+      parameters:
+      - description: GTS type path
+        in: path
+        name: code
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTypeDto'
+        description: Type update data
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TypeDto'
+          description: Updated type
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+      security:
+      - bearerAuth: []
+      summary: Update GTS type
+      tags:
+      - Resource Group Types
 components:
   schemas:
     CreateGroupDto:
-      type: object
       description: REST DTO for creating a new resource group.
-      required:
-      - type
-      - name
       properties:
         id:
+          description: Optional caller-supplied ID. If omitted, the server generates a UUID.
+          format: uuid
           type:
           - string
           - 'null'
-          format: uuid
-          description: Optional caller-supplied ID. If omitted, the server generates a UUID.
         metadata:
           description: Type-specific metadata.
         name:
-          type: string
           description: Display name (1..255 characters).
+          type: string
         parent_id:
-          type:
-          - string
-          - 'null'
-          format: uuid
           description: Parent group ID (null for root groups).
-        tenant_id:
+          format: uuid
           type:
           - string
           - 'null'
-          format: uuid
+        tenant_id:
           description: |-
             Optional target tenant for the created group (VHP-2162).
 
@@ -971,158 +1041,186 @@ components:
             request is rejected as though the target tenant did not exist.
             Rejected as a contradiction for tenant-typed groups: their effective
             tenant is always `group.id`.
+          format: uuid
+          type:
+          - string
+          - 'null'
         type:
-          type: string
           description: GTS chained type path. Must have prefix `gts.cf.core.rg.type.v1~`.
-    CreateTypeDto:
-      type: object
-      description: REST DTO for creating a new GTS type.
+          type: string
       required:
-      - code
-      - can_be_root
+      - type
+      - name
+      type: object
+    CreateTypeDto:
+      description: REST DTO for creating a new GTS type.
       properties:
         allowed_membership_types:
-          type: array
-          items:
-            type: string
           description: GTS type paths of allowed membership resource types.
-        allowed_parent_types:
-          type: array
           items:
             type: string
+          type: array
+        allowed_parent_types:
           description: GTS type paths of allowed parent types.
+          items:
+            type: string
+          type: array
         can_be_root:
-          type: boolean
           description: Whether groups of this type can be root nodes.
+          type: boolean
         code:
-          type: string
           description: |-
             GTS type path. Must have prefix `gts.cf.core.rg.type.v1~`.
 
             Whether the type creates a new tenant scope is derived from the code:
             any path starting with the tenant RG type prefix is a tenant type.
+          type: string
         metadata_schema:
           description: Optional JSON Schema for instance metadata.
-    GroupDto:
+      required:
+      - code
+      - can_be_root
       type: object
+    GroupDto:
       description: |-
         REST DTO for resource group representation.
 
         Group responses do NOT include `created_at`/`updated_at` (per DESIGN).
-      required:
-      - id
-      - type
-      - name
-      - hierarchy
       properties:
         hierarchy:
           $ref: '#/components/schemas/HierarchyDto'
           description: Hierarchy context.
         id:
-          type: string
-          format: uuid
           description: Group identifier.
+          format: uuid
+          type: string
         metadata:
           description: Type-specific metadata.
         name:
-          type: string
           description: Display name.
-        type:
           type: string
+        type:
           description: GTS chained type path.
-    GroupWithDepthDto:
-      type: object
-      description: REST DTO for resource group with depth (hierarchy queries).
+          type: string
       required:
       - id
       - type
       - name
       - hierarchy
+      type: object
+    GroupWithDepthDto:
+      description: REST DTO for resource group with depth (hierarchy queries).
       properties:
         hierarchy:
           $ref: '#/components/schemas/HierarchyWithDepthDto'
           description: Hierarchy context with depth.
         id:
-          type: string
-          format: uuid
           description: Group identifier.
+          format: uuid
+          type: string
         metadata:
           description: Type-specific metadata.
         name:
-          type: string
           description: Display name.
-        type:
           type: string
+        type:
           description: GTS chained type path.
-    HierarchyDto:
-      type: object
-      description: REST DTO for hierarchy context in group responses.
+          type: string
       required:
-      - parent_id
-      - tenant_id
+      - id
+      - type
+      - name
+      - hierarchy
+      type: object
+    HierarchyDto:
+      description: REST DTO for hierarchy context in group responses.
       properties:
         parent_id:
+          description: Parent group ID (null for root groups).
+          format: uuid
           type:
           - string
           - 'null'
-          format: uuid
-          description: Parent group ID (null for root groups).
         tenant_id:
-          type: string
-          format: uuid
           description: Tenant scope.
-    HierarchyWithDepthDto:
+          format: uuid
+          type: string
+      required:
+      - parent_id
+      - tenant_id
       type: object
+    HierarchyWithDepthDto:
       description: REST DTO for hierarchy context with depth in group responses.
+      properties:
+        depth:
+          description: Relative distance from reference group.
+          format: int32
+          type: integer
+        parent_id:
+          description: Parent group ID (null for root groups).
+          format: uuid
+          type:
+          - string
+          - 'null'
+        tenant_id:
+          description: Tenant scope.
+          format: uuid
+          type: string
       required:
       - parent_id
       - tenant_id
       - depth
-      properties:
-        depth:
-          type: integer
-          format: int32
-          description: Relative distance from reference group.
-        parent_id:
-          type:
-          - string
-          - 'null'
-          format: uuid
-          description: Parent group ID (null for root groups).
-        tenant_id:
-          type: string
-          format: uuid
-          description: Tenant scope.
-    MembershipDto:
       type: object
+    MembershipDto:
       description: |-
         REST DTO for membership representation.
 
         Membership responses do NOT include `tenant_id` (derived from group).
+      properties:
+        group_id:
+          description: Group identifier.
+          format: uuid
+          type: string
+        resource_id:
+          description: Resource identifier.
+          type: string
+        resource_type:
+          description: GTS type path of the resource type.
+          type: string
       required:
       - group_id
       - resource_type
       - resource_id
-      properties:
-        group_id:
-          type: string
-          format: uuid
-          description: Group identifier.
-        resource_id:
-          type: string
-          description: Resource identifier.
-        resource_type:
-          type: string
-          description: GTS type path of the resource type.
-    PageInfo:
       type: object
+    MoveGroupDto:
+      additionalProperties: false
+      description: |-
+        REST DTO for the group move operation
+        (`POST /groups/{group_id}/move`).
+
+        `parent_id` is **mandatory**, and an explicit `null` is its most important
+        value: `null` means "make this group a root", an omitted key means the
+        caller did not say where to move the group and is a 400. Collapsing those
+        two into one value is the defect this operation was split out to remove,
+        so the distinction is enforced here rather than assumed.
+      properties:
+        parent_id:
+          description: |-
+            New parent group ID, or `null` to move the group to the forest root.
+            The key itself must be present.
+          format: uuid
+          type:
+          - string
+          - 'null'
       required:
-      - limit
+      - parent_id
+      type: object
+    PageInfo:
       properties:
         limit:
-          type: integer
           format: int64
           minimum: 0
+          type: integer
         next_cursor:
           type:
           - string
@@ -1131,63 +1229,59 @@ components:
           type:
           - string
           - 'null'
-    Page_GroupDto:
-      type: object
       required:
-      - items
-      - page_info
+      - limit
+      type: object
+    Page_GroupDto:
       properties:
         items:
-          type: array
           items:
             $ref: '#/components/schemas/GroupDto'
+          type: array
         page_info:
           $ref: '#/components/schemas/PageInfo'
-    Page_GroupWithDepthDto:
-      type: object
       required:
       - items
       - page_info
+      type: object
+    Page_GroupWithDepthDto:
       properties:
         items:
-          type: array
           items:
             $ref: '#/components/schemas/GroupWithDepthDto'
+          type: array
         page_info:
           $ref: '#/components/schemas/PageInfo'
-    Page_MembershipDto:
-      type: object
       required:
       - items
       - page_info
+      type: object
+    Page_MembershipDto:
       properties:
         items:
-          type: array
           items:
             $ref: '#/components/schemas/MembershipDto'
+          type: array
         page_info:
           $ref: '#/components/schemas/PageInfo'
-    Page_TypeDto:
-      type: object
       required:
       - items
       - page_info
+      type: object
+    Page_TypeDto:
       properties:
         items:
-          type: array
           items:
             $ref: '#/components/schemas/TypeDto'
+          type: array
         page_info:
           $ref: '#/components/schemas/PageInfo'
-    Problem:
-      type: object
-      description: RFC 9457 problem+json. `context` varies by error category.
       required:
-      - type
-      - title
-      - status
-      - detail
-      - context
+      - items
+      - page_info
+      type: object
+    Problem:
+      description: RFC 9457 problem+json. `context` varies by error category.
       properties:
         context:
           type: object
@@ -1196,103 +1290,125 @@ components:
         instance:
           type: string
         status:
-          type: integer
           format: int32
+          type: integer
         title:
           type: string
         trace_id:
           type: string
         type:
           type: string
-    TypeDto:
+      required:
+      - type
+      - title
+      - status
+      - detail
+      - context
       type: object
+    TypeDto:
       description: REST DTO for GTS type representation.
+      properties:
+        allowed_membership_types:
+          description: GTS type paths of allowed membership resource types
+          items:
+            type: string
+          type: array
+        allowed_parent_types:
+          description: GTS type paths of allowed parent types
+          items:
+            type: string
+          type: array
+        can_be_root:
+          description: Whether groups of this type can be root nodes
+          type: boolean
+        code:
+          description: GTS type path
+          type: string
+        metadata_schema:
+          description: Optional JSON Schema for instance metadata
       required:
       - code
       - can_be_root
       - allowed_parent_types
       - allowed_membership_types
-      properties:
-        allowed_membership_types:
-          type: array
-          items:
-            type: string
-          description: GTS type paths of allowed membership resource types
-        allowed_parent_types:
-          type: array
-          items:
-            type: string
-          description: GTS type paths of allowed parent types
-        can_be_root:
-          type: boolean
-          description: Whether groups of this type can be root nodes
-        code:
-          type: string
-          description: GTS type path
-        metadata_schema:
-          description: Optional JSON Schema for instance metadata
-    UpdateGroupDto:
       type: object
+    UpdateGroupDto:
+      additionalProperties: false
       description: |-
-        REST DTO for updating a resource group (full replacement via PUT).
+        REST DTO for updating a resource group's ordinary attributes (full
+        replacement via PUT).
 
         **The group's GTS type is immutable after creation.** The payload
         deliberately does not carry a `type` field — to change a group's type,
         delete the existing group and create a new one. See the SDK
         `UpdateGroupRequest` doc for the full rationale.
 
-        Every replaceable field is **required** so an omitted field cannot be
-        confused with "preserve previous value". Nullable fields (`parent_id`,
-        `metadata`) must be sent explicitly as `null` to clear them — for
-        example, moving a group to root requires `"parent_id": null`, not an
-        omitted key.
-      required:
-      - name
-      - parent_id
-      - metadata
+        **The group's parent is not here either.** Re-parenting is a structural
+        mutation — cycle detection, depth/width invariants, closure-table rebuild —
+        so it has its own operation: `POST /groups/{group_id}/move` with
+        [`MoveGroupDto`]. What is left on this resource is `name` and `metadata`,
+        two ordinary fields, and this payload replaces both.
+
+        Both fields are **required**. An omitted key is a 400, not "preserve the
+        previous value": for `metadata` the two are genuinely indistinguishable to
+        serde, and treating an omission as `null` is what used to erase stored
+        metadata. Send `"metadata": null` to clear it deliberately.
+
+        `deny_unknown_fields` locks the wire envelope, so a client that tries to
+        change the immutable `type`, or that still sends `parent_id` expecting the
+        pre-split move-via-PUT behaviour, gets an explicit 400 instead of a
+        silently-discarded mutation.
       properties:
         metadata:
-          description: Type-specific metadata (`null` to clear).
+          description: 'Type-specific metadata. Required: send `null` to clear it.'
         name:
+          description: Display name (1..255 characters). Required.
           type: string
-          description: Display name (1..255 characters).
-        parent_id:
-          type:
-          - string
-          - 'null'
-          format: uuid
-          description: Parent group ID (`null` for root groups).
-    UpdateTypeDto:
+      required:
+      - name
+      - metadata
       type: object
+    UpdateTypeDto:
+      additionalProperties: false
       description: |-
         REST DTO for updating a GTS type (full replacement via PUT).
 
-        Every replaceable field is **required** so an omitted field cannot be
-        confused with "preserve previous value". Nullable fields
-        (`metadata_schema`) must be sent explicitly as `null` to clear them.
+        The type registry is a document resource: a type definition is replaced as
+        a whole, so strict full replacement is the correct shape for it (baseline
+        rule B1.1). Every replaceable field is therefore **required** and an
+        omitted key is an error, not "preserve previous value" — `metadata_schema`
+        must be sent explicitly as `null` to clear it.
+
+        `deny_unknown_fields` locks the wire envelope, so a client that sends
+        `code` (the type's identity, taken from the path and immutable) gets an
+        explicit 400 instead of a silently-dropped field.
+      properties:
+        allowed_membership_types:
+          description: GTS type paths of allowed membership resource types.
+          items:
+            type: string
+          type: array
+        allowed_parent_types:
+          description: GTS type paths of allowed parent types.
+          items:
+            type: string
+          type: array
+        can_be_root:
+          description: Whether groups of this type can be root nodes.
+          type: boolean
+        metadata_schema:
+          description: |-
+            JSON Schema for instance metadata. Required: send `null` to clear it.
+            An omitted key is rejected — it used to silently erase the stored
+            schema (`type_service.rs` writes the column unconditionally).
       required:
       - can_be_root
       - allowed_parent_types
       - allowed_membership_types
       - metadata_schema
-      properties:
-        allowed_membership_types:
-          type: array
-          items:
-            type: string
-          description: GTS type paths of allowed membership resource types.
-        allowed_parent_types:
-          type: array
-          items:
-            type: string
-          description: GTS type paths of allowed parent types.
-        can_be_root:
-          type: boolean
-          description: Whether groups of this type can be root nodes.
-        metadata_schema:
-          description: JSON Schema for instance metadata (`null` to clear).
+      type: object
   securitySchemes:
     bearerAuth:
-      type: http
-      scheme: bearer
       bearerFormat: JWT
+      scheme: bearer
+      type: http

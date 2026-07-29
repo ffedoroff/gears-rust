@@ -704,6 +704,14 @@
               "null"
             ]
           },
+          "tenant_id": {
+            "description": "Optional target tenant for the created group (VHP-2162).\n\nIf omitted, the tenant scope is derived from the caller's own\n`SecurityContext` -- today's unchanged default behavior. If present\nand different from the caller's own tenant, the create succeeds only\nwhen the caller's `create`-action `AccessScope` actually covers the\ntarget tenant (platform-admin / onboarding use case); otherwise the\nrequest is rejected as though the target tenant did not exist.\nRejected as a contradiction for tenant-typed groups: their effective\ntenant is always `group.id`.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "type": {
             "description": "GTS chained type path. Must have prefix `gts.cf.core.rg.type.v1~`.",
             "type": "string"
@@ -2194,6 +2202,24 @@
         },
         "required": [
           "items"
+        ],
+        "type": "object"
+      },
+      "MoveGroupDto": {
+        "additionalProperties": false,
+        "description": "REST DTO for the group move operation\n(`POST /groups/{group_id}/move`).\n\n`parent_id` is **mandatory**, and an explicit `null` is its most important\nvalue: `null` means \"make this group a root\", an omitted key means the\ncaller did not say where to move the group and is a 400. Collapsing those\ntwo into one value is the defect this operation was split out to remove,\nso the distinction is enforced here rather than assumed.",
+        "properties": {
+          "parent_id": {
+            "description": "New parent group ID, or `null` to move the group to the forest root.\nThe key itself must be present.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "parent_id"
         ],
         "type": "object"
       },
@@ -4923,27 +4949,19 @@
         "type": "object"
       },
       "UpdateGroupDto": {
-        "description": "REST DTO for updating a resource group (full replacement via PUT).\n\n**The group's GTS type is immutable after creation.** The payload\ndeliberately does not carry a `type` field — to change a group's type,\ndelete the existing group and create a new one. See the SDK\n`UpdateGroupRequest` doc for the full rationale.\n\nEvery replaceable field is **required** so an omitted field cannot be\nconfused with \"preserve previous value\". Nullable fields (`parent_id`,\n`metadata`) must be sent explicitly as `null` to clear them — for\nexample, moving a group to root requires `\"parent_id\": null`, not an\nomitted key.",
+        "additionalProperties": false,
+        "description": "REST DTO for updating a resource group's ordinary attributes (full\nreplacement via PUT).\n\n**The group's GTS type is immutable after creation.** The payload\ndeliberately does not carry a `type` field — to change a group's type,\ndelete the existing group and create a new one. See the SDK\n`UpdateGroupRequest` doc for the full rationale.\n\n**The group's parent is not here either.** Re-parenting is a structural\nmutation — cycle detection, depth/width invariants, closure-table rebuild —\nso it has its own operation: `POST /groups/{group_id}/move` with\n[`MoveGroupDto`]. What is left on this resource is `name` and `metadata`,\ntwo ordinary fields, and this payload replaces both.\n\nBoth fields are **required**. An omitted key is a 400, not \"preserve the\nprevious value\": for `metadata` the two are genuinely indistinguishable to\nserde, and treating an omission as `null` is what used to erase stored\nmetadata. Send `\"metadata\": null` to clear it deliberately.\n\n`deny_unknown_fields` locks the wire envelope, so a client that tries to\nchange the immutable `type`, or that still sends `parent_id` expecting the\npre-split move-via-PUT behaviour, gets an explicit 400 instead of a\nsilently-discarded mutation.",
         "properties": {
           "metadata": {
-            "description": "Type-specific metadata (`null` to clear)."
+            "description": "Type-specific metadata. Required: send `null` to clear it."
           },
           "name": {
-            "description": "Display name (1..255 characters).",
+            "description": "Display name (1..255 characters). Required.",
             "type": "string"
-          },
-          "parent_id": {
-            "description": "Parent group ID (`null` for root groups).",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "required": [
           "name",
-          "parent_id",
           "metadata"
         ],
         "type": "object"
@@ -5080,7 +5098,8 @@
         "type": "object"
       },
       "UpdateTypeDto": {
-        "description": "REST DTO for updating a GTS type (full replacement via PUT).\n\nEvery replaceable field is **required** so an omitted field cannot be\nconfused with \"preserve previous value\". Nullable fields\n(`metadata_schema`) must be sent explicitly as `null` to clear them.",
+        "additionalProperties": false,
+        "description": "REST DTO for updating a GTS type (full replacement via PUT).\n\nThe type registry is a document resource: a type definition is replaced as\na whole, so strict full replacement is the correct shape for it (baseline\nrule B1.1). Every replaceable field is therefore **required** and an\nomitted key is an error, not \"preserve previous value\" — `metadata_schema`\nmust be sent explicitly as `null` to clear it.\n\n`deny_unknown_fields` locks the wire envelope, so a client that sends\n`code` (the type's identity, taken from the path and immutable) gets an\nexplicit 400 instead of a silently-dropped field.",
         "properties": {
           "allowed_membership_types": {
             "description": "GTS type paths of allowed membership resource types.",
@@ -5101,7 +5120,7 @@
             "type": "boolean"
           },
           "metadata_schema": {
-            "description": "JSON Schema for instance metadata (`null` to clear)."
+            "description": "JSON Schema for instance metadata. Required: send `null` to clear it.\nAn omitted key is rejected — it used to silently erase the stored\nschema (`type_service.rs` writes the column unconditionally)."
           }
         },
         "required": [
@@ -16434,7 +16453,7 @@
         ]
       },
       "put": {
-        "description": "Update a resource group (full replacement via PUT, including parent move)",
+        "description": "Replace a resource group's ordinary attributes: `name` and `metadata`. Both keys are required -- an omitted key is a 400, not \"keep the stored value\"; send `\"metadata\": null` to clear the metadata. The group's `type` is immutable and its parent is not part of this payload: use POST /resource-group/v1/groups/{group_id}/move to re-parent a group. Unknown fields are rejected.",
         "operationId": "resource_group.update_group",
         "parameters": [
           {
@@ -16751,6 +16770,95 @@
             ]
           }
         }
+      }
+    },
+    "/resource-group/v1/groups/{group_id}/move": {
+      "post": {
+        "description": "Atomically move a resource group -- and its entire subtree -- to a new parent, or to the forest root. `parent_id` is required: an explicit `null` means \"make this group a root\", while omitting the key is a 400. Cycle detection, parent-type compatibility, depth/width limits, tenant-root uniqueness and the closure-table rebuild all run inside one SERIALIZABLE transaction, so the group is never left detached from both parents. Cross-tenant moves are rejected.",
+        "operationId": "resource_group.move_group",
+        "parameters": [
+          {
+            "description": "Group UUID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveGroupDto"
+              }
+            }
+          },
+          "description": "Move destination",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupDto"
+                }
+              }
+            },
+            "description": "Moved resource group"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Move resource group to a new parent",
+        "tags": [
+          "Resource Groups"
+        ]
       }
     },
     "/resource-group/v1/memberships": {

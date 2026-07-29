@@ -40,7 +40,7 @@
 //!    `local_client_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant`
 //!    drives all five type methods through `ResourceGroupLocalClient` with a deny-all
 //!    enforcer and an `am.system`-shaped, nil-tenant `SecurityContext`
-//!    (account-management's gear-init actor,
+//!    (account-management's platform-scoped system actor,
 //!    `system_actor.rs::for_gear_init`) and asserts every one comes back
 //!    `PermissionDenied`. A prior commit (`484d0582`) briefly routed these
 //!    five methods around the gate for exactly this caller; that bypass was
@@ -573,8 +573,8 @@ async fn seed_types_succeeds_with_deny_all_enforcer() {
 
 /// `ResourceGroupLocalClient`'s five type-lifecycle methods must be denied when the
 /// `TypeService` they delegate to is wired to a deny-all enforcer -- even
-/// for a nil-tenant, `am.system`-shaped `SecurityContext`, the exact shape
-/// account-management's gear-init actor uses
+/// for a nil-tenant, `am.system`-shaped `SecurityContext`, the shape
+/// account-management's platform-scoped system actor produces
 /// (`account-management/src/domain/system_actor.rs::for_gear_init`,
 /// `subject_type = "am.system"`, `subject_tenant_id = Uuid::nil()`).
 ///
@@ -584,16 +584,20 @@ async fn seed_types_succeeds_with_deny_all_enforcer() {
 /// in-process `ClientHub` caller -- not just AM's bootstrap path -- the same
 /// unscoped access to the whole type registry, without ever inspecting
 /// `ctx`. See `docs/DESIGN.md`'s expected-permissions notes and the revert
-/// commit for the full rationale, including the now-restored consequence
-/// that a dev stack running `static-authz-plugin` fails AM's gear-init
-/// closed until policy or the plugin learns to admit this system actor.
+/// commit for the full rationale.
 ///
-/// This test is the replacement coverage for the bypass test the revert
-/// removed: it proves the adapter is gated again, and it must keep failing
-/// (i.e. keep observing denial) for as long as the revert stands. If AM's
-/// gear-init needs to succeed against a real deployed `PolicyEnforcer`,
-/// that is a policy or plugin problem to solve on those layers -- not a
-/// reason to reintroduce an unscoped path here.
+/// AM's side of that story has since been fixed **on the caller**, not
+/// here: the user-group type registration moved out of `Gear::init` into
+/// `AccountManagementGear::serve` (an `AuthZ`-gated call is impossible
+/// during init at all -- the PDP plugin only becomes resolvable after the
+/// post-init barrier) and now runs under the tenant-bound
+/// `system_actor::for_bootstrap(root_id)` subject, which a tenant-clamping
+/// PDP can authorize. This test is unaffected and stays as-is: it asserts
+/// the *adapter* is gated, and the nil-tenant `am.system` shape it drives
+/// is exactly the caller shape that must keep being denied. It must keep
+/// observing denial for as long as the revert stands -- a caller that needs
+/// to succeed against a real `PolicyEnforcer` fixes its own phase and
+/// subject, not RG's gate.
 #[tokio::test]
 async fn local_client_type_lifecycle_denied_under_deny_all_enforcer_and_nil_tenant() {
     let db = common::test_db().await;

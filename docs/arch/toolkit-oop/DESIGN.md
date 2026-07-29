@@ -849,6 +849,15 @@ Note the split: per the tenant-scoped-vs-non-tenant criterion above, only `for_g
 operation. The tenant-bound `am.system` factories are tenant-scoped (a specific tenant, including the platform root) and
 belong on the tenant plane — they are *not* candidates for `PlatformSecurityContext`.
 
+Status update on the first row: the RG type registration it names no longer runs from `Gear::init`, and no longer uses
+`for_gear_init` on the normal path. An `AuthZ`-gated call is impossible during the runtime's init phase at all (the PDP
+plugin only becomes resolvable after the `post_init` barrier), so account-management moved the registration into its
+`serve` entry, and — because a tenant-clamping PDP cannot derive a scope for a nil tenant — it now runs under
+`for_bootstrap(root_id)`, i.e. on the **tenant plane**, scoped to the platform-root tenant. `for_gear_init` survives only
+as the fallback for deployments that configure no platform root. That does not settle whether a workspace-global type
+registration *ought* to be a platform-plane operation — the target column stands as the open question — but the "Today"
+column describes the pre-move state.
+
 ##### Responsibility scope
 
 - Define the `InternalCredential` enum and `attach_internal_auth` / `validate_internal_auth` helpers.

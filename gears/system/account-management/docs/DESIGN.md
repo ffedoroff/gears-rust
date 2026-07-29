@@ -48,7 +48,7 @@ The architecture separates data ownership from enforcement. AM stores and valida
 
 IdP integration uses the Gears gateway + plugin pattern, analogous to AuthN Resolver (see `cpt-cf-account-management-adr-idp-contract-separation`). AM defines an `IdpPluginClient` trait for tenant and user administrative operations (tenant provisioning/deprovisioning, user provision/update/deprovision, tenant-scoped query). The plugin is discovered via GTS types-registry and resolved through `ClientHub`. The platform ships a default provider plugin; vendors substitute their own implementation behind the same trait. The IdP provider plugin is intentionally separate from the AuthN Resolver plugin — the two target different concerns (admin operations vs hot-path token validation) with different performance profiles and protocols. The contract is one-directional: AM calls IdP, IdP does not call AM.
 
-User group management is handled by the [Resource Group](../../resource-group/docs/PRD.md) gear. AM registers a dedicated Resource Group type for user groups during gear initialization; consumers call `ResourceGroupClient` directly for group lifecycle, membership, and hierarchy operations.
+User group management is handled by the [Resource Group](../../resource-group/docs/PRD.md) gear. AM registers a dedicated Resource Group type for user groups at gear startup (in the gear's `serve` entry, before it signals ready); consumers call `ResourceGroupClient` directly for group lifecycle, membership, and hierarchy operations.
 
 #### System Context
 
@@ -108,7 +108,7 @@ graph LR
 | `cpt-cf-account-management-fr-idp-user-deprovision` | `IdpPluginClient::deprovision_user` with session revocation; an already-absent IdP user is treated as a successful no-op so `DELETE /tenants/{id}/users/{user_id}` remains idempotent. |
 | `cpt-cf-account-management-fr-idp-user-update` | `IdpPluginClient::update_user` applies a JSON Merge Patch of mutable attributes (`username`, `email`, `display_name`, `first_name`, `last_name`, `password`) as a pass-through; AM persists no user state. An absent user surfaces as `not_found` (NOT folded into success, unlike deprovision); a `username` collision as `already_exists`. Backed by `cpt-cf-account-management-adr-user-attribute-update`. |
 | `cpt-cf-account-management-fr-idp-user-query` | `IdpPluginClient::list_users` with tenant filter; supports optional user-ID filter for single-user lookups. |
-| `cpt-cf-account-management-fr-user-group-rg-type` | `AccountManagementGear` idempotently registers the user-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` during gear initialization, with `allowed_memberships` including the platform user resource type (`gts.cf.core.am.user.v1~`). |
+| `cpt-cf-account-management-fr-user-group-rg-type` | `AccountManagementGear` idempotently registers the user-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` at gear startup (from `serve`, after the bootstrap saga and before the ready signal — RG's type surface is `AuthZ`-gated and the PDP is unresolvable during the init phase), with `allowed_memberships` including the platform user resource type (`gts.cf.core.am.user.v1~`). |
 | `cpt-cf-account-management-fr-user-group-lifecycle` | Consumers call `ResourceGroupClient` directly for group create/update/delete. AM does not proxy these operations. |
 | `cpt-cf-account-management-fr-user-group-membership` | Consumers call `ResourceGroupClient` directly for membership add/remove. Callers verify user existence via AM's user-list endpoint; RG treats `resource_id` as opaque. |
 | `cpt-cf-account-management-fr-nested-user-groups` | Nested groups via Resource Group parent-child hierarchy; cycle detection enforced by Resource Group forest invariants. No AM involvement at runtime. |
@@ -215,7 +215,7 @@ AM does not enforce access-control barriers. It stores the `self_managed` flag o
 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-principle-delegation-to-rg`
 
-User group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are handled by the Resource Group gearAM registers the user-group RG type at gear initialization and triggers RG cleanup during tenant hard-deletion. Consumers call `ResourceGroupClient` directly for all group and membership operations — AM does not proxy or coordinate these calls. AM's user-list endpoint (`GET /tenants/{id}/users`) provides the valid user set; callers combine it with RG's membership API.
+User group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are handled by the Resource Group gear. AM registers the user-group RG type at gear startup (from `serve`) and triggers RG cleanup during tenant hard-deletion. Consumers call `ResourceGroupClient` directly for all group and membership operations — AM does not proxy or coordinate these calls. AM's user-list endpoint (`GET /tenants/{id}/users`) provides the valid user set; callers combine it with RG's membership API.
 
 **Drivers**: `cpt-cf-account-management-fr-user-group-rg-type`, `cpt-cf-account-management-fr-user-group-lifecycle`, `cpt-cf-account-management-fr-user-group-membership`, `cpt-cf-account-management-fr-nested-user-groups`
 
@@ -317,7 +317,7 @@ Legacy system integration is handled through the pluggable IdP provider contract
 - Tenant → ConversionRequest: One-to-many overall, at most one **pending** request per tenant at any time (enforced by partial unique index). A conversion request references the target tenant; `initiator_side` records which side (`child` or `parent`) issued the `POST`. Resolved rows remain attached to the tenant until the soft-delete retention window elapses and the cleanup job hard-deletes them.
 - Tenant → GTS Type: Many-to-one (via internal `tenant_type_uuid`, projected publicly as chained `tenant_type`). Each tenant references a GTS-registered type that defines parent-child constraints.
 - Tenant → IdP: Logical relationship via opaque tenant identifier used for IdP linking. No local foreign key — IdP is external.
-- Tenant → Resource Group (User Groups): Logical relationship. User groups are Resource Group entities scoped to a tenant. AM registers the RG type at init; consumers call `ResourceGroupClient` directly. `TenantService` triggers RG group cleanup during tenant hard-deletion.
+- Tenant → Resource Group (User Groups): Logical relationship. User groups are Resource Group entities scoped to a tenant. AM registers the RG type at gear startup from `serve`, not from `init`; consumers call `ResourceGroupClient` directly. `TenantService` triggers RG group cleanup during tenant hard-deletion.
 
 #### Value Objects and Invariants
 
@@ -501,6 +501,8 @@ Entry point for the ToolKit lifecycle. Initializes all internal services, regist
 
 Gear lifecycle (`init()` for wiring; `lifecycle(entry = ...)` for startup bootstrap and background jobs; `CancellationToken` for graceful shutdown), REST route registration via OperationBuilder, ClientHub registration of `AccountManagementClient` implementation, database migration registration, bootstrap orchestration on first start.
 
+`init()` is restricted to wiring plus purely local validation: it resolves clients from ClientHub and constructs services, but performs **no** cross-gear call that passes through an `AuthZ` gate. The PDP plugin is not resolvable anywhere in the runtime's init phase — types-registry publishes its plugin catalogue in the `post_init` barrier, which runs strictly after every gear's `init` has returned — so any gated call issued from `init` fails closed with `service_unavailable` regardless of gear ordering. Startup work that needs a gated call therefore runs inside `lifecycle(entry = ...)`, in order: (1) the bootstrap saga; (2) the user-group RG type registration (`fr-user-group-rg-type`), under the platform-root-scoped system actor; (3) `ready.notify()`; (4) the background tick loops. Every step before the ready signal is fatal to gear readiness if it fails.
+
 ##### Responsibility boundaries
 
 Does not contain business logic. Does not directly access the database. Delegates all domain operations to `TenantService` and `MetadataService`.
@@ -509,7 +511,7 @@ Does not contain business logic. Does not directly access the database. Delegate
 
 - `cpt-cf-account-management-component-tenant-service` — owns; creates and wires during initialization
 - `cpt-cf-account-management-component-metadata-service` — owns; creates and wires during initialization
-- `cpt-cf-account-management-component-bootstrap-service` — owns; invokes at the start of the `lifecycle(entry = ...)` method before signalling ready
+- `cpt-cf-account-management-component-bootstrap-service` — owns; invokes at the start of the `lifecycle(entry = ...)` method before signalling ready, immediately ahead of the user-group RG type registration
 
 #### TenantService
 
@@ -800,7 +802,7 @@ This interface exposes raw and resolved tenant metadata keyed by registered GTS 
 
 | Dependency Gear    | Interface Used | Purpose |
 |-------------------|----------------|---------|
-| [Resource Group](../../resource-group/docs/PRD.md) | `ResourceGroupClient` (SDK trait via ClientHub) | AM registers a user-group RG type at gear initialization, uses RG ownership-graph reads to verify that no tenant-owned resource associations remain before soft deletion, and triggers tenant-scoped group cleanup during hard-deletion. If RG is unavailable during deletion validation, AM fails the operation with `service_unavailable` rather than proceeding. Consumers call `ResourceGroupClient` directly for all group lifecycle, membership, and hierarchy operations. |
+| [Resource Group](../../resource-group/docs/PRD.md) | `ResourceGroupClient` (SDK trait via ClientHub) | AM registers a user-group RG type at gear startup (from `serve`), uses RG ownership-graph reads to verify that no tenant-owned resource associations remain before soft deletion, and triggers tenant-scoped group cleanup during hard-deletion. If RG is unavailable during deletion validation, AM fails the operation with `service_unavailable` rather than proceeding. Consumers call `ResourceGroupClient` directly for all group lifecycle, membership, and hierarchy operations. |
 | GTS Types Registry | `TypesRegistryClient` (SDK trait via ClientHub) | Runtime tenant type definitions, parent-child constraint validation, metadata schema registration and validation. |
 
 **Dependency Rules** (per project conventions):

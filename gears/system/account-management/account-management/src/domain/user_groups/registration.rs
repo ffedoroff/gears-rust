@@ -174,8 +174,8 @@ impl TypeSpec {
 /// Each step runs the full idempotent algorithm independently
 /// ([`register_one`]): `get_type` → classify-or-create → on
 /// `AlreadyExists` race re-read and classify. A step that lands
-/// on `DivergentSchema` aborts the pair; the caller (`gear init`)
-/// surfaces the error and does NOT signal ready.
+/// on `DivergentSchema` aborts the pair; the caller (the gear's
+/// `serve` entry) surfaces the error and does NOT signal ready.
 ///
 /// # Self-parent rule patched as a follow-up `update_type`
 ///
@@ -189,11 +189,14 @@ impl TypeSpec {
 /// as inclusive-equivalent against either pre-state — see
 /// [`classify_existing`]), then patching the self-parent rule with
 /// `update_type` once the row is in RG's `gts_type` table. The
-/// follow-up patch is idempotent: a prior init that already wrote
+/// follow-up patch is idempotent: a prior start that already wrote
 /// the self-parent rule sees the rule re-set to the same values.
 ///
-/// Called during `AccountManagementGear::init`. On success the
-/// gear may proceed to signal ready.
+/// Called from `AccountManagementGear::serve` (phase 2, after the
+/// bootstrap saga, before `ready.notify()`) — not from `Gear::init`,
+/// where RG's `AuthZ`-gated type surface is unreachable because the PDP
+/// plugin cannot be resolved until the post-init barrier has run. On
+/// success the gear may proceed to signal ready.
 pub async fn register_user_group_types(
     client: &Arc<dyn ResourceGroupClient + Send + Sync>,
     ctx: &SecurityContext,

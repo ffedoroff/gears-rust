@@ -33,11 +33,11 @@
 
 ### 1.1 Overview
 
-Delegates every aspect of user-group hierarchy, membership storage, cycle detection, and tenant-scoped isolation to the Resource Group gear. Account Management owns only three thin touchpoints: (1) registering the chained user-group RG type schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` at gear initialization; (2) triggering Resource Group cleanup of a tenant's user-group subtree during tenant hard-deletion; (3) publishing the tenant-scoped user-query surface that consumers combine with `ResourceGroupClient` membership operations to verify user existence.
+Delegates every aspect of user-group hierarchy, membership storage, cycle detection, and tenant-scoped isolation to the Resource Group gear. Account Management owns only three thin touchpoints: (1) registering the chained user-group RG type schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` at gear startup (in the `serve` entry, before the ready signal); (2) triggering Resource Group cleanup of a tenant's user-group subtree during tenant hard-deletion; (3) publishing the tenant-scoped user-query surface that consumers combine with `ResourceGroupClient` membership operations to verify user existence.
 
 ### 1.2 Purpose
 
-Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring Account Management NEVER becomes a second source of truth for user-group state. The Resource Group gearlready provides typed hierarchy, tenant scoping, forest invariants, cycle detection, and isolation — duplicating any of that inside AM would add pass-through layers without domain value (per `principle-delegation-to-rg` and the rejected alternative recorded in `adr-resource-group-tenant-hierarchy-source`). This feature therefore authorizes consumers to call `ResourceGroupClient` directly for CRUD and membership, while AM idempotently registers the RG type during gear init (`fr-user-group-rg-type`) and triggers RG cleanup during tenant hard-deletion so no orphaned user-group subtree survives a deleted tenant. User-existence checks needed for membership writes come from `feature-idp-user-operations-contract` (`GET /tenants/{tenant_id}/users` with `?user_id=<id>`) — this feature documents the combination pattern without adding any REST surface of its own.
+Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring Account Management NEVER becomes a second source of truth for user-group state. The Resource Group gearlready provides typed hierarchy, tenant scoping, forest invariants, cycle detection, and isolation — duplicating any of that inside AM would add pass-through layers without domain value (per `principle-delegation-to-rg` and the rejected alternative recorded in `adr-resource-group-tenant-hierarchy-source`). This feature therefore authorizes consumers to call `ResourceGroupClient` directly for CRUD and membership, while AM idempotently registers the RG type at gear startup (`fr-user-group-rg-type`) and triggers RG cleanup during tenant hard-deletion so no orphaned user-group subtree survives a deleted tenant. User-existence checks needed for membership writes come from `feature-idp-user-operations-contract` (`GET /tenants/{tenant_id}/users` with `?user_id=<id>`) — this feature documents the combination pattern without adding any REST surface of its own.
 
 **Requirements**: `cpt-cf-account-management-fr-user-group-rg-type`, `cpt-cf-account-management-fr-user-group-lifecycle`, `cpt-cf-account-management-fr-user-group-membership`, `cpt-cf-account-management-fr-nested-user-groups`
 
@@ -47,7 +47,7 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-account-management-actor-platform-admin` | Upstream caller of gear initialization (registers the user-group RG type schema) and of tenant hard-deletion (triggers the cascade cleanup through `tenant-hierarchy-management`); never invokes user-group operations directly — those go through `ResourceGroupClient`. |
+| `cpt-cf-account-management-actor-platform-admin` | Upstream caller of gear startup (registers the user-group RG type schema) and of tenant hard-deletion (triggers the cascade cleanup through `tenant-hierarchy-management`); never invokes user-group operations directly — those go through `ResourceGroupClient`. |
 | `cpt-cf-account-management-actor-tenant-admin` | Consumer of the delegated user-group surface; calls `ResourceGroupClient` directly for group CRUD, membership, and nested-group operations within their authorized tenant scope; combines that surface with AM's `GET /tenants/{tenant_id}/users` for user-existence checks. |
 
 ### 1.4 References
@@ -69,24 +69,26 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 **Success Scenarios**:
 
-- On `AccountManagementGear` initialization, AM invokes `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` against the Resource Group types registry via `ResourceGroupClient`. If the chained type schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` is already registered with identical traits, the call is a successful no-op. If it is absent, AM registers it with `allowed_memberships = [gts.cf.core.am.user.v1~]` and self-referential `allowed_parents = [gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~]` before the gear signals ready.
+- On `AccountManagementGear` startup, AM invokes `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` against the Resource Group types registry via `ResourceGroupClient`. If the chained type schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` is already registered with identical traits, the call is a successful no-op. If it is absent, AM registers it with `allowed_memberships = [gts.cf.core.am.user.v1~]` and self-referential `allowed_parents = [gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~]` before the gear signals ready.
+
+> **Lifecycle placement.** The registration runs in the gear's `serve` entry — after the `feature-platform-bootstrap` saga and before `ready.notify()` — **not** in `Gear::init`. RG's type surface is `AuthZ`-gated with no in-process exemption, and the PDP plugin is unresolvable for the whole init phase (types-registry publishes its instance catalogue in the `post_init` barrier, which runs strictly after every gear's `init` has returned), so an init-phase registration fails closed with `service_unavailable` by construction. The subject is the tenant-bound platform-root system actor (`system_actor::for_bootstrap(root_id)`), because a tenant-clamping PDP cannot derive a scope for a nil tenant. The "type exists before any consumer observes the gear as ready" guarantee is unchanged.
 
 **Error Scenarios**:
 
-- Resource Group is unreachable during gear initialization — AM gear init fails fast with `service_unavailable` category mapping delegated to the `feature-errors-observability` envelope, consistent with `feature-platform-bootstrap`'s hard-dependency posture. AM does NOT proceed to signal ready with an unregistered type.
+- Resource Group is unreachable during gear startup — AM's `serve` entry fails fast with `service_unavailable` category mapping delegated to the `feature-errors-observability` envelope, consistent with `feature-platform-bootstrap`'s hard-dependency posture. AM does NOT proceed to signal ready with an unregistered type.
 - The registered schema exists but its traits diverge from the required shape (e.g., `allowed_memberships` missing `gts.cf.core.am.user.v1~`, or `allowed_parents` missing self-nesting) — registration fails with a deterministic `validation` error; AM does NOT auto-repair the diverged schema.
 
 **Steps**:
 
-1. [ ] - `p1` - At `AccountManagementGear` initialization, invoke `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` with the chained type identifier `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the required traits (`allowed_memberships`, `allowed_parents`) - `inst-flow-rgreg-invoke-algo`
+1. [ ] - `p1` - During `AccountManagementGear` startup — in the `serve` entry, after the platform-bootstrap saga and before the ready signal — invoke `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` with the chained type identifier `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the required traits (`allowed_memberships`, `allowed_parents`), under the platform-root-scoped system actor - `inst-flow-rgreg-invoke-algo`
 2. [ ] - `p1` - **IF** algorithm returned already-present-and-equivalent - `inst-flow-rgreg-noop-branch`
-   1. [ ] - `p1` - **RETURN** success no-op; gear init continues - `inst-flow-rgreg-noop-return`
+   1. [ ] - `p1` - **RETURN** success no-op; gear startup continues - `inst-flow-rgreg-noop-return`
 3. [ ] - `p1` - **IF** algorithm returned registered-new - `inst-flow-rgreg-registered-branch`
-   1. [ ] - `p1` - **RETURN** success; gear init continues - `inst-flow-rgreg-registered-return`
+   1. [ ] - `p1` - **RETURN** success; gear startup continues - `inst-flow-rgreg-registered-return`
 4. [ ] - `p1` - **IF** algorithm returned `service_unavailable` (Resource Group unreachable) - `inst-flow-rgreg-unavailable-branch`
-   1. [ ] - `p1` - **RETURN** gear-init failure; gear does NOT signal ready - `inst-flow-rgreg-unavailable-return`
+   1. [ ] - `p1` - **RETURN** startup failure from `serve`; gear does NOT signal ready - `inst-flow-rgreg-unavailable-return`
 5. [ ] - `p1` - **IF** algorithm returned `validation` (diverged schema already present) - `inst-flow-rgreg-diverged-branch`
-   1. [ ] - `p1` - **RETURN** gear-init failure; operator intervention required to reconcile RG-side schema - `inst-flow-rgreg-diverged-return`
+   1. [ ] - `p1` - **RETURN** startup failure from `serve`; operator intervention required to reconcile RG-side schema - `inst-flow-rgreg-diverged-return`
 
 ### Tenant Hard-Delete Cascade Cleanup Trigger
 
@@ -126,11 +128,11 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 **Steps**:
 
-> Registration is idempotent per `fr-user-group-rg-type` so AM gear initialization is retry-safe across restarts. AM does NOT own a local cache of the RG type schema; registration status is re-verified against RG on every gear init. AM does NOT auto-reconcile a diverged RG-side schema — that is an operator-intervention path per DESIGN §3.4.
+> Registration is idempotent per `fr-user-group-rg-type` so AM gear startup is retry-safe across restarts. AM does NOT own a local cache of the RG type schema; registration status is re-verified against RG on every start. AM does NOT auto-reconcile a diverged RG-side schema — that is an operator-intervention path per DESIGN §3.4.
 
 1. [ ] - `p1` - Query the Resource Group types registry via `ResourceGroupClient` for the chained type identifier - `inst-algo-rgreg-query-existing`
 2. [ ] - `p1` - **IF** RG query raised transport failure or timed out - `inst-algo-rgreg-transport-failure`
-   1. [ ] - `p1` - **RETURN** `(reject, code=service_unavailable)` so the calling flow can fail gear init - `inst-algo-rgreg-transport-return`
+   1. [ ] - `p1` - **RETURN** `(reject, code=service_unavailable)` so the calling flow can fail gear startup - `inst-algo-rgreg-transport-return`
 3. [ ] - `p1` - **IF** the type is already registered with equivalent traits (`allowed_memberships` includes `gts.cf.core.am.user.v1~` AND `allowed_parents` includes itself) - `inst-algo-rgreg-equivalent-branch`
    1. [ ] - `p1` - **RETURN** `already-present-and-equivalent` - `inst-algo-rgreg-equivalent-return`
 4. [ ] - `p1` - **IF** the type is registered but traits diverge - `inst-algo-rgreg-diverged-branch`
@@ -141,7 +143,7 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 ## 4. States (CDSL)
 
-**Not applicable.** This feature owns no AM-side lifecycle. The user-group type-schema registration is a one-shot idempotent operation at gear init (no state machine); the cascade cleanup trigger is a pass-through call to `ResourceGroupClient` inside the hard-delete flow (no AM-side state to model). User-group hierarchy, membership, and nested-group state are ALL owned by the Resource Group gear — AM stores no user-group rows, no membership adapter tables, no registration mirror.
+**Not applicable.** This feature owns no AM-side lifecycle. The user-group type-schema registration is a one-shot idempotent operation at gear startup (no state machine); the cascade cleanup trigger is a pass-through call to `ResourceGroupClient` inside the hard-delete flow (no AM-side state to model). User-group hierarchy, membership, and nested-group state are ALL owned by the Resource Group gear — AM stores no user-group rows, no membership adapter tables, no registration mirror.
 
 ## 5. Definitions of Done
 
@@ -149,7 +151,7 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-user-groups-rg-type-schema-idempotent-registration`
 
-The system **MUST** invoke `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` during `AccountManagementGear` initialization for the chained type identifier `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` with `allowed_memberships` including `gts.cf.core.am.user.v1~` and self-referential `allowed_parents` to support nested user groups, per `fr-user-group-rg-type`. Registration **MUST** be idempotent: an already-present-and-equivalent RG-side schema is a successful no-op; an absent schema is registered with the required traits; a diverged existing schema **MUST** fail gear init with `code=validation` rather than silently overwriting operator state. AM **MUST NOT** proceed to gear-ready until registration returns success.
+The system **MUST** invoke `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` during `AccountManagementGear` startup — from the gear's `serve` entry, after the platform-bootstrap saga and before the ready signal — for the chained type identifier `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` with `allowed_memberships` including `gts.cf.core.am.user.v1~` and self-referential `allowed_parents` to support nested user groups, per `fr-user-group-rg-type`. Registration **MUST** be idempotent: an already-present-and-equivalent RG-side schema is a successful no-op; an absent schema is registered with the required traits; a diverged existing schema **MUST** fail gear startup with `code=validation` rather than silently overwriting operator state. AM **MUST NOT** proceed to gear-ready until registration returns success.
 
 **Implements**:
 
@@ -182,7 +184,7 @@ The system **MUST** trigger `ResourceGroupClient` cleanup of the tenant's user-g
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-user-groups-delegation-boundary`
 
-The system **MUST NOT** expose any AM-side REST endpoint for user-group CRUD, membership add/remove, or nested-group traversal — consumers call `ResourceGroupClient` directly per `principle-delegation-to-rg`. The AM OpenAPI surface **MUST NOT** contain a `/user-groups` family. AM **MUST NOT** own any `user_group_*` or `user_group_membership_*` storage table, any membership adapter table, or any group-hierarchy cache. AM **MUST NOT** proxy, coordinate, or observe individual RG CRUD / membership calls beyond the two authorized touchpoints (gear-init registration + hard-delete cascade cleanup). Cycle detection for nested groups **MUST** be enforced by Resource Group's forest invariants — AM does NOT re-implement it.
+The system **MUST NOT** expose any AM-side REST endpoint for user-group CRUD, membership add/remove, or nested-group traversal — consumers call `ResourceGroupClient` directly per `principle-delegation-to-rg`. The AM OpenAPI surface **MUST NOT** contain a `/user-groups` family. AM **MUST NOT** own any `user_group_*` or `user_group_membership_*` storage table, any membership adapter table, or any group-hierarchy cache. AM **MUST NOT** proxy, coordinate, or observe individual RG CRUD / membership calls beyond the two authorized touchpoints (startup-time registration + hard-delete cascade cleanup). Cycle detection for nested groups **MUST** be enforced by Resource Group's forest invariants — AM does NOT re-implement it.
 
 **Implements**:
 
@@ -212,8 +214,8 @@ Membership-write callers **MUST** combine AM's `GET /tenants/{tenant_id}/users` 
 ## 6. Acceptance Criteria
 
 - [ ] On `AccountManagementGear` initialization against a fresh Resource Group registry (no prior user-group type schema), AM invokes `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` and registers the chained type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` with `allowed_memberships = [gts.cf.core.am.user.v1~]` and self-referential `allowed_parents`; the gear signals ready only after registration returns `registered-new`. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
-- [ ] On subsequent gear restarts with an already-present-and-equivalent RG-side schema, `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` returns `already-present-and-equivalent` as a no-op and gear init continues; no duplicate or divergent registration is attempted. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
-- [ ] If Resource Group is unreachable during gear initialization, `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` returns `code=service_unavailable`; the gear does NOT signal ready and emits an observable error through the `feature-errors-observability` envelope. If a RG-side schema is present but diverges (missing `gts.cf.core.am.user.v1~` in `allowed_memberships` or missing self-nesting in `allowed_parents`), registration returns `code=validation` and the gear does NOT auto-repair. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
+- [ ] On subsequent gear restarts with an already-present-and-equivalent RG-side schema, `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` returns `already-present-and-equivalent` as a no-op and gear startup continues; no duplicate or divergent registration is attempted. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
+- [ ] If Resource Group is unreachable during gear startup, `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration` returns `code=service_unavailable`; the gear does NOT signal ready and emits an observable error through the `feature-errors-observability` envelope. If a RG-side schema is present but diverges (missing `gts.cf.core.am.user.v1~` in `allowed_memberships` or missing self-nesting in `allowed_parents`), registration returns `code=validation` and the gear does NOT auto-repair. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] During tenant hard-deletion invoked by the retention job in `feature-tenant-hierarchy-management`, AM calls `ResourceGroupClient` to delete the tenant's user-group subtree before the `tenants` row is removed; if the RG cleanup call fails transport-level, the hard-delete flow aborts with `code=service_unavailable` via the `feature-errors-observability` envelope and the `tenants` row is NOT removed. On the next retry, the hard-delete flow re-attempts cleanup. Fingerprints `dod-user-groups-cascade-cleanup-trigger`.
 - [ ] The AM OpenAPI spec contains NO `/user-groups` family of endpoints and NO `/memberships` family — user-group CRUD, membership add/remove, and nested-group operations are not part of AM's REST surface. The AM gear contains no `user_group_*` or `user_group_membership_*` tables, no adapter tables, and no in-memory group-hierarchy cache; RG is the single storage owner. Fingerprints `dod-user-groups-delegation-boundary`.
 - [ ] A membership-write consumer (e.g., `feature-user-groups` caller) combining `GET /tenants/{tenant_id}/users?user_id=<id>` with a `ResourceGroupClient` membership add returns the authoritative user-existence signal before the RG membership write is issued; AM does NOT expose a convenience endpoint that wraps the two-step pattern, and the user-group schema's `allowed_memberships` restricting membership to the platform user resource type `gts.cf.core.am.user.v1~` is the RG-side integrity guard. Fingerprints `dod-user-groups-membership-user-existence-pattern`, `dod-user-groups-delegation-boundary`.
