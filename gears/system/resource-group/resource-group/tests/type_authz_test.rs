@@ -34,6 +34,18 @@
 //! 4. `seed_types` (and the `*_unscoped` methods it calls) still works with
 //!    no `SecurityContext` at all -- even wired to a deny-all enforcer that
 //!    would reject every gated call.
+//! 5. `RgService` -- the `dyn ResourceGroupClient` adapter registered in
+//!    `ClientHub` -- deliberately bypasses this same gate for its five type
+//!    methods (a follow-up to VHP-2342, not a regression of it): it calls
+//!    `TypeService`'s `*_unscoped` variants directly, because
+//!    account-management's gear-init type registration goes through this
+//!    exact trait with a nil-tenant system-actor `SecurityContext` that
+//!    `static-authz-plugin` would otherwise deny unconditionally. See the
+//!    doc comment on `RgService`'s `ResourceGroupClient` impl
+//!    (`src/domain/rg_service.rs`) for the full rationale and precedent
+//!    (`ResourceGroupReadHierarchy`). The REST surface VHP-2342 actually
+//!    closed (`/types-registry/v1/types`) is untouched -- it resolves a
+//!    separate `ConcreteTypeService` object, not `RgService`.
 //!
 //! `tests/api_rest_test.rs` covers the same five actions at the HTTP layer
 //! (`list_types_denied_returns_403` etc.), asserting the actual wire status
@@ -53,13 +65,14 @@ use authz_resolver_sdk::{
     AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
     EvaluationResponseContext, PolicyEnforcer,
 };
-use toolkit_security::pep_properties;
+use toolkit_security::{SecurityContext, pep_properties};
 
 use resource_group::domain::error::DomainError;
+use resource_group::domain::rg_service::RgService;
 use resource_group::domain::seeding::seed_types;
 use resource_group::domain::type_service::{RG_TYPE_RESOURCE, TypeService};
 use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateTypeRequest, UpdateTypeRequest};
+use resource_group_sdk::{CreateTypeRequest, ResourceGroupClient, UpdateTypeRequest};
 
 /// Always permits, never attaches constraints. This is *a* valid PDP permit
 /// shape (`decision: true, constraints: []`) -- not the *only* one. It
@@ -548,4 +561,87 @@ async fn seed_types_succeeds_with_deny_all_enforcer() {
         .await
         .expect("get_type_unscoped must not consult the deny-all enforcer");
     assert_eq!(loaded.code, code);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 4. RgService (the ClientHub `dyn ResourceGroupClient` adapter) bypasses
+//    the gate for its five type methods -- the trusted in-process path
+//    account-management's gear-init type registration relies on.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// `RgService`'s five type-lifecycle methods must succeed even when every
+/// service they wrap is wired to a deny-all enforcer, and even when the
+/// caller `SecurityContext` carries a nil `subject_tenant_id` -- this
+/// reproduces account-management's gear-init actor exactly
+/// (`account-management/src/domain/system_actor.rs::for_gear_init`,
+/// `subject_type = "am.system"`, `subject_tenant_id = Uuid::nil()`), which
+/// `static-authz-plugin` denies unconditionally. If this test ever fails,
+/// the fix is to make `RgService`'s type methods call `TypeService`'s
+/// `*_unscoped` variants again -- not to loosen any enforcer; the deny-all
+/// wiring here stands in for a dev/monolith stack with no `am.system`
+/// policy deployed, which is the whole point of the bypass.
+#[tokio::test]
+async fn rg_service_type_lifecycle_bypasses_gate_under_deny_all_enforcer_and_nil_tenant() {
+    let db = common::test_db().await;
+    let rg_service = RgService::new(
+        Arc::new(common::make_type_service_deny(db.clone())),
+        Arc::new(common::make_group_service_deny(db.clone())),
+        Arc::new(common::make_membership_service_deny(db)),
+    );
+
+    // Mirrors `system_actor::for_gear_init()`'s output shape exactly:
+    // stable subject, "am.system" subject_type, nil subject_tenant_id.
+    let ctx = SecurityContext::builder()
+        .subject_id(Uuid::now_v7())
+        .subject_type("am.system")
+        .subject_tenant_id(Uuid::nil())
+        .build()
+        .expect("valid SecurityContext");
+
+    let code = unique_code("rgbypass");
+    let created = rg_service
+        .create_type(
+            &ctx,
+            CreateTypeRequest {
+                code: code.clone(),
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect(
+            "RgService::create_type must bypass PolicyEnforcer on the in-process ClientHub path",
+        );
+    assert_eq!(created.code, code);
+
+    rg_service
+        .get_type(&ctx, &code)
+        .await
+        .expect("RgService::get_type must bypass PolicyEnforcer");
+
+    rg_service
+        .list_types(&ctx, &toolkit_odata::ODataQuery::default())
+        .await
+        .expect("RgService::list_types must bypass PolicyEnforcer");
+
+    rg_service
+        .update_type(
+            &ctx,
+            &code,
+            UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .expect("RgService::update_type must bypass PolicyEnforcer");
+
+    rg_service
+        .delete_type(&ctx, &code)
+        .await
+        .expect("RgService::delete_type must bypass PolicyEnforcer");
 }
