@@ -144,10 +144,46 @@ fn dto_create_group_no_id_maps_to_none() {
         type_path: gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~").to_owned(),
         name: "X".to_owned(),
         parent_id: None,
+        tenant_id: None,
         metadata: None,
     };
     let req: CreateGroupRequest = dto.into();
     assert!(req.id.is_none());
+}
+
+// TC-DTO-05d (VHP-2162): Caller-supplied `tenant_id` is deserialized from
+// the snake_case wire key and passed through to the SDK request.
+#[test]
+fn dto_create_group_tenant_id_passthrough() {
+    let tenant_id = Uuid::now_v7();
+    let json = serde_json::json!({
+        "type": gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~"),
+        "name": "X",
+        "tenant_id": tenant_id
+    })
+    .to_string();
+    let dto: CreateGroupDto = serde_json::from_str(&json).unwrap();
+    assert_eq!(dto.tenant_id, Some(tenant_id));
+
+    let req: CreateGroupRequest = dto.into();
+    assert_eq!(req.tenant_id, Some(tenant_id));
+}
+
+// TC-DTO-05e (VHP-2162): Omitted `tenant_id` maps to `None` in the SDK
+// request -- byte-for-byte today's behavior (the service falls back to the
+// caller's own `SecurityContext` tenant).
+#[test]
+fn dto_create_group_no_tenant_id_maps_to_none() {
+    let dto = CreateGroupDto {
+        id: None,
+        type_path: gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~").to_owned(),
+        name: "X".to_owned(),
+        parent_id: None,
+        tenant_id: None,
+        metadata: None,
+    };
+    let req: CreateGroupRequest = dto.into();
+    assert!(req.tenant_id.is_none());
 }
 
 // TC-DTO-06: Deserialize with no vectors -> defaults to empty

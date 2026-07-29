@@ -165,6 +165,11 @@ pub async fn seed_groups<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait>(
                     code: seed.code.clone(),
                     name: seed.name.clone(),
                     parent_id: seed.parent_id,
+                    // Seeding always resolves the target tenant via the
+                    // trusted `seed.tenant_id` argument to
+                    // `create_group_unscoped` below (VHP-2162) -- never via
+                    // this field, so it stays `None` here.
+                    tenant_id: None,
                     metadata: seed.metadata.clone(),
                 };
                 group_service

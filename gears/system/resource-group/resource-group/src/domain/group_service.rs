@@ -114,8 +114,48 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // whose path starts with `TENANT_RG_TYPE_PATH` opens a new tenant scope.
         let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
 
-        // AuthZ gate with provisioning context
-        let _scope =
+        // VHP-2162: a tenant-typed group's effective tenant is always its
+        // own (generated) id -- see `create_group_inner`'s
+        // `effective_tenant_id` derivation. A caller-supplied `tenant_id` on
+        // such a request can never be consulted, so treat it as a
+        // contradiction rather than silently discarding it.
+        Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
+
+        // VHP-2162: resolve the target tenant for this create. Omitted
+        // `tenant_id` (`None`) is today's unchanged default: target == the
+        // caller's own tenant (`tenant_id`, derived by the REST handler from
+        // `SecurityContext::subject_tenant_id`). A present `tenant_id` lets
+        // an authorized caller (platform admin / onboarding) target a
+        // tenant other than their own, subject to the AuthZ checks below.
+        let target_tenant_id = req.tenant_id.unwrap_or(tenant_id);
+
+        // VHP-2343 guardrail: a client-supplied `id` is already accepted
+        // as-is on create (owner decision, tracked separately under
+        // VHP-2343 -- no derived-id, no id_seed, no restriction to tenant
+        // types). Combined with an explicit cross-tenant target, that
+        // identity-capture gap gets strictly worse: today a captured id
+        // lands in the attacker's own tenant; letting `tenant_id` differ
+        // too would let it be planted directly inside a tenant the caller
+        // does not belong to. Reject the combination outright -- a stopgap,
+        // not a fix for VHP-2343 -- until an identifier-ownership policy
+        // exists.
+        if req.id.is_some() && target_tenant_id != tenant_id {
+            return Err(DomainError::validation(
+                "id and tenant_id cannot both be set on group creation: an explicit id \
+                 combined with a cross-tenant target is not accepted while identifier \
+                 ownership policy is undecided (VHP-2343)"
+                    .to_owned(),
+            ));
+        }
+
+        // AuthZ gate with provisioning context. `owner_tenant_id` now also
+        // carries the *target* tenant (VHP-2162) alongside the pre-existing
+        // `is_tenant`/`parent_id` properties, so a policy that keys off it
+        // can decide whether this caller may create groups in that tenant --
+        // mirrors account-management's `authz_scope` helper
+        // (`domain/authz.rs`) and the CREATE example in `AccessRequest`'s
+        // own doc comment.
+        let scope =
             self.enforcer
                 .access_scope_with(
                     ctx,
@@ -131,10 +171,57 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                                     serde_json::Value::String(id.to_string())
                                 }),
                             ),
+                            (
+                                pep_properties::OWNER_TENANT_ID.to_owned(),
+                                serde_json::Value::String(target_tenant_id.to_string()),
+                            ),
                         ])),
                 )
                 .await
                 .map_err(DomainError::from)?;
+
+        // VHP-2162: when the target tenant differs from the caller's own
+        // token tenant, re-verify it against the *compiled* `AccessScope` --
+        // do not rely solely on the PDP's `decision: true`. This is
+        // defense-in-depth: a policy misconfiguration that grants "create"
+        // unconditionally must not translate into an unbounded cross-tenant
+        // create. When the target equals the caller's own tenant (the
+        // common case, including every request that omits `tenant_id`),
+        // this block is skipped entirely -- byte-for-byte the pre-VHP-2162
+        // behavior.
+        //
+        // **`InTenantSubtree` limitation (deliberate, not a bug).**
+        // `AccessScope::contains_uuid` cannot resolve subtree membership --
+        // per `toolkit_security::access_scope::ScopeFilter::values`'s
+        // documented write-path limitation, it always returns `false` for an
+        // `InTenantSubtree` filter, because doing so would require a
+        // DB-backed lookup against `tenant_closure` (owned by Account
+        // Management; this crate has no dependency on it). A caller whose
+        // only grant for the target tenant is an `InTenantSubtree`
+        // constraint (e.g. "parent tenant admins may manage descendant
+        // tenants") is therefore denied here even when `target_tenant_id` is
+        // genuinely inside that subtree. This is a conservative fail-closed
+        // choice over trusting an unverifiable claim; lifting it would
+        // require RG to gain a dependency on AM's `tenant_closure`, which is
+        // out of scope for this change.
+        if target_tenant_id != tenant_id {
+            let permitted = scope.is_unconstrained()
+                || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, target_tenant_id);
+            if !permitted {
+                // Not-found shape, not forbidden (mirrors the VHP-2341
+                // membership gates in `membership_service.rs`): a tenant the
+                // caller has no grant for must be indistinguishable from a
+                // tenant that does not exist -- this gear owns no tenant
+                // data and cannot legitimately claim to know the
+                // difference.
+                debug!(
+                    caller_tenant_id = %tenant_id,
+                    target_tenant_id = %target_tenant_id,
+                    "create_group rejected: target tenant outside caller's AccessScope"
+                );
+                return Err(DomainError::tenant_not_found(target_tenant_id));
+            }
+        }
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
 
         // Validate metadata against the GTS type schema before opening the
@@ -163,8 +250,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let group_repo = group_repo.clone();
             let type_repo = type_repo.clone();
             Box::pin(async move {
-                Self::create_group_inner(&*group_repo, &*type_repo, tx, &req, tenant_id, &profile)
-                    .await
+                Self::create_group_inner(
+                    &*group_repo,
+                    &*type_repo,
+                    tx,
+                    &req,
+                    target_tenant_id,
+                    &profile,
+                )
+                .await
             })
         })
         .await
@@ -511,6 +605,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// maintenance) still run because this method calls the same
     /// `create_group_inner` as the public path; only the `PolicyEnforcer`
     /// gate is skipped.
+    ///
+    /// **`tenant_id` vs `req.tenant_id` (VHP-2162).** `tenant_id` is the
+    /// caller-trusted target tenant -- seeding already resolved it before
+    /// calling in (see `seeding::seed_groups`, which always passes
+    /// `req.tenant_id: None`). If `req.tenant_id` is *also* set and
+    /// disagrees with the `tenant_id` argument, that is treated as a caller
+    /// bug, not a preference to resolve silently: this is a trusted internal
+    /// path, so a disagreement most likely means a construction mistake
+    /// upstream, and quietly picking a winner (either one) would hide it.
+    /// Erroring is the safer choice here; an agreeing (equal) value is
+    /// accepted as a no-op.
     pub async fn create_group_unscoped(
         &self,
         req: CreateGroupRequest,
@@ -518,6 +623,19 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     ) -> Result<ResourceGroup, DomainError> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
+
+        let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
+
+        if let Some(req_tenant_id) = req.tenant_id
+            && req_tenant_id != tenant_id
+        {
+            return Err(DomainError::validation(format!(
+                "create_group_unscoped: req.tenant_id ({req_tenant_id}) disagrees with the \
+                 trusted tenant_id argument ({tenant_id}); this indicates a caller bug, not a \
+                 policy decision to make silently"
+            )));
+        }
 
         // Same RG-09 fix as `create_group`: validate metadata against the
         // GTS type schema (a cross-gear ClientHub call) before opening the
@@ -554,6 +672,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// **Metadata schema validation.** `create_group` already ran
     /// `validate_metadata_via_gts` before opening this transaction (RG-09):
     /// it's a cross-gear `ClientHub` call, not a DB read to make atomic.
+    ///
+    /// **`tenant_id` parameter (VHP-2162).** This is the already-resolved
+    /// *target* tenant, not necessarily the caller's own token tenant:
+    /// `create_group` folds an authorized `req.tenant_id` override into this
+    /// value (already AuthZ-gated against the caller's `AccessScope`)
+    /// before calling in; `create_group_unscoped` (seeding) passes its own
+    /// trusted tenant directly. Either way, this function treats it as
+    /// *the* tenant to enforce/persist -- it has no separate notion of
+    /// "the caller's own tenant".
     #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     async fn create_group_inner(
         group_repo: &GR,
@@ -628,8 +755,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 // exists and which tenant owns it. Mirrors
                 // `update_group_inner`'s cross-tenant parent-change
                 // message below. Real values stay in this debug log only.
+                //
+                // `tenant_id` here is the resolved *target* tenant
+                // (VHP-2162), which for the default (no explicit
+                // `CreateGroupRequest::tenant_id`) case is exactly the
+                // caller's own tenant -- so this also covers the
+                // conflict-with-parent rule for an explicit cross-tenant
+                // target: the parent's tenant must match the *requested*
+                // tenant, not just the caller's.
                 debug!(
-                    caller_tenant_id = %tenant_id,
+                    target_tenant_id = %tenant_id,
                     parent_tenant_id = %parent.tenant_id,
                     parent_id = %parent_id,
                     "create_group rejected: parent belongs to a different tenant"
@@ -1314,6 +1449,29 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         if name.is_empty() || name.chars().count() > 255 {
             return Err(DomainError::validation(
                 "Group name must be between 1 and 255 characters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject an explicit `tenant_id` on a tenant-typed group create
+    /// request (VHP-2162).
+    ///
+    /// A tenant-typed group's effective tenant is always its own generated
+    /// id (see `create_group_inner`'s `effective_tenant_id` derivation) --
+    /// never a caller-supplied value. Silently accepting `tenant_id` on such
+    /// a request would either be ignored (confusing) or, worse, be assumed
+    /// by the caller to have taken effect. Shared by `create_group` and
+    /// `create_group_unscoped` so both entry points enforce the same rule.
+    fn reject_tenant_id_on_tenant_type(
+        is_tenant: bool,
+        req_tenant_id: Option<Uuid>,
+    ) -> Result<(), DomainError> {
+        if is_tenant && req_tenant_id.is_some() {
+            return Err(DomainError::validation(
+                "tenant_id must not be set when creating a tenant-typed group: its tenant \
+                 scope is always the group's own id, never a caller-supplied value"
+                    .to_owned(),
             ));
         }
         Ok(())

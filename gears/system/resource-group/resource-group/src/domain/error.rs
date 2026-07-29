@@ -45,6 +45,23 @@ pub enum DomainError {
     #[error("Group already exists: {id}")]
     GroupAlreadyExists { id: uuid::Uuid },
 
+    /// Target tenant from an explicit `CreateGroupRequest::tenant_id` is
+    /// outside the caller's `create`-action `AccessScope` (VHP-2162).
+    ///
+    /// Deliberately mirrors `GroupNotFound`'s shape rather than
+    /// `AccessDenied`: a foreign tenant the caller has no grant for must be
+    /// indistinguishable from a tenant that does not exist at all. RG does
+    /// not own tenant data (that's Account Management's `tenants` /
+    /// `tenant_closure`), so it can never legitimately claim to know the
+    /// difference between "real tenant, no grant" and "no such tenant" --
+    /// the same anti-oracle principle the VHP-2341 membership gates
+    /// established (see `membership_service.rs`). Maps to canonical
+    /// `not_found` (HTTP 404). The echoed `tenant_id` is the caller's own
+    /// request payload, so echoing it back discloses nothing the caller did
+    /// not already know.
+    #[error("Tenant not found: {tenant_id}")]
+    TenantNotFound { tenant_id: uuid::Uuid },
+
     #[error("Membership not found: {key}")]
     MembershipNotFound { key: String },
 
@@ -167,6 +184,11 @@ impl DomainError {
     #[must_use]
     pub fn group_already_exists(id: uuid::Uuid) -> Self {
         Self::GroupAlreadyExists { id }
+    }
+
+    #[must_use]
+    pub fn tenant_not_found(tenant_id: uuid::Uuid) -> Self {
+        Self::TenantNotFound { tenant_id }
     }
 
     pub fn membership_not_found(key: impl Into<String>) -> Self {

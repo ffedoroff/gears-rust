@@ -22,7 +22,7 @@ use uuid::Uuid;
 use authz_resolver_sdk::{
     AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
     EvaluationResponseContext, PolicyEnforcer,
-    constraints::{Constraint, InPredicate, Predicate},
+    constraints::{Constraint, InPredicate, InTenantSubtreePredicate, Predicate},
 };
 use sea_orm_migration::MigratorTrait;
 use toolkit::api::OpenApiRegistry;
@@ -251,6 +251,120 @@ async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
 /// -- used by the VHP-2342 rejection tests below.
 async fn build_test_router_type_denied() -> (Router, Arc<TypeService<TypeRepository>>) {
     build_test_router_with_type_enforcer(make_type_enforcer_deny()).await
+}
+
+// ── Mock AuthZ: target-tenant echo (VHP-2162) ───────────────────────────
+
+/// Permits any target tenant by echoing back whatever `owner_tenant_id`
+/// resource property the caller sent, as an `In` constraint.
+///
+/// Models "the policy grants access to this specific tenant" and, as a
+/// side effect, proves `GroupService::create_group` actually forwards the
+/// resolved target tenant to the PDP (VHP-2162): if it didn't, this mock
+/// would fall back to `Uuid::nil()` and the foreign-tenant-succeeds tests
+/// below would fail.
+struct TargetTenantAllowAuthZ;
+
+#[async_trait]
+impl AuthZResolverClient for TargetTenantAllowAuthZ {
+    async fn evaluate(
+        &self,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        let target = request
+            .resource
+            .properties
+            .get(pep_properties::OWNER_TENANT_ID)
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or(Uuid::nil());
+
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [target],
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// Permits, but the sole constraint is `InTenantSubtree` rooted at a
+/// caller-chosen tenant -- exercises VHP-2162's documented fail-closed
+/// limitation at the HTTP layer: even when the target tenant equals the
+/// constraint's own root, `AccessScope::contains_uuid` cannot resolve
+/// subtree membership for this filter variant, so the request is denied.
+struct InTenantSubtreeOnlyAuthZ {
+    root_tenant_id: Uuid,
+}
+
+#[async_trait]
+impl AuthZResolverClient for InTenantSubtreeOnlyAuthZ {
+    async fn evaluate(
+        &self,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::InTenantSubtree(InTenantSubtreePredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        self.root_tenant_id,
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// Router wired with a caller-supplied enforcer for the group routes only;
+/// the type-registry and membership routes keep the normal defaults.
+/// Mirrors `build_test_router_with_type_enforcer`, swapping which service
+/// gets the custom enforcer.
+async fn build_test_router_with_group_enforcer(
+    group_enforcer: PolicyEnforcer,
+) -> (Router, Arc<TypeService<TypeRepository>>) {
+    let db = test_db().await;
+    let enforcer = make_enforcer();
+
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        make_type_enforcer(),
+        Arc::new(TypeRepository),
+    ));
+    let group_svc = Arc::new(GroupService::new(
+        db.clone(),
+        QueryProfile::default(),
+        group_enforcer,
+        Arc::new(GroupRepository),
+        Arc::new(TypeRepository),
+        common::make_types_registry(),
+    ));
+    let membership_svc = Arc::new(MembershipService::new(
+        db,
+        enforcer,
+        Arc::new(GroupRepository),
+        Arc::new(TypeRepository),
+        Arc::new(MembershipRepository),
+    ));
+
+    let openapi = NoopOpenApiRegistry;
+    let router = resource_group::api::rest::routes::register_routes(
+        Router::new(),
+        &openapi,
+        type_svc.clone(),
+        group_svc,
+        membership_svc,
+    );
+
+    (router, type_svc)
 }
 
 fn json_request(
@@ -683,6 +797,347 @@ async fn create_group_duplicate_id_returns_409() {
     assert_eq!(body["context"]["resource_name"], dup_id.to_string());
 }
 
+// ── Group create: explicit target tenant (VHP-2162) ─────────────────────
+
+/// Omitted `tenant_id` in the request body is byte-for-byte the
+/// pre-VHP-2162 wire shape: the created group lands in the caller's own
+/// (JWT-derived) tenant.
+#[tokio::test]
+async fn rest_create_group_tenant_id_omitted_returns_201() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162a.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "Omitted"
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_eq!(body["hierarchy"]["tenant_id"], tenant_id.to_string());
+    assert_no_surrogate_ids(&body);
+}
+
+/// An explicit `tenant_id` equal to the caller's own tenant succeeds
+/// identically to omitting the field.
+#[tokio::test]
+async fn rest_create_group_tenant_id_same_as_caller_returns_201() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162b.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "SameTenant",
+            "tenant_id": tenant_id
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_eq!(body["hierarchy"]["tenant_id"], tenant_id.to_string());
+    assert_no_surrogate_ids(&body);
+}
+
+/// A foreign `tenant_id` covered by the compiled `AccessScope` succeeds --
+/// the platform-admin / onboarding use case VHP-2162 exists for.
+#[tokio::test]
+async fn rest_create_group_foreign_tenant_id_allowed_returns_201() {
+    let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
+        TargetTenantAllowAuthZ,
+    )))
+    .await;
+    let caller_tenant = Uuid::now_v7();
+    let target_tenant = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162c.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "ForeignAllowed",
+            "tenant_id": target_tenant
+        })),
+        caller_tenant,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_eq!(body["hierarchy"]["tenant_id"], target_tenant.to_string());
+    assert_no_surrogate_ids(&body);
+}
+
+/// A foreign `tenant_id` NOT covered by the compiled `AccessScope` (the
+/// realistic tenant-clamp shape every PDP plugin in this repo returns)
+/// comes back 404, matching the shape of "tenant doesn't exist" -- not 403,
+/// per the anti-oracle rule this mirrors from the VHP-2341 membership
+/// gates.
+#[tokio::test]
+async fn rest_create_group_foreign_tenant_id_denied_returns_404() {
+    let (router, type_svc) = build_test_router().await;
+    let caller_tenant = Uuid::now_v7();
+    let target_tenant = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162d.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "ForeignDenied",
+            "tenant_id": target_tenant
+        })),
+        caller_tenant,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
+}
+
+/// An `AccessScope` built only from an `InTenantSubtree` constraint is
+/// rejected fail-closed at the HTTP layer too, even when the target tenant
+/// is literally the constraint's own root (VHP-2162's documented
+/// limitation -- see `GroupService::create_group`'s doc comment).
+#[tokio::test]
+async fn rest_create_group_in_tenant_subtree_scope_returns_404() {
+    let caller_tenant = Uuid::now_v7();
+    let target_tenant = Uuid::now_v7();
+    let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
+        InTenantSubtreeOnlyAuthZ {
+            root_tenant_id: target_tenant,
+        },
+    )))
+    .await;
+    let type_code = rg_type_id!("test.vhp2162e.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "SubtreeDenied",
+            "tenant_id": target_tenant
+        })),
+        caller_tenant,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
+}
+
+/// A tenant-typed group's effective tenant is always its own generated id;
+/// an explicit `tenant_id` in the request body is a contradiction and
+/// comes back 400, not silently ignored.
+#[tokio::test]
+async fn rest_create_group_tenant_typed_with_explicit_tenant_id_returns_400() {
+    let (router, type_svc) = build_test_router().await;
+    let tenant_id = Uuid::now_v7();
+    let other_tenant = Uuid::now_v7();
+    let type_code = format!(
+        "{}test{}.v1~",
+        resource_group_sdk::TENANT_RG_TYPE_PATH,
+        Uuid::now_v7().as_simple()
+    );
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "TenantTypedConflict",
+            "tenant_id": other_tenant
+        })),
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// An explicit `id` combined with a cross-tenant target is rejected (400)
+/// as a VHP-2343 stopgap, even under a policy that would otherwise permit
+/// the target tenant.
+#[tokio::test]
+async fn rest_create_group_explicit_id_with_foreign_tenant_returns_400() {
+    let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
+        TargetTenantAllowAuthZ,
+    )))
+    .await;
+    let caller_tenant = Uuid::now_v7();
+    let target_tenant = Uuid::now_v7();
+    let type_code = rg_type_id!("test.vhp2162f.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "id": Uuid::now_v7(),
+            "type": type_code,
+            "name": "IdPlusForeignTenant",
+            "tenant_id": target_tenant
+        })),
+        caller_tenant,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// An explicit `tenant_id` conflicting with an explicit `parent_id`'s
+/// actual tenant is rejected (400), even under a policy that would
+/// otherwise permit the target tenant on its own.
+#[tokio::test]
+async fn rest_create_group_tenant_id_conflicts_with_parent_returns_400() {
+    let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
+        TargetTenantAllowAuthZ,
+    )))
+    .await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+
+    let root_type = rg_type_id!("test.vhp2162g.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: root_type.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+    let child_type = rg_type_id!("test.vhp2162g-child.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: child_type.clone(),
+            can_be_root: false,
+            allowed_parent_types: vec![root_type.clone()],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    // Root group is created in tenant_a (the mock permits any tenant).
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": root_type,
+            "name": "Root"
+        })),
+        tenant_a,
+    );
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let root_body = response_body(resp).await;
+    let root_id = root_body["id"].as_str().unwrap();
+
+    // Child under `root_id` but targeting tenant_b explicitly -- conflict.
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": child_type,
+            "name": "Conflict",
+            "parent_id": root_id,
+            "tenant_id": tenant_b
+        })),
+        tenant_a,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+    let text = body.to_string();
+    assert!(
+        !text.contains(&tenant_a.to_string()) && !text.contains(&tenant_b.to_string()),
+        "problem body must not leak tenant ids (VHP-2345 style): {text}"
+    );
+}
+
 #[tokio::test]
 async fn list_groups_returns_200() {
     let (router, _) = build_test_router().await;
@@ -990,6 +1445,7 @@ async fn rest_post_membership_returns_201() {
                 code: gt_code,
                 name: "G1".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1061,6 +1517,7 @@ async fn rest_post_membership_duplicate_returns_409() {
                 code: gt_code,
                 name: "G1".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1191,6 +1648,7 @@ async fn rest_delete_membership_returns_204() {
                 code: gt,
                 name: "GDel".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1277,6 +1735,7 @@ async fn rest_post_membership_cross_tenant_returns_404() {
                 code: gt_code,
                 name: "GA".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_a,
@@ -1340,6 +1799,7 @@ async fn rest_delete_membership_cross_tenant_returns_404() {
                 code: gt_code,
                 name: "GAR".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_a,
@@ -1421,6 +1881,7 @@ async fn rest_get_memberships_is_tenant_scoped() {
                 code: gt_code.clone(),
                 name: "GAList".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_a,
@@ -1435,6 +1896,7 @@ async fn rest_get_memberships_is_tenant_scoped() {
                 code: gt_code,
                 name: "GBList".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_b,
@@ -1507,6 +1969,7 @@ async fn rest_post_group_with_parent_returns_201() {
                 code: root_type.clone(),
                 name: "Parent".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1549,6 +2012,7 @@ async fn rest_delete_group_force_returns_204() {
                 code: rt.clone(),
                 name: "FParent".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1565,6 +2029,7 @@ async fn rest_delete_group_force_returns_204() {
                 code: rt,
                 name: "FChild".to_owned(),
                 parent_id: Some(parent.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1599,6 +2064,7 @@ async fn rest_get_group_hierarchy_returns_200() {
                 code: rt.clone(),
                 name: "HRoot".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1614,6 +2080,7 @@ async fn rest_get_group_hierarchy_returns_200() {
                 code: rt,
                 name: "HChild".to_owned(),
                 parent_id: Some(root.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1681,6 +2148,7 @@ async fn rest_update_group_reparent_under_descendant_returns_400_cycle() {
                 code: rt.clone(),
                 name: "CycRoot".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1696,6 +2164,7 @@ async fn rest_update_group_reparent_under_descendant_returns_400_cycle() {
                 code: rt,
                 name: "CycChild".to_owned(),
                 parent_id: Some(root.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -1752,6 +2221,7 @@ async fn rest_update_group_self_parent_returns_400_cycle() {
                 code: rt,
                 name: "SelfRoot".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2072,6 +2542,7 @@ async fn input_membership_non_gts_resource_type() {
                 code: rt,
                 name: "NGGroup".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2421,6 +2892,7 @@ async fn gts_membership_post_tilde_encoded() {
                 code: gt,
                 name: "TildeGroup".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2481,6 +2953,7 @@ async fn gts_membership_delete_tilde_encoded() {
                 code: gt,
                 name: "TildeDelGrp".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2649,6 +3122,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
                 code: gt,
                 name: "MSIDGrp".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2692,6 +3166,7 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
                 code: rt.clone(),
                 name: "HSIDRoot".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -2707,6 +3182,7 @@ async fn smallint_hierarchy_response_has_no_surrogate_ids() {
                 code: rt,
                 name: "HSIDChild".to_owned(),
                 parent_id: Some(root.id),
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -3173,6 +3649,7 @@ async fn rest_list_groups_filters_by_type() {
                 code: type_a.code.clone(),
                 name: "RestTypeA".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,
@@ -3187,6 +3664,7 @@ async fn rest_list_groups_filters_by_type() {
                 code: type_b.code.clone(),
                 name: "RestTypeB".to_owned(),
                 parent_id: None,
+                tenant_id: None,
                 metadata: None,
             },
             tenant_id,

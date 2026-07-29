@@ -181,6 +181,18 @@ pub struct CreateGroupDto {
     pub name: String,
     /// Parent group ID (null for root groups).
     pub parent_id: Option<Uuid>,
+    /// Optional target tenant for the created group (VHP-2162).
+    ///
+    /// If omitted, the tenant scope is derived from the caller's own
+    /// `SecurityContext` -- today's unchanged default behavior. If present
+    /// and different from the caller's own tenant, the create succeeds only
+    /// when the caller's `create`-action `AccessScope` actually covers the
+    /// target tenant (platform-admin / onboarding use case); otherwise the
+    /// request is rejected as though the target tenant did not exist.
+    /// Rejected as a contradiction for tenant-typed groups: their effective
+    /// tenant is always `group.id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     /// Type-specific metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -251,6 +263,7 @@ impl From<CreateGroupDto> for CreateGroupRequest {
             code: dto.type_path,
             name: dto.name,
             parent_id: dto.parent_id,
+            tenant_id: dto.tenant_id,
             metadata: dto.metadata,
         }
     }

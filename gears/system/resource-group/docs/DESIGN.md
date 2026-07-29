@@ -487,7 +487,7 @@ Base path: `/api/resource-group/v1` (groups, memberships), `/api/types-registry/
 | PUT | types-registry | `/types/{code}` | `updateType` | Update type |
 | DELETE | types-registry | `/types/{code}` | `deleteType` | Delete type |
 | GET | resource-group | `/groups` | `listGroups` | List groups with OData query |
-| POST | resource-group | `/groups` | `createGroup` | Create group (`tenant_id` derived from `SecurityContext` effective tenant scope) |
+| POST | resource-group | `/groups` | `createGroup` | Create group. Tenant defaults to `SecurityContext` effective tenant scope; an optional explicit `tenant_id` in the request targets a different tenant, accepted only when the caller's `create`-action `AccessScope` covers that tenant (VHP-2162; platform-admin / onboarding use case). A scope built only from an `InTenantSubtree` constraint cannot be verified this way (no DB-backed tenant-hierarchy lookup in this gear) and is therefore rejected fail-closed. Rejected outright for tenant-typed groups, whose tenant is always the group's own id. |
 | GET | resource-group | `/groups/{group_id}` | `getGroup` | Get group by ID |
 | PUT | resource-group | `/groups/{group_id}` | `updateGroup` | Full replace of group (including parent move) |
 | DELETE | resource-group | `/groups/{group_id}` | `deleteGroup` | Delete group (optional `?force=true`) |
