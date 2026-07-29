@@ -94,7 +94,7 @@ Types define the structural rules for the resource group hierarchy — which par
 
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/types-registry/v1/types with type definition payload - `inst-create-type-1`
-2. [x] - `p1` - Validate GTS type path format via `GtsTypePath` value object - `inst-create-type-2`
+2. [x] - `p1` - Parse the GTS type path **once** via the `GtsTypePath` value object (`validation::canonical_type_code`) and use its canonical, lowercased/trimmed result for every subsequent step — the uniqueness pre-check, the junction lookups and the persisted `gts_type.schema_id`. Structure (`vendor.package.namespace.type.vMAJOR` per `~`-delimited segment), the RG prefix and the 1024-char limit are all decided here - `inst-create-type-2`
 3. [x] - `p1` - Validate placement invariant: `can_be_root OR len(allowed_parent_types) >= 1` - `inst-create-type-3`
 4. [x] - `p1` - **IF** allowed_parent_types is non-empty - `inst-create-type-4`
    1. [x] - `p1` - DB: SELECT id FROM gts_type WHERE schema_id IN (allowed_parent_types) — verify all referenced parent types exist - `inst-create-type-4a`
@@ -174,17 +174,17 @@ Types define the structural rules for the resource group hierarchy — which par
 **Output**: Validated type definition or validation error with field-level details
 
 **Steps**:
-1. [x] - `p1` - Validate `schema_id` via GtsTypePath value object (format, length, non-empty) - `inst-val-input-1`
+1. [x] - `p1` - Parse `schema_id` via the GtsTypePath value object (format, length, non-empty) and carry the **canonical** result forward; an earlier revision validated a trimmed/lowercased copy and then persisted the caller's raw spelling, which allowed rows differing only in case and broke the tenant-prefix classification in `GroupService` - `inst-val-input-1`
 2. [x] - `p1` - **IF** `schema_id` does not have RG type prefix `gts.cf.core.rg.type.v1~` - `inst-val-input-2`
    1. [x] - `p1` - **RETURN** Validation error: "Type schema_id must have RG type prefix" - `inst-val-input-2a`
 3. [x] - `p1` - Validate placement invariant: `can_be_root == true OR len(allowed_parent_types) >= 1` - `inst-val-input-3`
 4. [x] - `p1` - **IF** invariant violated - `inst-val-input-4`
    1. [x] - `p1` - **RETURN** Validation error: "Type must allow root placement or have at least one allowed parent" - `inst-val-input-4a`
 5. [x] - `p1` - **FOR EACH** parent_path in allowed_parent_types - `inst-val-input-5`
-   1. [x] - `p1` - Validate parent_path has RG type prefix `gts.cf.core.rg.type.v1~` - `inst-val-input-5a`
+   1. [x] - `p1` - Parse parent_path the same way (RG type prefix `gts.cf.core.rg.type.v1~` required) and use its canonical form for the existence lookup below - `inst-val-input-5a`
    2. [x] - `p1` - Verify parent_path exists in gts_type table - `inst-val-input-5b`
 6. [x] - `p1` - **FOR EACH** membership_path in allowed_membership_types - `inst-val-input-6`
-   1. [x] - `p1` - Validate membership_path is a valid GtsTypePath (no RG prefix requirement) - `inst-val-input-6a`
+   1. [x] - `p1` - Parse membership_path as a valid GTS ID (no RG prefix requirement) and use its canonical form for the existence lookup below - `inst-val-input-6a`
    2. [x] - `p1` - Verify membership_path exists in gts_type table - `inst-val-input-6b`
 7. [x] - `p1` - **IF** metadata_schema provided, validate it is a valid JSON Schema via `jsonschema::validator_for()` (compile-check). Runtime metadata validation against group instances uses `validate_metadata_via_gts()` through `TypesRegistryClient`. - `inst-val-input-7`
 8. [x] - `p1` - **RETURN** validated type definition - `inst-val-input-8`
@@ -682,12 +682,15 @@ These tests verify the system is resilient to adversarial metadata_schema payloa
 - Create group of type P (root), create child group of type C under it
 - **Assert**: success — proves the path stored for P matches P's code exactly during comparison
 
-#### TC-GTS-20: validate_type_code vs GtsTypePath length limits differ [P2]
-- Domain: `validate_type_code` allows up to 1024 chars
-- SDK: `GtsTypePath::new()` allows up to 255 chars
-- Create type with 300-char code via service → succeeds (domain limit 1024)
-- Wrap same code in GtsTypePath::new() → fails (SDK limit 255)
-- **Document**: inconsistency between domain and SDK validation
+#### TC-GTS-20: domain and SDK share one parser and one limit [P2]
+- Superseded. There is no longer a second validation path to diverge from: the domain's
+  `validation::canonical_type_code` *is* `GtsTypePath::new` plus the RG-prefix rule, and
+  both bottom out in `gts::GtsId::try_new`, whose limit is 1024 characters. The SDK's
+  255-char limit this case was written against does not exist in the current
+  `GtsTypePath`.
+- What is worth pinning instead, and is: a code accepted by the domain is byte-for-byte
+  the code the SDK value object accepts, and the domain returns that canonical form
+  rather than the caller's spelling (`domain_unit_test.rs::canonical_type_code_*`).
 
 ### Seeding — Types and Groups
 

@@ -6,7 +6,7 @@
 //! (`toolkit::api::canonical_error_middleware`) converts the `CanonicalError`
 //! to a wire `Problem` and fills `instance` / `trace_id` post-response.
 
-use resource_group_sdk::{field, precondition, reason};
+use resource_group_sdk::{TENANT_RG_TYPE_PATH, field, precondition, reason};
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 
 use crate::domain::error::DomainError;
@@ -125,12 +125,33 @@ impl From<DomainError> for CanonicalError {
                     .with_resource(id.to_string())
                     .create()
             }
+            // VHP-2345: the conflicting root's **id never reaches the wire**.
+            // It comes from `find_root_id_with_type_prefix`, which deliberately
+            // bypasses `SecureORM` (tenant-root uniqueness is a forest-wide
+            // invariant and has to see every tenant), so the existing root can
+            // belong to a tenant the caller has no grant for -- and a
+            // tenant-type group's `id` *is* its `tenant_id`, which makes the
+            // leak a foreign *tenant* identifier, not merely a foreign group's.
+            //
+            // `already_exists` requires *some* `resource_name` by typestate
+            // (duplicate-on-create must name what it collided with), so name
+            // the violated singleton rather than the row: at most one root may
+            // carry the tenant type path, and that path is derivable from the
+            // caller's own rejected request. `detail`, built at the call site,
+            // names only that request's code/name. The real id stays in this
+            // debug log.
             DomainError::TenantRootAlreadyExists {
                 existing_root_id,
                 detail,
-            } => RgError::already_exists(detail)
-                .with_resource(existing_root_id.to_string())
-                .create(),
+            } => {
+                tracing::debug!(
+                    existing_root_id = %existing_root_id,
+                    "tenant-root uniqueness rejected a create/move"
+                );
+                RgError::already_exists(detail)
+                    .with_resource(TENANT_RG_TYPE_PATH)
+                    .create()
+            }
             // Generic conflict carries no structural resource id — route
             // through `aborted` with a stable reason discriminator.
             DomainError::Conflict { message } => RgError::aborted(message)

@@ -84,8 +84,13 @@ pub enum DomainError {
     /// with more than one root group whose GTS type code starts with
     /// `TENANT_RG_TYPE_PATH`. Enforces
     /// `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. Maps to
-    /// canonical `already_exists` (HTTP 409) with `existing_root_id` as the
-    /// `resource_name`.
+    /// canonical `already_exists` (HTTP 409) whose `resource_name` is the
+    /// **tenant type path**, not `existing_root_id`: that id is found by a
+    /// deliberately unscoped, forest-wide query, so it can name a group --
+    /// and, since a tenant-type group's `id` *is* its `tenant_id`, a tenant --
+    /// the caller has no grant for (VHP-2345). The field is retained for
+    /// logging and for in-process callers that already see every tenant; it
+    /// never reaches the wire.
     #[error("Tenant root already exists (id={existing_root_id}): {detail}")]
     TenantRootAlreadyExists {
         existing_root_id: uuid::Uuid,
@@ -98,6 +103,12 @@ pub enum DomainError {
     /// tenant differs from the tenant of any existing membership for the same
     /// `(resource_type, resource_id)` pair. A resource must belong to groups
     /// of a single tenant.
+    ///
+    /// `message` is deliberately **anonymous** — no tenant ids, no resource
+    /// key. The conflicting tenant set is collected under the system scope
+    /// (the invariant is forest-wide), so naming it would disclose foreign
+    /// tenants to any caller who can guess a `(resource_type, resource_id)`
+    /// pair (VHP-2345). See `MembershipService::add_membership_in_tx`.
     #[error("Tenant incompatibility: {message}")]
     TenantIncompatibility { message: String },
 

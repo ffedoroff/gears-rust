@@ -632,7 +632,7 @@ async fn group_move_child_to_root() {
     // Create a type that can be both root and child
     let root_type = common::create_root_type(&type_svc, "org").await;
     let child_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flexible{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flexible.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     let _flexible_type = type_svc
@@ -757,7 +757,7 @@ async fn group_move_max_width_exceeded() {
 
     let root_type = common::create_root_type(&type_svc, "org").await;
     let child_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flex{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flex.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1365,7 +1365,7 @@ async fn group_move_max_depth_exceeded() {
     let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
     // sub_type allows child_type as parent, can also be root
     let sub_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.sub{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.sub.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1397,7 +1397,7 @@ async fn group_move_max_depth_exceeded() {
         common::create_root_group(&group_svc, &ctx, &sub_code, "Standalone", tenant_id).await;
     // sub needs a type that allows sub_code as parent -- create another type for that
     let subsub_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.subsub{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.subsub.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -2014,8 +2014,11 @@ async fn create_adr_types(
     let user_type = common::create_root_type(type_svc, "adruser").await;
     let course_type = common::create_root_type(type_svc, "adrcourse").await;
 
-    let suffix_t = format!("adrtenant{}", uuid::Uuid::now_v7().as_simple());
-    let tenant_code = format!("{}x.test.{suffix_t}.v1~", gts_id!("cf.core.rg.type.v1~"));
+    let suffix_t = format!("i{}", uuid::Uuid::now_v7().as_simple());
+    let tenant_code = format!(
+        "{}x.test.adrtenant.{suffix_t}.v1~",
+        gts_id!("cf.core.rg.type.v1~")
+    );
 
     // Tenant type: create first without self-reference, then update
     type_svc
@@ -2465,7 +2468,7 @@ async fn security_group_metadata_large_payload() {
 /// tenant-type group.
 fn unique_tenant_type_code() -> String {
     format!(
-        "{}test{}.v1~",
+        "{}x.test.tn.i{}.v1~",
         resource_group_sdk::TENANT_RG_TYPE_PATH,
         Uuid::now_v7().as_simple()
     )
@@ -3070,7 +3073,7 @@ async fn create_self_ref_type(
     suffix: &str,
 ) -> CreateTypeRequest {
     let code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{suffix}{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{suffix}.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     let req = CreateTypeRequest {
@@ -3314,4 +3317,158 @@ async fn group_move_cross_tenant_parent_rejected_without_leak() {
     let conn = db.conn().expect("conn");
     common::assert_closure_rows(&conn, b_root.id, &[(b_root.id, 0)]).await;
     common::assert_closure_rows(&conn, a_root.id, &[(a_root.id, 0)]).await;
+}
+
+// =========================================================================
+// T1.3 -- a non-canonical tenant chain must still open a tenant scope
+// =========================================================================
+
+/// The consequence that makes T1.3 a security finding rather than a tidiness
+/// one: a tenant-typed code spelled non-canonically must still give its group
+/// `tenant_id == group.id`, not the caller's tenant.
+///
+/// Before the fix, `validate_type_code` normalized a *copy*, so the uppercase
+/// code was stored verbatim and the tenant decision was a case-sensitive
+/// `req.code.starts_with(TENANT_RG_TYPE_PATH)` on that verbatim value. It
+/// answered `false`, the group was treated as an ordinary type, and it landed
+/// in the *caller's* tenant — a tenant-identity break: the group that was
+/// supposed to *be* a tenant instead became a member of one.
+#[tokio::test]
+async fn create_group_noncanonical_tenant_chain_still_opens_its_own_tenant_scope() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let caller_tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(caller_tenant);
+
+    let tenant_type = create_tenant_type(&type_svc).await;
+    // Same code, shouted and padded — the exact input that used to slip past
+    // the tenant-prefix test.
+    let noisy_code = format!("  {}  ", tenant_type.code.to_uppercase());
+
+    let group = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: noisy_code,
+                name: "ShoutedTenant".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            caller_tenant,
+        )
+        .await
+        .expect("a non-canonical tenant code must be accepted and canonicalized");
+
+    assert_eq!(
+        group.code, tenant_type.code,
+        "the stored/returned code must be canonical"
+    );
+    assert_eq!(
+        group.hierarchy.tenant_id, group.id,
+        "a tenant-typed group opens a new tenant scope -- its tenant is its own id. Getting the \
+         caller's tenant here means the tenant-prefix test was applied to a non-canonical string"
+    );
+    assert_ne!(
+        group.hierarchy.tenant_id, caller_tenant,
+        "the caller's tenant must not leak into a tenant-typed group"
+    );
+}
+
+/// The same rule on the internal seeding path, which has its own copy of the
+/// pre-validation and must not diverge from the public one.
+#[tokio::test]
+async fn create_group_unscoped_noncanonical_tenant_chain_still_opens_its_own_tenant_scope() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let seed_tenant = Uuid::now_v7();
+
+    let tenant_type = create_tenant_type(&type_svc).await;
+    let group = group_svc
+        .create_group_unscoped(
+            CreateGroupRequest {
+                id: None,
+                code: tenant_type.code.to_uppercase(),
+                name: "SeededTenant".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            seed_tenant,
+        )
+        .await
+        .expect("seeding must apply the same canonical parse");
+
+    assert_eq!(group.code, tenant_type.code);
+    assert_eq!(
+        group.hierarchy.tenant_id, group.id,
+        "seeding must classify a tenant-typed code the same way the public path does"
+    );
+}
+
+/// An ordinary (non-tenant) code spelled non-canonically stays ordinary: the
+/// canonicalization must not accidentally widen who becomes a tenant.
+#[tokio::test]
+async fn create_group_noncanonical_ordinary_code_keeps_the_caller_tenant() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let caller_tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(caller_tenant);
+
+    let t = common::create_root_type(&type_svc, "ordinarycase").await;
+    let group = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: t.code.to_uppercase(),
+                name: "Ordinary".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            caller_tenant,
+        )
+        .await
+        .expect("an uppercase ordinary code must be accepted");
+
+    assert_eq!(group.code, t.code);
+    assert_eq!(
+        group.hierarchy.tenant_id, caller_tenant,
+        "an ordinary type inherits the caller's tenant"
+    );
+}
+
+/// A structurally invalid chain is refused on group create too, not only on
+/// type create.
+#[tokio::test]
+async fn create_group_rejects_a_structurally_invalid_gts_chain() {
+    let db = common::test_db().await;
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let err = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: None,
+                code: format!("{GTS_ID_PREFIX}cf.core.rg.type.v1~tenant"),
+                name: "Bad".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect_err("a malformed chain must be rejected");
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected Validation, got: {err:?}"
+    );
 }

@@ -82,7 +82,7 @@ fn make_group_service_with_enforcer(
 /// `TENANT_RG_TYPE_PATH` classifies the group as tenant-typed.
 fn unique_tenant_type_code() -> String {
     format!(
-        "{}test{}.v1~",
+        "{}x.test.tn.i{}.v1~",
         TENANT_RG_TYPE_PATH,
         Uuid::now_v7().as_simple()
     )

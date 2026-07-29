@@ -617,22 +617,16 @@ impl GroupRepositoryTrait for GroupRepository {
             })
     }
 
-    /// Update a resource group entity.
-    async fn update<C: DBRunner>(
+    /// Replace a group's ordinary attributes (`name`, `metadata`) — see the
+    /// trait method's doc comment for why the write set stops there.
+    async fn update_attributes<C: DBRunner>(
         &self,
         db: &C,
         id: Uuid,
-        parent_id: Option<Uuid>,
-        gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
     ) -> Result<rg_entity::Model, DomainError> {
         let scope = system_scope();
-
-        let parent_val: sea_orm::Value = match parent_id {
-            Some(pid) => sea_orm::Value::Uuid(Some(Box::new(pid))),
-            None => sea_orm::Value::Uuid(None),
-        };
 
         let metadata_val: sea_orm::Value = match metadata {
             Some(v) => sea_orm::Value::Json(Some(Box::new(v.clone()))),
@@ -642,10 +636,41 @@ impl GroupRepositoryTrait for GroupRepository {
         ResourceGroupEntity::update_many()
             .filter(rg_entity::Column::Id.eq(id))
             .secure()
-            .col_expr(rg_entity::Column::ParentId, Expr::value(parent_val))
-            .col_expr(rg_entity::Column::GtsTypeId, Expr::value(gts_type_id))
             .col_expr(rg_entity::Column::Name, Expr::value(name.to_owned()))
             .col_expr(rg_entity::Column::Metadata, Expr::value(metadata_val))
+            .col_expr(
+                rg_entity::Column::UpdatedAt,
+                Expr::value(time::OffsetDateTime::now_utc()),
+            )
+            .scope_with(&scope)
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        self.find_model_by_id(db, id)
+            .await?
+            .ok_or_else(|| DomainError::group_not_found(id))
+    }
+
+    /// Re-parent a group — see the trait method's doc comment for why this
+    /// writes `parent_id` and nothing else.
+    async fn update_parent<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+        parent_id: Option<Uuid>,
+    ) -> Result<rg_entity::Model, DomainError> {
+        let scope = system_scope();
+
+        let parent_val: sea_orm::Value = match parent_id {
+            Some(pid) => sea_orm::Value::Uuid(Some(Box::new(pid))),
+            None => sea_orm::Value::Uuid(None),
+        };
+
+        ResourceGroupEntity::update_many()
+            .filter(rg_entity::Column::Id.eq(id))
+            .secure()
+            .col_expr(rg_entity::Column::ParentId, Expr::value(parent_val))
             .col_expr(
                 rg_entity::Column::UpdatedAt,
                 Expr::value(time::OffsetDateTime::now_utc()),

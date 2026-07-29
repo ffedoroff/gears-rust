@@ -126,7 +126,7 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
    6. [x] - `p1` - Invoke query profile enforcement: check width limit (sibling count under parent) - `inst-create-group-4f`
 5. [x] - `p1` - **ELSE** (root group) - `inst-create-group-5`
    1. [x] - `p1` - **IF** type does not allow root placement (can_be_root=false) → **RETURN** Validation error - `inst-create-group-5a`
-   2. [x] - `p1` - **IF** type code starts with `TENANT_RG_TYPE_PATH` (tenant type) AND there already exists any other root group whose type is a tenant type → **RETURN** `TenantRootAlreadyExists` (409 Conflict) - `inst-create-group-5c`
+   2. [x] - `p1` - **IF** the (canonicalized) type code starts with `TENANT_RG_TYPE_PATH` (tenant type) AND there already exists any other root group whose type is a tenant type → **RETURN** `TenantRootAlreadyExists` (409 Conflict). The response must **not** carry the existing root's id — the uniqueness lookup is deliberately unscoped and a tenant-typed group's id is its `tenant_id`, so `resource_name` is the tenant type path instead (VHP-2345, see `DESIGN.md` § 3.9) - `inst-create-group-5c`
 6. [x] - `p1` - **IF** metadata provided AND type has metadata_schema → validate metadata against the chained GTS type schema via `TypesRegistryClient` (types-registry-sdk, already in workspace). The `gts` crate (v0.8.4) validates metadata fields against the inline `metadata` sub-schema defined in the chained RG type (`additionalProperties: false`, field types, `maxLength`). **IF** invalid → **RETURN** Validation error with field-level details - `inst-create-group-5b`
 7. [x] - `p1` - DB: INSERT INTO resource_group (id, parent_id, gts_type_id, name, metadata, tenant_id) - `inst-create-group-6`
 7. [x] - `p1` - DB: INSERT INTO resource_group_closure (ancestor_id=id, descendant_id=id, depth=0) — self-row - `inst-create-group-7`
@@ -166,8 +166,8 @@ mandatory, and an omitted key is a 400, not "keep the stored value" (see
 4. [x] - `p1` - DB: SELECT FROM resource_group WHERE id = {group_id} (AccessScope-filtered) — load existing group - `inst-update-group-2`
 5. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-update-group-3`
 6. [x] - `p1` - **IF** metadata provided AND type has metadata_schema → validate metadata against the chained GTS type schema via `TypesRegistryClient` / `gts` crate. **IF** invalid → **RETURN** Validation error. Runs *before* the transaction opens — it is a cross-gear `ClientHub` call, not a DB read to make atomic (RG-09) - `inst-update-group-4e`
-7. [x] - `p1` - DB: BEGIN transaction at the backend default isolation. A single-row write by primary key has no cross-row predicate for a concurrent writer to invalidate, so `SERIALIZABLE` is not required here — unlike Move Group (`rg-db-audit-transactions.md`, recommendation #3) - `inst-update-group-4f`
-8. [x] - `p1` - DB: UPDATE resource_group SET name, metadata, updated_at — `parent_id` and `gts_type_id` are re-supplied from the row just read, because the repository writes every column unconditionally - `inst-update-group-5`
+7. [x] - `p1` - DB: BEGIN transaction at the backend default isolation. A single-row write by primary key, over a column set no other operation writes, has no cross-row predicate *and* no shared column for a concurrent writer to invalidate, so `SERIALIZABLE` is not required here — unlike Move Group (`rg-db-audit-transactions.md`, recommendation #3) - `inst-update-group-4f`
+8. [x] - `p1` - DB: UPDATE resource_group SET name, metadata, updated_at — and nothing else. The repository exposes two column-specific writers with disjoint write sets (`update_attributes` here, `update_parent` for Move Group); `parent_id`, `gts_type_id` and `tenant_id` are not in this statement's `SET` list and are not read back for it - `inst-update-group-5`
 9. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
 
 **Removed steps.** The former sub-steps `inst-update-group-4`, `4a`–`4d` covered a `type`
@@ -178,6 +178,24 @@ live in this flow — together with its isolation-level guess and the
 `UpdateGroupOutcome::NeedsSerializable` restart protocol that closed the race on that
 guess — moved wholesale into Move Group, where the level is unconditional and no guess
 exists.
+
+**Removing the restart protocol required a second change to be sound, and initially
+did not have it.** Dropping `NeedsSerializable` was justified on the grounds that an
+update can no longer *become* a move. That is true of the request, but was not true of
+the write: while a single repository method wrote every column, this flow still
+re-supplied the `parent_id` it had read inside its own (READ COMMITTED) transaction. A
+Move Group committing between that read and this write therefore had its parent change
+reverted in `resource_group` while its rebuilt `resource_group_closure` rows survived —
+a lost update with no serialization conflict on either side, and the mirror image (a
+move reverting a concurrent rename) in the other commit order. The protocol had in fact
+been protecting a blind structural write, not the payload ambiguity. Splitting the
+repository writer into `update_attributes` (`name`, `metadata`, `updated_at`) and
+`update_parent` (`parent_id`, `updated_at`) removes the shared column, so `parent_id`
+and the closure table are now written only by Move Group, always under `SERIALIZABLE`.
+Pinned by `tests/pg_concurrency_test.rs::ordinary_update_after_committed_move_keeps_both_effects`
+(the interleaving, replayed deterministically against real PostgreSQL) and
+`tests/db_behavior_audit_test.rs::update_group_write_set_excludes_structural_columns`
+(the write set, read out of the emitted SQL).
 
 ### Move Group (Subtree)
 

@@ -40,9 +40,70 @@ use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::migrations::Migrator;
 use resource_group::infra::storage::type_repo::TypeRepository;
 
+/// Build an RG type code from a loose, test-local tail.
+///
+/// Type codes are now parsed on the way in by
+/// `validation::canonical_type_code` → `GtsTypePath` → `gts::GtsId`, which
+/// requires every `~`-delimited segment to be exactly
+/// `vendor.package.namespace.type.vMAJOR` with each name token matching
+/// `[a-z_][a-z0-9_]*`. Before that, only the prefix and the length were
+/// checked (`GtsTypePath::new` was dead code), so the ~50 call sites in this
+/// file grew tails that are not valid GTS: four tokens instead of five, a
+/// bare UUID hex as a token (leading digit), the odd hyphen. None of those
+/// tests is *about* the code's syntax — they need a unique registered type —
+/// so normalize here instead of rewriting every literal, and let
+/// `create_type_invalid_gts_chain_returns_400` carry the syntax guarantee.
+///
+/// Sanitizes each token, drops a trailing `vN` (re-added as `v1`), and pads
+/// the name part to the required four tokens. Tails that were already valid
+/// (`test.mt2._.i{uuid}.v1~`) come out unchanged, so the unique component —
+/// and with it the per-test isolation these codes exist for — survives.
+fn rg_type_code(tail: &str) -> String {
+    fn sanitize(token: &str) -> String {
+        let mapped: String = token
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        match mapped.chars().next() {
+            Some(c) if c.is_ascii_lowercase() || c == '_' => mapped,
+            _ => format!("i{mapped}"),
+        }
+    }
+
+    let mut tokens: Vec<String> = tail
+        .trim()
+        .trim_end_matches('~')
+        .split('.')
+        .map(sanitize)
+        .collect();
+    // Drop a trailing version token; the version is re-attached below.
+    if tokens
+        .last()
+        .is_some_and(|t| t.starts_with('v') && t[1..].chars().all(|c| c.is_ascii_digit()))
+    {
+        tokens.pop();
+    }
+    // Fold any surplus into the type token, then pad to four name tokens.
+    if tokens.len() > 4 {
+        let tail_tokens = tokens.split_off(3).join("_");
+        tokens.push(tail_tokens);
+    }
+    while tokens.len() < 4 {
+        tokens.push("x".to_owned());
+    }
+    format!("{}{}.v1~", gts_id!("cf.core.rg.type.v1~"), tokens.join("."))
+}
+
 macro_rules! rg_type_id {
     ($($arg:tt)*) => {
-        format!("{}{}", gts_id!("cf.core.rg.type.v1~"), format_args!($($arg)*))
+        rg_type_code(&format!($($arg)*))
     };
 }
 
@@ -1000,7 +1061,7 @@ async fn rest_create_group_tenant_typed_with_explicit_tenant_id_returns_400() {
     let tenant_id = Uuid::now_v7();
     let other_tenant = Uuid::now_v7();
     let type_code = format!(
-        "{}test{}.v1~",
+        "{}x.test.tn.i{}.v1~",
         resource_group_sdk::TENANT_RG_TYPE_PATH,
         Uuid::now_v7().as_simple()
     );

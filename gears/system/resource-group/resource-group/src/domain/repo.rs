@@ -96,14 +96,43 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         tenant_id: Uuid,
     ) -> Result<rg_entity::Model, DomainError>;
 
-    async fn update<C: DBRunner>(
+    /// Replace a group's **ordinary attributes** — `name` and `metadata` —
+    /// and bump `updated_at`. Writes no other column.
+    ///
+    /// The write set is deliberately disjoint from [`Self::update_parent`]'s.
+    /// A single method that wrote every column let the ordinary-update path
+    /// (READ COMMITTED, `update_group`) re-write a `parent_id` it had read
+    /// before a concurrent `move_group` (SERIALIZABLE) committed a new one:
+    /// the entity row reverted to the stale parent while the closure table
+    /// kept the move's rebuilt rows, and neither transaction saw a conflict
+    /// worth aborting for. Splitting the write sets removes the shared column
+    /// that made that lost update expressible, so `parent_id` is now written
+    /// by exactly one path — the serializable one that also rebuilds the
+    /// closure.
+    ///
+    /// `gts_type_id` is not writable at all: a group's type is fixed at
+    /// creation, and re-writing it with a value read moments earlier only
+    /// created another chance to write something stale.
+    async fn update_attributes<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+        name: &str,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<rg_entity::Model, DomainError>;
+
+    /// Re-parent a group: write `parent_id` (`None` = forest root) and bump
+    /// `updated_at`. Writes no other column.
+    ///
+    /// See [`Self::update_attributes`] for why the two write sets must stay
+    /// disjoint. Must be called inside the `SERIALIZABLE` transaction that
+    /// also rebuilds the closure table, so the entity row and the closure
+    /// projection commit together.
+    async fn update_parent<C: DBRunner>(
         &self,
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
-        name: &str,
-        metadata: Option<&serde_json::Value>,
     ) -> Result<rg_entity::Model, DomainError>;
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError>;

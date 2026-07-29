@@ -18,6 +18,7 @@ use tracing::debug;
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
 use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeRepositoryTrait};
+use crate::domain::validation;
 
 /// `AuthZ` resource type descriptor for group memberships.
 ///
@@ -172,7 +173,16 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
         let membership_repo = self.membership_repo.clone();
-        let resource_type = resource_type.to_owned();
+        // `resource_type` addresses an already-registered `gts_type` row and is
+        // string-compared against the group type's `allowed_membership_types`
+        // (themselves stored canonically, see
+        // `TypeService::canonical_membership_types`). Canonicalize the lookup
+        // key for the same reason the type-registry lookups do: rows are
+        // written canonically, so a differently-cased path would miss both the
+        // row and the allow-list entry. Structure is not re-parsed here -- a
+        // code that names nothing must stay the existing "unknown resource
+        // type" validation error, not become a syntax complaint.
+        let resource_type = validation::canonicalize_code(resource_type);
         let resource_id = resource_id.to_owned();
         let scope = scope.clone();
 
@@ -267,16 +277,33 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // Collect distinct tenant_ids from existing memberships (existing_tenants)
 
         if !existing_tenants.is_empty() && !existing_tenants.contains(&group_model.tenant_id) {
+            // VHP-2345: the message must not name the tenants this resource is
+            // already linked in. `existing_tenants` is collected under the
+            // *system* scope (the invariant is global by construction --
+            // `get_existing_membership_tenant_ids` has to see every tenant to
+            // decide it), so those ids are, by definition, not the caller's to
+            // learn: interpolating them turned this endpoint into a
+            // cross-tenant oracle -- supply any `(resource_type,
+            // resource_id)` and read back which tenants hold it. Mirrors the
+            // deliberately anonymised cross-tenant messages in
+            // `group_service.rs` (`create_group` parent check, `move_group`
+            // new-parent check). The target tenant is the caller's own group's,
+            // but is dropped too: keeping it would only invite reconstructing
+            // the pair, and the caller already knows which group it asked for.
+            // Real values stay in this debug log only.
             debug!(
                 group_id = %group_id,
+                group_tenant_id = %group_model.tenant_id,
+                existing_tenant_ids = ?existing_tenants,
                 resource_type = %resource_type,
                 resource_id = %resource_id,
                 "Tenant incompatibility on membership add"
             );
-            return Err(DomainError::tenant_incompatibility(format!(
-                "Resource ({resource_type}, {resource_id}) is already linked in tenant {:?}, cannot add to tenant {}",
-                existing_tenants, group_model.tenant_id
-            )));
+            return Err(DomainError::tenant_incompatibility(
+                "Cannot add this membership; the resource is already linked from a group in a \
+                 different tenant"
+                    .to_owned(),
+            ));
         }
 
         // Insert the membership (repo handles duplicate detection)
@@ -334,7 +361,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         let group_repo = self.group_repo.clone();
         let type_repo = self.type_repo.clone();
         let membership_repo = self.membership_repo.clone();
-        let resource_type = resource_type.to_owned();
+        // Same canonical lookup key as `add_membership_inner`: a membership
+        // added under the canonical path must be removable by the same request
+        // spelling that created it.
+        let resource_type = validation::canonicalize_code(resource_type);
         let resource_id = resource_id.to_owned();
 
         // TxConfig::default() (not ::serializable()) -- see this method's

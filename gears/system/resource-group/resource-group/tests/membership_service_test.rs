@@ -30,7 +30,7 @@ async fn create_type_with_memberships(
     memberships: &[&str],
 ) -> resource_group_sdk::ResourceGroupType {
     let code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}.i{}.v1~",
         suffix,
         Uuid::now_v7().as_simple()
     );
@@ -255,6 +255,29 @@ async fn membership_add_tenant_incompatibility() {
     assert!(
         matches!(err, DomainError::TenantIncompatibility { .. }),
         "expected TenantIncompatibility, got: {err:?}"
+    );
+
+    // T1.2 (VHP-2345): the message must not name the tenants involved, nor the
+    // resource key. `get_existing_membership_tenant_ids` collects the existing
+    // tenant set under the *system* scope -- it has to, the invariant is
+    // forest-wide -- so those ids are not the caller's to learn. Interpolating
+    // them made this a cross-tenant existence oracle: supply any
+    // `(resource_type, resource_id)` and read back which tenants hold it.
+    let message = err.to_string();
+    for leaked in [
+        tenant_a.to_string(),
+        tenant_b.to_string(),
+        group_a.id.to_string(),
+        group_b.id.to_string(),
+    ] {
+        assert!(
+            !message.contains(&leaked),
+            "TenantIncompatibility must not disclose `{leaked}`: {message}"
+        );
+    }
+    assert!(
+        !message.contains("shared-res"),
+        "TenantIncompatibility must not echo the resource key back: {message}"
     );
 }
 
@@ -785,4 +808,39 @@ async fn list_memberships_unscoped_returns_rows_without_ctx() {
 
     let count = page.items.iter().filter(|m| m.group_id == group.id).count();
     assert_eq!(count, 1, "seeded membership must be listed");
+}
+
+/// T1.3 spillover: `resource_type` is a lookup key into `gts_type`, whose rows
+/// are written canonically, and it is string-compared against the group type's
+/// `allowed_membership_types` (also stored canonically). Canonicalizing the key
+/// keeps add/remove reachable with the same spellings the type registry accepts,
+/// instead of answering "unknown resource type" for a type that plainly exists.
+#[tokio::test]
+async fn membership_add_and_remove_accept_a_noncanonical_resource_type() {
+    let db = test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = make_group_service(db.clone());
+    let mbr_svc = make_membership_service(db.clone());
+
+    let tenant = Uuid::now_v7();
+    let ctx = make_ctx(tenant);
+
+    let member_type = create_root_type(&type_svc, "mbrcase").await;
+    let grp_type = create_type_with_memberships(&type_svc, "grpcase", &[&member_type.code]).await;
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G", tenant).await;
+
+    let shouted = format!("  {}  ", member_type.code.to_uppercase());
+    let created = mbr_svc
+        .add_membership(&ctx, group.id, &shouted, "res-case")
+        .await
+        .expect("a non-canonical resource_type must resolve to the registered type");
+    assert_eq!(
+        created.resource_type, member_type.code,
+        "the membership must record the canonical resource type"
+    );
+
+    mbr_svc
+        .remove_membership(&ctx, group.id, &shouted, "res-case")
+        .await
+        .expect("remove must canonicalize its key the same way add did");
 }

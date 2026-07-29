@@ -1,42 +1,93 @@
 // Created: 2026-04-16 by Constructor Tech
 //! Shared domain validation utilities.
 
-use crate::domain::error::DomainError;
+use resource_group_sdk::TENANT_RG_TYPE_PATH;
+use resource_group_sdk::models::GtsTypePath;
 use toolkit_gts::gts_id;
+
+use crate::domain::error::DomainError;
 
 /// GTS type path prefix required for resource group types.
 pub const RG_TYPE_PREFIX: &str = gts_id!("cf.core.rg.type.v1~");
 
-/// Validate a GTS type code: non-empty, correct prefix, length limit.
+/// Canonical form of a GTS code: whitespace-trimmed and lowercased.
 ///
-/// Input is normalized (trimmed and lowercased) before validation, consistent
-/// with [`resource_group_sdk::models::GtsTypePath::new`].
+/// This is the *only* normalization this gear applies to a GTS code, and it
+/// matches what [`GtsTypePath::new`] and [`gts::GtsId::try_new`] do
+/// internally, so a code that round-trips through this function compares
+/// byte-for-byte against the value those parsers would accept.
+///
+/// Use this on **lookup** paths (`GET`/`PUT`/`DELETE /types/{code}`), where a
+/// code that names nothing must stay a not-found rather than becoming a
+/// validation error. Use [`canonical_type_code`] on **write** paths, which
+/// additionally parse the code's structure.
+#[must_use]
+pub fn canonicalize_code(code: &str) -> String {
+    code.trim().to_lowercase()
+}
+
+/// Whether a GTS type code designates a **tenant** type — i.e. a group of
+/// this type opens a new tenant scope (`tenant_id = group.id`) instead of
+/// inheriting its caller's/parent's tenant.
+///
+/// The prefix test is performed on the [canonical](canonicalize_code) form,
+/// not on the raw string. That matters for rows written before type codes
+/// were canonicalized on the way in: a stored `GTS.CF.CORE.RG.TYPE.V1~…` or
+/// `" gts…"` would otherwise fail a case-sensitive `starts_with` and be
+/// classified as an *ordinary* type, silently giving its group the caller's
+/// tenant instead of its own id — a tenant-identity break, not merely a
+/// cosmetic mismatch. Canonicalizing here keeps that classification correct
+/// for legacy rows without a data migration.
+#[must_use]
+pub fn is_tenant_type_code(code: &str) -> bool {
+    canonicalize_code(code).starts_with(TENANT_RG_TYPE_PATH)
+}
+
+/// Parse a resource-group GTS type code, returning its canonical form.
+///
+/// Performs the full write-path check in one place: non-empty, the RG
+/// type-registry prefix, the 1024-char GTS limit, and — via
+/// [`GtsTypePath::new`], which delegates to [`gts::GtsId::try_new`] — the
+/// structure of every `~`-delimited segment
+/// (`vendor.package.namespace.type.vMAJOR`).
+///
+/// **Callers must use the returned value, not their input.** The predecessor
+/// of this function validated a trimmed/lowercased *copy* and returned `()`,
+/// so the original string was what got persisted, looked up, and prefix-tested
+/// for tenant-ness: an uppercase or space-padded tenant code passed validation
+/// and was then classified as an ordinary type, putting the group in the
+/// caller's tenant instead of its own. Returning the canonical form makes that
+/// class of bug unrepresentable — there is nothing else to pass on.
 ///
 /// # Errors
 ///
-/// Returns [`DomainError`] if the code is empty, missing the required prefix, or exceeds 1024 chars.
-pub fn validate_type_code(code: &str) -> Result<(), DomainError> {
-    let code = code.trim().to_lowercase();
-    let code = code.as_str();
-    if code.is_empty() {
+/// Returns [`DomainError::validation`] if the code is empty, lacks the
+/// required prefix, exceeds 1024 characters, or is not a structurally valid
+/// GTS type path.
+pub fn canonical_type_code(code: &str) -> Result<String, DomainError> {
+    let canonical = canonicalize_code(code);
+    if canonical.is_empty() {
         return Err(DomainError::validation("Type code must not be empty"));
     }
-    if !code.starts_with(RG_TYPE_PREFIX) {
+    if !canonical.starts_with(RG_TYPE_PREFIX) {
         return Err(DomainError::validation(format!(
-            "Type code must start with prefix '{RG_TYPE_PREFIX}', got: '{code}'"
+            "Type code must start with prefix '{RG_TYPE_PREFIX}', got: '{canonical}'"
         )));
     }
-    if code.chars().count() > 1024 {
+    if canonical.chars().count() > 1024 {
         return Err(DomainError::validation(
             "Type code must not exceed 1024 characters",
         ));
     }
-    Ok(())
+    let path = GtsTypePath::new(canonical.as_str())
+        .map_err(|e| DomainError::validation(format!("Invalid type code '{canonical}': {e}")))?;
+    Ok(path.into())
 }
 
-/// Validate a GTS type code used as a membership resource type.
+/// Parse a GTS type code used as a membership resource type, returning its
+/// canonical form.
 ///
-/// Unlike [`validate_type_code`], this does NOT require the
+/// Unlike [`canonical_type_code`], this does NOT require the
 /// `gts.cf.core.rg.type.v1~` prefix. Per `DESIGN.md` ("RG type prefix
 /// requirement"), `allowed_memberships` entries are external domain
 /// types (e.g. `gts.cf.core.idp.user.v1~`, `gts.cf.vendor.lms.course.v1~`)
@@ -53,16 +104,17 @@ pub fn validate_type_code(code: &str) -> Result<(), DomainError> {
 ///
 /// Returns [`DomainError::validation`] if the code is not a valid GTS
 /// ID, or if it is a wildcard pattern.
-pub fn validate_membership_type_code(code: &str) -> Result<(), DomainError> {
+pub fn canonical_membership_type_code(code: &str) -> Result<String, DomainError> {
     if code.contains('*') {
         return Err(DomainError::validation(format!(
             "Membership type code '{code}' must be a concrete GTS type, not a wildcard pattern"
         )));
     }
-    gts::GtsId::try_new(code).map_err(|e| {
-        DomainError::validation(format!("Invalid membership type code '{code}': {e}"))
+    let canonical = canonicalize_code(code);
+    gts::GtsId::try_new(&canonical).map_err(|e| {
+        DomainError::validation(format!("Invalid membership type code '{canonical}': {e}"))
     })?;
-    Ok(())
+    Ok(canonical)
 }
 
 /// Validate that a `metadata_schema` value is a valid JSON Schema.

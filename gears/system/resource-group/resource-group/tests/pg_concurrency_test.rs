@@ -31,8 +31,9 @@
 //! protects an invariant, not merely fails to break one.
 //!
 //! `hierarchy_move_races` exercises `move_group`'s closure-rebuild machinery
-//! under concurrent, *overlapping* hierarchy writes -- moves, creates, and
-//! force-deletes that all touch the same ancestor chain at once.
+//! under concurrent, *overlapping* hierarchy writes -- moves, creates,
+//! force-deletes that all touch the same ancestor chain at once, and an
+//! ordinary update racing a move on the same group (T1.1).
 //!
 //! Full rationale for each finding: `../../docs/db-behavior-audit.md`.
 //!
@@ -51,13 +52,14 @@ use std::time::{Duration, Instant};
 
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::QueryProfile;
-use resource_group::domain::repo::TypeRepositoryTrait;
+use resource_group::domain::repo::{GroupRepositoryTrait, TypeRepositoryTrait};
 use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::resource_group::{
     Column as RgColumn, Entity as RgEntity,
 };
 use resource_group::infra::storage::entity::resource_group_closure::Entity as ClosureEntity;
 use resource_group::infra::storage::entity::resource_group_membership::Entity as MbrEntity;
+use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::migrations::Migrator;
 use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::CreateGroupRequest;
@@ -924,7 +926,7 @@ async fn create_group_duplicate_id_on_postgres_yields_clean_already_exists(
 
 fn unique_tenant_type_code() -> String {
     format!(
-        "{}pgrace{}.v1~",
+        "{}x.test.pgrace.i{}.v1~",
         resource_group_sdk::TENANT_RG_TYPE_PATH,
         Uuid::now_v7().as_simple()
     )
@@ -1654,6 +1656,307 @@ async fn create_child_races_move_parent(db: &Arc<DBProvider<DbError>>) {
     }
 }
 
+// T1.1: ordinary update races move on the *same* group.
+//
+// The pair that was missing: every scenario above races two *structural*
+// writers, or two ordinary writers
+// (`concurrent_rename_same_group_both_succeed`), never one of each. That was
+// the gap the update/move split left open -- while both paths shared one
+// full-row repository writer, the READ COMMITTED update re-wrote a `parent_id`
+// it had read before the SERIALIZABLE move committed a new one, reverting the
+// entity row while the move's rebuilt closure rows survived. Neither side saw
+// a conflict worth aborting for, so nothing in the call outcomes revealed it --
+// only the data did.
+
+/// The audit's exact interleaving, replayed deterministically: an ordinary
+/// update reads the row, a move commits, and only then does the update write.
+///
+/// A barrier cannot aim at this window from outside the service. The update's
+/// read and write are adjacent statements and the update is by far the shorter
+/// of the two operations, so it normally commits *first*; the move then hits a
+/// `40001` on the row it is about to write, retries, re-reads the fresh row and
+/// produces the correct result -- which is why
+/// [`concurrent_rename_races_move_same_group`] below stays green even against
+/// the pre-split code. The dangerous order is the other one, and it only
+/// materialises if the update's write lands after the move's commit. So drive
+/// the update's two halves by hand inside one READ COMMITTED transaction and
+/// commit the whole move in between.
+///
+/// Pre-split, step (3) wrote every column of the row, including the
+/// `parent_id` observed in step (1) -- so this sequence reverted the entity
+/// row to the old parent while leaving the move's rebuilt closure rows in
+/// place, and neither transaction had anything to abort on. Post-split it
+/// writes `name`/`metadata`/`updated_at` only, so both effects stand.
+///
+/// The move runs in a `tokio::spawn`ed task on purpose: `Db`'s
+/// transaction-bypass guard is a task-local, so a spawned task starts with a
+/// clean one and the move's own `transaction_with_retry` behaves exactly as it
+/// does in production.
+async fn ordinary_update_after_committed_move_keeps_both_effects(db: &Arc<DBProvider<DbError>>) {
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let t = self_referencing_root_type(&type_svc, "pgupdmvseq").await;
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let old_parent =
+        common::create_root_group(&group_svc, &ctx, &t.code, "OldParent", tenant_id).await;
+    let new_parent =
+        common::create_root_group(&group_svc, &ctx, &t.code, "NewParent", tenant_id).await;
+    let g = common::create_child_group(
+        &group_svc,
+        &ctx,
+        &t.code,
+        old_parent.id,
+        "Original",
+        tenant_id,
+    )
+    .await;
+
+    let move_svc = common::make_group_service(db.clone());
+    let (g_id, old_parent_id, new_parent_id) = (g.id, old_parent.id, new_parent.id);
+    let renamed_to = "RenamedByUpdate".to_owned();
+
+    let observed_parent = db
+        .transaction_with_config(toolkit_db::secure::TxConfig::default(), move |tx| {
+            Box::pin(async move {
+                // (1) The read the ordinary update path performs on the row.
+                let before = GroupRepository
+                    .find_model_by_id(tx, g_id)
+                    .await
+                    .expect("read the group inside the update transaction")
+                    .expect("the group exists");
+
+                // (2) The move commits -- its own SERIALIZABLE transaction,
+                //     closure rebuild included -- while the transaction above
+                //     is still open.
+                tokio::spawn(async move {
+                    move_svc
+                        .move_group_unscoped(g_id, Some(new_parent_id))
+                        .await
+                })
+                .await
+                .expect("move task join")
+                .expect("the move must succeed");
+
+                // (3) The ordinary update's write, issued after the move
+                //     committed and carrying only ordinary columns.
+                GroupRepository
+                    .update_attributes(tx, g_id, &renamed_to, None)
+                    .await
+                    .expect("write the rename inside the update transaction");
+
+                Ok::<_, DbError>(before.parent_id)
+            })
+        })
+        .await
+        .expect("the ordinary update transaction must commit");
+
+    assert_eq!(
+        observed_parent,
+        Some(old_parent_id),
+        "harness precondition: the update transaction must have observed the *pre-move* parent, \
+         otherwise this test is not reproducing the interleaving it claims to"
+    );
+
+    let final_group = group_svc
+        .get_group_unscoped(g_id)
+        .await
+        .expect("read back the group");
+    assert_eq!(
+        final_group.name, "RenamedByUpdate",
+        "the ordinary update's own field must be written"
+    );
+    assert_eq!(
+        final_group.hierarchy.parent_id,
+        Some(new_parent_id),
+        "the committed move's parent must survive an ordinary update that read the row before \
+         the move committed -- writing back the observed `parent_id` here is the lost update \
+         that desynchronises resource_group from resource_group_closure"
+    );
+    assert_hierarchy_invariants(db).await;
+
+    for root_id in [old_parent_id, new_parent_id] {
+        group_svc.delete_group(&ctx, root_id, true).await.ok();
+    }
+}
+
+/// A rename and a re-parent of the **same** group, issued concurrently: both
+/// effects must survive, and `resource_group.parent_id` must still agree with
+/// `resource_group_closure`.
+///
+/// The two operations now write disjoint column sets (`name`/`metadata` vs
+/// `parent_id`), so the outcome is order-independent: whichever commits second
+/// cannot carry a stale copy of the other's column, because it does not write
+/// that column at all. That is the property under test.
+///
+/// **Scope of this test.** It is an end-to-end guard, not the proof: the
+/// losing interleaving needs the move's commit to land inside the update's
+/// read→write window, which no barrier can force from outside the service (see
+/// [`ordinary_update_after_committed_move_keeps_both_effects`], which drives
+/// that interleaving by hand and *is* the proof). Here the point is that two
+/// real transactions against real `PostgreSQL`, at the two different isolation
+/// levels the gear actually uses, leave both effects in place and the
+/// projection consistent whichever way they interleave on their own.
+///
+/// Ordering is alternated across trials (rename first / move first) so neither
+/// commit order goes unexercised.
+async fn concurrent_rename_races_move_same_group(db: &Arc<DBProvider<DbError>>) {
+    const TRIALS: usize = 10;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let t = self_referencing_root_type(&type_svc, "pgrenmv").await;
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let mut both_succeeded = 0usize;
+    let mut contended = 0usize;
+
+    for trial in 0..TRIALS {
+        // Fresh shape per trial: `old_parent` -> `g`, plus a sibling root
+        // `new_parent` for the move to land under.
+        let old_parent = common::create_root_group(
+            &group_svc,
+            &ctx,
+            &t.code,
+            &format!("OldParent{trial}"),
+            tenant_id,
+        )
+        .await;
+        let new_parent = common::create_root_group(
+            &group_svc,
+            &ctx,
+            &t.code,
+            &format!("NewParent{trial}"),
+            tenant_id,
+        )
+        .await;
+        let g = common::create_child_group(
+            &group_svc,
+            &ctx,
+            &t.code,
+            old_parent.id,
+            "Original",
+            tenant_id,
+        )
+        .await;
+
+        let renamed_to = format!("RenamedByUpdate{trial}");
+        let barrier = Arc::new(Barrier::new(2));
+        let (b1, b2) = (Arc::clone(&barrier), Arc::clone(&barrier));
+        // Fresh service instances per task -- see the comment in
+        // `membership_first_write_race_exactly_one_tenant_wins`.
+        let (svc_update, svc_move) = (
+            common::make_group_service(db.clone()),
+            common::make_group_service(db.clone()),
+        );
+        let ctx_update = ctx.clone();
+        let (g_id, new_parent_id) = (g.id, new_parent.id);
+        let name_for_task = renamed_to.clone();
+
+        let update_task = tokio::spawn(async move {
+            b1.wait().await;
+            svc_update
+                .update_group(
+                    &ctx_update,
+                    g_id,
+                    resource_group_sdk::UpdateGroupRequest {
+                        name: name_for_task,
+                        metadata: None,
+                    },
+                )
+                .await
+        });
+        let move_task = tokio::spawn(async move {
+            b2.wait().await;
+            svc_move
+                .move_group_unscoped(g_id, Some(new_parent_id))
+                .await
+        });
+
+        // Alternate which future is polled first, so both commit orders get a
+        // turn without resorting to sleeps.
+        let (update_res, move_res) = if trial % 2 == 0 {
+            timed("concurrent_rename_races_move_same_group trial", async {
+                tokio::join!(update_task, move_task)
+            })
+            .await
+        } else {
+            let (move_res, update_res) =
+                timed("concurrent_rename_races_move_same_group trial", async {
+                    tokio::join!(move_task, update_task)
+                })
+                .await;
+            (update_res, move_res)
+        };
+        let update_res = update_res.expect("update task join");
+        let move_res = move_res.expect("move task join");
+
+        eprintln!(
+            "concurrent_rename_races_move_same_group trial {trial}: update={} move={}",
+            describe_result(&update_res),
+            describe_result(&move_res),
+        );
+
+        // A spent retry budget is a legal outcome for the SERIALIZABLE side
+        // (both statements touch the same row, so one of them can legitimately
+        // be told to start over); anything else is a defect.
+        for (label, failed) in [
+            ("update_group", update_res.as_ref().err()),
+            ("move_group", move_res.as_ref().err()),
+        ] {
+            if let Some(e) = failed {
+                assert!(
+                    is_contention_error(e),
+                    "{label} failed with something other than retry-budget exhaustion: {e:?}"
+                );
+            }
+        }
+
+        // The data-level guarantee holds unconditionally.
+        assert_hierarchy_invariants(db).await;
+
+        if update_res.is_ok() && move_res.is_ok() {
+            both_succeeded += 1;
+            let final_group = group_svc
+                .get_group_unscoped(g_id)
+                .await
+                .expect("read back the group after the race");
+            assert_eq!(
+                final_group.name, renamed_to,
+                "the rename must survive the concurrent move: a move that writes back a `name` \
+                 it read before the update committed would revert it (trial {trial})"
+            );
+            assert_eq!(
+                final_group.hierarchy.parent_id,
+                Some(new_parent_id),
+                "the re-parent must survive the concurrent rename: an update that writes back a \
+                 `parent_id` it read before the move committed would revert the entity row while \
+                 leaving the move's rebuilt closure rows in place (trial {trial})"
+            );
+        } else {
+            contended += 1;
+        }
+
+        // Clean up this trial's three groups (the moved child sits under
+        // whichever parent won, so cascade from both roots).
+        for root_id in [old_parent.id, new_parent.id] {
+            group_svc.delete_group(&ctx, root_id, true).await.ok();
+        }
+    }
+
+    eprintln!(
+        "concurrent_rename_races_move_same_group: both_succeeded={both_succeeded} \
+         contended={contended} (out of {TRIALS} trials)"
+    );
+    assert!(
+        both_succeeded > 0,
+        "every one of {TRIALS} trials lost to contention, so the both-effects-survive assertion \
+         never ran -- that is a harness failure, not a passing test"
+    );
+}
+
 /// `G` is force-deleted while a caller concurrently attaches a new child to
 /// it. `parent_id` is `ON DELETE RESTRICT`, so this asks whether retry
 /// resolves the race cleanly (`GroupNotFound`, or child cascaded too).
@@ -1867,7 +2170,7 @@ async fn force_delete_races_add_membership(db: &Arc<DBProvider<DbError>>) {
     );
 }
 
-/// Runs the five `move_group` scenarios above against one shared PostgreSQL
+/// Runs the seven `move_group` scenarios above against one shared PostgreSQL
 /// database. None creates a type under `TENANT_RG_TYPE_PATH`, so this test
 /// runs safely concurrent with [`membership_and_type_races`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1883,6 +2186,14 @@ async fn hierarchy_move_races() {
 
     eprintln!("=== hierarchy_move_races: create_child_races_move_parent ===");
     create_child_races_move_parent(&db).await;
+
+    eprintln!(
+        "=== hierarchy_move_races: ordinary_update_after_committed_move_keeps_both_effects ==="
+    );
+    ordinary_update_after_committed_move_keeps_both_effects(&db).await;
+
+    eprintln!("=== hierarchy_move_races: concurrent_rename_races_move_same_group ===");
+    concurrent_rename_races_move_same_group(&db).await;
 
     eprintln!("=== hierarchy_move_races: force_delete_races_create_child ===");
     force_delete_races_create_child(&db).await;

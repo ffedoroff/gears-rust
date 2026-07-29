@@ -18,7 +18,6 @@ use tracing::{debug, warn};
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
 use crate::domain::repo::TypeRepositoryTrait;
-#[allow(unused_imports)]
 use crate::domain::validation;
 
 /// `AuthZ` resource type descriptor for GTS type definitions.
@@ -179,26 +178,32 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         req: CreateTypeRequest,
     ) -> Result<ResourceGroupType, DomainError> {
         // Pre-validation (pure, no DB) — runs outside the transaction.
-        // Validate GTS type path format via `GtsTypePath` value object.
-        validation::validate_type_code(&req.code)?;
+        //
+        // Every GTS code on this request is parsed *once*, here, through the
+        // canonical `GtsTypePath` / `gts::GtsId` parser, and the canonical
+        // result replaces the caller's spelling for the rest of the operation:
+        // the uniqueness pre-check, the junction lookups and the persisted
+        // `gts_type.schema_id` all see the same string. Validating a
+        // normalized copy while persisting the raw input is what allowed two
+        // rows differing only in case, and a tenant code that evaded the
+        // (case-sensitive) tenant-prefix test in `GroupService`.
+        let mut req = req;
+        req.code = validation::canonical_type_code(&req.code)?;
         // Validate placement invariant: `can_be_root OR len(allowed_parent_types) >= 1`.
         Self::validate_placement_invariant(req.can_be_root, &req.allowed_parent_types)?;
         if let Some(ref schema) = req.metadata_schema {
             validation::validate_metadata_schema(schema)?;
         }
         // FOR EACH parent_path in allowed_parent_types
-        for parent_code in &req.allowed_parent_types {
-            // Validate parent_path has RG type prefix `gts.cf.core.rg.type.v1~`
-            validation::validate_type_code(parent_code)?;
-        }
+        // Validate parent_path has RG type prefix `gts.cf.core.rg.type.v1~`
+        req.allowed_parent_types = Self::canonical_parent_types(&req.allowed_parent_types)?;
         // FOR EACH membership_path in allowed_membership_types
-        for membership_code in &req.allowed_membership_types {
-            // Validate membership_path is a syntactically valid GtsTypePath.
-            // Per DESIGN.md, membership resource types are external domain
-            // types (e.g. `gts.cf.core.idp.user.v1~`) and are NOT required
-            // to carry the RG type-registry prefix.
-            validation::validate_membership_type_code(membership_code)?;
-        }
+        // Validate membership_path is a syntactically valid GtsTypePath.
+        // Per DESIGN.md, membership resource types are external domain
+        // types (e.g. `gts.cf.core.idp.user.v1~`) and are NOT required
+        // to carry the RG type-registry prefix.
+        req.allowed_membership_types =
+            Self::canonical_membership_types(&req.allowed_membership_types)?;
 
         let stored_schema =
             Self::build_stored_schema(req.can_be_root, req.metadata_schema.as_ref());
@@ -308,9 +313,11 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     /// exists at gear-init time) and by [`crate::domain::local_client::ResourceGroupLocalClient`]
     /// internals that need a plain lookup after their own gate already ran.
     pub async fn get_type_unscoped(&self, code: &str) -> Result<ResourceGroupType, DomainError> {
+        // Lookup key: canonicalized, not parsed -- see `update_type_unscoped`.
+        let code = validation::canonicalize_code(code);
         let conn = self.db.conn()?;
         self.type_repo
-            .find_by_code(&conn, code)
+            .find_by_code(&conn, &code)
             .await?
             .ok_or_else(|| DomainError::type_not_found(code))
     }
@@ -370,13 +377,11 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     ) -> Result<ResourceGroupType, DomainError> {
         // Pre-validation (pure, no DB) — runs outside the transaction.
         // Validate placement invariant on new values.
+        let mut req = req;
         Self::validate_placement_invariant(req.can_be_root, &req.allowed_parent_types)?;
-        for parent_code in &req.allowed_parent_types {
-            validation::validate_type_code(parent_code)?;
-        }
-        for membership_code in &req.allowed_membership_types {
-            validation::validate_membership_type_code(membership_code)?;
-        }
+        req.allowed_parent_types = Self::canonical_parent_types(&req.allowed_parent_types)?;
+        req.allowed_membership_types =
+            Self::canonical_membership_types(&req.allowed_membership_types)?;
         if let Some(ref schema) = req.metadata_schema {
             validation::validate_metadata_schema(schema)?;
         }
@@ -385,7 +390,12 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
             Self::build_stored_schema(req.can_be_root, req.metadata_schema.as_ref());
         let db = self.db.db();
         let type_repo = self.type_repo.clone();
-        let code = code.to_owned();
+        // `code` addresses an existing row, so it is canonicalized rather than
+        // fully parsed: a code that names nothing must stay a `NotFound`, not
+        // become a validation error. Canonicalizing is still required -- rows
+        // are written canonically, so a differently-cased path would otherwise
+        // miss the row it is meant to update.
+        let code = validation::canonicalize_code(code);
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let req = req.clone();
@@ -484,7 +494,8 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // Actor sends DELETE /api/types-registry/v1/types/{code}
         let db = self.db.db();
         let type_repo = self.type_repo.clone();
-        let code = code.to_owned();
+        // Lookup key: canonicalized, not parsed -- see `update_type_unscoped`.
+        let code = validation::canonicalize_code(code);
 
         db.transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
             let type_repo = type_repo.clone();
@@ -520,6 +531,32 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
     }
 
     // -- Validation helpers --
+
+    /// Parse every `allowed_parent_types` entry, returning the canonical
+    /// forms in the caller's order.
+    ///
+    /// Parent paths are stored as junction rows keyed by the surrogate id
+    /// `resolve_ids` looks up from `gts_type.schema_id`, so a non-canonical
+    /// entry would either miss an existing row (spurious "type does not
+    /// exist") or, once written, make `check_hierarchy_safety`'s
+    /// old-minus-new set difference report a parent as removed when only its
+    /// spelling changed.
+    fn canonical_parent_types(codes: &[String]) -> Result<Vec<String>, DomainError> {
+        codes
+            .iter()
+            .map(|code| validation::canonical_type_code(code))
+            .collect()
+    }
+
+    /// Parse every `allowed_membership_types` entry, returning the canonical
+    /// forms in the caller's order. Same lookup/diff reasoning as
+    /// [`Self::canonical_parent_types`], minus the RG-prefix requirement.
+    fn canonical_membership_types(codes: &[String]) -> Result<Vec<String>, DomainError> {
+        codes
+            .iter()
+            .map(|code| validation::canonical_membership_type_code(code))
+            .collect()
+    }
 
     fn validate_placement_invariant(
         can_be_root: bool,

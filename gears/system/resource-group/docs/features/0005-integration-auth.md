@@ -185,7 +185,7 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 2. [x] - `p1` - **IF** caller is privileged platform-admin (provisioning exception) → **RETURN** pass (but data invariants still checked) - `inst-tenant-enforce-2`
 3. [x] - `p1` - **IF** parent-child edge: validate parent and child are in same tenant or related via configured tenant hierarchy scope - `inst-tenant-enforce-3`
 4. [x] - `p1` - **IF** membership write: validate target group's tenant_id is compatible with caller's effective tenant scope - `inst-tenant-enforce-4`
-5. [x] - `p1` - **IF** tenant-incompatible → **RETURN** TenantIncompatibility with tenant details - `inst-tenant-enforce-5`
+5. [x] - `p1` - **IF** tenant-incompatible → **RETURN** TenantIncompatibility with a tenant-anonymous message — never the conflicting tenant ids, which are collected outside the caller's scope (VHP-2345; see `0004-membership.md`, tenant-compatibility algorithm) - `inst-tenant-enforce-5`
 6. [x] - `p1` - **RETURN** pass - `inst-tenant-enforce-6`
 
 ### Authentication Mode Decision (`p2` — deferred, not implemented yet)

@@ -36,11 +36,17 @@ const INTERNAL_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.internal
 /// Resource-group GTS prefix (matches `RgError`'s `#[resource_error(...)]`).
 const RG_GTS: &str = gts_id!("cf.core.rg.group.v1~");
 
-// ── validate_type_code ──────────────────────────────────────────────────
+// ── canonical_type_code ─────────────────────────────────────────────────
+
+/// A structurally valid RG type code: the RG prefix plus one
+/// `vendor.package.namespace.type.vMAJOR` segment.
+fn valid_rg_code() -> String {
+    format!("{RG_TYPE_PREFIX}x.test.tn.tenant.v1~")
+}
 
 #[test]
-fn validate_type_code_rejects_empty() {
-    let result = validation::validate_type_code("");
+fn canonical_type_code_rejects_empty() {
+    let result = validation::canonical_type_code("");
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(matches!(err, DomainError::Validation { .. }));
@@ -48,8 +54,8 @@ fn validate_type_code_rejects_empty() {
 }
 
 #[test]
-fn validate_type_code_rejects_wrong_prefix() {
-    let result = validation::validate_type_code("wrong.prefix.type");
+fn canonical_type_code_rejects_wrong_prefix() {
+    let result = validation::canonical_type_code("wrong.prefix.type");
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(matches!(err, DomainError::Validation { .. }));
@@ -57,14 +63,14 @@ fn validate_type_code_rejects_wrong_prefix() {
 }
 
 #[test]
-fn validate_type_code_rejects_too_long() {
+fn canonical_type_code_rejects_too_long() {
     let long_code = format!(
         "{}{}",
         RG_TYPE_PREFIX,
         "a".repeat(1025 - RG_TYPE_PREFIX.len())
     );
     assert!(long_code.len() > 1024);
-    let result = validation::validate_type_code(&long_code);
+    let result = validation::canonical_type_code(&long_code);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(matches!(err, DomainError::Validation { .. }));
@@ -72,52 +78,119 @@ fn validate_type_code_rejects_too_long() {
 }
 
 #[test]
-fn validate_type_code_accepts_valid_code() {
-    let code = format!("{RG_TYPE_PREFIX}tenant");
-    let result = validation::validate_type_code(&code);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn validate_type_code_accepts_exact_max_length() {
-    let code = format!(
-        "{}{}",
-        RG_TYPE_PREFIX,
-        "a".repeat(1024 - RG_TYPE_PREFIX.len())
+fn canonical_type_code_accepts_valid_code() {
+    let code = valid_rg_code();
+    let result = validation::canonical_type_code(&code);
+    assert_eq!(
+        result.expect("a well-formed chained RG code must parse"),
+        code
     );
-    assert_eq!(code.len(), 1024);
-    let result = validation::validate_type_code(&code);
-    assert!(result.is_ok());
 }
 
+/// T1.3: the returned value — not the caller's spelling — is what the rest of
+/// the gear must use. An uppercase, space-padded code is accepted and comes
+/// back canonical, so a caller cannot accidentally persist the raw form.
 #[test]
-fn validate_type_code_rejects_prefix_only() {
-    // The prefix itself is a valid type code (non-empty, correct prefix, within length)
-    let result = validation::validate_type_code(RG_TYPE_PREFIX);
-    assert!(result.is_ok());
+fn canonical_type_code_normalizes_case_and_surrounding_whitespace() {
+    let canonical = valid_rg_code();
+    let noisy = format!("  {}  ", canonical.to_uppercase());
+    let result = validation::canonical_type_code(&noisy);
+    assert_eq!(
+        result.expect("case/whitespace differences must be normalized, not rejected"),
+        canonical,
+        "canonical_type_code must return the normalized code"
+    );
 }
 
-// ── validate_membership_type_code ───────────────────────────────────────
+/// The bare prefix stays acceptable: `cf.core.rg.type.v1~` is itself a
+/// well-formed `vendor.package.namespace.type.vMAJOR` type segment, so adding
+/// structural parsing does not narrow this case.
+#[test]
+fn canonical_type_code_accepts_the_bare_prefix() {
+    let result = validation::canonical_type_code(RG_TYPE_PREFIX);
+    assert!(
+        result.is_ok(),
+        "the bare prefix is a single well-formed segment and stays acceptable: {result:?}"
+    );
+}
+
+/// T1.3: a structurally invalid chain (a segment that is not
+/// `vendor.package.namespace.type.vMAJOR`) must be rejected on the way in.
+/// `GtsTypePath::new` was previously dead code, so nothing checked this.
+#[test]
+fn canonical_type_code_rejects_structurally_invalid_chain() {
+    for bad in [
+        // Too few tokens in the chained segment.
+        format!("{RG_TYPE_PREFIX}tenant"),
+        format!("{RG_TYPE_PREFIX}x.test.tenant.v1~"),
+        // A name token that does not start with `[a-z_]`.
+        format!("{RG_TYPE_PREFIX}x.test.tn.1tenant.v1~"),
+        // A hyphen is not a legal GTS token character.
+        format!("{RG_TYPE_PREFIX}x.test.tn.ten-ant.v1~"),
+        // Consecutive `~` — an empty segment.
+        format!("{RG_TYPE_PREFIX}~x.test.tn.tenant.v1~"),
+    ] {
+        let result = validation::canonical_type_code(&bad);
+        assert!(
+            result.is_err(),
+            "structurally invalid chain '{bad}' must be rejected, got {result:?}"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            DomainError::Validation { .. }
+        ));
+    }
+}
+
+// ── is_tenant_type_code ─────────────────────────────────────────────────
+
+/// T1.3: tenant classification is the security-relevant consumer of the
+/// canonical form — a tenant-typed group's `tenant_id` is its own id, an
+/// ordinary group's is the caller's. The prefix test therefore canonicalizes
+/// before comparing, so a legacy row stored with different case still
+/// classifies as a tenant type.
+#[test]
+fn is_tenant_type_code_ignores_case_and_whitespace() {
+    let tenant = resource_group_sdk::TENANT_RG_TYPE_PATH;
+    assert!(validation::is_tenant_type_code(tenant));
+    assert!(validation::is_tenant_type_code(&tenant.to_uppercase()));
+    assert!(validation::is_tenant_type_code(&format!("  {tenant}  ")));
+    assert!(validation::is_tenant_type_code(&format!(
+        "{tenant}x.test.tn.sub.v1~"
+    )));
+    assert!(!validation::is_tenant_type_code(&valid_rg_code()));
+}
+
+// ── canonical_membership_type_code ──────────────────────────────────────
 
 #[test]
-fn validate_membership_type_code_accepts_non_rg_prefix() {
+fn canonical_membership_type_code_accepts_non_rg_prefix() {
     // Per DESIGN.md, membership resource types are external domain types
     // and do NOT require the `gts.cf.core.rg.type.v1~` prefix.
-    let result = validation::validate_membership_type_code(gts_id!("cf.core.idp.user.v1~"));
-    assert!(result.is_ok(), "Expected ok, got {result:?}");
+    let code = gts_id!("cf.core.idp.user.v1~");
+    let result = validation::canonical_membership_type_code(code);
+    assert_eq!(result.expect("expected ok"), code);
 }
 
 #[test]
-fn validate_membership_type_code_accepts_rg_prefixed() {
+fn canonical_membership_type_code_accepts_rg_prefixed() {
     // Backwards compatibility: RG-prefixed codes still validate.
     let code = format!("{RG_TYPE_PREFIX}y.core.tn.tenant.v1~");
-    let result = validation::validate_membership_type_code(&code);
-    assert!(result.is_ok(), "Expected ok, got {result:?}");
+    let result = validation::canonical_membership_type_code(&code);
+    assert_eq!(result.expect("expected ok"), code);
 }
 
 #[test]
-fn validate_membership_type_code_rejects_empty() {
-    let result = validation::validate_membership_type_code("");
+fn canonical_membership_type_code_normalizes_case_and_whitespace() {
+    let code = gts_id!("cf.core.idp.user.v1~");
+    let result =
+        validation::canonical_membership_type_code(&format!("  {}  ", code.to_uppercase()));
+    assert_eq!(result.expect("expected ok"), code);
+}
+
+#[test]
+fn canonical_membership_type_code_rejects_empty() {
+    let result = validation::canonical_membership_type_code("");
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -126,11 +199,11 @@ fn validate_membership_type_code_rejects_empty() {
 }
 
 #[test]
-fn validate_membership_type_code_rejects_trailing_wildcard_after_tilde() {
+fn canonical_membership_type_code_rejects_trailing_wildcard_after_tilde() {
     // Wildcard patterns are not accepted: `gts_type_allowed_membership`
     // stores a SMALLINT FK to a concrete registered type, not a pattern.
     let pattern = format!("{GTS_ID_PREFIX}cf.core.rg.type.v1~*");
-    let result = validation::validate_membership_type_code(pattern.as_str());
+    let result = validation::canonical_membership_type_code(pattern.as_str());
     assert!(result.is_err(), "Expected err, got {result:?}");
     assert!(matches!(
         result.unwrap_err(),
@@ -139,9 +212,9 @@ fn validate_membership_type_code_rejects_trailing_wildcard_after_tilde() {
 }
 
 #[test]
-fn validate_membership_type_code_rejects_trailing_wildcard_after_dot() {
+fn canonical_membership_type_code_rejects_trailing_wildcard_after_dot() {
     let invalid_pattern = format!("{GTS_ID_PREFIX}cf.*");
-    let result = validation::validate_membership_type_code(&invalid_pattern);
+    let result = validation::canonical_membership_type_code(&invalid_pattern);
     assert!(result.is_err(), "Expected err, got {result:?}");
     assert!(matches!(
         result.unwrap_err(),
@@ -150,8 +223,8 @@ fn validate_membership_type_code_rejects_trailing_wildcard_after_dot() {
 }
 
 #[test]
-fn validate_membership_type_code_rejects_malformed_gts_path() {
-    let result = validation::validate_membership_type_code("not-a-gts-path");
+fn canonical_membership_type_code_rejects_malformed_gts_path() {
+    let result = validation::canonical_membership_type_code("not-a-gts-path");
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -160,9 +233,9 @@ fn validate_membership_type_code_rejects_malformed_gts_path() {
 }
 
 #[test]
-fn validate_membership_type_code_rejects_mid_string_wildcard() {
+fn canonical_membership_type_code_rejects_mid_string_wildcard() {
     let invalid_pattern = format!("{GTS_ID_PREFIX}cf.*.user.v1~");
-    let result = validation::validate_membership_type_code(&invalid_pattern);
+    let result = validation::canonical_membership_type_code(&invalid_pattern);
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -991,8 +1064,13 @@ fn domain_to_problem_conflict_is_409() {
     assert!(problem.detail.contains("dup"));
 }
 
+/// T1.2 companion: the 409 still carries a `resource_name`, but it names the
+/// violated singleton (the tenant type path), never the existing root's id.
+/// That id is produced by a deliberately unscoped, forest-wide lookup, and for
+/// a tenant-typed group `id == tenant_id`, so echoing it would hand the caller
+/// a foreign tenant's identifier.
 #[test]
-fn domain_to_problem_tenant_root_already_exists_is_409() {
+fn domain_to_problem_tenant_root_already_exists_is_409_without_the_existing_id() {
     let existing_root_id = uuid::Uuid::now_v7();
     let domain = DomainError::tenant_root_already_exists(
         existing_root_id,
@@ -1004,7 +1082,12 @@ fn domain_to_problem_tenant_root_already_exists_is_409() {
     assert_eq!(problem.context["resource_type"], RG_GTS);
     assert_eq!(
         problem.context["resource_name"],
-        existing_root_id.to_string()
+        resource_group_sdk::TENANT_RG_TYPE_PATH
+    );
+    let wire_text = serde_json::to_string(&problem).expect("serialize problem");
+    assert!(
+        !wire_text.contains(&existing_root_id.to_string()),
+        "the conflicting root's id must not appear anywhere on the wire: {wire_text}"
     );
 }
 

@@ -263,9 +263,28 @@ SMALLINT surrogate IDs (`gts_type.id`, `gts_type_id` FK columns) are a **DB-inte
 If a referenced type does not exist, the operation **MUST** return a validation error. Each chained type (e.g., `gts.cf.core.rg.type.v1~y.system.tn.tenant.v1~`) is a distinct type that must be registered separately — chaining does not auto-create constituent types. Registration order matters: base/resource types first, then chained RG types that reference them. Base types (including `gts.cf.core.rg.type.v1~`) must be created before use — via seeding, API calls, or manual DB administration.
 
 **RG type prefix requirement (`gts.cf.core.rg.type.v1~`)**:
-- **`type` in group operations**: `POST /groups`, `PUT /groups/{id}` — **MUST** have `gts.cf.core.rg.type.v1~` prefix. Rejected without it.
+- **`type` in group operations**: `POST /groups` — **MUST** have `gts.cf.core.rg.type.v1~` prefix. Rejected without it. (`PUT /groups/{id}` carries no `type`: a group's type is immutable.)
 - **`allowed_parents`**: **MUST** have `gts.cf.core.rg.type.v1~` prefix — parent groups are always RG types.
 - **`allowed_memberships`**: **NO prefix requirement** — membership resource types are external domain types (e.g., `gts.vendor.system.idp.user.v1~`, `gts.vendor.system.lms.course.v1~`) that do not need to be RG types.
+
+**One canonical parse per code, and the canonical result is what is used.** Every type code
+entering a write path (`POST /types`, its `allowed_parents` / `allowed_memberships` lists, and
+`POST /groups`'s `type`) is parsed once through `validation::canonical_type_code` →
+`GtsTypePath::new` → `gts::GtsId::try_new`, which decides the prefix, the 1024-character limit
+**and the structure of every `~`-delimited segment** (`vendor.package.namespace.type.vMAJOR`,
+tokens matching `[a-z_][a-z0-9_]*`). The canonical — trimmed, lowercased — result is then what is
+persisted, what uniqueness is decided on, what junction lookups resolve against, and what the
+tenant-prefix test in § "Tenant Root Uniqueness" is applied to. Codes addressing an existing row
+(`GET`/`PUT`/`DELETE /types/{code}`) are canonicalized but not structurally re-parsed, so a code
+that names nothing stays a 404 instead of becoming a 400.
+
+  Getting this wrong was not cosmetic. An earlier revision validated a trimmed/lowercased *copy*
+  and persisted the caller's raw spelling, so `GTS.CF.CORE.RG.TYPE.V1~…TENANT…` was accepted,
+  stored verbatim, and then failed the case-sensitive tenant-prefix test — the group was
+  classified as an *ordinary* type and received the caller's `tenant_id` instead of its own id.
+  That is a tenant-identity break: the group meant to *be* a tenant became a member of one.
+  The prefix test itself now canonicalizes as well (`validation::is_tenant_type_code`), so rows
+  written before this rule still classify correctly and no data migration is required.
 
 This ensures the hierarchy is always governed by the RG type contract (`can_be_root`, `allowed_parents`, `allowed_memberships`), while membership resources can be any registered GTS type.
 
@@ -1264,10 +1283,18 @@ Ownership-graph tenant enforcement:
 | active references on delete | `ConflictActiveReferences` (response body MUST include list of blocking entities — children and/or memberships — so the caller can display what prevents deletion) |
 | depth/width violation       | `LimitViolation`           |
 | tenant-incompatible parent/child/membership write | `TenantIncompatibility` (membership path only; a cross-tenant
-parent on create/update/move is a plain `Validation` with a generic message) |
+parent on create/update/move is a plain `Validation` with a generic message). Its message is
+tenant-anonymous: the conflicting tenant set is collected under the system scope — the invariant
+is forest-wide — so naming it would disclose tenants the caller has no grant for and turn the
+endpoint into an existence oracle for any guessed `(resource_type, resource_id)`. Real values are
+logged at `debug` (VHP-2345) |
 | duplicate caller-supplied group `id` | `GroupAlreadyExists` (409 `already_exists`, resource name = the id). A caller may
 supply `id` on create; a collision is a typed conflict rather than a raw database error, so monitoring can tell it apart
 from a flaky write |
+| second tenant-type forest root | `TenantRootAlreadyExists` (409 `already_exists`). `resource_name` is the **tenant type path**, not the
+existing root's id: that id comes from a deliberately unscoped, forest-wide lookup, and a tenant-typed group's `id` *is*
+its `tenant_id`, so echoing it would hand the caller a foreign tenant's identifier. The `detail` names only the rejected
+request's own code and name; the existing id is logged at `debug` (VHP-2345) |
 | target tenant not reachable by the caller | `TenantNotFound` → **404**, deliberately not 403. RG does not own tenant
 data and must not disclose which foreign tenants exist, so an unreachable target is indistinguishable from an absent one.
 The same rule governs the message text: no foreign `tenant_id` is ever interpolated into an error |
@@ -1409,6 +1436,8 @@ A group has three mutable-looking fields — `name`, `parent`, `metadata` — wh
 
 **Decision.** The structural operation was extracted to `POST /groups/{group_id}/move` (B1.3: atomic, single `SERIALIZABLE` transaction with bounded retry, never "detach then attach"). What remains on `PUT /groups/{group_id}` is `name` + `metadata` — two ordinary fields of comparable weight, with no cross-field validation between them.
 
+**Splitting the endpoint was not sufficient on its own; splitting the *write set* was the other half.** Extracting the move removed the payload ambiguity, so the isolation-level guess and its restart protocol had no subject left — but for a while the update path still *wrote* `parent_id`, carrying back the value it had read inside its own READ COMMITTED transaction. A move committing in that window had its parent change reverted in `resource_group` while its rebuilt `resource_group_closure` rows survived, and neither transaction had a conflict to abort on (the mirror image, a move reverting a concurrent rename, was reachable in the other commit order). The repository therefore exposes two column-specific writers with disjoint write sets — `update_attributes` (`name`, `metadata`, `updated_at`) and `update_parent` (`parent_id`, `updated_at`) — and `gts_type_id` is writable by neither, since a group's type is fixed at creation. `parent_id` and the closure projection are consequently written by exactly one path, always under `SERIALIZABLE`, which is what makes "`PUT` needs no serializable isolation" a true statement rather than an aspiration. See `features/0003-entity-hierarchy.md` ("Removed steps") and the two regression tests named there.
+
 **There is deliberately no `PATCH` for groups, and B1.1 is satisfied without one.** B1.1's own text carves this out: the test "is not which verb is present but whether changing one field forces the client to know, and resend, the rest". After the split the only thing a client is forced to resend is the other one of `name` / `metadata`, both of which it already has from the `GET` it must perform anyway to know the group exists. Adding `PATCH` would buy a client nothing it cannot express, while re-introducing exactly the ambiguity that caused the original defect: an omitted key that means "leave alone" is one refactor away from an omitted key that means "clear". This gear keeps one verb per resource, matching the platform convention that no resource in the repository exposes both (the type registry is `PUT`-only for the same reason — a type definition is a document).
 
 **Strictness is the other half of the decision.** Because `PUT` is a full replacement, an omitted key must be an error, not an implicit `null`:
@@ -1417,6 +1446,7 @@ A group has three mutable-looking fields — `name`, `parent`, `metadata` — wh
 - `MoveGroupDto` requires `parent_id` for the same reason, inverted: `null` is the *destructive* value there ("become a root"), so it must be typed out rather than arrived at by omission.
 - All three carry `deny_unknown_fields`, so a client that sends the immutable `type`, or the pre-split `parent_id`, is told instead of having the field dropped.
 - These three request bodies are extracted with `api::rest::extract::StrictJson` rather than `axum::Json`, so a serde rejection is a 400 RFC-9457 `problem+json` document instead of axum's bare `text/plain` 422 — otherwise the strictness would be invisible to a conforming client (see `04_rest_operation_builder.md`).
+- **Status deviation, platform-limited (`STATUS_CODES.md`).** *Every* `StrictJson` rejection carries the full RFC-9457 envelope, but two of them carry a status the guide does not assign. A missing or non-JSON `Content-Type` is a **400** where the guide requires **415**, and a body over the request-body limit is a **400** where the guide requires **413** (reachable with no extra middleware — `Bytes::from_request` applies axum's own 2 MiB `DefaultBodyLimit`). Neither status is expressible: `CanonicalError::status_code` has no 415 or 413 category (`ResourceExhausted` is 429, `OutOfRange` is 400), and leaving the canonical ladder to mint a bare status would trade a wrong status for a non-canonical body. The platform's own API Gateway resolved the same conflict the same way — `mime_validation_middleware` answers an unsupported/missing `Content-Type` with a canonical `invalid_argument` (400) carrying `field_violations[0].reason = UNSUPPORTED_MEDIA_TYPE`, noting there is "no top-level `CanonicalError::*` constructor for this category". Closing this properly is a `toolkit-canonical-errors` change, not a gear change. Empty and malformed JSON are correctly 400. The body-limit case is distinguished in the `detail` (axum renders both `FailedToBufferBody` variants with the same string), and both envelopes are pinned by `extract_tests.rs::{wrong_content_type,oversize_body}_rejection_is_a_full_problem_document`, so adding the categories upstream will fail those tests rather than pass unnoticed.
 
 **B1.2** (create/read shape agreement) remains open and unaddressed by this change: `parent_id` is still accepted flat on create and returned nested under `hierarchy` on read.
 

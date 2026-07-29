@@ -12,10 +12,11 @@
 //! under concurrent mutations.
 //!
 //! `update_group` is deliberately *not* one of them: it replaces a group's
-//! ordinary attributes (`name`, `metadata`) and cannot change the group's
-//! parent -- re-parenting is `move_group`, a separate operation. A single-row
-//! write by primary key has no cross-row predicate to protect, so
-//! `update_group` runs at the backend default isolation
+//! ordinary attributes (`name`, `metadata`) and writes no structural column at
+//! all -- `parent_id` is written only by `move_group`, through the dedicated
+//! `GroupRepositoryTrait::update_parent`. A single-row write by primary key
+//! over a column set no other operation touches has no cross-row predicate to
+//! protect, so `update_group` runs at the backend default isolation
 //! (`rg-db-audit-transactions.md`, recommendation #3); see its own doc
 //! comment for why the former isolation-guessing/restart protocol is gone.
 
@@ -106,13 +107,22 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: CreateGroupRequest,
         tenant_id: Uuid,
     ) -> Result<ResourceGroup, DomainError> {
-        // Pre-validation (stateless, outside transaction)
-        validation::validate_type_code(&req.code)?;
+        // Pre-validation (stateless, outside transaction).
+        //
+        // The type code is parsed *once*, here, and the canonical result
+        // replaces the caller's spelling for the rest of this operation --
+        // AuthZ properties, the type lookup, the metadata-schema resolution
+        // and the persisted row all see the same string. Validating a
+        // normalized copy while carrying the raw input forward is what let an
+        // uppercase or space-padded tenant code be stored and then classified
+        // as an *ordinary* type below (see `validation::canonical_type_code`).
+        let mut req = req;
+        req.code = validation::canonical_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
         // Derive `is_tenant` for AuthZ properties from the code prefix: any type
         // whose path starts with `TENANT_RG_TYPE_PATH` opens a new tenant scope.
-        let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        let is_tenant = validation::is_tenant_type_code(&req.code);
 
         // VHP-2162: a tenant-typed group's effective tenant is always its
         // own (generated) id -- see `create_group_inner`'s
@@ -305,9 +315,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     ///
     /// **This is not a structural mutation.** `UpdateGroupRequest` carries no
     /// `parent_id`: re-parenting is [`Self::move_group`], a separate
-    /// operation. This path therefore writes exactly one row by primary key
-    /// and has no cross-row predicate a concurrent writer could invalidate,
-    /// so it opens its transaction at the backend default isolation
+    /// operation. This path writes exactly one row by primary key, through
+    /// [`GroupRepositoryTrait::update_attributes`], whose write set
+    /// (`name`, `metadata`, `updated_at`) is disjoint from the move path's
+    /// (`parent_id`, `updated_at`). There is therefore no cross-row predicate
+    /// *and* no shared column a concurrent writer could invalidate, so it
+    /// opens its transaction at the backend default isolation
     /// (`TxConfig::default()` -- READ COMMITTED on `PostgreSQL`; `SQLite` always
     /// runs SERIALIZABLE regardless, per `TxIsolationLevel`'s backend notes,
     /// so the saving is PostgreSQL-only) with bounded retry (max 3
@@ -328,6 +341,18 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// change runs under `SERIALIZABLE`, with cycle detection and the
     /// closure rebuild inside the same transaction -- now lives in
     /// [`Self::move_group`], which is unconditionally serializable.
+    ///
+    /// **Removing the protocol was only half the fix.** Until the repository's
+    /// single full-row `update` was split in two, this path still *wrote*
+    /// `parent_id` -- carrying back the value it had read, which is a blind
+    /// structural write, not a no-op. A move committing between that read and
+    /// this write reverted the parent while leaving the move's rebuilt closure
+    /// rows in place, desynchronising `resource_group.parent_id` from
+    /// `resource_group_closure` with no serialization conflict on either side
+    /// (and, in the other commit order, letting the move overwrite a
+    /// concurrent rename). The disjoint write sets are what make the claim
+    /// above true; `concurrent_rename_races_move_same_group` in
+    /// `tests/pg_concurrency_test.rs` pins it against a real `PostgreSQL`.
     pub async fn update_group(
         &self,
         ctx: &SecurityContext,
@@ -646,10 +671,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         req: CreateGroupRequest,
         tenant_id: Uuid,
     ) -> Result<ResourceGroup, DomainError> {
-        validation::validate_type_code(&req.code)?;
+        // Same single canonical parse as `create_group` -- seeding goes
+        // through the identical rule, so a seed definition cannot introduce a
+        // non-canonical code the public path would have rejected.
+        let mut req = req;
+        req.code = validation::canonical_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
-        let is_tenant = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        let is_tenant = validation::is_tenant_type_code(&req.code);
         Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
 
         if let Some(req_tenant_id) = req.tenant_id
@@ -725,8 +754,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // Determine effective tenant_id by code-prefix rule:
         // - code starts with TENANT_RG_TYPE_PATH → tenant_id = group.id (new scope)
         // - otherwise                           → tenant_id from caller / parent
+        //
+        // `req.code` is already the canonical form (both callers parse it
+        // through `validation::canonical_type_code` before opening the
+        // transaction), and the prefix test itself canonicalizes again, so
+        // this classification cannot disagree with the `is_tenant` value the
+        // AuthZ gate above was given.
         let group_id = req.id.unwrap_or_else(Uuid::now_v7);
-        let is_tenant_type = req.code.starts_with(TENANT_RG_TYPE_PATH);
+        let is_tenant_type = validation::is_tenant_type_code(&req.code);
         let effective_tenant_id = if is_tenant_type { group_id } else { tenant_id };
 
         if let Some(parent_id) = req.parent_id {
@@ -883,21 +918,26 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// Inner logic for `update_group`, runs inside the transaction opened by
     /// `update_group` at the backend default isolation.
     ///
-    /// **Nothing structural happens here.** `UpdateGroupRequest` carries only
-    /// `name` and `metadata`; the group's `parent_id`, `gts_type_id` and
-    /// `tenant_id` are all read back from the existing row and written
-    /// through unchanged. That read-back is not decorative:
-    /// `GroupRepository::update` writes every column of the row
-    /// unconditionally, so passing anything else for `parent_id` here would
-    /// silently re-parent the group (and passing `None` would silently
-    /// promote it to a root) without any of the checks
-    /// `move_group_internal_impl` performs.
+    /// **Nothing structural happens here, and nothing structural is written.**
+    /// `UpdateGroupRequest` carries only `name` and `metadata`, and
+    /// [`GroupRepositoryTrait::update_attributes`] writes only those two plus
+    /// `updated_at`. `parent_id`, `gts_type_id` and `tenant_id` are not in the
+    /// statement's `SET` list at all, so this path cannot re-parent, re-type
+    /// or re-tenant a group even by accident.
+    ///
+    /// The previous shape read the row back and re-supplied `parent_id` /
+    /// `gts_type_id` to a repository method that wrote every column
+    /// unconditionally. That read-back was not a no-op but a blind structural
+    /// write of a value observed before the write: a `move_group` committing
+    /// in between had its parent change reverted while its closure rebuild
+    /// survived. Not writing the column is the fix; the read it existed to
+    /// serve is gone with it.
     ///
     /// **Type immutability.** A group's GTS type is fixed at creation —
-    /// `UpdateGroupRequest` does not carry a `code` field. The existing
-    /// `gts_type_id` is reused unchanged, so all type-driven validation
-    /// (allowed parents/children, tenant-root rule, metadata schema lookup)
-    /// stays anchored on the existing type, not on a caller-supplied one.
+    /// `UpdateGroupRequest` does not carry a `code` field, and `gts_type_id`
+    /// is no longer writable through any repository method, so all
+    /// type-driven validation (allowed parents/children, tenant-root rule,
+    /// metadata schema lookup) stays anchored on the existing type.
     ///
     /// **Metadata schema validation.** `update_group` already ran
     /// `validate_metadata_via_gts` before opening this transaction (RG-09);
@@ -916,23 +956,10 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .await?
             .ok_or_else(|| DomainError::group_not_found(group_id))?;
 
-        let existing = group_repo
-            .find_model_by_id(tx, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))?;
-
-        // Persist name/metadata. `parent_id` and `gts_type_id` are carried
-        // over from the existing row verbatim — see this function's doc
-        // comment for why that is load-bearing rather than cosmetic.
+        // Persist name/metadata only. Nothing else about the row is read,
+        // because nothing else is written.
         let _model = group_repo
-            .update(
-                tx,
-                group_id,
-                existing.parent_id,
-                existing.gts_type_id,
-                &req.name,
-                req.metadata.as_ref(),
-            )
+            .update_attributes(tx, group_id, &req.name, req.metadata.as_ref())
             .await?;
 
         let sys = toolkit_security::AccessScope::allow_all();
@@ -1026,17 +1053,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         )
         .await?;
 
-        // Update parent_id on the group. Type, name, metadata and tenant_id
-        // are untouched by a move — all reuse the existing row's values.
+        // Update parent_id on the group. `name`, `metadata`, `gts_type_id` and
+        // `tenant_id` are not in this statement's SET list, so a concurrent
+        // `update_group` renaming the same group cannot have its rename
+        // clobbered by a stale copy read at the top of this transaction --
+        // see `GroupRepositoryTrait::update_parent`.
         group_repo
-            .update(
-                tx,
-                group_id,
-                new_parent_id,
-                existing.gts_type_id,
-                &existing.name,
-                existing.metadata.as_ref(),
-            )
+            .update_parent(tx, group_id, new_parent_id)
             .await?;
 
         let sys = toolkit_security::AccessScope::allow_all();
@@ -1216,7 +1239,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. We
             // exclude the moved group itself so a no-op move (already root)
             // does not falsely fire.
-            if rg_type.code.starts_with(TENANT_RG_TYPE_PATH)
+            if validation::is_tenant_type_code(&rg_type.code)
                 && let Some(existing_root_id) = group_repo
                     .find_root_id_with_type_prefix(conn, TENANT_RG_TYPE_PATH)
                     .await?

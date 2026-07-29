@@ -375,6 +375,30 @@ pub fn make_type_service_deny(db: Arc<DBProvider<DbError>>) -> TypeService<TypeR
 
 // -- Type helpers --
 
+/// Normalize a caller-supplied suffix into a legal GTS name token.
+///
+/// A GTS token must match `[a-z_][a-z0-9_]*`, so lowercasing is not enough:
+/// callers pass things like `vhp2162f-child`, and a hyphen is rejected outright
+/// by `gts::GtsId` (now reached on every write through
+/// `validation::canonical_type_code`).
+fn gts_token(suffix: &str) -> String {
+    let mapped: String = suffix
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    match mapped.chars().next() {
+        Some(c) if c.is_ascii_lowercase() || c == '_' => mapped,
+        _ => format!("i{mapped}"),
+    }
+}
+
 /// Create a root type (can_be_root = true, no parents, no memberships).
 ///
 /// Uses `create_type_unscoped`: these fixture helpers exist to set up types
@@ -386,13 +410,13 @@ pub async fn create_root_type(
     suffix: &str,
 ) -> ResourceGroupType {
     // Format: vendor.package.namespace.type.vMAJOR -- 5 tokens per ADR-001
-    // Finding 2. Suffix goes in namespace (lowercased so callers can use
-    // CamelCase without breaking the GTS regex); UUID-hex (prefixed with
-    // `i` so it starts with a letter) goes in type.
+    // Finding 2. Suffix goes in namespace (normalized by `gts_token` so
+    // callers can use CamelCase or hyphens without breaking the GTS grammar);
+    // UUID-hex (prefixed with `i` so it starts with a letter) goes in type.
     let code = format!(
         "{}x.test.{}.i{}.v1~",
         gts_id!("cf.core.rg.type.v1~"),
-        suffix.to_ascii_lowercase(),
+        gts_token(suffix),
         Uuid::now_v7().as_simple()
     );
     svc.create_type_unscoped(CreateTypeRequest {
@@ -416,13 +440,13 @@ pub async fn create_child_type(
     memberships: &[&str],
 ) -> ResourceGroupType {
     // Format: vendor.package.namespace.type.vMAJOR -- 5 tokens per ADR-001
-    // Finding 2. Suffix goes in namespace (lowercased so callers can use
-    // CamelCase without breaking the GTS regex); UUID-hex (prefixed with
-    // `i` so it starts with a letter) goes in type.
+    // Finding 2. Suffix goes in namespace (normalized by `gts_token`, see
+    // `create_root_type`); UUID-hex (prefixed with `i` so it starts with a
+    // letter) goes in type.
     let code = format!(
         "{}x.test.{}.i{}.v1~",
         gts_id!("cf.core.rg.type.v1~"),
-        suffix.to_ascii_lowercase(),
+        gts_token(suffix),
         Uuid::now_v7().as_simple()
     );
     svc.create_type_unscoped(CreateTypeRequest {

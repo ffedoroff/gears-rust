@@ -145,14 +145,22 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 
 **Input**: resource_type, resource_id, target group's tenant_id
 
-**Output**: Pass or TenantIncompatibility with conflicting tenant details
+**Output**: Pass or TenantIncompatibility with a **tenant-anonymous** message
+
+The conflicting tenant set is deliberately *not* part of the output. It is collected
+under the system scope — the invariant is forest-wide, so the query has to see every
+tenant — which makes those ids, by construction, not the caller's to learn. Naming them
+turned this endpoint into a cross-tenant existence oracle: supply any
+`(resource_type, resource_id)` and read back which tenants hold it, in direct conflict
+with the security-review rule against identifiers of inaccessible objects in error
+messages. Real values are logged at `debug` (VHP-2345).
 
 **Steps**:
 1. [x] - `p1` - DB: SELECT rgm.group_id, rg.tenant_id FROM resource_group_membership rgm JOIN resource_group rg ON rgm.group_id = rg.id WHERE rgm.gts_type_id = {resource_type_id} AND rgm.resource_id = {resource_id} — find existing memberships for this resource - `inst-tenant-check-1`
 2. [x] - `p1` - **IF** no existing memberships → **RETURN** pass (first membership, any tenant allowed) - `inst-tenant-check-2`
 3. [x] - `p1` - Collect distinct tenant_ids from existing memberships - `inst-tenant-check-3`
 4. [x] - `p1` - **IF** target group's tenant_id is in the same tenant scope as existing memberships (same tenant or related via tenant hierarchy) → **RETURN** pass - `inst-tenant-check-4`
-5. [x] - `p1` - **RETURN** TenantIncompatibility: resource already linked in tenant {existing_tenant}, cannot add to tenant {target_tenant} - `inst-tenant-check-5`
+5. [x] - `p1` - **RETURN** TenantIncompatibility with a fixed, tenant-anonymous message ("the resource is already linked from a group in a different tenant") — no tenant ids, no resource key; the real values go to the `debug` log only, see this algorithm's **Output** - `inst-tenant-check-5`
 
 ### Membership Data Seeding
 
@@ -260,7 +268,7 @@ All acceptance criteria from feature 0004 are covered by automated tests:
 - [x] Adding membership with unregistered resource_type GTS path returns validation error (400)
 - [x] Adding membership with resource_type not in group type's allowed_membership_types returns validation error (400)
 - [x] Multiple resource types can coexist in the same group: `(G1, User, U1)` and `(G1, Document, D1)` both succeed
-- [x] Adding membership for resource already linked in incompatible tenant returns `TenantIncompatibility` (400, precondition subject `tenant`)
+- [x] Adding membership for resource already linked in incompatible tenant returns `TenantIncompatibility` (400, precondition subject `tenant`) whose message names neither the existing nor the target tenant, and does not echo the resource key (`membership_add_tenant_incompatibility`)
 - [x] Removing existing membership returns 204 No Content
 - [x] Removing nonexistent membership returns `NotFound` (404)
 - [x] List memberships with `$filter=group_id eq 'G1'` returns all memberships for group G1

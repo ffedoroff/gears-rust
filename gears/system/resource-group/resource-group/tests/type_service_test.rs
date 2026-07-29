@@ -29,7 +29,7 @@ use toolkit_security::AccessScope;
 /// Generate a unique GTS type code with the given suffix.
 fn type_code(suffix: &str) -> String {
     format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}.i{}.v1~",
         suffix,
         Uuid::now_v7().as_simple()
     )
@@ -1794,5 +1794,202 @@ async fn security_metadata_schema_last_write_wins() {
     assert!(
         schema.get("extra").is_none(),
         "Previous update keys must not merge: {schema}"
+    );
+}
+
+// =========================================================================
+// T1.3 -- one canonical parse for every written / looked-up type code
+// =========================================================================
+
+/// The persisted `gts_type.schema_id` must be the **canonical** code, not the
+/// caller's spelling.
+///
+/// Before this, `validate_type_code` normalized a local copy and returned `()`,
+/// so an uppercase code passed validation and was stored verbatim. That is what
+/// let two rows differ only in case, and — worse — let a tenant code evade the
+/// case-sensitive tenant-prefix test in `GroupService`
+/// (`create_group_tenant_typed_code_in_uppercase_still_opens_a_tenant_scope`
+/// in `group_service_test.rs` covers that consequence).
+#[tokio::test]
+async fn type_create_persists_the_canonical_code_for_a_noncanonical_input() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+
+    let canonical = type_code("canon");
+    let noisy = format!("  {}  ", canonical.to_uppercase());
+
+    let created = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: noisy.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("an uppercase, space-padded code must be accepted and canonicalized");
+    assert_eq!(
+        created.code, canonical,
+        "the returned type must carry the canonical code"
+    );
+
+    // DB assertion: the stored row is canonical, and no row carries the raw input.
+    let conn = db.conn().expect("get conn");
+    let scope = system_scope();
+    assert!(
+        GtsTypeEntity::find()
+            .filter(gts_type::Column::SchemaId.eq(&canonical))
+            .secure()
+            .scope_with(&scope)
+            .one(&conn)
+            .await
+            .expect("query by canonical code")
+            .is_some(),
+        "the canonical code must be what landed in gts_type.schema_id"
+    );
+    assert!(
+        GtsTypeEntity::find()
+            .filter(gts_type::Column::SchemaId.eq(noisy.trim()))
+            .secure()
+            .scope_with(&scope)
+            .one(&conn)
+            .await
+            .expect("query by raw code")
+            .is_none(),
+        "the caller's raw spelling must not be persisted"
+    );
+}
+
+/// Uniqueness is decided on the canonical form: the same code in a different
+/// case is the *same* type, not a second one.
+#[tokio::test]
+async fn type_create_duplicate_differing_only_in_case_is_rejected() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+
+    let code = type_code("dupcase");
+    type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create the first type");
+
+    let err = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: code.to_uppercase(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect_err("the same code in a different case must collide");
+    assert!(
+        matches!(err, DomainError::TypeAlreadyExists { .. }),
+        "expected TypeAlreadyExists, got: {err:?}"
+    );
+}
+
+/// Lookups canonicalize too, so a caller that shouts still finds its type —
+/// and does not get a confusing 404 for a row that exists.
+#[tokio::test]
+async fn type_lookup_update_and_delete_accept_a_noncanonical_code() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+
+    let code = type_code("lookupcase");
+    type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create type");
+
+    let shouted = format!(" {} ", code.to_uppercase());
+    let loaded = type_svc
+        .get_type_unscoped(&shouted)
+        .await
+        .expect("get must canonicalize its lookup key");
+    assert_eq!(loaded.code, code);
+
+    type_svc
+        .update_type_unscoped(
+            &shouted,
+            UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![],
+                metadata_schema: Some(json!({"v": 1})),
+            },
+        )
+        .await
+        .expect("update must canonicalize its lookup key");
+
+    type_svc
+        .delete_type_unscoped(&shouted)
+        .await
+        .expect("delete must canonicalize its lookup key");
+    let err = type_svc
+        .get_type_unscoped(&code)
+        .await
+        .expect_err("the type is gone");
+    assert!(matches!(err, DomainError::TypeNotFound { .. }));
+}
+
+/// `allowed_parent_types` entries are canonicalized before they are resolved to
+/// junction rows, so a differently-cased reference resolves instead of being
+/// reported as a non-existent type.
+#[tokio::test]
+async fn type_create_canonicalizes_allowed_parent_types() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+
+    let parent = common::create_root_type(&type_svc, "parentcase").await;
+    let child = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: type_code("childcase"),
+            can_be_root: false,
+            allowed_parent_types: vec![parent.code.to_uppercase()],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("an uppercase parent reference must resolve to the existing type");
+    assert_eq!(child.allowed_parent_types, vec![parent.code.clone()]);
+}
+
+/// A structurally invalid GTS chain is refused on the way in.
+///
+/// `GtsTypePath::new` used to be dead code — nothing checked the shape of a
+/// written code beyond its prefix and length, so `…v1~tenant` (a segment with
+/// one token instead of five) was accepted and stored.
+#[tokio::test]
+async fn type_create_rejects_a_structurally_invalid_gts_chain() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+
+    let bad = format!("{GTS_ID_PREFIX}cf.core.rg.type.v1~tenant");
+    let err = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: bad,
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect_err("a malformed chain must be rejected");
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected Validation, got: {err:?}"
     );
 }

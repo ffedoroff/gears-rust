@@ -309,6 +309,121 @@ async fn trace_update_group() {
     );
 }
 
+/// The `UPDATE resource_group` statements a trace contains, as normalized SQL.
+fn resource_group_updates(rec: &toolkit_db::test_support::QueryRecorder) -> Vec<String> {
+    rec.events()
+        .into_iter()
+        .filter(|q| q.kind == QueryKind::Update && q.table.as_deref() == Some("resource_group"))
+        .map(|q| q.sql)
+        .collect()
+}
+
+/// T1.1: an ordinary update must not write a **structural** column.
+///
+/// This is the invariant the update/move lost-update race reduces to. While a
+/// single repository method wrote every column, `update_group` re-supplied the
+/// `parent_id` it had read moments earlier -- a blind structural write that a
+/// concurrently committed `move_group` had already superseded, leaving
+/// `resource_group.parent_id` disagreeing with `resource_group_closure` and
+/// neither transaction with anything to abort on. The concurrency proof lives
+/// in `pg_concurrency_test.rs::concurrent_rename_races_move_same_group`; this
+/// test pins the *cause* directly and deterministically, by reading the write
+/// set out of the SQL rather than trying to lose a race on purpose.
+#[tokio::test]
+async fn update_group_write_set_excludes_structural_columns() {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let t = common::create_root_type(&type_svc, "wsupd").await;
+    let root = common::create_root_group(&group_svc, &ctx, &t.code, "Root", tenant_id).await;
+
+    rec.clear();
+    group_svc
+        .update_group(
+            &ctx,
+            root.id,
+            UpdateGroupRequest {
+                name: "Renamed".to_owned(),
+                metadata: None,
+            },
+        )
+        .await
+        .expect("update_group should succeed");
+
+    let updates = resource_group_updates(&rec);
+    assert_eq!(
+        updates.len(),
+        1,
+        "update_group must issue exactly one UPDATE on resource_group:\n{}",
+        rec.dump()
+    );
+    let sql = &updates[0];
+    for ordinary in ["name", "metadata", "updated_at"] {
+        assert!(
+            sql.contains(ordinary),
+            "update_group must write `{ordinary}`, got: {sql}"
+        );
+    }
+    for structural in ["parent_id", "gts_type_id", "tenant_id"] {
+        assert!(
+            !sql.contains(structural),
+            "update_group must NOT write `{structural}` -- writing a value read earlier in the \
+             same transaction is a lost-update hazard against a concurrent move, not a no-op. \
+             Got: {sql}"
+        );
+    }
+}
+
+/// T1.1, the other half: a move must not write ordinary attributes.
+///
+/// Symmetric hazard -- the move read `name`/`metadata` at the top of its
+/// (long) SERIALIZABLE transaction and wrote them back at the end, so it could
+/// revert a rename that committed in between.
+#[tokio::test]
+async fn move_group_write_set_is_only_the_structural_column() {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let t = create_self_referencing_type(&type_svc, "wsmv").await;
+    let root = common::create_root_group(&group_svc, &ctx, &t.code, "root", tenant_id).await;
+    let target =
+        common::create_child_group(&group_svc, &ctx, &t.code, root.id, "target", tenant_id).await;
+    let moved =
+        common::create_child_group(&group_svc, &ctx, &t.code, root.id, "moved", tenant_id).await;
+
+    rec.clear();
+    group_svc
+        .move_group_unscoped(moved.id, Some(target.id))
+        .await
+        .expect("move_group should succeed");
+
+    let updates = resource_group_updates(&rec);
+    assert_eq!(
+        updates.len(),
+        1,
+        "move_group must issue exactly one UPDATE on resource_group:\n{}",
+        rec.dump()
+    );
+    let sql = &updates[0];
+    for structural in ["parent_id", "updated_at"] {
+        assert!(
+            sql.contains(structural),
+            "move_group must write `{structural}`, got: {sql}"
+        );
+    }
+    for ordinary in ["name", "metadata", "gts_type_id", "tenant_id"] {
+        assert!(
+            !sql.contains(ordinary),
+            "move_group must NOT write `{ordinary}` -- it would overwrite a concurrently \
+             committed update with the copy read at the top of this transaction. Got: {sql}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn trace_move_group() {
     let (db, rec) = common::test_db_with_recorder().await;
@@ -1168,7 +1283,7 @@ async fn scale_update_type_removed_parents_statements_do_not_grow_with_count() {
 
 fn unique_tenant_type_code() -> String {
     format!(
-        "{}test{}.v1~",
+        "{}x.test.tn.i{}.v1~",
         resource_group_sdk::TENANT_RG_TYPE_PATH,
         Uuid::now_v7().as_simple()
     )
