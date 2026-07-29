@@ -66,10 +66,17 @@ use crate::domain::validation;
 /// Declaring `OWNER_TENANT_ID` here lets that baseline constraint compile
 /// normally. That the constraint is tenant-shaped and this table has no
 /// tenant column is harmless: `gate()` never reads the resulting
-/// `AccessScope`'s filters, only whether compilation succeeded — the scope
-/// can never be anything but `allow_all()` or an error for this resource,
-/// and the property list exists purely so the compiler doesn't reject the
-/// PDP's normal output before `gate()` gets to ignore it.
+/// `AccessScope`'s filters, only whether compilation succeeded. The
+/// compiled scope is *not* guaranteed to be `allow_all()` — a PDP that
+/// attaches the baseline `In(OWNER_TENANT_ID, ..)` clamp compiles to a
+/// constrained scope via `AccessScope::from_constraints`, exactly what
+/// `access_scope_with_realistic_tenant_clamp_constraint_succeeds` (see
+/// `tests/type_authz_test.rs`) exercises. Runtime safety comes from `gate()`
+/// unconditionally discarding whatever scope it gets back, constrained or
+/// not — `gts_type` has no tenant column, so there is nothing for such a
+/// filter to apply to — not from the scope somehow always compiling to
+/// `allow_all()`. The property list exists purely so the compiler doesn't
+/// reject the PDP's normal output before `gate()` gets to ignore it.
 ///
 /// # Why every call site *also* uses `access_scope_with(.., require_constraints(false))`
 ///

@@ -30,6 +30,7 @@ use toolkit::api::operation_builder::OperationSpec;
 use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
+use toolkit_odata::{CursorV1, SortDir};
 use toolkit_security::{SecurityContext, pep_properties};
 
 use resource_group::domain::group_service::{GroupService, QueryProfile};
@@ -483,7 +484,7 @@ async fn list_types_denied_returns_403() {
 
     let req = json_request("GET", "/types-registry/v1/types", None, tenant_id);
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
 }
 
 #[tokio::test]
@@ -504,7 +505,7 @@ async fn create_type_denied_returns_403() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
 }
 
 #[tokio::test]
@@ -523,7 +524,7 @@ async fn get_type_denied_returns_403() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
 }
 
 #[tokio::test]
@@ -544,7 +545,7 @@ async fn update_type_denied_returns_403() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
 }
 
 #[tokio::test]
@@ -561,7 +562,7 @@ async fn delete_type_denied_returns_403() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
 }
 
 /// HTTP-level regression proof for VHP-2342's actual defect (not just the
@@ -584,6 +585,9 @@ async fn list_types_with_realistic_tenant_clamp_authz_succeeds() {
     let req = json_request("GET", "/types-registry/v1/types", None, tenant_id);
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = response_body(resp).await;
+    assert_no_surrogate_ids(&body);
 }
 
 // ── Group CRUD Tests ────────────────────────────────────────────────────
@@ -660,6 +664,7 @@ async fn create_group_duplicate_id_returns_409() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = response_body(resp).await;
     assert_eq!(body["id"], dup_id.to_string());
+    assert_no_surrogate_ids(&body);
 
     let req = json_request(
         "POST",
@@ -672,17 +677,7 @@ async fn create_group_duplicate_id_returns_409() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "expected 409");
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .expect("Content-Type header must be present");
-    assert!(
-        ct.to_str().unwrap().contains("application/problem+json"),
-        "expected application/problem+json for 409, got: {ct:?}"
-    );
-    let body = response_body(resp).await;
-    assert_eq!(body["status"], 409);
+    let body = assert_problem_shape(resp, StatusCode::CONFLICT).await;
     assert_eq!(body["context"]["resource_name"], dup_id.to_string());
 }
 
@@ -772,6 +767,65 @@ fn assert_no_surrogate_ids(json: &serde_json::Value) {
         !text.contains("\"schema_id\""),
         "Response should not contain schema_id: {text}"
     );
+}
+
+// ── Helper: assert RFC 9457 Problem Details shape ───────────────────────
+//
+// Per `docs/toolkit_unified_system/12_unit_testing.md` ("Error Response
+// Shape (REST tests)"): every REST test that exercises an error response
+// MUST check the status code, that Content-Type contains
+// `application/problem+json`, that the body carries `status`/`title`/
+// `detail`, and that no `stack`/`trace`/`backtrace` leaks into the wire
+// body. Consumes the response (mirrors `response_body`) and hands back the
+// parsed JSON so callers can layer on endpoint-specific assertions (e.g.
+// `context.violations`).
+async fn assert_problem_shape(
+    resp: axum::http::Response<Body>,
+    expected_status: StatusCode,
+) -> serde_json::Value {
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .expect("Content-Type header must be present")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status, expected_status,
+        "unexpected status, got {status}: {body}"
+    );
+    assert!(
+        ct.contains("application/problem+json"),
+        "expected application/problem+json for {expected_status}, got: {ct}"
+    );
+    assert_eq!(
+        body["status"],
+        expected_status.as_u16(),
+        "Problem 'status' must match the HTTP status: {body}"
+    );
+    assert!(
+        body["title"].is_string(),
+        "Problem must have 'title': {body}"
+    );
+    assert!(
+        body["detail"].is_string(),
+        "Problem must have 'detail': {body}"
+    );
+    assert!(
+        body.get("stack").is_none(),
+        "no stack trace must leak into the response: {body}"
+    );
+    assert!(
+        body.get("trace").is_none(),
+        "no trace must leak into the response: {body}"
+    );
+    assert!(
+        body.get("backtrace").is_none(),
+        "no backtrace must leak into the response: {body}"
+    );
+    body
 }
 
 // =========================================================================
@@ -966,20 +1020,12 @@ async fn rest_post_membership_duplicate_returns_409() {
     let first = json_request("POST", &path, None, tenant_id);
     let resp = router.clone().oneshot(first).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = response_body(resp).await;
+    assert_no_surrogate_ids(&body);
 
     let second = json_request("POST", &path, None, tenant_id);
     let resp = router.oneshot(second).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "expected 409");
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .expect("Content-Type header must be present");
-    assert!(
-        ct.to_str().unwrap().contains("application/problem+json"),
-        "expected application/problem+json for 409, got: {ct:?}"
-    );
-    let body = response_body(resp).await;
-    assert_eq!(body["status"], 409);
+    assert_problem_shape(resp, StatusCode::CONFLICT).await;
 }
 
 /// Helper: create a self-referencing root type (create, then update to allow self as parent).
@@ -1193,11 +1239,7 @@ async fn rest_post_membership_cross_tenant_returns_404() {
         tenant_b,
     );
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "cross-tenant add_membership must be reported as not-found"
-    );
+    assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
 }
 
 /// VHP-2341: DELETE membership from a cross-tenant group returns 404, and
@@ -1265,11 +1307,7 @@ async fn rest_delete_membership_cross_tenant_returns_404() {
         tenant_b,
     );
     let resp = router.clone().oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "cross-tenant remove_membership must be reported as not-found"
-    );
+    assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
 
     // Tenant A must still see the membership -- the rejected cross-tenant
     // delete must not have removed it.
@@ -1281,6 +1319,7 @@ async fn rest_delete_membership_cross_tenant_returns_404() {
         items.iter().any(|m| m["resource_id"] == "res-xtenant-del"),
         "membership must survive a rejected cross-tenant delete, got: {items:?}"
     );
+    assert_no_surrogate_ids(&body);
 }
 
 /// VHP-2341: GET memberships is tenant-scoped -- tenant A must not see
@@ -1368,6 +1407,7 @@ async fn rest_get_memberships_is_tenant_scoped() {
         !items.iter().any(|m| m["resource_id"] == "res-list-b"),
         "tenant A must NOT see tenant B's membership, got: {items:?}"
     );
+    assert_no_surrogate_ids(&body);
 }
 
 /// TC-REST-06: POST group with parent_id returns 201 with hierarchy.
@@ -1618,13 +1658,7 @@ async fn rest_update_group_reparent_under_descendant_returns_400_cycle() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let body = response_body(resp).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "expected 400 for cycle on re-parent, got {status}: {body}"
-    );
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 
     let violations = body["context"]["violations"]
         .as_array()
@@ -1680,13 +1714,7 @@ async fn rest_update_group_self_parent_returns_400_cycle() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let body = response_body(resp).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "expected 400 for self-parent cycle, got {status}: {body}"
-    );
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 
     let violations = body["context"]["violations"]
         .as_array()
@@ -2927,13 +2955,7 @@ async fn rest_get_memberships_quoted_uuid_filter_returns_400_not_500() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let body = response_body(resp).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "quoted-UUID $filter must be a 400 client error, not {status}: {body}"
-    );
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
 /// VHP-1954 regression guard: the wire-correct *bare* UUID
@@ -2961,6 +2983,87 @@ async fn rest_get_memberships_bare_uuid_filter_returns_200() {
         "bare-UUID $filter regressed: {body}"
     );
     assert!(body["items"].is_array());
+    assert_no_surrogate_ids(&body);
+}
+
+// =========================================================================
+// Classifier coverage: `From<toolkit_odata::Error> for DomainError`
+// (`src/domain/error.rs`) must be exercised by an error that actually
+// originates *inside* `paginate_odata`, not by the `$filter` pre-validation
+// (`convert_expr_to_filter_node` / `resolve_type_filter_node`) that runs
+// before it in `list_memberships`. The quoted-UUID test above never reaches
+// the classifier: `MembershipFilterField::GroupId`'s `FieldKind::Uuid`
+// rejects the quoted literal at `convert_expr_to_filter_node`, well before
+// `paginate_odata` is ever called -- reverting the classifier's application
+// site (the `.map_err(DomainError::from)?` on `paginate_odata`'s result) to
+// the old blanket `.map_err(|e| DomainError::database(e.to_string()))`
+// leaves that test green. These two tests instead drive failures that
+// originate *inside* `paginate_odata_collect`: an unknown `$orderby` field,
+// and a cursor whose embedded filter hash disagrees with the request's
+// current `$filter`. Confirmed by mutation: reverting the classifier's
+// application site to the blanket `Database` mapping turns both red (500
+// instead of 400).
+// =========================================================================
+
+/// VHP-1954 classifier proof (1/2): `$orderby` on a field
+/// `MembershipFilterField` doesn't declare passes the extractor
+/// (`parse_orderby` only validates syntax, not field names -- see
+/// `libs/toolkit/src/api/odata.rs`) and fails *inside*
+/// `paginate_odata_collect`'s field-resolution loop with
+/// `ODataError::InvalidOrderByField` (`libs/toolkit-db/src/odata/sea_orm_filter.rs`).
+/// Must classify as a caller error (400), not a backend fault (500).
+#[tokio::test]
+async fn rest_get_memberships_unknown_orderby_field_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request(
+        "GET",
+        "/resource-group/v1/memberships?%24orderby=not_a_real_field%20asc",
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// VHP-1954 classifier proof (2/2): a cursor whose embedded filter hash
+/// (`cursor.f`) doesn't match the current request's `$filter` hash fails
+/// *inside* `paginate_odata_collect` with `ODataError::FilterMismatch` -- a
+/// client replaying a cursor minted under a different filter, not a
+/// backend fault. The cursor is hand-built (rather than round-tripped
+/// through a real `next_cursor`) so the mismatch is deterministic: `s`
+/// (`"-group_id"`) matches `list_memberships`' real tiebreaker, so it
+/// clears the orderby-field check first and the mismatch check is what
+/// actually fires; `f` is a value no real `$filter` string will ever hash
+/// to. The filter itself (`resource_id eq 'res-1'`) targets a field
+/// `TypeRepository::resolve_type_filter_node` passes through untouched, so
+/// nothing upstream of `paginate_odata` can reject it first.
+#[tokio::test]
+async fn rest_get_memberships_cursor_filter_mismatch_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+
+    let cursor = CursorV1 {
+        k: vec!["group_id".to_owned()],
+        o: SortDir::Desc,
+        s: "-group_id".to_owned(),
+        f: Some("mismatched-filter-hash".to_owned()),
+        d: "fwd".to_owned(),
+    };
+    let token = cursor.encode().expect("encode hand-built cursor");
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/memberships\
+             ?%24filter=resource_id%20eq%20%27res-1%27&cursor={token}"
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
 // =========================================================================
@@ -3056,6 +3159,7 @@ async fn rest_list_groups_filters_by_type() {
     );
     assert_eq!(items[0]["id"], group_a.id.to_string());
     assert_eq!(items[0]["type"], type_a.code);
+    assert_no_surrogate_ids(&body);
 }
 
 /// Mirrors the membership `$filter` 400-not-500 guard above
@@ -3078,11 +3182,5 @@ async fn rest_list_groups_unknown_type_filter_returns_400_not_500() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    let body = response_body(resp).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "unknown GTS type in $filter must be a 400 client error, not {status}: {body}"
-    );
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
