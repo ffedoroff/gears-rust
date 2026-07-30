@@ -77,7 +77,12 @@ impl crate::domain::repos::ChatRepository for ChatRepository {
             Into::into,
         )
         .await
-        .map_err(db_err)?;
+        // ML-5130: don't route through db_err (impl Display -> Database)
+        // here -- paginate_odata's toolkit_odata::Error has 13 caller-caused
+        // variants (bad $filter, unknown $orderby field, stale/mismatched
+        // cursor, bad $top) alongside the 2 genuine backend faults (Db,
+        // ParsingUnavailable). DomainError::from classifies accordingly.
+        .map_err(DomainError::from)?;
 
         Ok(page)
     }
@@ -260,3 +265,7 @@ struct ChatMessageCount {
     chat_id: Uuid,
     cnt: i64,
 }
+
+#[cfg(test)]
+#[path = "chat_repo_test.rs"]
+mod tests;

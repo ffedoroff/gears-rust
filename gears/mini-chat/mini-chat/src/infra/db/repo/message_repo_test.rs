@@ -502,3 +502,40 @@ async fn batch_cross_tenant_returns_empty() {
 
     assert_eq!(map.len(), 1, "own tenant query must return attachments");
 }
+
+// ════════════════════════════════════════════════════════════════════
+// ML-5130: list_by_chat must classify client-caused OData errors as
+// DomainError::Validation (-> HTTP 400), not DomainError::Database
+// (-> HTTP 500). An unknown $orderby field never reaches SQL: it fails
+// inside paginate_odata's field-resolution loop with
+// toolkit_odata::Error::InvalidOrderByField, before any row is read.
+// ════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn list_by_chat_unknown_orderby_field_returns_validation_not_database() {
+    let db = test_db().await;
+    let tenant_id = Uuid::new_v4();
+    let chat_id = Uuid::new_v4();
+    insert_chat(&db, tenant_id, chat_id).await;
+
+    let repo = MessageRepository::new(limit_cfg());
+    let conn = db.conn().unwrap();
+    let scope = AccessScope::for_tenant(tenant_id);
+
+    let query = toolkit_odata::ODataQuery::new().with_order(toolkit_odata::ODataOrderBy(vec![
+        toolkit_odata::OrderKey {
+            field: "not_a_real_field".to_owned(),
+            dir: toolkit_odata::SortDir::Asc,
+        },
+    ]));
+
+    let err = repo
+        .list_by_chat(&conn, &scope, chat_id, &query)
+        .await
+        .expect_err("unknown $orderby field must be rejected");
+
+    assert!(
+        matches!(err, crate::domain::error::DomainError::Validation { .. }),
+        "client-caused $orderby error must classify as Validation (400), got {err:?}"
+    );
+}

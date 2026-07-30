@@ -207,7 +207,13 @@ impl crate::domain::repos::MessageRepository for MessageRepository {
             std::convert::identity,
         )
         .await
-        .map_err(|e| DomainError::database(e.to_string()))?;
+        // ML-5130: paginate_odata's toolkit_odata::Error covers 15
+        // variants, 13 of which are caller mistakes (bad $filter, unknown
+        // $orderby field, stale/mismatched cursor, bad $top). Only Db /
+        // ParsingUnavailable are backend faults. DomainError::from
+        // classifies accordingly instead of folding everything into a
+        // blanket Database (500).
+        .map_err(DomainError::from)?;
 
         Ok(page)
     }

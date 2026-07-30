@@ -214,6 +214,53 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     }
 }
 
+/// Classify an `OData` pagination/filter failure (`toolkit_odata::Error`,
+/// surfaced by `paginate_odata`) as caller-caused (-> `Validation`, HTTP
+/// 400) or a genuine backend failure (-> `Database`, HTTP 500).
+///
+/// Mirrors the contract documented over `toolkit_odata::Error`
+/// (`libs/toolkit-odata/src/lib.rs`) and its `From<Error> for
+/// CanonicalError` (`libs/toolkit-odata/src/problem_mapping.rs`): every
+/// variant except `Db` / `ParsingUnavailable` originates from a
+/// caller-supplied `$filter` / `$orderby` / cursor / `$top` and is never a
+/// backend fault, so it must map to `Validation`, not `Database`.
+///
+/// Used by `ChatRepository::list_page` and `MessageRepository::list_by_chat`
+/// (ML-5130) so a malformed `$filter`, an unknown `$orderby` field, or a
+/// stale/mismatched cursor surfaces as 400 instead of being folded into a
+/// blanket 500 alongside actual DB failures.
+// TODO(DE1302): both arms collapse the typed `toolkit_odata::Error` into a
+// String, so the source is dropped — same limitation as `From<DbError>`
+// above. Extend `Database` / `Validation` to hold the source error, or adopt
+// the toolkit-side classification API that hands back the typed error, and
+// remove this allow.
+#[allow(unknown_lints, de1302_error_from_to_string)]
+impl From<toolkit_odata::Error> for DomainError {
+    fn from(e: toolkit_odata::Error) -> Self {
+        use toolkit_odata::Error as OE;
+        // Both arms are spelled out on purpose: no wildcard. A variant added
+        // to `toolkit_odata::Error` must break this build and force an
+        // explicit 400/500 decision, rather than default into `Validation`
+        // and quietly report an infrastructure failure as the caller's fault.
+        match &e {
+            OE::Db(_) | OE::ParsingUnavailable(_) => DomainError::database(e.to_string()),
+            OE::InvalidFilter(_)
+            | OE::InvalidOrderByField(_)
+            | OE::OrderMismatch
+            | OE::FilterMismatch
+            | OE::InvalidCursor
+            | OE::InvalidLimit
+            | OE::OrderWithCursor
+            | OE::CursorInvalidBase64
+            | OE::CursorInvalidJson
+            | OE::CursorInvalidVersion
+            | OE::CursorInvalidKeys
+            | OE::CursorInvalidFields
+            | OE::CursorInvalidDirection => DomainError::validation(e.to_string()),
+        }
+    }
+}
+
 fn map_db_err(db_err: &sea_orm::DbErr) -> DomainError {
     if let Some(sea_orm::SqlErr::UniqueConstraintViolation(msg)) = db_err.sql_err() {
         return DomainError::Conflict {
@@ -232,3 +279,7 @@ fn map_db_err(db_err: &sea_orm::DbErr) -> DomainError {
     }
     DomainError::database(db_err.to_string())
 }
+
+#[cfg(test)]
+#[path = "error_test.rs"]
+mod tests;
