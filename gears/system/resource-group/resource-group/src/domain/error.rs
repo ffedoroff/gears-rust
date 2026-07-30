@@ -302,16 +302,40 @@ impl From<toolkit_db::DbError> for DomainError {
 /// from a client-supplied `$filter` / `$orderby` / cursor and is never a
 /// backend fault, so it must map to `Validation`, not `Database`.
 ///
-/// Used by `MembershipRepository::list_memberships` (VHP-1954) so a
-/// malformed `$filter` (unknown field, type mismatch, bad `$orderby` field,
-/// stale cursor) surfaces as 400 instead of being folded into a blanket 500
+/// Used by every list repository of this gear — `list_memberships`
+/// (VHP-1954), `list_groups` and `list_types` (ML-7391) — so a malformed
+/// `$filter` (unknown field, type mismatch, bad `$orderby` field, stale
+/// cursor) surfaces as 400 instead of being folded into a blanket 500
 /// alongside actual DB failures.
+// TODO(DE1302): both arms collapse the typed `toolkit_odata::Error` into a
+// `String` via `.to_string()`, dropping the source chain. `DomainError` has
+// no variant able to carry a source for this case. Removing this allow needs
+// either such a variant or the toolkit-side classification API that hands
+// back the typed error (see ML-6207), after which the arms can wrap instead
+// of stringify.
+#[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<toolkit_odata::Error> for DomainError {
     fn from(e: toolkit_odata::Error) -> Self {
         use toolkit_odata::Error as OE;
+        // Both arms are spelled out on purpose: no wildcard. A variant added
+        // to `toolkit_odata::Error` must break this build and force an
+        // explicit 400/500 decision, rather than default into `Validation`
+        // and quietly report an infrastructure failure as the caller's fault.
         match &e {
             OE::Db(_) | OE::ParsingUnavailable(_) => DomainError::database(e.to_string()),
-            _ => DomainError::validation(e.to_string()),
+            OE::InvalidFilter(_)
+            | OE::InvalidOrderByField(_)
+            | OE::OrderMismatch
+            | OE::FilterMismatch
+            | OE::InvalidCursor
+            | OE::InvalidLimit
+            | OE::OrderWithCursor
+            | OE::CursorInvalidBase64
+            | OE::CursorInvalidJson
+            | OE::CursorInvalidVersion
+            | OE::CursorInvalidKeys
+            | OE::CursorInvalidFields
+            | OE::CursorInvalidDirection => DomainError::validation(e.to_string()),
         }
     }
 }
@@ -333,3 +357,7 @@ impl From<EnforcerError> for DomainError {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "error_tests.rs"]
+mod tests;

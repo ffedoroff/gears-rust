@@ -3774,6 +3774,134 @@ async fn rest_list_groups_unknown_type_filter_returns_400_not_500() {
 }
 
 // =========================================================================
+// ML-7391 classifier coverage: `/groups` and `/types` must classify
+// `paginate_odata` failures exactly like `/memberships` already does (see
+// the classifier-coverage block above for `list_memberships`). Before this
+// fix, `GroupRepository::list_groups` and `TypeRepository::list_types` both
+// folded every `paginate_odata` failure into a blanket
+// `.map_err(|e| DomainError::database(e.to_string()))?` instead of routing
+// through `DomainError::from` (`impl From<toolkit_odata::Error> for
+// DomainError`, `src/domain/error.rs`) -- so a stale/mismatched cursor or an
+// unknown `$orderby` field surfaced as 500 on these two routes while the
+// identical failure was already a correct 400 on `/memberships`. These four
+// tests mirror `rest_get_memberships_unknown_orderby_field_returns_400_not_500`
+// and `rest_get_memberships_cursor_filter_mismatch_returns_400_not_500`
+// one-for-one for `/groups` and `/types`.
+// =========================================================================
+
+/// `/groups` counterpart of `rest_get_memberships_unknown_orderby_field_returns_400_not_500`:
+/// `$orderby` on a field `GroupFilterField` doesn't declare passes syntax
+/// validation and fails *inside* `paginate_odata_collect`'s field-resolution
+/// loop with `ODataError::InvalidOrderByField`. Must classify as a caller
+/// error (400), not a backend fault (500).
+#[tokio::test]
+async fn rest_get_groups_unknown_orderby_field_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request(
+        "GET",
+        "/resource-group/v1/groups?%24orderby=not_a_real_field%20asc",
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// `/groups` counterpart of `rest_get_memberships_cursor_filter_mismatch_returns_400_not_500`:
+/// a cursor whose embedded filter hash (`cursor.f`) doesn't match the
+/// current request's `$filter` hash fails *inside* `paginate_odata_collect`
+/// with `ODataError::FilterMismatch`. The cursor is hand-built so the
+/// mismatch is deterministic: `s` (`"-id"`) matches `list_groups`' real
+/// tiebreaker (`("id", SortDir::Desc)`), so it clears the orderby-field
+/// check first and the mismatch check is what actually fires; `f` is a
+/// value no real `$filter` string will ever hash to. The filter itself
+/// (`name eq 'g-1'`) targets `GroupFilterField::Name`, which
+/// `TypeRepository::resolve_type_filter_node` passes through untouched (it
+/// only rewrites `GroupFilterField::Type` literals), so nothing upstream of
+/// `paginate_odata` can reject it first.
+#[tokio::test]
+async fn rest_get_groups_cursor_filter_mismatch_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+
+    let cursor = CursorV1 {
+        k: vec!["id".to_owned()],
+        o: SortDir::Desc,
+        s: "-id".to_owned(),
+        f: Some("mismatched-filter-hash".to_owned()),
+        d: "fwd".to_owned(),
+    };
+    let token = cursor.encode().expect("encode hand-built cursor");
+
+    let req = json_request(
+        "GET",
+        &format!("/resource-group/v1/groups?%24filter=name%20eq%20%27g-1%27&cursor={token}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// `/types` counterpart of `rest_get_memberships_unknown_orderby_field_returns_400_not_500`:
+/// `$orderby` on a field `TypeFilterField` doesn't declare (its only field
+/// is `code`) passes syntax validation and fails *inside*
+/// `paginate_odata_collect`'s field-resolution loop with
+/// `ODataError::InvalidOrderByField`. Must classify as a caller error (400),
+/// not a backend fault (500).
+#[tokio::test]
+async fn rest_get_types_unknown_orderby_field_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request(
+        "GET",
+        "/types-registry/v1/types?%24orderby=not_a_real_field%20asc",
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// `/types` counterpart of `rest_get_memberships_cursor_filter_mismatch_returns_400_not_500`:
+/// a cursor whose embedded filter hash (`cursor.f`) doesn't match the
+/// current request's `$filter` hash fails *inside* `paginate_odata_collect`
+/// with `ODataError::FilterMismatch`. The cursor is hand-built so the
+/// mismatch is deterministic: `s` (`"-code"`) matches `list_types`' real
+/// tiebreaker (`("code", SortDir::Desc)`), so it clears the orderby-field
+/// check first and the mismatch check is what actually fires; `f` is a
+/// value no real `$filter` string will ever hash to. Unlike `list_groups`
+/// and `list_memberships`, `list_types` passes the request's `$filter`
+/// straight into `paginate_odata` with no pre-resolution step, so the
+/// `code eq 'foo'` filter here reaches the classifier unmodified.
+#[tokio::test]
+async fn rest_get_types_cursor_filter_mismatch_returns_400_not_500() {
+    let (router, _, _, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+
+    let cursor = CursorV1 {
+        k: vec!["code".to_owned()],
+        o: SortDir::Desc,
+        s: "-code".to_owned(),
+        f: Some("mismatched-filter-hash".to_owned()),
+        d: "fwd".to_owned(),
+    };
+    let token = cursor.encode().expect("encode hand-built cursor");
+
+    let req = json_request(
+        "GET",
+        &format!("/types-registry/v1/types?%24filter=code%20eq%20%27foo%27&cursor={token}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+// =========================================================================
 // Split of "update" and "move": strict PUT + POST /move
 // =========================================================================
 //

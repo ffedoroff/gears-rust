@@ -459,7 +459,11 @@ impl GroupRepositoryTrait for GroupRepository {
             |m: rg_entity::Model| m,
         )
         .await
-        .map_err(|e| DomainError::database(e.to_string()))?;
+        // Any `paginate_odata` failure (bad `$orderby` field, stale cursor,
+        // filter/order mismatch, or a genuine DB error) is classified by
+        // `DomainError::from` (ML-7391): client-caused query rejections map
+        // to `Validation` (400), backend failures stay `Database` (500).
+        .map_err(DomainError::from)?;
 
         // Batch-resolve type paths for all groups in the page (single query)
         let type_ids: Vec<i16> = page.items.iter().map(|m| m.gts_type_id).collect();

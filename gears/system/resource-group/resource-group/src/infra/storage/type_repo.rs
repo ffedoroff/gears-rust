@@ -845,7 +845,11 @@ impl TypeRepositoryTrait for TypeRepository {
             |m: gts_type::Model| m,
         )
         .await
-        .map_err(|e| DomainError::database(e.to_string()))?;
+        // Any `paginate_odata` failure (bad `$orderby` field, stale cursor,
+        // filter/order mismatch, or a genuine DB error) is classified by
+        // `DomainError::from` (ML-7391): client-caused query rejections map
+        // to `Validation` (400), backend failures stay `Database` (500).
+        .map_err(DomainError::from)?;
 
         // Resolve full types (junction references) for the whole page in a
         // constant number of queries (fixes known defect RG-12).
