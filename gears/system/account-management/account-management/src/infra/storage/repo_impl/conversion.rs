@@ -49,7 +49,7 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, Order, QueryFilter};
 use time::OffsetDateTime;
 use toolkit_db::odata::sea_orm_filter::{
-    FieldToColumn, LimitCfg, ODataFieldMapping, PaginateOdataTryError, paginate_odata_try,
+    FieldToColumn, LimitCfg, ODataFieldMapping, paginate_odata_try,
 };
 use toolkit_db::secure::{
     DbTx, SecureEntityExt, SecureInsertExt, SecureUpdateExt, is_unique_violation,
@@ -69,7 +69,9 @@ use crate::domain::tenant::model::TenantStatus;
 use crate::infra::storage::entity::{conversion_requests, tenant_closure, tenants};
 
 use super::AmDbProvider;
-use super::helpers::{TxError, map_scope_err, map_scope_to_tx, with_serializable_retry};
+use super::helpers::{
+    TxError, map_paginate_try_err, map_scope_err, map_scope_to_tx, with_serializable_retry,
+};
 
 /// `SeaORM` repository adapter for [`ConversionRepo`].
 ///
@@ -1521,16 +1523,7 @@ async fn list_paged(
         entity_to_conversion,
     )
     .await
-    .map_err(|e| match e {
-        PaginateOdataTryError::OData(odata_err) => DomainError::Validation {
-            detail: format!("conversion listing query rejected: {odata_err}"),
-        },
-        // Caller's domain error is preserved verbatim — an out-of-domain
-        // `SMALLINT` value on a `conversion_requests` row surfaces as
-        // `Internal` (HTTP 500) per the `entity_to_conversion`
-        // classifier, with the bad row identifier in the diagnostic.
-        PaginateOdataTryError::MapError(domain_err) => domain_err,
-    })?;
+    .map_err(|e| map_paginate_try_err(e, "conversion listing query"))?;
 
     Ok(page)
 }

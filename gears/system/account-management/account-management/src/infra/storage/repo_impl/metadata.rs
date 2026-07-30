@@ -64,7 +64,9 @@ use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, MetricKind, emit_metric};
 use crate::infra::storage::entity::tenant_metadata;
 
 use super::AmDbProvider;
-use super::helpers::{TxError, map_scope_err, map_scope_to_tx, with_serializable_retry};
+use super::helpers::{
+    TxError, map_odata_err, map_scope_err, map_scope_to_tx, with_serializable_retry,
+};
 
 /// `OData` mapper for `tenant_metadata`. Maps the public SDK filter
 /// fields (`MetadataEntryFilterField` — `UpdatedAt` and `SchemaUuid`)
@@ -207,9 +209,7 @@ async fn list_for_tenant(
         entity_to_row,
     )
     .await
-    .map_err(|e| DomainError::Validation {
-        detail: format!("metadata list query rejected: {e}"),
-    })?;
+    .map_err(|e| map_odata_err(e, "metadata list query"))?;
 
     Ok(page)
 }

@@ -16,7 +16,7 @@ use sea_orm::{
 };
 use serde_json::Value;
 use toolkit_db::odata::sea_orm_filter::{
-    FieldToColumn, LimitCfg, ODataFieldMapping, PaginateOdataTryError, paginate_odata_try,
+    FieldToColumn, LimitCfg, ODataFieldMapping, paginate_odata_try,
 };
 use toolkit_db::secure::SecureEntityExt;
 use toolkit_odata::filter::{FieldKind, FilterField as _, FilterOp, ODataValue};
@@ -29,7 +29,7 @@ use crate::domain::tenant::model::{ChildCountFilter, TenantModel, TenantStatus};
 use crate::infra::storage::entity::{tenant_closure, tenant_idp_metadata, tenants};
 
 use super::TenantRepoImpl;
-use super::helpers::{entity_to_model, id_eq, map_scope_err};
+use super::helpers::{entity_to_model, id_eq, map_paginate_try_err, map_scope_err};
 
 /// `OData` mapper for `tenants`. Maps the public SDK filter fields
 /// ([`TenantInfoFilterField`]) onto the underlying `SeaORM` columns
@@ -415,16 +415,7 @@ pub(super) async fn list_children(
         entity_to_model,
     )
     .await
-    .map_err(|e| match e {
-        PaginateOdataTryError::OData(odata_err) => DomainError::Validation {
-            detail: format!("list_children query rejected: {odata_err}"),
-        },
-        // Caller's domain error (`Internal { diagnostic, cause }`)
-        // is preserved verbatim — the canonical envelope at the AM
-        // boundary maps it to HTTP 500 with the drift diagnostic
-        // payload so operators see the bad row identifier.
-        PaginateOdataTryError::MapError(domain_err) => domain_err,
-    })?;
+    .map_err(|e| map_paginate_try_err(e, "list_children query"))?;
 
     Ok(page)
 }

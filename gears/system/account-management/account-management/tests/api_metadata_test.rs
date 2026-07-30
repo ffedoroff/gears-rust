@@ -274,6 +274,43 @@ async fn list_metadata_returns_200_with_page() {
     assert_eq!(items[0]["type_id"], REGISTERED_METADATA_SCHEMA);
 }
 
+/// `MetadataEntryFilterField` only declares `updated_at` and
+/// `schema_uuid` (see `MetadataODataMapper` in
+/// `crate::infra::storage::repo_impl::metadata`); an `$orderby` on any
+/// other field name is unknown to the mapper and MUST be rejected as a
+/// client error (400), not swallowed as a 500.
+///
+/// NOT a regression pin for ML-2864, despite arriving with it: the pre-fix
+/// code mapped *every* OData error to `Validation`, so this test would have
+/// been green before the fix too. ML-2864 was the opposite direction —
+/// `Error::Db` reported as 400 — and that direction is pinned only at unit
+/// level, by `map_odata_err_db_is_internal`. Inducing a real DB failure
+/// after `paginate_odata` has been entered needs failure injection this
+/// suite does not have, so there is no HTTP-level pin on the 500 side.
+///
+/// What this test is worth: a guard against overshooting the fix, i.e.
+/// against client mistakes starting to surface as 500.
+#[tokio::test]
+async fn list_metadata_unknown_orderby_field_returns_400() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let (_services, router) = router_with_registered_schema(&h);
+
+    let list_req = json_request(
+        "GET",
+        &format!("/account-management/v1/tenants/{root}/metadata?%24orderby=name"),
+        None,
+        ctx_for(root),
+    );
+    let resp = router.oneshot(list_req).await.expect("router");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "unknown $orderby field MUST be rejected -- not a valid MetadataEntryFilterField",
+    );
+}
+
 // ─── RESOLVED ────────────────────────────────────────────────────────
 
 #[tokio::test]

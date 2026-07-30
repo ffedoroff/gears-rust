@@ -11,7 +11,9 @@ use std::time::Duration;
 use sea_orm::{ColumnTrait, Condition, DbErr};
 use toolkit_db::DbError;
 use toolkit_db::contention::is_retryable_contention;
+use toolkit_db::odata::sea_orm_filter::PaginateOdataTryError;
 use toolkit_db::secure::{DbTx, ScopeError, TxConfig};
+use toolkit_odata::Error as ODataError;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -103,6 +105,76 @@ pub(super) fn map_scope_err(err: ScopeError) -> DomainError {
     match map_scope_to_tx(err) {
         TxError::Db(db) => classify_db_err_to_domain(db),
         TxError::Domain(d) => d,
+    }
+}
+
+/// Classify an `OData` pagination failure surfaced by `paginate_odata`
+/// / `paginate_odata_try` into a typed [`DomainError`], splitting
+/// [`ODataError`]'s 15 variants along the client-vs-infrastructure line
+/// documented on the enum itself (`toolkit_odata::Error` docs) and in
+/// `toolkit_odata::problem_mapping`:
+///
+/// * [`ODataError::Db`] / [`ODataError::ParsingUnavailable`] — the ONLY
+///   two infrastructure variants — become [`DomainError::Internal`]
+///   (HTTP 500). A DB outage or `OData` parser misconfiguration MUST
+///   surface as an operator-facing alert, not a client-blaming 400
+///   (ML-2864: collapsing these into `Validation` reads a downed
+///   database as "your request was rejected", which suppresses
+///   alerting and misdirects triage at the client).
+/// * Every other variant (malformed `$filter`, unsupported `$orderby`
+///   field, stale/corrupt cursor, bad `$top`) is a genuine client
+///   mistake and becomes [`DomainError::Validation`] (HTTP 400).
+///
+/// `op` labels the calling operation (e.g. `"metadata list query"`,
+/// `"list_children query"`) and is folded into both branches' message
+/// so operators can grep on the same prefix regardless of which half
+/// fired; only the verb differs ("rejected" for the client branch,
+/// "failed" for the infra branch) so a 500 doesn't read like a request
+/// that was merely turned down.
+pub(super) fn map_odata_err(err: ODataError, op: &str) -> DomainError {
+    // Both arms are spelled out on purpose: no wildcard. A variant added to
+    // `toolkit_odata::Error` must break this build and force an explicit
+    // 400/500 decision, rather than default into `Validation` and quietly
+    // report an infrastructure failure as the caller's fault — which is the
+    // very defect this helper exists to fix.
+    match err {
+        ODataError::Db(_) | ODataError::ParsingUnavailable(_) => DomainError::Internal {
+            diagnostic: format!("{op} failed: {err}"),
+            cause: Some(Box::new(err)),
+        },
+        ODataError::InvalidFilter(_)
+        | ODataError::InvalidOrderByField(_)
+        | ODataError::OrderMismatch
+        | ODataError::FilterMismatch
+        | ODataError::InvalidCursor
+        | ODataError::InvalidLimit
+        | ODataError::OrderWithCursor
+        | ODataError::CursorInvalidBase64
+        | ODataError::CursorInvalidJson
+        | ODataError::CursorInvalidVersion
+        | ODataError::CursorInvalidKeys
+        | ODataError::CursorInvalidFields
+        | ODataError::CursorInvalidDirection => DomainError::Validation {
+            detail: format!("{op} rejected: {err}"),
+        },
+    }
+}
+
+/// Classify a [`PaginateOdataTryError<DomainError>`] surfaced by
+/// `paginate_odata_try`. The `OData` half defers to [`map_odata_err`]
+/// for the client-vs-infrastructure split; the `MapError` half is
+/// already a typed [`DomainError`] produced by the caller's fallible
+/// `model -> domain` projection (e.g. an out-of-domain `SMALLINT`
+/// classified as `Internal` by [`entity_to_model`]) and is returned
+/// VERBATIM — it already carries the right AIP-193 category and must
+/// not be re-classified or reformatted here.
+pub(super) fn map_paginate_try_err(
+    err: PaginateOdataTryError<DomainError>,
+    op: &str,
+) -> DomainError {
+    match err {
+        PaginateOdataTryError::OData(odata_err) => map_odata_err(odata_err, op),
+        PaginateOdataTryError::MapError(domain_err) => domain_err,
     }
 }
 
