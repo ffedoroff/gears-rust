@@ -5,6 +5,7 @@
 
 - [What was found](#what-was-found)
   - [Findings added after this report](#findings-added-after-this-report)
+  - [Transaction-behaviour findings (`TX-nn`)](#transaction-behaviour-findings-tx-nn)
 - [How it was found](#how-it-was-found)
 - [Deviation from the unit/E2E testing guide](#deviation-from-the-unite2e-testing-guide)
 - [Running this audit on another module](#running-this-audit-on-another-module)
@@ -70,6 +71,35 @@ work added two findings that code comments reference by letter rather than by
 
 Either give these `RG-16`/`RG-17` numbers or keep this table; what must not happen
 is a code comment pointing at an audit that does not mention the finding.
+
+### Transaction-behaviour findings (`TX-nn`)
+
+A companion pass reviewed every write transaction in the gear — isolation level, retry budget,
+external calls inside the transaction, and whether the declared invariant actually needs
+`SERIALIZABLE`. Its conclusion was that nothing in the branch sat in the "must fix" class: no
+unprotected write-skew and no cross-gear call inside a transaction remained. Three items were
+"worth doing", and all three were done. They are recorded here because the code cites them.
+
+| ID | Finding | Why `SERIALIZABLE` was not the right tool | Status |
+|----|---------|-------------------------------------------|--------|
+| TX-01 | `TypeRepository::insert` did not classify `is_unique_violation()`, unlike `GroupRepository` and `MembershipRepository` | The invariant is `UNIQUE(schema_id)`, held by the schema at every isolation level. Only the *error shape* depended on `SERIALIZABLE`: without the mapping, a duplicate code surfaced as a raw database error unless an SSI abort happened to retry into a clean one. | Fixed — typed `TypeAlreadyExists` (409) independent of isolation |
+| TX-02 | `update_group` always opened `SERIALIZABLE`, including for a pure rename | The predicates that need SSI — cycle detection, depth and width limits, closure rebuild — are reachable only when `parent_id` changes. | Fixed, then simplified. First by choosing the level conditionally with a restart protocol; then the move became its own operation, so an update is a single-row write by primary key over columns no other operation writes and runs at the backend default unconditionally. |
+| TX-03 | `remove_membership_in_tx` did not need `SERIALIZABLE` | It deletes by the exact composite primary key `(group_id, gts_type_id, resource_id)` — no predicate a concurrent writer can invalidate. The commit that introduced the transaction documented the level as "for symmetry" with `add_membership`, not as a correctness requirement. | Fixed — backend default, bounded retry kept because a real deadlock (`40P01`) is still possible regardless of isolation |
+
+Bounded retry is kept on every downgraded path. Lowering the isolation level removes SSI aborts
+(`40001`), not lock-ordering deadlocks (`40P01`), and `is_retryable_contention` treats both alike.
+
+Two further observations from that pass, neither acted on:
+
+- `check_hierarchy_safety` inside `update_type_in_tx` loops over the removed allowed-parent types
+  with three queries per iteration. It scales with the size of the *request*, not of the database,
+  so it is not in the N+1 class above — but a very long list holds a `SERIALIZABLE` transaction open
+  proportionally longer. Low risk in practice: type definitions are administered by hand.
+- `11_database_patterns.md` documents transactions exclusively through
+  `SecureConn::in_transaction_mapped`, which has neither retry nor a configurable isolation level.
+  The `Db` / `TxConfig::serializable()` / `transaction_with_retry` path this gear uses — and so do
+  `ledger` and `account-management` — is absent from the guide, which therefore misleads anyone
+  writing a new gear against it. This is a gap in the guide, not a deviation by the gear.
 
 ## How it was found
 

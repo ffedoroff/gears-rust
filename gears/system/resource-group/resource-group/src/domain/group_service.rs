@@ -17,7 +17,7 @@
 //! `GroupRepositoryTrait::update_parent`. A single-row write by primary key
 //! over a column set no other operation touches has no cross-row predicate to
 //! protect, so `update_group` runs at the backend default isolation
-//! (`rg-db-audit-transactions.md`, recommendation #3); see its own doc
+//! (`docs/db-behavior-audit.md`, TX-02); see its own doc
 //! comment for why the former isolation-guessing/restart protocol is gone.
 
 use std::sync::Arc;
@@ -325,7 +325,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// runs SERIALIZABLE regardless, per `TxIsolationLevel`'s backend notes,
     /// so the saving is PostgreSQL-only) with bounded retry (max 3
     /// attempts). Per the DB-behaviour audit
-    /// (`rg-db-audit-transactions.md`, recommendation #3).
+    /// (`docs/db-behavior-audit.md`, TX-02).
     ///
     /// **Why there is no isolation-level guess any more.** While `parent_id`
     /// still travelled in the update payload, this method could not know

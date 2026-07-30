@@ -1205,7 +1205,7 @@ async fn gts_resolve_id_nonexistent() {
     );
 }
 
-/// rg-db-audit-transactions.md fix #1: `TypeRepository::insert` maps a
+/// docs/db-behavior-audit.md TX-01: `TypeRepository::insert` maps a
 /// unique-constraint violation on `schema_id` to the typed
 /// `TypeAlreadyExists` domain error, symmetric with
 /// `GroupRepository::insert`/`MembershipRepository::insert`

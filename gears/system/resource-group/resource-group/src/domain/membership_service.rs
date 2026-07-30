@@ -332,7 +332,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     /// The base PR's commit introducing this transaction (`ab073c7a`)
     /// documented `SERIALIZABLE` here as "for symmetry" with `add_membership`,
     /// not as a correctness requirement; the DB-behavior audit
-    /// (`rg-db-audit-transactions.md`, finding #7 / recommendation #2)
+    /// (`docs/db-behavior-audit.md`, TX-03)
     /// confirmed write-skew is impossible on a delete-by-primary-key and
     /// recommended the downgrade. Bounded retry is kept (not dropped) because
     /// a real deadlock (`40P01`) is still possible between two transactions

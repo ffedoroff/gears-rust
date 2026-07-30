@@ -799,7 +799,7 @@ async fn create_type_conflict_retried_yields_clean_already_exists_for_loser(
     assert_hierarchy_invariants(db).await;
 }
 
-// rg-db-audit-transactions.md fix #1: real-Postgres coverage for
+// docs/db-behavior-audit.md TX-01: real-Postgres coverage for
 // `TypeRepository::insert`'s unique-key classification path.
 
 /// `TypeRepository::insert` with a `schema_id` that collides with an
@@ -1168,7 +1168,7 @@ async fn negative_control_width_limited_race_exactly_one_succeeds(db: &Arc<DBPro
         .expect("cleanup: force delete root + surviving child");
 }
 
-// rg-db-audit-transactions.md fix #2: update_group's rename-only path
+// docs/db-behavior-audit.md TX-02: update_group's rename-only path
 // (no parent_id change) now opens its transaction at TxConfig::default()
 // instead of always paying for SERIALIZABLE.
 
@@ -1256,7 +1256,7 @@ async fn concurrent_rename_same_group_both_succeed(db: &Arc<DBProvider<DbError>>
         .expect("cleanup: delete the leaf group");
 }
 
-// rg-db-audit-transactions.md fix #3: remove_membership now opens its
+// docs/db-behavior-audit.md TX-03: remove_membership now opens its
 // transaction at TxConfig::default() instead of SERIALIZABLE ("for
 // symmetry" per ab073c7a, not a correctness requirement -- a delete by
 // exact composite primary key has no write-skew hazard).
