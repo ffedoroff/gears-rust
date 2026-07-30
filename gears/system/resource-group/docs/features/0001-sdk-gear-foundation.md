@@ -604,7 +604,7 @@ Create 5 groups of same type
 all_ids = []
 cursor = None
 while True:
-    GET /groups?$top=2&$skiptoken={cursor}     → 200
+    GET /groups?limit=2&cursor={cursor}        → 200
     all_ids.extend(page item IDs)
     if page_info.next_cursor is None:
         break

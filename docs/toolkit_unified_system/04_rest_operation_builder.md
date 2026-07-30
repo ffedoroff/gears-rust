@@ -166,7 +166,7 @@ pub async fn user_events(
 .standard_errors(openapi)
 ```
 
-Adds: 400, 401, 403, 404, 409, 422, 429, 500.
+Adds: 400, 401, 403, 404, 409, 429, 500. (422 is intentionally omitted — canonical `InvalidArgument` maps to 400; see `docs/arch/errors/ADR/0001-cpt-cf-adr-canonical-error-categories.md`.)
 
 ### Specific errors
 
@@ -174,7 +174,7 @@ Adds: 400, 401, 403, 404, 409, 422, 429, 500.
 .problem_response(openapi, StatusCode::BAD_REQUEST, "Invalid input")
 .problem_response(openapi, StatusCode::CONFLICT, "Email already exists")
 .problem_response(openapi, StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
-.with_422_validation_error(openapi)
+.with_400_validation_error(openapi)
 ```
 
 ### Handler error pattern
@@ -249,7 +249,7 @@ pub async fn list_users(
 .error_403(openapi)
 .error_404(openapi)
 .error_409(openapi)
-.error_422(openapi)
+.error_422(openapi)   // legacy / non-canonical: no canonical category maps to 422
 .error_500(openapi)
 ```
 

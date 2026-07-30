@@ -950,7 +950,7 @@ successful Decision in the body at HTTP 200; the calling service may translate i
 is `Problem`.
 
 **OpenAPI registration.** Each `OperationBuilder` chain registers expected `Problem` responses via
-`.standard_errors(&registry)` (covers 400 / 401 / 403 / 404 / 409 / 422 / 429 / 500) or per-status
+`.standard_errors(&registry)` (covers 400 / 401 / 403 / 404 / 409 / 429 / 500) or per-status
 `.error_400 / 401 / 403 / 404 / 409 / 415 / 422 / 429 / 500`. ToolKit exposes only those status methods; 5xx outcomes
 other than 500 (i.e. 501 / 503 / 504 in this gear) are registered under `error_500` for OpenAPI bookkeeping, and the
 runtime HTTP status is the AIP-193 fixed status of the canonical category, surfaced via the `Problem` body's `status`

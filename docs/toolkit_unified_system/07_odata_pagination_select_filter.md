@@ -471,30 +471,25 @@ $select=id,user.profile.name,user.profile.email
 
 ### OData error type
 
-OData errors are defined in `toolkit_odata::Error` (aliased as `ODataError` in `toolkit`). Key variants:
+OData errors are defined in `toolkit_odata::Error` (which `toolkit` imports privately as `ODataError`; there is no public re-export). All client-input variants map to the canonical `InvalidArgument` category, which is HTTP 400 — not 422 (422 is intentionally excluded from the platform's canonical categories; see `docs/arch/errors/ADR/0001-cpt-cf-adr-canonical-error-categories.md`). The authoritative mapping lives in `libs/toolkit-odata/src/problem_mapping.rs`; use it to verify this table rather than relying on it as documentation of record. Key variants:
 
 | Variant | Description | HTTP status |
 |---------|-------------|-------------|
-| `InvalidFilter(String)` | Malformed `$filter` expression | 422 |
-| `InvalidOrderByField(String)` | Unsupported `$orderby` field | 422 |
-| `InvalidCursor` / `CursorInvalid*` | Malformed or expired cursor | 422 |
-| `OrderMismatch` | Cursor/query order conflict | 422 |
-| `FilterMismatch` | Cursor/query filter conflict | 422 |
-| `InvalidLimit` | Invalid limit parameter | 422 |
+| `InvalidFilter(String)` | Malformed `$filter` expression | 400 |
+| `InvalidOrderByField(String)` | Unsupported `$orderby` field | 400 |
+| `InvalidCursor` / `CursorInvalid*` | Malformed cursor | 400 |
+| `OrderMismatch` | Cursor/query order conflict | 400 |
+| `FilterMismatch` | Cursor/query filter conflict | 400 |
+| `InvalidLimit` | Invalid limit parameter | 400 |
+| `OrderWithCursor` | `$orderby` sent together with a cursor | 400 |
 | `Db(String)` | Database error (logged, generic message returned) | 500 |
+| `ParsingUnavailable(&'static str)` | OData parsing feature unavailable (logged, generic message returned) | 500 |
 
 `$select` validation errors (too long, too many fields, duplicates) are caught during parsing in the `OData` extractor and returned as `400 Bad Request` with RFC 9457 Problem Details before reaching the handler.
 
 ### Error conversion
 
-The `From<toolkit_odata::Error> for Problem` impl (in `toolkit-odata/src/problem_mapping.rs`) maps each variant to a GTS error code. The HTTP layer in `toolkit` adds instance paths and trace IDs via `odata_error_to_problem()`:
-
-```rust
-use toolkit::api::odata::error::odata_error_to_problem;
-
-// Automatically used by the OData extractor; manual usage:
-let problem = odata_error_to_problem(&err, "/users-info/v1/users", None);
-```
+The `From<toolkit_odata::Error> for CanonicalError` impl (in `toolkit-odata/src/problem_mapping.rs`) is the single source of truth for mapping each variant to its canonical category and GTS-typed field violations. `IntoResponse for CanonicalError` (in `toolkit-canonical-errors`) renders the wire `Problem`; the `canonical_error_middleware` (in `toolkit::api::canonical_error_layer`) then fills in `instance`, and `trace_id` when a trace context, header, or active span is available. The `OData` axum extractor's `Rejection` type is `CanonicalError`, so this conversion runs automatically — no manual call is needed in handlers.
 
 ## Testing OData
 

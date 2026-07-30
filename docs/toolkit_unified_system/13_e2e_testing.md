@@ -505,9 +505,9 @@ async def test_pagination_cursor_roundtrip(client, create_entities):
     all_ids = []
     cursor = None
     while True:
-        params = {"$top": 2}
+        params = {"limit": 2}
         if cursor:
-            params["$skiptoken"] = cursor
+            params["cursor"] = cursor
         r = await client.get("/cf/<gear>/v1/entities", params=params)
         assert r.status_code == 200
         page = r.json()

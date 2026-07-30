@@ -1387,7 +1387,7 @@ where
         self
     }
 
-    /// Add standard error responses (400, 401, 403, 404, 409, 422, 429, 500).
+    /// Add standard error responses (400, 401, 403, 404, 409, 429, 500).
     ///
     /// All responses reference the shared Problem schema (RFC 9457) for consistent
     /// error handling across your API. This is the recommended way to declare
@@ -1421,13 +1421,15 @@ where
     /// - 403 Forbidden
     /// - 404 Not Found
     /// - 409 Conflict
-    /// - 422 Unprocessable Entity
     /// - 429 Too Many Requests
     /// - 500 Internal Server Error
     ///
     /// 422 is intentionally absent: canonical `InvalidArgument` maps to 400
     /// per `docs/arch/errors/DESIGN.md` §1.2, so no canonical-handler path
-    /// produces a 422 response.
+    /// produces a 422 response. The decision to leave 422 out of the canonical
+    /// category set is recorded in
+    /// `docs/arch/errors/ADR/0001-cpt-cf-adr-canonical-error-categories.md`;
+    /// `DESIGN.md` itself never mentions 422.
     pub fn standard_errors(mut self, registry: &dyn OpenApiRegistry) -> Self {
         use http::StatusCode;
         // Canonical Problem schema (RFC 9457 + GTS-typed). Component name "Problem".

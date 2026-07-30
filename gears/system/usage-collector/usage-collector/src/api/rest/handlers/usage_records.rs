@@ -377,9 +377,11 @@ pub const MAX_METADATA_FILTER_VALUES: usize = 32;
 
 /// `$`-prefixed `OData` parameters (parsed by the toolkit `OData`
 /// extractor) and the non-`OData` scalars the toolkit also accepts.
-/// Both `$top` (canonical `OData`) and `limit` (toolkit alias) are
-/// admitted — the toolkit extractor folds them onto the same
-/// `ODataQuery.limit` slot.
+/// `limit` is the only page-size parameter the toolkit extractor reads
+/// (`ODataParams` in `toolkit::api::odata` has no `$top` field). `$top` is
+/// listed here only so the allow-list does not reject it outright; the
+/// extractor drops it, so a caller sending `$top` silently gets the default
+/// page size. Do not document `$top` as an accepted alias — it is not one.
 const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$select", "$top", "limit", "cursor"];
 
 /// Typed query parameters carrying SDK values that are NOT part of the
