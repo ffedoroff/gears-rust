@@ -623,9 +623,11 @@ impl<R: TenantRepo> TenantService<R> {
     ///
     /// - [`DomainError::CrossTenantDenied`] when the PDP denies the
     ///   caller access to the parent tenant.
-    /// - [`DomainError::Validation`] when the parent is missing or not
-    ///   `Active` (create under a suspended / deleted / provisioning
-    ///   parent is rejected).
+    /// - [`DomainError::Validation`] when the parent is missing, outside
+    ///   the caller's authorized [`AccessScope`] (indistinguishable from
+    ///   missing — see the parent-read comment below), or not `Active`
+    ///   (create under a suspended / deleted / provisioning parent is
+    ///   rejected).
     /// - [`DomainError::ServiceUnavailable`] when the provider reports a
     ///   clean compensable failure; the `provisioning` row is removed.
     /// - [`DomainError::UnsupportedOperation`] when the provider signals
@@ -650,9 +652,28 @@ impl<R: TenantRepo> TenantService<R> {
         ctx: &SecurityContext,
         input: CreateTenantRequest,
     ) -> Result<Tenant, DomainError> {
-        // PEP gate (DESIGN §4.2). resource_id=None — child not committed
-        // yet; ownership PEP keys on parent_id.
-        let _scope = self
+        // PEP gate (DESIGN §4.2) + DB-level subtree clamp (gears-rust#1813).
+        // resource_id=None — child not committed yet; ownership PEP keys
+        // on parent_id. `scope` flows into the parent read below so an
+        // out-of-subtree caller collapses to `Validation` (parent not
+        // found) at the DB JOIN, not just at the PEP gate.
+        //
+        // This matters even though `parent_id` is already sent to the
+        // PDP as `OWNER_TENANT_ID`: `response.decision` only proves the
+        // caller holds *some* valid create grant, not that this
+        // specific `parent_id` is inside it. Nothing about the request
+        // shape (a boolean allow) forces a policy engine to inspect the
+        // resource property before answering — a PDP is free to decide
+        // "this subject may create *something*" from context/subject
+        // alone and leave the actual scoping to the returned
+        // constraints, which is exactly the case `evaluate_list`-style
+        // policies implement for CREATE / LIST_CHILDREN (no single
+        // target to check `decision` against). Applying `scope` here is
+        // what turns "PDP allowed create under this owner_tenant_id
+        // value-space" into "and this parent_id is actually in it" —
+        // the same defence-in-depth `get_tenant` / `list_children` /
+        // `update_tenant` already apply to their own reads.
+        let scope = self
             .authorize(ctx, pep::actions::CREATE, input.parent_id, None)
             .await?;
 
@@ -672,17 +693,21 @@ impl<R: TenantRepo> TenantService<R> {
             .to_uuid();
 
         // Saga pre-step: validate parent exists + is Active.
-        // allow_all: structural read per DESIGN §4.2 — the PEP has
-        // already gated the operation; the parent-status check is a
-        // saga precondition, not a data-disclosure read. Runs BEFORE
-        // any registry-backed GTS validation so a Types Registry
-        // outage cannot mask `parent tenant not found / not active`
-        // as a 503 or add external latency to a request that would
-        // fail locally anyway — same error-channel protection that
-        // `update_tenant` already applies.
+        // Reads under `scope`, not `allow_all()` — see the rationale on
+        // the `authorize` call above. A caller-supplied `parent_id` the
+        // PDP's constraints do not cover collapses to the same
+        // `Validation` "parent tenant not found" error as a genuinely
+        // missing row (deliberately indistinguishable — this call must
+        // not become a tenant-existence oracle for ids outside the
+        // caller's scope). Runs BEFORE any registry-backed GTS
+        // validation so a Types Registry outage cannot mask `parent
+        // tenant not found / not active` as a 503 or add external
+        // latency to a request that would fail locally anyway — same
+        // error-channel protection that `update_tenant` already
+        // applies.
         let parent = self
             .repo
-            .find_by_id(&AccessScope::allow_all(), input.parent_id)
+            .find_by_id(&scope, input.parent_id)
             .await?
             .ok_or_else(|| DomainError::Validation {
                 detail: format!("parent tenant {} not found", input.parent_id),

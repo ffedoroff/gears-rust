@@ -483,6 +483,7 @@ async fn create_tenant_advisory_depth_threshold_emits_metric_and_succeeds() {
     let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("epoch");
 
     let mut prev: Option<Uuid> = None;
+    let mut ancestors: Vec<Uuid> = Vec::new();
     let mut deepest = Uuid::nil();
     for i in 0..=4u128 {
         let id = Uuid::from_u128(0x1000 + i);
@@ -499,6 +500,18 @@ async fn create_tenant_advisory_depth_threshold_emits_metric_and_succeeds() {
             deleted_at: None,
         };
         repo.insert_tenant_raw(model);
+        // `insert_tenant_raw` bypasses the create saga (and therefore
+        // closure-row materialization) on purpose, so a hand-built
+        // multi-level chain must hand-seed `tenant_closure` itself.
+        // Needed post-#1813-for-create so the parent-existence read
+        // below (`create_tenant`'s `find_by_id(&scope, deepest)`) can
+        // resolve `deepest` as inside `subtree(root)`. None of these
+        // nodes are `self_managed`, so every edge is barrier=0.
+        repo.seed_closure(id, id, 0, TenantStatus::Active);
+        for &ancestor in &ancestors {
+            repo.seed_closure(ancestor, id, 0, TenantStatus::Active);
+        }
+        ancestors.push(id);
         prev = Some(id);
         deepest = id;
     }
@@ -962,7 +975,17 @@ async fn closure_invariants_are_preserved_across_self_managed_path() {
     svc.create_tenant(&ctx_for(root), mid_input)
         .await
         .expect("mid ok");
-    svc.create_tenant(&ctx_for(root), child_input(leaf, mid))
+    // `leaf`'s creator is `mid` itself, not `root`: `mid` is
+    // self_managed, so the `(root, mid)` closure edge carries
+    // `barrier = 1` and `create_tenant`'s (post-#1813-for-create)
+    // parent-existence read clamps to the caller's barrier-respecting
+    // subtree. `root` creating directly under its own self-managed
+    // child would be exactly the cross-barrier authority the barrier
+    // exists to prevent; a real caller authorized to create under
+    // `mid` is `mid`'s own scope, which this test models via
+    // `ctx_for(mid)` (reflexively in `subtree(mid)` regardless of the
+    // barrier on the edge *above* `mid`).
+    svc.create_tenant(&ctx_for(mid), child_input(leaf, mid))
         .await
         .expect("leaf ok");
 
@@ -2565,6 +2588,7 @@ async fn strict_mode_rejects_deep_child() {
     let repo = Arc::new(FakeTenantRepo::new());
     let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("epoch");
     let mut prev: Option<Uuid> = None;
+    let mut ancestors: Vec<Uuid> = Vec::new();
     let mut deepest = Uuid::nil();
     for i in 0..=2u128 {
         let id = Uuid::from_u128(0x2000 + i);
@@ -2580,6 +2604,16 @@ async fn strict_mode_rejects_deep_child() {
             updated_at: now,
             deleted_at: None,
         });
+        // See the identical seeding note in
+        // `create_tenant_advisory_depth_threshold_emits_metric_and_succeeds`:
+        // `insert_tenant_raw` bypasses closure-row materialization, so
+        // the hand-built chain must hand-seed `tenant_closure` for the
+        // post-#1813-for-create scope clamp to resolve `deepest`.
+        repo.seed_closure(id, id, 0, TenantStatus::Active);
+        for &ancestor in &ancestors {
+            repo.seed_closure(ancestor, id, 0, TenantStatus::Active);
+        }
+        ancestors.push(id);
         prev = Some(id);
         deepest = id;
     }
@@ -3931,6 +3965,89 @@ async fn list_children_outside_caller_subtree_returns_not_found() {
         DomainError::NotFound { .. } => {}
         other => panic!("expected NotFound, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn create_tenant_outside_caller_subtree_rejected() {
+    // Symmetric to `list_children_outside_caller_subtree_returns_not_found`
+    // and the `get_tenant` / `update_tenant` / `delete_tenant` cross-
+    // subtree siblings above -- but for `create_tenant`'s parent-
+    // existence gate specifically.
+    //
+    // `create_tenant`'s `authorize(CREATE, parent_id, None)` call sends
+    // `parent_id` to the PDP as `OWNER_TENANT_ID`, but CREATE has no
+    // single target (`resource_id=None`), so nothing about the PEP
+    // request shape forces a PDP's boolean `decision` to depend on the
+    // value of that property -- a policy is free to decide "this
+    // subject may create *something*" from subject/context alone and
+    // leave the actual scoping entirely to the returned constraints.
+    // `ConstraintBearingAuthZResolver` (`constraint_bearing_enforcer`)
+    // models exactly that shape: `decision: true` unconditionally, with
+    // the compiled scope pinned to a fixed root regardless of what
+    // `parent_id` the caller asks to create under.
+    //
+    // Caller is authorized only for `subtree(child) = {child}`; the
+    // create request asks for a new tenant under `root`, which sits
+    // outside that scope. This MUST be rejected -- the same `Validation`
+    // "parent tenant not found" shape a genuinely missing parent
+    // produces, so the call is not a tenant-existence oracle for ids
+    // outside the caller's scope.
+    //
+    // Before the `let _scope` → `let scope` fix (and threading `scope`
+    // into the parent `find_by_id`), this call read the parent under
+    // `AccessScope::allow_all()` and SUCCEEDED despite `root` being
+    // outside the caller's authorized subtree -- `response.decision`
+    // alone does not validate `parent_id` for this PDP shape.
+    //
+    // Deliberately hand-rolled rather than reusing
+    // `make_cross_subtree_svc`: this test needs `.with_types_registry`
+    // wired on the *returned* `svc` (not just the setup service) so
+    // that, pre-fix, the call runs the saga to actual completion
+    // instead of tripping an unrelated `ServiceUnavailable` from
+    // `load_tenant_context`'s registry requirement at line ~832 —
+    // i.e. so the demonstrated pre-fix failure is "the create
+    // succeeded despite being out of scope", not an incidental gap in
+    // this fixture's wiring.
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x501);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let setup_svc = TenantService::new(
+        repo.clone(),
+        Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok)),
+        Arc::new(InertResourceOwnershipChecker),
+        crate::domain::tenant_type::inert_tenant_type_checker(),
+        mock_enforcer(),
+        AccountManagementConfig::default(),
+    )
+    .with_types_registry(Arc::new(ConstantTypesRegistry));
+    setup_svc
+        .create_tenant(&ctx_for(root), child_input(child, root))
+        .await
+        .expect("create child via mock provisioning happy path");
+
+    let svc = TenantService::new(
+        repo.clone(),
+        Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok)),
+        Arc::new(InertResourceOwnershipChecker),
+        crate::domain::tenant_type::inert_tenant_type_checker(),
+        constraint_bearing_enforcer(child),
+        AccountManagementConfig::default(),
+    )
+    .with_types_registry(Arc::new(ConstantTypesRegistry));
+
+    let new_id = Uuid::from_u128(0x502);
+    let err = svc
+        .create_tenant(&ctx_for(root), child_input(new_id, root))
+        .await
+        .expect_err("cross-subtree create_tenant MUST be rejected at the parent gate, not created");
+    match err {
+        DomainError::Validation { .. } => {}
+        other => panic!("expected Validation (parent not found), got {other:?}"),
+    }
+    assert!(
+        repo.find_by_id_unchecked(new_id).is_none(),
+        "the out-of-scope create MUST NOT have materialized a row"
+    );
 }
 
 // ---------------------------------------------------------------------------
