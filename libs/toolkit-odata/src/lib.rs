@@ -278,6 +278,12 @@ impl std::fmt::Display for ODataOrderBy {
 ///   `InvalidArgument` (HTTP 400), with the offending parameter surfaced as
 ///   a `field_violation` (`$filter`, `$orderby`, `$top`, or `cursor`).
 /// - `Db` / `ParsingUnavailable` → canonical `Internal` (HTTP 500).
+///
+/// Callers that convert straight to `CanonicalError` get this for free via
+/// `From<Error> for CanonicalError` in [`crate::problem_mapping`]. Callers
+/// that return their own domain error type
+/// instead — and therefore cannot use that `From` impl — should use
+/// [`Error::classify`] rather than re-deriving the same two-way split.
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum Error {
     // Filter parsing and validation errors
@@ -330,6 +336,68 @@ pub enum Error {
     // Configuration errors
     #[error("OData parsing unavailable: {0}")]
     ParsingUnavailable(&'static str),
+}
+
+/// Outcome of [`Error::classify`]: splits the 15 `Error` variants into the
+/// same two response categories documented on `Error` and implemented by
+/// `impl From<Error> for CanonicalError` in [`crate::problem_mapping`], while
+/// keeping the original, typed `Error` value available to the caller.
+///
+/// Consumers that return their own domain error type (rather than converting
+/// straight to `CanonicalError`) cannot use the `From` impl directly and
+/// would otherwise have to re-derive this categorization by hand — exactly
+/// the drift `classify` exists to prevent. Match on this enum instead of
+/// re-triaging `Error`'s variants at the call site.
+///
+/// ## Limitation
+///
+/// `classify` preserves *which variant* fired, not a causal source chain:
+/// `Db(String)` and `ParsingUnavailable(&'static str)` already carry their
+/// detail as a plain string, so there is no underlying error object for
+/// `classify` to retain — it moves the same `Error` value into the matching
+/// bucket, nothing more.
+#[derive(Clone, Debug)]
+pub enum ClassifiedError {
+    /// The request itself was malformed: bad `$filter` / `$orderby`, a
+    /// corrupt, stale, or mismatched cursor, or an invalid `limit`. Covers 13
+    /// of the 15 `Error` variants — every one except `Db` and
+    /// `ParsingUnavailable`.
+    Client(Error),
+    /// The failure originates below the `OData` layer rather than from the
+    /// request: `Db` or `ParsingUnavailable`.
+    Infrastructure(Error),
+}
+
+impl Error {
+    /// Classify this error as caused by the client's request
+    /// ([`ClassifiedError::Client`]) or by the infrastructure underneath the
+    /// `OData` layer ([`ClassifiedError::Infrastructure`]).
+    ///
+    /// The match is exhaustive with no wildcard arm by design: a variant
+    /// added to `Error` in the future must be triaged here explicitly, so
+    /// the compiler rejects the change until someone decides its category —
+    /// rather than it silently landing in whichever bucket a `_ => ...` arm
+    /// happened to pick.
+    #[must_use]
+    pub fn classify(self) -> ClassifiedError {
+        match self {
+            Self::InvalidFilter(_)
+            | Self::InvalidOrderByField(_)
+            | Self::OrderMismatch
+            | Self::FilterMismatch
+            | Self::InvalidCursor
+            | Self::InvalidLimit
+            | Self::OrderWithCursor
+            | Self::CursorInvalidBase64
+            | Self::CursorInvalidJson
+            | Self::CursorInvalidVersion
+            | Self::CursorInvalidKeys
+            | Self::CursorInvalidFields
+            | Self::CursorInvalidDirection => ClassifiedError::Client(self),
+
+            Self::Db(_) | Self::ParsingUnavailable(_) => ClassifiedError::Infrastructure(self),
+        }
+    }
 }
 
 /// Validate cursor consistency against effective order and filter hash.
@@ -548,6 +616,9 @@ impl From<Option<ast::Expr>> for ODataQuery {
     }
 }
 
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod classify_tests;
 #[cfg(test)]
 mod odata_parse_tests;
 mod tests;

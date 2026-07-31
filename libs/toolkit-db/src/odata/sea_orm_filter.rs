@@ -14,7 +14,9 @@ use sea_orm::{
 use toolkit_odata::filter::{
     FieldKind, FilterField, FilterNode, FilterOp, ODataValue, convert_expr_to_filter_node,
 };
-use toolkit_odata::{CursorV1, Error as ODataError, ODataOrderBy, Page, PageInfo, SortDir};
+use toolkit_odata::{
+    ClassifiedError, CursorV1, Error as ODataError, ODataOrderBy, Page, PageInfo, SortDir,
+};
 
 use crate::secure::{DBRunner, DBRunnerInternal, SeaOrmRunner};
 
@@ -658,6 +660,47 @@ pub enum PaginateOdataTryError<MapErr> {
     MapError(MapErr),
 }
 
+/// Outcome of [`PaginateOdataTryError::classify`]: nests
+/// [`toolkit_odata::ClassifiedError`] under [`ClassifiedPaginateError::OData`]
+/// instead of flattening it into parallel `ClientOData` /
+/// `InfrastructureOData` / `MapError` variants. A flat shape would restate
+/// the `Client` / `Infrastructure` split from `toolkit-odata` in this crate
+/// too — a second copy of the same taxonomy, which is the drift this method
+/// exists to prevent. Nesting keeps `toolkit-odata` the single place that
+/// taxonomy is defined; matching on the outer enum still forces the caller
+/// to handle both the `OData` and `MapError` halves, and matching on the
+/// inner [`toolkit_odata::ClassifiedError`] still forces both of its
+/// branches.
+#[derive(Debug)]
+pub enum ClassifiedPaginateError<MapErr> {
+    /// The underlying `OData` / filter / cursor / DB failure, already split
+    /// into [`toolkit_odata::ClassifiedError::Client`] or
+    /// [`toolkit_odata::ClassifiedError::Infrastructure`].
+    OData(ClassifiedError),
+    /// Caller's `model -> domain` mapping error, forwarded verbatim. It is
+    /// already the caller's own typed domain error with its own correct
+    /// category, so `classify` must not re-triage it — that categorization
+    /// belongs entirely to the caller.
+    MapError(MapErr),
+}
+
+impl<MapErr> PaginateOdataTryError<MapErr> {
+    /// Split this error into its `OData` and mapper halves, delegating the
+    /// `OData` half to [`ODataError::classify`] rather than re-deriving that
+    /// categorization here.
+    ///
+    /// The match is exhaustive with no wildcard arm: [`PaginateOdataTryError`]
+    /// only ever has these two variants, and adding a third in the future
+    /// must force a decision here rather than falling through silently.
+    #[must_use]
+    pub fn classify(self) -> ClassifiedPaginateError<MapErr> {
+        match self {
+            Self::OData(err) => ClassifiedPaginateError::OData(err.classify()),
+            Self::MapError(err) => ClassifiedPaginateError::MapError(err),
+        }
+    }
+}
+
 /// Internal page-collector shared by [`paginate_odata`] and
 /// [`paginate_odata_try`]. Returns the raw `Vec<E::Model>` rows plus
 /// the assembled [`PageInfo`] (cursor tokens + clamped limit) so the
@@ -967,5 +1010,62 @@ mod cursor_codec_tests {
         assert!(
             encode_cursor_value(&sea_orm::Value::SmallInt(Some(2)), FieldKind::String).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    // `MapError` already carries the caller's own typed domain error with
+    // its own correct category (see the doc comment on
+    // `ClassifiedPaginateError::MapError`). `classify` must hand it back
+    // unchanged, not re-triage it.
+    #[test]
+    fn classify_forwards_map_error_verbatim() {
+        let original = "row 42: enum discriminant 7 not in CHECK constraint".to_owned();
+        let err: PaginateOdataTryError<String> = PaginateOdataTryError::MapError(original.clone());
+
+        match err.classify() {
+            ClassifiedPaginateError::MapError(forwarded) => {
+                assert_eq!(
+                    forwarded, original,
+                    "MapError must pass through classify() unchanged"
+                );
+            }
+            other @ ClassifiedPaginateError::OData(_) => {
+                panic!("MapError must not be re-triaged as OData, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn classify_wraps_odata_client_error_via_toolkit_odata_classify() {
+        let err: PaginateOdataTryError<String> =
+            PaginateOdataTryError::OData(ODataError::InvalidFilter("bad filter".to_owned()));
+
+        match err.classify() {
+            ClassifiedPaginateError::OData(ClassifiedError::Client(ODataError::InvalidFilter(
+                msg,
+            ))) => {
+                assert_eq!(msg, "bad filter");
+            }
+            other => panic!("expected OData(Client(InvalidFilter(..))), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_wraps_odata_infrastructure_error_via_toolkit_odata_classify() {
+        let err: PaginateOdataTryError<String> =
+            PaginateOdataTryError::OData(ODataError::Db("connection reset".to_owned()));
+
+        match err.classify() {
+            ClassifiedPaginateError::OData(ClassifiedError::Infrastructure(ODataError::Db(
+                msg,
+            ))) => {
+                assert_eq!(msg, "connection reset");
+            }
+            other => panic!("expected OData(Infrastructure(Db(..))), got {other:?}"),
+        }
     }
 }
