@@ -820,12 +820,14 @@ where
             .ensure_tiebreaker(tiebreaker.0, tiebreaker.1)
     };
 
-    // Validate cursor consistency (filter hash only) if cursor present
-    if let Some(cur) = &q.cursor
-        && let (Some(h), Some(cf)) = (q.filter_hash.as_deref(), cur.f.as_deref())
-        && h != cf
-    {
-        return Err(ODataError::FilterMismatch);
+    // Validate cursor consistency against the effective order and filter
+    // hash via the single shared check in `toolkit-odata`, rather than a
+    // local copy of the comparison (ML-8967). `effective_order` above was
+    // derived from `cur.s` itself when a cursor is present, so the
+    // order-half of this check always trivially matches here; what this
+    // call actually enforces is the strict filter-hash comparison.
+    if let Some(cur) = &q.cursor {
+        toolkit_odata::validate_cursor_against(cur, &effective_order, q.filter_hash.as_deref())?;
     }
 
     // Compose: filter → cursor predicate → order; apply limit+1 at the end

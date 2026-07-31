@@ -215,16 +215,13 @@ where
                 ));
             }
 
-            // Generate filter hash for cursor consistency (use non-consuming accessor)
-            let filter_hash = toolkit_odata::pagination::short_filter_hash(Some(parsed.as_expr()));
-
             // Extract expression for query
             let core_expr = parsed.into_expr();
 
+            // `with_filter` computes and stores the filter hash for cursor
+            // consistency automatically (ML-8967); no separate
+            // short_filter_hash + with_filter_hash call is needed here.
             query = query.with_filter(core_expr);
-            if let Some(hash) = filter_hash {
-                query = query.with_filter_hash(hash);
-            }
         }
     }
 

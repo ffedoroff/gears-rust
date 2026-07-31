@@ -239,6 +239,20 @@ mod tests {
 
         assert!(odata.filter.is_some());
         assert_eq!(odata.limit, Some(10));
+
+        // The cursor a page embeds is bound to the filter by this hash, and
+        // the strict check in `validate_cursor_against` compares the two
+        // `Option`s whole — so an extractor that parses a filter without
+        // stamping the hash would make every filtered continuation fail with
+        // `FilterMismatch`. Pin that it is set, and that it is the hash of
+        // the AST the extractor actually parsed.
+        let expected = toolkit_odata::pagination::short_filter_hash(odata.filter())
+            .expect("a non-empty filter always hashes to Some");
+        assert_eq!(
+            odata.filter_hash.as_deref(),
+            Some(expected.as_str()),
+            "the extractor must stamp filter_hash for a parsed $filter"
+        );
     }
 
     #[test]

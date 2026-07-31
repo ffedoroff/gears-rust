@@ -402,6 +402,34 @@ impl Error {
 
 /// Validate cursor consistency against effective order and filter hash.
 ///
+/// This is the shared cursor/query consistency check. Four production call
+/// sites use it rather than re-deriving the comparison: `usage-collector`'s
+/// REST handler, `static-idp-plugin`'s in-memory client, and `toolkit-db`'s
+/// two `SeaORM` paginators (`sea_orm_filter::paginate_odata` and
+/// `core::paginate_with_odata`).
+///
+/// It is not, however, the only place in the workspace that compares a
+/// cursor's filter hash: the `TimescaleDB` usage-collector plugin still does
+/// its own strict comparison in `record_store` and `catalog_store`. That
+/// comparison is already strict, so it is not a correctness gap — but the
+/// error category it produces is wrong, tracked separately. Do not describe
+/// this function as the single source of that policy workspace-wide.
+///
+/// Within those four, calling it keeps the mismatch policy below in one place.
+///
+/// The filter-hash half compares the two `Option<&str>` values **whole**,
+/// not just their inner strings when both happen to be `Some`. A cursor
+/// minted without a hash (`None`) replayed against a now-hashed filter, or
+/// a hashed cursor replayed against an unhashed effective filter, is just
+/// as much a mismatch as two different hashes: in every such case the
+/// cursor's keyset position was computed against a different row set than
+/// the current request would produce, so silently accepting it would
+/// mean the page silently skips or repeats rows. Only `None` against `None`
+/// is a match — meaning neither side is bound to a filter hash, which is not
+/// the same as saying no filter was in play: `static-idp-plugin` deliberately
+/// validates a filtered query while passing `None`, having minted its own
+/// cursors with `f: None`, and so keeps only the order half of this check.
+///
 /// # Errors
 /// Returns `Error::OrderMismatch` if the cursor's sort order doesn't match the effective order.
 /// Returns `Error::FilterMismatch` if the cursor's filter hash doesn't match the effective filter.
@@ -413,9 +441,7 @@ pub fn validate_cursor_against(
     if !effective_order.equals_signed_tokens(&cursor.s) {
         return Err(Error::OrderMismatch);
     }
-    if let (Some(h), Some(cf)) = (effective_filter_hash, cursor.f.as_deref())
-        && h != cf
-    {
+    if effective_filter_hash != cursor.f.as_deref() {
         return Err(Error::FilterMismatch);
     }
     Ok(())
@@ -537,6 +563,23 @@ pub struct ODataQuery {
     pub order: ODataOrderBy,
     pub limit: Option<u64>,
     pub cursor: Option<CursorV1>,
+    /// Short hash of `filter`, embedded in minted cursors and re-checked by
+    /// [`validate_cursor_against`] against a cursor's own hash on the
+    /// follow-up page.
+    ///
+    /// This is **not** a type-enforced invariant: both fields are public
+    /// and nothing stops a caller from mutating `filter` (or `filter_hash`)
+    /// directly without going through a setter — `compose_query_with_scope`
+    /// in usage-collector does exactly that on purpose, to AND-merge a
+    /// server-injected PDP scope into `filter` while deliberately keeping
+    /// `filter_hash` pinned to the original *user* filter's hash (see that
+    /// function's doc comment). What IS guaranteed is narrower: going
+    /// through [`ODataQuery::with_filter`] or `From<Option<ast::Expr>>`
+    /// keeps this field in sync with `filter` automatically. Call sites
+    /// that bypass those — direct field mutation, or the deliberate
+    /// [`ODataQuery::with_filter_hash`] — are on their own and should be
+    /// audited individually, as `compose_query_with_scope` documents its
+    /// own reasoning inline.
     pub filter_hash: Option<String>,
     pub select: Option<Vec<String>>,
 }
@@ -546,7 +589,22 @@ impl ODataQuery {
         Self::default()
     }
 
+    /// Set the filter expression, and — as the single automatic side effect
+    /// this method performs — (re)compute `filter_hash` from it via
+    /// [`pagination::short_filter_hash`].
+    ///
+    /// This is what keeps `filter` and `filter_hash` in sync for every
+    /// caller that builds an [`ODataQuery`] in-process rather than through
+    /// the REST extractor or [`builder::QueryBuilder`] (both of which
+    /// already computed the hash by hand before this method did it for
+    /// them). Before this, an in-process caller like
+    /// `ODataQuery::default().with_filter(expr)` left `filter_hash` at
+    /// `None` — indistinguishable, under a strict `Option` comparison in
+    /// [`validate_cursor_against`], from "no filter at all". Computing the
+    /// hash here, at the one place a filter is attached, means that
+    /// distinction no longer has to be tracked by hand at every call site.
     pub fn with_filter(mut self, expr: ast::Expr) -> Self {
+        self.filter_hash = pagination::short_filter_hash(Some(&expr));
         self.filter = Some(Box::new(expr));
         self
     }
@@ -566,6 +624,32 @@ impl ODataQuery {
         self
     }
 
+    /// Set `filter_hash` directly, overriding whatever
+    /// [`ODataQuery::with_filter`] computed.
+    ///
+    /// [`ODataQuery::with_filter`] derives the hash from the filter AST, which
+    /// is what almost every caller wants: the two must move together, or the
+    /// cursor stops describing the query it was minted for.
+    ///
+    /// This setter exists for the one case where they legitimately differ —
+    /// the effective AST carries a server-side scope the caller did not ask
+    /// for, while the cursor must stay bound to the *user's* filter. Narrowing
+    /// a query by tenant or by grant and then paginating it is exactly that
+    /// shape: recomputing the hash over the narrowed AST would reject the
+    /// caller's own next page with `FilterMismatch`. `usage-collector`'s
+    /// `compose_query_with_scope` is the worked example of that *shape* — it
+    /// keeps the user's hash while replacing the AST — though it achieves it by
+    /// cloning the query and assigning `filter` directly rather than calling
+    /// this setter. Either route is fine; what matters is that the divergence
+    /// is deliberate. Its contract is pinned by a test.
+    ///
+    /// Order matters: this setter and [`ODataQuery::with_filter`] both write
+    /// `filter_hash`, and the last call wins. Set the filter first, then
+    /// override — the reverse silently discards the override.
+    ///
+    /// Reach for it only when the divergence is deliberate and documented at
+    /// the call site. Otherwise build the filter through `with_filter` and let
+    /// it hash.
     pub fn with_filter_hash(mut self, hash: String) -> Self {
         self.filter_hash = Some(hash);
         self
@@ -622,6 +706,8 @@ mod classify_tests;
 #[cfg(test)]
 mod odata_parse_tests;
 mod tests;
+#[cfg(test)]
+mod validate_cursor_tests;
 
 mod convert_odata_filters {
     use super::ast::{CompareOperator, Expr, Value};

@@ -50,9 +50,7 @@
 //! ```
 
 use crate::schema::{AsFieldKey, AsFieldName, FieldRef, Schema};
-use crate::{
-    ODataOrderBy, ODataQuery, OrderKey, SortDir, ast::Expr, pagination::short_filter_hash,
-};
+use crate::{ODataOrderBy, ODataQuery, OrderKey, SortDir, ast::Expr};
 use std::marker::PhantomData;
 
 /// Typed query builder for `OData` queries.
@@ -169,11 +167,10 @@ impl<S: Schema> QueryBuilder<S> {
 
     /// Build the final `ODataQuery` with computed filter hash.
     ///
-    /// The filter hash is computed using the stable hashing algorithm from
-    /// `pagination::short_filter_hash`.
+    /// The filter hash is computed by `ODataQuery::with_filter` using the
+    /// stable hashing algorithm from `pagination::short_filter_hash` — this
+    /// builder does not need to compute it separately.
     pub fn build(self) -> ODataQuery {
-        let filter_hash = short_filter_hash(self.filter.as_ref());
-
         let mut query = ODataQuery::new();
 
         if let Some(expr) = self.filter {
@@ -186,10 +183,6 @@ impl<S: Schema> QueryBuilder<S> {
 
         if let Some(limit) = self.limit {
             query = query.with_limit(limit);
-        }
-
-        if let Some(hash) = filter_hash {
-            query = query.with_filter_hash(hash);
         }
 
         if let Some(fields) = self.select {

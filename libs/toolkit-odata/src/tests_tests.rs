@@ -224,6 +224,10 @@ fn test_odata_query_builder_pattern() {
         d: "fwd".to_owned(),
     };
 
+    // `with_filter` already set `filter_hash` from `expr`; the trailing
+    // `with_filter_hash` call below is the deliberate direct override,
+    // exercised here on purpose to prove it still wins over the
+    // automatically-computed value.
     let query = ODataQuery::new()
         .with_filter(expr)
         .with_order(order)
