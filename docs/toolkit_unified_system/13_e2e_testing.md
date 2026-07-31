@@ -84,6 +84,12 @@ Every important API endpoint should be called **at most once** across the entire
 
 **Corner case and edge-case coverage in E2E is only acceptable if it could not be achieved in unit tests.** Before adding an E2E test for an edge case, verify that the same scenario cannot be written as a unit test against SQLite or a mock. If it can — it goes there, not here.
 
+**Divergence between SQLite and PostgreSQL is on its own sufficient grounds for an E2E test**, and is the most common reason a case legitimately cannot move down a tier. Numeric column widths (`SMALLINT` vs `INTEGER` range and comparison), `CHECK` constraint enforcement, FK actions, domain types, isolation levels and type affinity all behave differently, and SQLite's dynamic typing hides mismatches rather than surfacing them. If you can name the way the two backends differ, the test belongs here.
+
+That permission does not loosen the restraint above it. E2E carries far fewer tests than the unit suite by design: one case per seam, each justified by what a unit test cannot reach. "It is database-related" is not the criterion — "it behaves differently on PostgreSQL, and here is how" is.
+
+**A caveat that has already bitten at least one gear.** The definition above is normative: a suite is only an E2E suite if it runs against real PostgreSQL. A harness that seeds SQLite directly and drives HTTP over it is a useful integration suite, but it **cannot discharge any PostgreSQL-specific claim** — the very divergences listed above are the ones it cannot see. Before routing a PG-specific case here, confirm the gear's harness actually uses PostgreSQL; if it does not, the behaviour is untested, and that gap belongs in the backlog rather than in an assumption.
+
 After adding or removing any E2E test, **check the coverage checklist**: verify which HTTP methods (GET, POST, PUT, PATCH, DELETE) are called across all tests in the gear suite. If a method is already exercised in test A, test B does not need to call it again. Remove redundant calls without hesitation.
 
 ### Priority Order (in case of conflict)

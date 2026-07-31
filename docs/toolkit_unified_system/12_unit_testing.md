@@ -64,6 +64,8 @@ Every test must pass all three:
 
 All of the above requires a running server with real PostgreSQL. Unit tests use SQLite and mock AuthZ — they cannot catch these bugs.
 
+Routing a case to E2E only counts as coverage if the gear's E2E harness actually runs on PostgreSQL. Some harnesses seed SQLite directly; sending a PostgreSQL-specific case there moves it out of the unit suite without testing it anywhere. Check before you route, and record the gap if the venue does not exist yet — see the caveat under [Coverage Goal](13_e2e_testing.md#coverage-goal-one-call-per-api-method) in the E2E guide.
+
 ### Relationship to E2E Tests
 
 Unit and E2E tests form a **complementary pair with zero overlap**:
