@@ -118,6 +118,18 @@ enum Node {
     Not(Box<Node>),
 }
 
+/// The `$filter` grammar this module accepts, in the form the REST layer
+/// advertises it.
+///
+/// It lives here rather than in the route module because this is where the
+/// grammar is actually decided — [`parse`] is the only thing that can accept
+/// or reject an operator, so a description kept anywhere else would drift the
+/// first time the matrix changes. `hierarchy_filter_tests` asserts that every
+/// field/operator pair listed here is accepted by `parse` and every pair left
+/// out is rejected, so the string cannot quietly outlive the code.
+pub const FILTER_PARAM_DESCRIPTION: &str =
+    "OData v4 filter expression\n- hierarchy/depth: eq|ne|gt|ge|lt|le\n- type: eq|ne|in";
+
 /// Parse and validate an `OData` `$filter` against the hierarchy field x
 /// operator matrix. The **only** place this module can fail.
 ///

@@ -641,6 +641,91 @@ async fn delete_type_returns_204() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
+/// ML-4935: deleting a type that still has group(s) referencing it maps to
+/// `DomainError::ConflictActiveReferences` -> canonical `failed_precondition`
+/// -> HTTP 400 (see `src/api/rest/error.rs`), not 409 -- backs the
+/// `error_400(openapi)` this ticket added to the DELETE route in
+/// `api/rest/routes/types.rs` (which previously declared only 404/409/500,
+/// none of which this path can actually return).
+#[tokio::test]
+async fn delete_type_active_references_returns_400() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let code = rg_type_id!("test.delref.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    // A group of this type is the "active reference" that blocks the delete.
+    group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: code.clone(),
+                name: "Referencing".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+
+    let encoded = code.replace('~', "%7E");
+    let req = json_request(
+        "DELETE",
+        &format!("/types-registry/v1/types/{encoded}"),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+
+    // `detail` itself is the generic "Operation precondition not met" --
+    // the active-reference explanation lives in `context.violations`, same
+    // shape as the hierarchy-safety 400s elsewhere in this file (see
+    // `rest_move_group_*_returns_400_cycle` and friends).
+    let violations = body["context"]["violations"]
+        .as_array()
+        .expect("context.violations must be present");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one precondition violation: {body}"
+    );
+    assert_eq!(violations[0]["subject"], "active_references");
+    assert_eq!(violations[0]["type"], "STATE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("group")),
+        "expected violation description to explain the active-reference conflict: {body}"
+    );
+
+    // The rejected DELETE must leave the type where it was. A 400 that also
+    // half-deleted the row would satisfy every assertion above, so the
+    // secondary artefact is the part worth checking (`12_unit_testing.md`
+    // "Delete entity" / "Error path").
+    let survived = type_svc
+        .get_type_unscoped(&code)
+        .await
+        .expect("a type whose delete was rejected must still exist");
+    assert_eq!(
+        survived.code, code,
+        "the surviving type must be the one the delete was refused for"
+    );
+}
+
 // ── Type CRUD AuthZ Tests (VHP-2342) ────────────────────────────────────
 //
 // Before this fix, all five `/types-registry/v1/types` routes were
@@ -1639,15 +1724,20 @@ async fn create_self_ref_type(type_svc: &TypeService<TypeRepository>, suffix: &s
     code
 }
 
-/// Helper: build a fully-wired router with shared services for multi-request tests.
-async fn build_shared_router() -> (
+/// Helper: build a fully-wired router with shared services for multi-request
+/// tests, gating the group/membership routes with the given `PolicyEnforcer`
+/// (the type routes always keep the normal allow-all-no-constraints mock,
+/// mirroring `build_test_router_with_type_enforcer`'s split for the
+/// type-only deny variant).
+async fn build_shared_router_with_enforcer(
+    enforcer: PolicyEnforcer,
+) -> (
     Router,
     Arc<TypeService<TypeRepository>>,
     Arc<GroupService<GroupRepository, TypeRepository>>,
     Arc<MembershipService<GroupRepository, TypeRepository, MembershipRepository>>,
 ) {
     let db = test_db().await;
-    let enforcer = make_enforcer();
     let type_svc = Arc::new(TypeService::new(
         db.clone(),
         make_type_enforcer(),
@@ -1676,6 +1766,153 @@ async fn build_shared_router() -> (
         membership_svc.clone(),
     );
     (router, type_svc, group_svc, membership_svc)
+}
+
+/// Helper: build a fully-wired router with shared services for multi-request tests.
+async fn build_shared_router() -> (
+    Router,
+    Arc<TypeService<TypeRepository>>,
+    Arc<GroupService<GroupRepository, TypeRepository>>,
+    Arc<MembershipService<GroupRepository, TypeRepository, MembershipRepository>>,
+) {
+    build_shared_router_with_enforcer(make_enforcer()).await
+}
+
+/// Router wired with a deny-all enforcer for the group/membership routes
+/// (type routes keep the normal allow-all mock) -- used by the group/
+/// membership REST-level 403 tests below. `make_type_enforcer_deny` just
+/// wraps `DenyAllAuthZ` in a `PolicyEnforcer`; nothing about it is
+/// type-route-specific, so it is reused here unchanged.
+async fn build_shared_router_denied() -> (
+    Router,
+    Arc<TypeService<TypeRepository>>,
+    Arc<GroupService<GroupRepository, TypeRepository>>,
+    Arc<MembershipService<GroupRepository, TypeRepository, MembershipRepository>>,
+) {
+    build_shared_router_with_enforcer(make_type_enforcer_deny()).await
+}
+
+// ── Group / Membership AuthZ Tests (ML-4935) ────────────────────────────
+//
+// The type-registry routes already had REST-level 403 coverage (see
+// `list_types_denied_returns_403` and friends above); the group and
+// membership routes did not, even though `GroupService`/`MembershipService`
+// gate every public entry point exactly the same way (`enforcer.access_scope`
+// -- see `domain/group_service.rs` / `domain/membership_service.rs`). These
+// pin the REST-level 403 for one representative route per area, backing the
+// `error_403(openapi)` declarations ML-4935 added to every route in
+// `api/rest/routes/{groups,memberships}.rs`.
+
+#[tokio::test]
+async fn list_groups_denied_returns_403() {
+    let (router, _, _, _) = build_shared_router_denied().await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request("GET", "/resource-group/v1/groups", None, tenant_id);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn list_memberships_denied_returns_403() {
+    let (router, _, _, _) = build_shared_router_denied().await;
+    let tenant_id = Uuid::now_v7();
+
+    let req = json_request("GET", "/resource-group/v1/memberships", None, tenant_id);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
+}
+
+/// ML-4935: every `.authenticated()` route in this gear must declare both
+/// 401 and 403 -- not just the routes covered by the HTTP-level tests above.
+///
+/// 401 itself cannot be driven through `Router::oneshot` here: it is
+/// produced by `api-gateway`'s `authn_middleware`
+/// (`gears/system/api-gateway/src/middleware/auth.rs`), which is layered
+/// onto the *combined* multi-gear router centrally, strictly after every
+/// gear (this one included) has registered its own routes -- this gear's
+/// own `register_routes` adds no auth-checking layer, and this suite's
+/// `json_request` bypasses auth entirely by inserting a `SecurityContext`
+/// straight into the request extensions. So no oneshot test in this file
+/// can ever observe a real 401.
+///
+/// But `.authenticated()` is not inert documentation either: it sets
+/// `OperationSpec.authenticated` (`operation_builder.rs`'s `authenticated()`),
+/// which `api-gateway`'s `build_route_policy_from_specs`
+/// (`gears/system/api-gateway/src/gear.rs`) reads directly off *this gear's*
+/// registered specs to decide which routes its `authn_middleware` gates --
+/// i.e. this gear's own `.authenticated()` calls are exactly what makes 401
+/// reachable for these routes in the deployed system, even though this
+/// gear's own code never renders the 401 response itself. So the declared
+/// codes need to track `authenticated`, not the (untestable-from-here) HTTP
+/// behavior: this test enforces that statically, against a real
+/// `OpenApiRegistryImpl` rather than the `NoopOpenApiRegistry` the other
+/// tests use (which discards specs on registration and so cannot support
+/// this assertion).
+#[tokio::test]
+async fn authenticated_routes_declare_401_and_403() {
+    let db = test_db().await;
+    let enforcer = make_enforcer();
+    let type_svc = Arc::new(TypeService::new(
+        db.clone(),
+        make_type_enforcer(),
+        Arc::new(TypeRepository),
+    ));
+    let group_svc = Arc::new(GroupService::new(
+        db.clone(),
+        QueryProfile::default(),
+        enforcer.clone(),
+        Arc::new(GroupRepository),
+        Arc::new(TypeRepository),
+        common::make_types_registry(),
+    ));
+    let membership_svc = Arc::new(MembershipService::new(
+        db,
+        enforcer,
+        Arc::new(GroupRepository),
+        Arc::new(TypeRepository),
+        Arc::new(MembershipRepository),
+    ));
+
+    let registry = toolkit::api::OpenApiRegistryImpl::new();
+    let _router = resource_group::api::rest::routes::register_routes(
+        Router::new(),
+        &registry,
+        type_svc,
+        group_svc,
+        membership_svc,
+    );
+
+    let mut checked = 0;
+    for entry in &registry.operation_specs {
+        let spec = entry.value();
+        if !spec.authenticated {
+            continue;
+        }
+        checked += 1;
+        let statuses: Vec<u16> = spec.responses.iter().map(|r| r.status).collect();
+        assert!(
+            statuses.contains(&StatusCode::UNAUTHORIZED.as_u16()),
+            "{} {} is `.authenticated()` but does not declare 401: {statuses:?}",
+            spec.method,
+            spec.path
+        );
+        assert!(
+            statuses.contains(&StatusCode::FORBIDDEN.as_u16()),
+            "{} {} is `.authenticated()` but does not declare 403: {statuses:?}",
+            spec.method,
+            spec.path
+        );
+    }
+    // The invariant is "every authenticated route declares 401 and 403", so all this
+    // needs is proof the loop actually ran. Asserting an exact route count would make
+    // the test red on adding a perfectly correct new route, reporting a declaration
+    // regression that did not happen — API inventory is a separate subject from this
+    // invariant, and pinning it here would only hide the real signal.
+    assert!(
+        checked > 0,
+        "no authenticated routes were examined -- the registry walk found nothing"
+    );
 }
 
 /// TC-REST-04: DELETE membership returns 204.
@@ -1742,6 +1979,73 @@ async fn rest_delete_membership_returns_204() {
     );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+/// ML-4935 audit finding (not one of the ticket's named examples): DELETE
+/// membership can return 400 -- `remove_membership_in_tx` maps an
+/// unresolvable `resource_type` to `DomainError::validation` exactly like
+/// `add_membership` does -- but the route previously declared only
+/// 404/500. Backs the `error_400(openapi)` this ticket added to the DELETE
+/// route in `api/rest/routes/memberships.rs`.
+#[tokio::test]
+async fn remove_membership_unknown_resource_type_returns_400() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let gt = rg_type_id!("test.rmunk.{}.v1~", Uuid::now_v7().as_simple());
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: gt.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let group = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: gt,
+                name: "GRmUnk".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+
+    // A well-formed but never-created type code: `resolve_id` returns `None`
+    // for it, which is exactly the "unresolvable resource_type" path
+    // `remove_membership_in_tx` maps to `DomainError::validation` (400) --
+    // no membership needs to exist for this: type resolution happens before
+    // the membership lookup.
+    let unknown_type = rg_type_id!("test.rmunk.nosuch.{}.v1~", Uuid::now_v7().as_simple());
+    let encoded = unknown_type.replace('~', "%7E");
+    let req = json_request(
+        "DELETE",
+        &format!(
+            "/resource-group/v1/memberships/{}/{}/res-unk",
+            group.id, encoded
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown resource type"),
+        "detail should explain the unresolvable resource_type: {body}"
+    );
 }
 
 /// TC-REST-05: GET memberships returns 200 with list.
@@ -3121,9 +3425,17 @@ async fn input_deser_membership_path_non_uuid_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// TC-DESER-11: Extra unknown fields in body are tolerated (verify behavior).
+/// TC-DESER-11: Extra unknown fields in the body are silently ignored, not
+/// rejected. `CreateTypeDto` carries no `#[serde(deny_unknown_fields)]` (see
+/// `toolkit_macros::api_dto`, which does not add one), and `StrictJson`
+/// deserializes with plain `serde_json::from_slice` -- no extra strictness
+/// layered on top -- so an unrecognized key can never turn into a 400/422;
+/// the request always succeeds with the field dropped. Previously asserted
+/// `201 || 400 || 422`, which accepted a status this handler can never
+/// actually return and would have stayed green through a real regression in
+/// either direction.
 #[tokio::test]
-async fn input_deser_extra_fields_behavior() {
+async fn create_type_unknown_field_returns_201() {
     let (router, _) = build_test_router().await;
     let tenant_id = Uuid::now_v7();
     let code = rg_type_id!("test.extra.{}.v1~", Uuid::now_v7().as_simple());
@@ -3141,14 +3453,13 @@ async fn input_deser_extra_fields_behavior() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    let status = resp.status();
-    // Most Rust frameworks ignore extra fields by default (deny_unknown_fields not set)
-    // or reject them. Either is valid.
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let body = response_body(resp).await;
+    assert_eq!(body["code"], code);
     assert!(
-        status == StatusCode::CREATED
-            || status == StatusCode::BAD_REQUEST
-            || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "Expected 201 (ignored) or 400/422 (denied), got {status}"
+        body.get("unknown_field").is_none(),
+        "unrecognized key must not be echoed back: {body}"
     );
 }
 

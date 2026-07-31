@@ -32,6 +32,8 @@ pub(super) fn register_type_routes(mut router: Router, openapi: &dyn OpenApiRegi
         )
         .with_odata_filter::<TypeFilterField>()
         .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
         .error_500(openapi)
         .register(router, openapi);
 
@@ -51,6 +53,8 @@ pub(super) fn register_type_routes(mut router: Router, openapi: &dyn OpenApiRegi
             "Created type",
         )
         .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
         .error_409(openapi)
         .error_500(openapi)
         .register(router, openapi);
@@ -66,6 +70,8 @@ pub(super) fn register_type_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .path_param("code", "GTS type path")
         .handler(handlers::get_type)
         .json_response_with_schema::<dto::TypeDto>(openapi, http::StatusCode::OK, "Type found")
+        .error_401(openapi)
+        .error_403(openapi)
         .error_404(openapi)
         .error_500(openapi)
         .register(router, openapi);
@@ -82,9 +88,17 @@ pub(super) fn register_type_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .json_request::<dto::UpdateTypeDto>(openapi, "Type update data")
         .handler(handlers::update_type)
         .json_response_with_schema::<dto::TypeDto>(openapi, http::StatusCode::OK, "Updated type")
+        // No 409: `UpdateTypeDto` carries no `code` -- the type's code is
+        // immutable on update (only `PUT` path param addresses it), so
+        // nothing in `TypeService::update_type_unscoped` can ever raise
+        // `TypeAlreadyExists`. A previously-declared `error_409(openapi)`
+        // here was unreachable (ML-4935): the same "declared but impossible"
+        // defect as the DELETE route's 409 below, just not the instance the
+        // ticket named.
         .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
         .error_404(openapi)
-        .error_409(openapi)
         .error_500(openapi)
         .register(router, openapi);
 
@@ -99,8 +113,18 @@ pub(super) fn register_type_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .path_param("code", "GTS type path")
         .handler(handlers::delete_type)
         .json_response(http::StatusCode::NO_CONTENT, "Type deleted successfully")
+        // 400, not 409: `delete_type_in_tx` maps an existing active reference
+        // (groups of this type still exist) to `ConflictActiveReferences`,
+        // which the domain -> canonical ladder resolves to
+        // `failed_precondition` (HTTP 400), not `already_exists`/`aborted`
+        // (409) -- see `src/api/rest/error.rs`. Nothing in the delete path
+        // raises a 409-mapped error at all, so the `error_409(openapi)` this
+        // route used to declare was unreachable: exactly the defect this
+        // ticket (ML-4935) tracks.
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
         .error_404(openapi)
-        .error_409(openapi)
         .error_500(openapi)
         .register(router, openapi);
 

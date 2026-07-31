@@ -523,3 +523,71 @@ fn hierarchy_filter_bounds_invariant_holds_across_shapes() {
         assert_bound_never_excludes_a_match(raw);
     }
 }
+
+/// The advertised `$filter` grammar matches what `parse` actually accepts.
+///
+/// The REST layer publishes `FILTER_PARAM_DESCRIPTION` verbatim into the
+/// `OpenAPI` document, and that document is what clients are generated from —
+/// so a description that outlives the grammar promises a form the gear answers
+/// with 400. This does not compare the string to another string; it probes
+/// `parse` with every field/operator pair and requires acceptance to agree
+/// with what the description lists. Widen or narrow the matrix in `parse` and
+/// this test names the operator that drifted.
+#[test]
+fn advertised_filter_grammar_matches_what_parse_accepts() {
+    let advertised = |field: &str, op: &str| -> bool {
+        crate::domain::hierarchy_filter::FILTER_PARAM_DESCRIPTION
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("- {field}: ")))
+            .expect("the description must list this field")
+            .split('|')
+            .any(|listed| listed == op)
+    };
+
+    // `in` is spelled as a list, every other operator as a binary comparison.
+    let expr = |field: &str, op: &str| match op {
+        "in" => format!("{field} in ('x', 'y')"),
+        "contains" | "startswith" | "endswith" => format!("{op}({field}, 'x')"),
+        _ => {
+            let literal = if field == "type" {
+                "'x'".to_owned()
+            } else {
+                "1".to_owned()
+            };
+            format!("{field} {op} {literal}")
+        }
+    };
+
+    for field in ["hierarchy/depth", "type"] {
+        // Every operator the generic converter can produce, not just the ones
+        // expected to pass. An operator missing from this list is an operator
+        // whose drift the guard cannot see — which is how a test like this
+        // quietly stops guarding anything. Verified by widening the
+        // description and watching this redden.
+        for op in [
+            "eq",
+            "ne",
+            "gt",
+            "ge",
+            "lt",
+            "le",
+            "in",
+            "contains",
+            "startswith",
+            "endswith",
+        ] {
+            let accepted = parse(&filter_query(&expr(field, op))).is_ok();
+            assert_eq!(
+                accepted,
+                advertised(field, op),
+                "`{field} {op}` is {} by parse but {} in FILTER_PARAM_DESCRIPTION",
+                if accepted { "accepted" } else { "rejected" },
+                if advertised(field, op) {
+                    "advertised"
+                } else {
+                    "not advertised"
+                }
+            );
+        }
+    }
+}

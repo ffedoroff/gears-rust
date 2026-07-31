@@ -16174,6 +16174,26 @@
             },
             "description": "Bad Request"
           },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -16265,6 +16285,26 @@
             },
             "description": "Bad Request"
           },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -16345,6 +16385,26 @@
             },
             "description": "Bad Request"
           },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -16354,16 +16414,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
           },
           "500": {
             "content": {
@@ -16420,6 +16470,26 @@
               }
             },
             "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -16498,6 +16568,26 @@
             },
             "description": "Bad Request"
           },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -16507,16 +16597,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
           },
           "500": {
             "content": {
@@ -16573,7 +16653,7 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- hierarchy/depth: eq|ne|gt|ge|lt|le|in\n- type: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- hierarchy/depth: eq|ne|gt|ge|lt|le\n- type: eq|ne|in",
             "in": "query",
             "name": "$filter",
             "required": false,
@@ -16602,6 +16682,26 @@
               }
             },
             "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -16632,28 +16732,7 @@
         "summary": "Get group ancestors",
         "tags": [
           "Resource Groups"
-        ],
-        "x-odata-filter": {
-          "allowedFields": {
-            "hierarchy/depth": [
-              "eq",
-              "ne",
-              "gt",
-              "ge",
-              "lt",
-              "le",
-              "in"
-            ],
-            "type": [
-              "eq",
-              "ne",
-              "contains",
-              "startswith",
-              "endswith",
-              "in"
-            ]
-          }
-        }
+        ]
       }
     },
     "/resource-group/v1/groups/{group_id}/descendants": {
@@ -16689,7 +16768,7 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- hierarchy/depth: eq|ne|gt|ge|lt|le|in\n- type: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- hierarchy/depth: eq|ne|gt|ge|lt|le\n- type: eq|ne|in",
             "in": "query",
             "name": "$filter",
             "required": false,
@@ -16718,6 +16797,26 @@
               }
             },
             "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -16748,28 +16847,7 @@
         "summary": "Get group descendants",
         "tags": [
           "Resource Groups"
-        ],
-        "x-odata-filter": {
-          "allowedFields": {
-            "hierarchy/depth": [
-              "eq",
-              "ne",
-              "gt",
-              "ge",
-              "lt",
-              "le",
-              "in"
-            ],
-            "type": [
-              "eq",
-              "ne",
-              "contains",
-              "startswith",
-              "endswith",
-              "in"
-            ]
-          }
-        }
+        ]
       }
     },
     "/resource-group/v1/groups/{group_id}/move": {
@@ -16818,6 +16896,26 @@
               }
             },
             "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -16915,6 +17013,26 @@
             },
             "description": "Bad Request"
           },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -17006,6 +17124,36 @@
             },
             "description": "Membership removed successfully"
           },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -17089,6 +17237,26 @@
               }
             },
             "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -17782,6 +17950,26 @@
             },
             "description": "Bad Request"
           },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -17850,6 +18038,26 @@
             },
             "description": "Bad Request"
           },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "409": {
             "content": {
               "application/problem+json": {
@@ -17908,6 +18116,36 @@
             },
             "description": "Type deleted successfully"
           },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -17917,16 +18155,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
           },
           "500": {
             "content": {
@@ -17973,6 +18201,26 @@
               }
             },
             "description": "Type found"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -18051,6 +18299,26 @@
             },
             "description": "Bad Request"
           },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
           "404": {
             "content": {
               "application/problem+json": {
@@ -18060,16 +18328,6 @@
               }
             },
             "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
           },
           "500": {
             "content": {

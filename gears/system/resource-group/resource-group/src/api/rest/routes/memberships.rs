@@ -38,6 +38,8 @@ pub(super) fn register_membership_routes(
         )
         .with_odata_filter::<MembershipFilterField>()
         .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
         .error_500(openapi)
         .register(router, openapi);
 
@@ -61,6 +63,8 @@ pub(super) fn register_membership_routes(
         "Membership created",
     )
     .error_400(openapi)
+    .error_401(openapi)
+    .error_403(openapi)
     .error_404(openapi)
     .error_409(openapi)
     .error_500(openapi)
@@ -84,6 +88,14 @@ pub(super) fn register_membership_routes(
         http::StatusCode::NO_CONTENT,
         "Membership removed successfully",
     )
+    // 400 was missing here even though this route can produce one:
+    // `remove_membership_in_tx` maps an unresolvable `resource_type` to
+    // `DomainError::validation` (400), the same as `add_membership` above --
+    // found during the ML-4935 route audit, not one of the ticket's named
+    // examples.
+    .error_400(openapi)
+    .error_401(openapi)
+    .error_403(openapi)
     .error_404(openapi)
     .error_500(openapi)
     .register(router, openapi);
