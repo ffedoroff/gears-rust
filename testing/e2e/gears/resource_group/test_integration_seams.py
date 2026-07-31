@@ -813,3 +813,68 @@ async def test_barrier_metadata_in_descendants(
         normal_item = next(i for i in items if i["id"] == normal["id"])
         normal_meta = normal_item.get("metadata")
         assert normal_meta is None or normal_meta.get("self_managed") is not True
+
+# ── S12: Hierarchy cursor codec over the wire ───────────────────────────
+
+
+@pytest.mark.smoke
+async def test_hierarchy_cursor_codec_over_the_wire(
+    rg_base_url, rg_headers, create_type, create_group,
+):
+    """Seam: hierarchy offset-cursor codec <-> HTTP (13_e2e_testing.md:58).
+
+    The offset cursor of `/descendants` is a different codec from the keyset
+    cursor of the flat `/groups` list, and S9 exercises only the latter. This
+    one drives the hierarchy token specifically: base64url through a query
+    string, back through the decoder, and on to a second page under the same
+    `$filter`.
+
+    Why this cannot move down a tier: the repository-level tests decode the
+    token by calling `CursorV1::decode` directly, so they never touch URL
+    encoding or the handler's parse of `?cursor=`. That part only runs here.
+
+    What it deliberately does not test: the offset arithmetic, or whether the
+    filter is honoured. Both are pinned by unit and repository tests, and
+    `13:85` sends anything reachable there to those tiers. The filter below is
+    a plain `type eq`, supported before this change as well, precisely so a
+    failure here means the codec and not the evaluator.
+    """
+    root_type = await create_type("s12root")
+    child_type = await create_type(
+        "s12child", can_be_root=False, allowed_parent_types=[root_type["code"]],
+    )
+
+    root = await create_group(root_type["code"], "S12 Root")
+    created = {
+        (await create_group(child_type["code"], f"S12 Child {i}", parent_id=root["id"]))["id"]
+        for i in range(3)
+    }
+
+    params = {"limit": "2", "$filter": f"type eq '{child_type['code']}'"}
+    seen: list[str] = []
+    cursor = None
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        for _ in range(5):  # safety cap
+            page_params = dict(params)
+            if cursor:
+                page_params["cursor"] = cursor
+
+            r = await c.get(
+                f"{_groups(rg_base_url)}/{root['id']}/descendants",
+                headers=rg_headers,
+                params=page_params,
+            )
+            assert r.status_code == 200, (
+                f"a cursor this endpoint minted must be accepted back: {r.text}"
+            )
+            data = r.json()
+            seen.extend(item["id"] for item in data["items"])
+
+            cursor = data["page_info"].get("next_cursor")
+            if not cursor:
+                break
+
+    assert len(seen) == len(set(seen)), f"cursor round trip duplicated rows: {seen}"
+    assert created <= set(seen), "cursor round trip lost rows"
+

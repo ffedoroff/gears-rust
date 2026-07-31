@@ -44,25 +44,6 @@ fn group_odata_mapper_field_to_column() {
     );
 }
 
-// TC-ODATA-08a: HierarchyODataMapper field -> column
-#[test]
-fn hierarchy_odata_mapper_field_to_column() {
-    assert!(
-        matches!(
-            HierarchyODataMapper::map_field(HierarchyFilterField::HierarchyDepth),
-            GroupColumn::Id
-        ),
-        "HierarchyDepth -> Id (placeholder)"
-    );
-    assert!(
-        matches!(
-            HierarchyODataMapper::map_field(HierarchyFilterField::Type),
-            GroupColumn::GtsTypeId
-        ),
-        "Type -> GtsTypeId"
-    );
-}
-
 // TC-ODATA-08: MembershipODataMapper field -> column
 #[test]
 fn membership_odata_mapper_field_to_column() {

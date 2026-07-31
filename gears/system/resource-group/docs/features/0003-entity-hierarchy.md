@@ -391,7 +391,7 @@ The system **MUST** implement a Hierarchy Service that maintains the closure tab
 - Ancestor queries: return all ancestors of a group ordered by depth (ascending)
 - Descendant queries: return all descendants of a group ordered by depth (ascending)
 - Hierarchy depth endpoints — **two routes, not one**: `GET /groups/{group_id}/descendants` (`depth ≥ 0`) and `GET /groups/{group_id}/ancestors` (`depth ≤ 0`), each returning `Page<ResourceGroupWithDepth>` with a relative `hierarchy.depth` (0 = the reference group, positive = below it, negative = above it). There is no aggregating `/hierarchy` route
-- OData filtering on `hierarchy/depth` (eq, ne, gt, ge, lt, le) and `type` (`eq` only — other operators are dropped rather than rejected); order is fixed at `depth`, then `id`, and `$orderby` is ignored
+- OData filtering on `hierarchy/depth` (eq, ne, gt, ge, lt, le) and `type` (eq, ne, in); `and`/`or`/`not` compose freely, and an unsupported form (`hierarchy/depth in (...)`, `type gt`/`ge`/`lt`/`le`, a string function on `type`, or an unknown field) is rejected with 400 rather than silently dropped; order is fixed at `depth`, then `id`, and `$orderby` is ignored
 - Query profile enforcement: `max_depth`/`max_width` checked on writes only; reads return full stored data even if profile was tightened; no data rewrite on profile change
 
 **Implements**:

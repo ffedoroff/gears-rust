@@ -2185,6 +2185,265 @@ async fn rest_get_group_hierarchy_returns_200() {
 }
 
 // =========================================================================
+// ML-4182/ML-8813: hierarchy $filter -- both routes, status AND page
+// composition (`13_e2e_testing.md:61` -- `Router::oneshot` is the юнит
+// ярус for this stack, not E2E; the full parse->SQL->result chain is
+// already exercised by the SQLite-level tests, this layer only needs to
+// confirm the HTTP wiring: status code and, for the positive cases,
+// response body composition).
+// =========================================================================
+//
+// The positive tests below intentionally check *which rows come back*, not
+// just the status: `type ne`/`in`/`or` returned 200 before this change too
+// -- with every row, unfiltered, because the old extractor could not type
+// those shapes and silently fell back to "no filter". A test that only
+// asserted `StatusCode::OK` would have passed against that old behavior;
+// checking the exact id set is what actually pins the fix. Expected id
+// sets are the literal fixture ids created in each test, not a value
+// computed via `HierarchyFilter` itself -- computing the expectation with
+// the same evaluator under test would be a circular oracle.
+
+/// ML-4182: `type ne` must exclude exactly the matching type from
+/// `/descendants`, not return every row with 200.
+#[tokio::test]
+async fn rest_group_descendants_type_ne_filters_by_page_composition() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "rgtnea").await;
+    let x_type = common::create_child_type(&type_svc, "rgtneb", &[&root_type.code], &[]).await;
+    let y_type = common::create_child_type(&type_svc, "rgtnec", &[&root_type.code], &[]).await;
+
+    let root =
+        common::create_root_group(&group_svc, &ctx, &root_type.code, "root", tenant_id).await;
+    common::create_child_group(&group_svc, &ctx, &x_type.code, root.id, "x", tenant_id).await;
+    let child_y =
+        common::create_child_group(&group_svc, &ctx, &y_type.code, root.id, "y", tenant_id).await;
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/groups/{}/descendants?%24filter={}",
+            root.id,
+            enc_filter(&format!("type ne '{}'", x_type.code))
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    let ids = item_ids(&body);
+    let expected: std::collections::BTreeSet<String> =
+        [root.id.to_string(), child_y.id.to_string()]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        ids, expected,
+        "type ne must exclude exactly the matching-type child, not every row: {body}"
+    );
+}
+
+/// ML-4182: `type in (...)` must narrow `/descendants` to exactly the
+/// listed types.
+#[tokio::test]
+async fn rest_group_descendants_type_in_filters_by_page_composition() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "rgtina").await;
+    let x_type = common::create_child_type(&type_svc, "rgtinb", &[&root_type.code], &[]).await;
+    let y_type = common::create_child_type(&type_svc, "rgtinc", &[&root_type.code], &[]).await;
+
+    let root =
+        common::create_root_group(&group_svc, &ctx, &root_type.code, "root", tenant_id).await;
+    let child_x =
+        common::create_child_group(&group_svc, &ctx, &x_type.code, root.id, "x", tenant_id).await;
+    let child_y =
+        common::create_child_group(&group_svc, &ctx, &y_type.code, root.id, "y", tenant_id).await;
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/groups/{}/descendants?%24filter={}",
+            root.id,
+            enc_filter(&format!("type in ('{}', '{}')", x_type.code, y_type.code))
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    let ids = item_ids(&body);
+    let expected: std::collections::BTreeSet<String> =
+        [child_x.id.to_string(), child_y.id.to_string()]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        ids, expected,
+        "type in (...) must return exactly the listed types, excluding root: {body}"
+    );
+}
+
+/// ML-4182: `hierarchy/depth eq A or hierarchy/depth eq B` must return the
+/// union of both depths from `/descendants`, excluding rows in between.
+#[tokio::test]
+async fn rest_group_descendants_depth_or_filters_by_page_composition() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let rt = create_self_ref_type(&type_svc, "rgdora").await;
+    let root = common::create_root_group(&group_svc, &ctx, &rt, "root", tenant_id).await;
+    let mid = common::create_child_group(&group_svc, &ctx, &rt, root.id, "mid", tenant_id).await;
+    let leaf = common::create_child_group(&group_svc, &ctx, &rt, mid.id, "leaf", tenant_id).await;
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/groups/{}/descendants?%24filter={}",
+            root.id,
+            enc_filter("hierarchy/depth eq 0 or hierarchy/depth eq 2")
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    let ids = item_ids(&body);
+    let expected: std::collections::BTreeSet<String> = [root.id.to_string(), leaf.id.to_string()]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        ids, expected,
+        "depth eq 0 or depth eq 2 must return root and leaf, excluding mid: {body}"
+    );
+}
+
+/// ML-4182: the same `type ne` composition guarantee on `/ancestors` --
+/// the other of the "two routes, not one" this gear serves.
+#[tokio::test]
+async fn rest_group_ancestors_type_ne_filters_by_page_composition() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "rgana").await;
+    let mid_type = common::create_child_type(&type_svc, "rganb", &[&root_type.code], &[]).await;
+    let leaf_type = common::create_child_type(&type_svc, "rganc", &[&mid_type.code], &[]).await;
+
+    let root =
+        common::create_root_group(&group_svc, &ctx, &root_type.code, "root", tenant_id).await;
+    let mid =
+        common::create_child_group(&group_svc, &ctx, &mid_type.code, root.id, "mid", tenant_id)
+            .await;
+    let leaf =
+        common::create_child_group(&group_svc, &ctx, &leaf_type.code, mid.id, "leaf", tenant_id)
+            .await;
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/groups/{}/ancestors?%24filter={}",
+            leaf.id,
+            enc_filter(&format!("type ne '{}'", mid_type.code))
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    let ids = item_ids(&body);
+    let expected: std::collections::BTreeSet<String> = [leaf.id.to_string(), root.id.to_string()]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        ids, expected,
+        "type ne must exclude exactly the matching-type ancestor (mid), not every row: {body}"
+    );
+}
+
+/// `hierarchy/depth in (...)` is not part of the SDK contract
+/// (`resource-group-sdk/src/odata/hierarchy.rs:4-5` promises only single-
+/// value comparisons for depth) and must be a 400 `problem+json`, not a
+/// silently-dropped filter.
+#[tokio::test]
+async fn rest_group_descendants_depth_in_returns_400() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let rt = create_self_ref_type(&type_svc, "rgd400").await;
+    let root = common::create_root_group(&group_svc, &ctx, &rt, "root", tenant_id).await;
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/groups/{}/descendants?%24filter={}",
+            root.id,
+            enc_filter("hierarchy/depth in (1, 2)")
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// `type gt` is not part of the SDK contract (only `eq`/`ne`/`in`) and must
+/// be a 400 on `/ancestors` too -- the other route over the same
+/// repository.
+#[tokio::test]
+async fn rest_group_ancestors_type_gt_returns_400() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let rt = create_self_ref_type(&type_svc, "rga400").await;
+    let root = common::create_root_group(&group_svc, &ctx, &rt, "root", tenant_id).await;
+
+    let req = json_request(
+        "GET",
+        &format!(
+            "/resource-group/v1/groups/{}/ancestors?%24filter={}",
+            root.id,
+            enc_filter("type gt 'a'")
+        ),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+}
+
+/// Minimal percent-encoding for the characters this file's hand-built
+/// `$filter` query strings use (space, `'`) -- mirrors the existing
+/// `%24filter=...%20...%27...%27` style already used throughout this file
+/// for `list_groups`/`list_memberships` `$filter` tests, rather than adding
+/// a URL-encoding crate dependency for this one need.
+fn enc_filter(raw: &str) -> String {
+    raw.replace(' ', "%20").replace('\'', "%27")
+}
+
+/// Collect the `id` field of every item in a hierarchy page response body.
+fn item_ids(body: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    body["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .map(|i| {
+            i["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("item missing string id: {i}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+// =========================================================================
 // VHP-1977: re-parent cycle detection (REST-level regression coverage)
 // =========================================================================
 //

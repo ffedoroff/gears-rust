@@ -2292,6 +2292,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bigdecimal",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-resource-group-sdk",

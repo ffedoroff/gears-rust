@@ -37,6 +37,13 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
+# Hierarchy $filter depth-literal validation (domain/hierarchy_filter.rs):
+# the OData parser hands back an arbitrary-precision BigDecimal, and this
+# crate needs its inherent `is_integer`/`with_scale`/`to_plain_string` to
+# enforce the integer-and-fits-i64 contract that FieldKind::I64 alone does
+# not check. Already resolved identically via toolkit-odata; this just
+# wires the existing workspace version in directly.
+bigdecimal = { workspace = true }
 
 # Serde and JSON schema
 serde = { workspace = true }

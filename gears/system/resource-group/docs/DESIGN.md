@@ -579,15 +579,20 @@ they overlap only on the `depth = 0` row.
 Both routes share one contract:
 
 - **Query**: `limit` (1..200, default 25) and `cursor`. `$filter` fields are `hierarchy/depth` (eq, ne, gt, ge, lt, le)
-  and `type`.
+  and `type` (eq, ne, in).
 - **Ancestor depths are negative.** `$filter=hierarchy/depth ge -2` on `/ancestors` means "no further than two levels
   up"; the same expression on `/descendants` matches everything, since descendant depths are never negative. Asking
   `/descendants` for `hierarchy/depth le 0` or `/ancestors` for `hierarchy/depth ge 0` yields just the reference group.
 - **Order is fixed** (`depth`, then `id`) and `$orderby` is ignored rather than rejected.
 - **The cursor is offset-based**, unlike the keyset cursors of the flat lists: results are assembled in memory from two
-  closure queries, so the token carries a page offset and a fixed `depth` sort signature.
-- `type` honours **`eq` only** — other operators are currently dropped rather than rejected, so the result comes back
-  unfiltered.
+  closure queries, so the token carries a page offset and a fixed sort-signature epoch. The epoch is bumped whenever
+  the in-memory filter evaluator's semantics change, so a cursor minted under an older epoch is rejected outright
+  rather than replayed against a page composition it no longer matches (ML-4182/ML-8813).
+- **`and`, `or`, `not`, `in`, and `ne` are all honoured, not just `eq`/single comparisons** — an in-memory evaluator
+  computes the full predicate for every candidate row, rather than extracting a best-effort subset and falling back to
+  "no filter" for anything it can't type. A form this gear cannot express safely (`hierarchy/depth in (...)`, `type`
+  `gt`/`ge`/`lt`/`le`, a string function on `type`, or an unknown field) is rejected with 400, never silently dropped
+  or partially applied.
 - **Over REST, an unknown or cross-tenant reference group is a 404**, not a 200 with an empty page: both scoped service
   methods run a scope-aware preflight `find_by_id` before touching the closure table, so a foreign root is
   indistinguishable from a random UUID.
@@ -677,7 +682,7 @@ The integration read contract returns **data rows only** (no policy/decision fie
 | `hierarchy.tenant_id` | UUID  | Yes    | Tenant scope (can differ per row under tenant hierarchy scope)               |
 | `hierarchy.depth` | INT     | Yes      | Relative distance from reference group (`0` = self, positive = descendants, negative = ancestors) |
 
-OData filters for `get_group_descendants` / `get_group_ancestors`: `hierarchy/depth` (eq, ne, gt, ge, lt, le), `type` (`eq` only — other operators are currently ignored rather than rejected). Pagination: `cursor`, `limit`. Uses OData nested path syntax (e.g., `$filter=hierarchy/depth ge 0 and type eq '...'`).
+OData filters for `get_group_descendants` / `get_group_ancestors`: `hierarchy/depth` (eq, ne, gt, ge, lt, le), `type` (eq, ne, in — other operators, and `hierarchy/depth in (...)`, are rejected with 400). Pagination: `cursor`, `limit`. Uses OData nested path syntax (e.g., `$filter=hierarchy/depth ge 0 and type eq '...'`).
 
 `list_memberships(ctx, query)` returns `Page<ResourceGroupMembership>` (matches REST `GET /memberships` → `MembershipPage`):
 

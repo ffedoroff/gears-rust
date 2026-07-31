@@ -16,9 +16,7 @@ use crate::infra::storage::entity::resource_group::{
 use crate::infra::storage::entity::resource_group_membership::{
     Column as MembershipColumn, Entity as MembershipEntity, Model as MembershipModel,
 };
-use resource_group_sdk::odata::{
-    GroupFilterField, HierarchyFilterField, MembershipFilterField, TypeFilterField,
-};
+use resource_group_sdk::odata::{GroupFilterField, MembershipFilterField, TypeFilterField};
 
 /// `OData` mapper for GTS types.
 pub struct TypeODataMapper;
@@ -87,40 +85,6 @@ impl ODataFieldMapping<GroupFilterField> for GroupODataMapper {
         match field {
             GroupFilterField::Type => FieldKind::I64,
             other => other.kind(),
-        }
-    }
-}
-
-/// `OData` mapper for hierarchy queries (not used for `paginate_odata`; hierarchy
-/// queries are handled manually). Included for completeness.
-pub struct HierarchyODataMapper;
-
-impl FieldToColumn<HierarchyFilterField> for HierarchyODataMapper {
-    type Column = GroupColumn;
-
-    fn map_field(field: HierarchyFilterField) -> GroupColumn {
-        match field {
-            HierarchyFilterField::HierarchyDepth => GroupColumn::Id, // placeholder
-            HierarchyFilterField::Type => GroupColumn::GtsTypeId,
-        }
-    }
-}
-
-impl ODataFieldMapping<HierarchyFilterField> for HierarchyODataMapper {
-    type Entity = GroupEntity;
-
-    fn extract_cursor_value(model: &GroupModel, field: HierarchyFilterField) -> sea_orm::Value {
-        match field {
-            HierarchyFilterField::HierarchyDepth => sea_orm::Value::Int(None),
-            HierarchyFilterField::Type => sea_orm::Value::SmallInt(Some(model.gts_type_id)),
-        }
-    }
-
-    /// Same wire-string / storage-SMALLINT seam as `GroupODataMapper`.
-    fn cursor_kind(field: HierarchyFilterField) -> FieldKind {
-        match field {
-            HierarchyFilterField::Type => FieldKind::I64,
-            HierarchyFilterField::HierarchyDepth => field.kind(),
         }
     }
 }

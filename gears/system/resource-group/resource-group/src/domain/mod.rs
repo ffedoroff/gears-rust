@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod group_service;
+pub(crate) mod hierarchy_filter;
 pub mod local_client;
 pub mod membership_service;
 pub mod read_service;

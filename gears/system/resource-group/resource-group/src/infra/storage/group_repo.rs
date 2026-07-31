@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use resource_group_sdk::models::{
     GroupHierarchy, GroupHierarchyWithDepth, ResourceGroup, ResourceGroupWithDepth,
 };
-use resource_group_sdk::odata::{GroupFilterField, HierarchyFilterField};
+use resource_group_sdk::odata::GroupFilterField;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
@@ -19,6 +19,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::hierarchy_filter::{self, HierarchyDirection, HierarchyFilter, TraversalBounds};
 use crate::domain::repo::GroupRepositoryTrait;
 use crate::infra::storage::entity::{
     gts_type::{self, Entity as GtsTypeEntity},
@@ -34,6 +35,23 @@ const GROUP_LIMIT_CFG: LimitCfg = LimitCfg {
     default: 25,
     max: 200,
 };
+
+/// Sort-signature epoch for hierarchy offset cursors (`/descendants`,
+/// `/ancestors`).
+///
+/// Bumped from the historical `"depth"` value as part of ML-4182/ML-8813:
+/// `short_filter_hash` (which `f` is checked against) is computed from the
+/// *syntactic*, normalized filter AST, before any interpretation — `or`,
+/// `not`, `ne`, and `in` were already part of that normalization
+/// (`libs/toolkit-odata/src/pagination.rs`). So the hash alone does not
+/// change just because the in-memory evaluator now honors predicates it
+/// used to silently drop, and an old cursor would pass the filter-hash
+/// check while its offset was computed against a page composition the new
+/// evaluator no longer produces. Changing the signature is what actually
+/// invalidates those old cursors: a stale token now fails the exact `s`
+/// comparison in [`GroupRepository::decode_offset_cursor`] and is rejected
+/// with 400 instead of being replayed against different semantics.
+const HIERARCHY_CURSOR_SIGNATURE: &str = "hdepth-v2";
 
 /// System-level access scope (no tenant/resource filtering).
 fn system_scope() -> AccessScope {
@@ -78,29 +96,110 @@ impl GroupRepository {
     ///
     /// The hierarchy endpoint uses offset-based pagination (not keyset) because
     /// results are assembled in memory from two separate queries. The offset is
-    /// stored in the `k` field and a fixed sort signature `"depth"` distinguishes
-    /// these cursors from keyset cursors used by `paginate_odata`.
-    fn encode_offset_cursor(offset: usize, direction: &str) -> Option<String> {
+    /// stored in the `k` field and the fixed [`HIERARCHY_CURSOR_SIGNATURE`]
+    /// distinguishes these cursors from keyset cursors used by `paginate_odata`.
+    ///
+    /// `filter_hash` is minted from the *current* query's `query.filter_hash`,
+    /// not left `None`: a follow-up page request replays the same `$filter`
+    /// (and therefore the same `filter_hash`), and [`Self::decode_offset_cursor`]
+    /// checks it by exact `Option<&str>` equality. Minting `None` here would
+    /// make any filtered `/descendants`/`/ancestors` request's second page fail
+    /// that check with `FilterMismatch` as soon as the check stopped comparing
+    /// two `None`s against each other.
+    fn encode_offset_cursor(
+        offset: usize,
+        direction: &str,
+        filter_hash: Option<&str>,
+    ) -> Option<String> {
         let cursor = CursorV1 {
             k: vec![offset.to_string()],
             o: SortDir::Asc,
-            s: "depth".to_owned(),
-            f: None,
+            s: HIERARCHY_CURSOR_SIGNATURE.to_owned(),
+            f: filter_hash.map(str::to_owned),
             d: direction.to_owned(),
         };
         cursor.encode().ok()
     }
 
+    /// Validate a hierarchy offset cursor against the current query and
+    /// return the decoded offset (`Ok(0)` when no cursor is present — first
+    /// page). Any mismatch is rejected with a 400-mapping `DomainError`
+    /// (`DomainError::from(toolkit_odata::Error)` — every cursor-shaped
+    /// variant of that ladder already maps to `Validation`), never degraded
+    /// to offset `0`: silently restarting a caller's pagination mid-walk
+    /// would skip or repeat rows without any signal that it happened.
+    ///
+    /// Checks, all exact (no fuzzy/partial matching):
+    /// - `s` equals [`HIERARCHY_CURSOR_SIGNATURE`] — rejects stale
+    ///   pre-epoch cursors minted before this filter's semantics changed.
+    /// - `o` is `Asc` (the only direction these cursors are ever minted with).
+    /// - `k` has exactly one entry, which parses as a non-negative integer
+    ///   (`str::parse::<usize>`, replacing the old `unwrap_or(0)` that
+    ///   silently turned a missing/negative/non-numeric key into offset 0).
+    /// - `f` equals `query.filter_hash` by `Option<&str>` equality — catches
+    ///   a cursor minted for a different (or absent) `$filter` being replayed
+    ///   against this one.
+    ///
+    /// `d` is re-checked here rather than trusted to `CursorV1::decode`. The
+    /// REST path does decode every cursor before the handler runs, but
+    /// `ODataQuery::with_cursor` takes a `CursorV1` by value, so an
+    /// in-process caller can hand this repository a struct that never passed
+    /// through the decoder — and this gear has in-process callers by design
+    /// (`RgReadService` over `ClientHub`). Only the cursor's own `v` and JSON
+    /// shape stay decode's business: they cannot exist on a value-constructed
+    /// `CursorV1` at all.
+    fn decode_offset_cursor(query: &ODataQuery) -> Result<usize, DomainError> {
+        let Some(cursor) = query.cursor.as_ref() else {
+            return Ok(0);
+        };
+
+        if cursor.s != HIERARCHY_CURSOR_SIGNATURE
+            || cursor.o != SortDir::Asc
+            || cursor.k.len() != 1
+            || !matches!(cursor.d.as_str(), "fwd" | "bwd")
+        {
+            return Err(DomainError::from(toolkit_odata::Error::InvalidCursor));
+        }
+
+        let offset = cursor
+            .k
+            .first()
+            .and_then(|k| k.parse::<usize>().ok())
+            .ok_or_else(|| DomainError::from(toolkit_odata::Error::InvalidCursor))?;
+
+        if cursor.f.as_deref() != query.filter_hash.as_deref() {
+            return Err(DomainError::from(toolkit_odata::Error::FilterMismatch));
+        }
+
+        Ok(offset)
+    }
+
     /// Shared helper: given raw `(group_id, depth)` pairs, load groups, resolve
-    /// type paths, apply `OData` filters, paginate, and return a `Page`.
+    /// type paths, apply the (already-parsed) hierarchy filter, paginate, and
+    /// return a `Page`.
+    ///
+    /// `filter` is parsed exactly once by the caller (`get_descendants` /
+    /// `get_ancestors`) and passed in here rather than re-parsed, both to
+    /// avoid doing the work twice per request and because the traversal-bound
+    /// narrowing those callers apply to their closure-table query must use
+    /// the same parsed filter this method uses for the final in-memory
+    /// recheck — two independent parses of the same `$filter` string could
+    /// never disagree in practice, but there is no reason to parse twice
+    /// when a `&HierarchyFilter` is Send+Sync-free to hold across the call.
     async fn build_hierarchy_page(
         &self,
         db: &impl DBRunner,
         scope: &AccessScope,
         query: &ODataQuery,
+        filter: &HierarchyFilter,
         group_depths: Vec<(Uuid, i32)>,
     ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        let (depth_filter, type_filter) = Self::parse_hierarchy_filter(query);
+        // Validate the cursor before anything else, including the
+        // group-ids-empty early return below: a stale/mismatched cursor is a
+        // client error regardless of how many rows the query would have
+        // produced, so it must not be swallowed by an early "nothing to
+        // paginate" response.
+        let offset = Self::decode_offset_cursor(query)?;
 
         let group_ids: Vec<Uuid> = group_depths.iter().map(|(id, _)| *id).collect();
         if group_ids.is_empty() {
@@ -130,19 +229,12 @@ impl GroupRepository {
 
         let mut results: Vec<ResourceGroupWithDepth> = Vec::new();
         for (gid, depth) in &group_depths {
-            if let Some(ref df) = depth_filter
-                && !df.matches(*depth)
-            {
-                continue;
-            }
             if let Some(model) = group_map.get(gid) {
                 let type_path = type_path_map
                     .get(&model.gts_type_id)
                     .cloned()
                     .unwrap_or_default();
-                if let Some(ref tf) = type_filter
-                    && !tf.matches(&type_path)
-                {
+                if !filter.matches(*depth, &type_path) {
                     continue;
                 }
                 results.push(ResourceGroupWithDepth {
@@ -166,25 +258,28 @@ impl GroupRepository {
                 .then_with(|| a.id.cmp(&b.id))
         });
 
-        let offset = query
-            .cursor
-            .as_ref()
-            .and_then(|c| c.k.first())
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
         let limit_val = query.limit.unwrap_or(25).min(200);
         let limit_usize = limit_val as usize;
         let total = results.len();
         let items: Vec<ResourceGroupWithDepth> =
             results.into_iter().skip(offset).take(limit_usize).collect();
 
-        let next_cursor = if offset + limit_usize < total {
-            Self::encode_offset_cursor(offset + limit_usize, "fwd")
-        } else {
-            None
+        // Checked: an offset replayed from a cursor is caller-controlled and
+        // must never panic this on overflow (a huge-but-valid `usize` offset
+        // plus `limit_usize` can overflow `usize` arithmetic). Overflow simply
+        // means "past the end" -- no next page, same as the `< total` miss below.
+        let next_cursor = match offset.checked_add(limit_usize) {
+            Some(end) if end < total => {
+                Self::encode_offset_cursor(end, "fwd", query.filter_hash.as_deref())
+            }
+            _ => None,
         };
         let prev_cursor = if offset > 0 {
-            Self::encode_offset_cursor(offset.saturating_sub(limit_usize), "bwd")
+            Self::encode_offset_cursor(
+                offset.saturating_sub(limit_usize),
+                "bwd",
+                query.filter_hash.as_deref(),
+            )
         } else {
             None
         };
@@ -197,105 +292,6 @@ impl GroupRepository {
                 limit: limit_val,
             },
         })
-    }
-
-    /// Parse and extract hierarchy filters from an `OData` query.
-    fn parse_hierarchy_filter(query: &ODataQuery) -> (Option<DepthFilter>, Option<TypeFilter>) {
-        let Some(filter_expr) = query.filter() else {
-            return (None, None);
-        };
-
-        let filter_node = match toolkit_odata::filter::convert_expr_to_filter_node::<
-            HierarchyFilterField,
-        >(filter_expr)
-        {
-            Ok(node) => node,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "hierarchy $filter could not be typed (e.g. Or/Ne/In on hierarchy fields); falling back to superset + in-memory filter"
-                );
-                return (None, None);
-            }
-        };
-
-        let depth = Self::extract_depth_from_node(&filter_node);
-        let type_f = Self::extract_type_from_hierarchy_node(&filter_node);
-        (depth, type_f)
-    }
-
-    fn extract_depth_from_node(
-        node: &toolkit_odata::filter::FilterNode<HierarchyFilterField>,
-    ) -> Option<DepthFilter> {
-        use toolkit_odata::filter::{FilterNode, FilterOp};
-
-        match node {
-            FilterNode::Binary {
-                field: HierarchyFilterField::HierarchyDepth,
-                op,
-                value,
-            } => {
-                let v = match value {
-                    toolkit_odata::filter::ODataValue::Number(n) => {
-                        // BigDecimal to i32
-                        n.to_string().parse::<i32>().ok()?
-                    }
-                    _ => return None,
-                };
-                Some(DepthFilter::Single(*op, v))
-            }
-            FilterNode::Composite {
-                op: FilterOp::And,
-                children,
-            } => {
-                let mut filters = Vec::new();
-                for child in children {
-                    if let Some(f) = Self::extract_depth_from_node(child) {
-                        filters.push(f);
-                    }
-                }
-                if filters.is_empty() {
-                    None
-                } else if filters.len() == 1 {
-                    Some(filters.remove(0))
-                } else {
-                    Some(DepthFilter::And(filters))
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn extract_type_from_hierarchy_node(
-        node: &toolkit_odata::filter::FilterNode<HierarchyFilterField>,
-    ) -> Option<TypeFilter> {
-        use toolkit_odata::filter::{FilterNode, FilterOp};
-
-        match node {
-            FilterNode::Binary {
-                field: HierarchyFilterField::Type,
-                op: FilterOp::Eq,
-                value,
-            } => {
-                if let toolkit_odata::filter::ODataValue::String(s) = value {
-                    Some(TypeFilter::Eq(s.clone()))
-                } else {
-                    None
-                }
-            }
-            FilterNode::Composite {
-                op: FilterOp::And,
-                children,
-            } => {
-                for child in children {
-                    if let Some(f) = Self::extract_type_from_hierarchy_node(child) {
-                        return Some(f);
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
     }
 }
 
@@ -497,29 +493,28 @@ impl GroupRepositoryTrait for GroupRepository {
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        let (depth_filter, _) = Self::parse_hierarchy_filter(query);
+        let filter = hierarchy_filter::parse(query)?;
         let sys = system_scope();
 
-        let mut desc_query =
-            ClosureEntity::find().filter(closure_entity::Column::AncestorId.eq(group_id));
-        if let Some(max_desc) = depth_filter
-            .as_ref()
-            .and_then(DepthFilter::max_descendant_depth)
-            && max_desc >= 0
-        {
-            desc_query = desc_query.filter(closure_entity::Column::Depth.lte(max_desc));
-        }
-        let rows = desc_query
-            .secure()
-            .scope_with(&sys)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+        let bounds = filter.traversal_bounds(HierarchyDirection::Descendant);
+        let group_depths: Vec<(Uuid, i32)> = if matches!(bounds, TraversalBounds::Empty) {
+            Vec::new()
+        } else {
+            let mut desc_query =
+                ClosureEntity::find().filter(closure_entity::Column::AncestorId.eq(group_id));
+            if let TraversalBounds::Max(max_desc) = bounds {
+                desc_query = desc_query.filter(closure_entity::Column::Depth.lte(max_desc));
+            }
+            let rows = desc_query
+                .secure()
+                .scope_with(&sys)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            rows.iter().map(|r| (r.descendant_id, r.depth)).collect()
+        };
 
-        let group_depths: Vec<(Uuid, i32)> =
-            rows.iter().map(|r| (r.descendant_id, r.depth)).collect();
-
-        self.build_hierarchy_page(db, scope, query, group_depths)
+        self.build_hierarchy_page(db, scope, query, &filter, group_depths)
             .await
     }
 
@@ -530,10 +525,14 @@ impl GroupRepositoryTrait for GroupRepository {
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        let (depth_filter, _) = Self::parse_hierarchy_filter(query);
+        let filter = hierarchy_filter::parse(query)?;
         let sys = system_scope();
 
-        // Self-row (depth=0)
+        // Self-row (depth=0) -- always fetched regardless of the filter's
+        // traversal bound: the bound below only prunes the *ancestor* rows
+        // (depth > 0 in closure), and the final `build_hierarchy_page`
+        // in-memory recheck via `filter.matches` is what actually decides
+        // whether the self row belongs in the result.
         let self_row = ClosureEntity::find()
             .filter(closure_entity::Column::AncestorId.eq(group_id))
             .filter(closure_entity::Column::Depth.eq(0))
@@ -547,27 +546,26 @@ impl GroupRepositoryTrait for GroupRepository {
             self_row.iter().map(|r| (r.descendant_id, 0)).collect();
 
         // Ancestor rows (depth > 0 in closure, negated to < 0 in result)
-        let mut anc_query = ClosureEntity::find()
-            .filter(closure_entity::Column::DescendantId.eq(group_id))
-            .filter(closure_entity::Column::Depth.ne(0));
-        if let Some(max_anc) = depth_filter
-            .as_ref()
-            .and_then(DepthFilter::max_ancestor_depth)
-            && max_anc > 0
-        {
-            anc_query = anc_query.filter(closure_entity::Column::Depth.lte(max_anc));
-        }
-        let rows = anc_query
-            .secure()
-            .scope_with(&sys)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-        for row in &rows {
-            group_depths.push((row.ancestor_id, -row.depth));
+        let bounds = filter.traversal_bounds(HierarchyDirection::Ancestor);
+        if !matches!(bounds, TraversalBounds::Empty) {
+            let mut anc_query = ClosureEntity::find()
+                .filter(closure_entity::Column::DescendantId.eq(group_id))
+                .filter(closure_entity::Column::Depth.ne(0));
+            if let TraversalBounds::Max(max_anc) = bounds {
+                anc_query = anc_query.filter(closure_entity::Column::Depth.lte(max_anc));
+            }
+            let rows = anc_query
+                .secure()
+                .scope_with(&sys)
+                .all(db)
+                .await
+                .map_err(|e| DomainError::database(e.to_string()))?;
+            for row in &rows {
+                group_depths.push((row.ancestor_id, -row.depth));
+            }
         }
 
-        self.build_hierarchy_page(db, scope, query, group_depths)
+        self.build_hierarchy_page(db, scope, query, &filter, group_depths)
             .await
     }
 
@@ -1177,71 +1175,5 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(models.into_iter().map(|m| (m.id, m.schema_id)).collect())
-    }
-}
-
-/// Depth filter for hierarchy queries.
-enum DepthFilter {
-    Single(toolkit_odata::filter::FilterOp, i32),
-    And(Vec<DepthFilter>),
-}
-
-impl DepthFilter {
-    fn matches(&self, depth: i32) -> bool {
-        use toolkit_odata::filter::FilterOp;
-        match self {
-            Self::Single(op, v) => match op {
-                FilterOp::Eq => depth == *v,
-                FilterOp::Ne => depth != *v,
-                FilterOp::Gt => depth > *v,
-                FilterOp::Ge => depth >= *v,
-                FilterOp::Lt => depth < *v,
-                FilterOp::Le => depth <= *v,
-                _ => true, // Unsupported ops pass through
-            },
-            Self::And(filters) => filters.iter().all(|f| f.matches(depth)),
-        }
-    }
-
-    /// Derive the maximum descendant depth (positive) implied by this filter.
-    /// Returns `None` if no upper bound can be derived.
-    fn max_descendant_depth(&self) -> Option<i32> {
-        use toolkit_odata::filter::FilterOp;
-        match self {
-            Self::Single(op, v) => match op {
-                FilterOp::Eq | FilterOp::Le => Some(*v),
-                FilterOp::Lt => Some(*v - 1),
-                _ => None,
-            },
-            Self::And(filters) => filters.iter().filter_map(Self::max_descendant_depth).min(),
-        }
-    }
-
-    /// Derive the maximum ancestor depth (positive closure depth) implied by this filter.
-    /// Since ancestors have negative relative depth, `depth ge -3` means closure depth <= 3.
-    /// Returns `None` if no lower bound can be derived.
-    fn max_ancestor_depth(&self) -> Option<i32> {
-        use toolkit_odata::filter::FilterOp;
-        match self {
-            Self::Single(op, v) => match op {
-                FilterOp::Eq | FilterOp::Ge => Some(v.abs()),
-                FilterOp::Gt => Some((v - 1).abs()),
-                _ => None,
-            },
-            Self::And(filters) => filters.iter().filter_map(Self::max_ancestor_depth).min(),
-        }
-    }
-}
-
-/// Type filter for hierarchy queries.
-enum TypeFilter {
-    Eq(String),
-}
-
-impl TypeFilter {
-    fn matches(&self, type_path: &str) -> bool {
-        match self {
-            Self::Eq(s) => type_path == s,
-        }
     }
 }
