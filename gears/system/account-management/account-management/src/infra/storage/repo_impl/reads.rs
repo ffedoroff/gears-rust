@@ -203,10 +203,7 @@ impl ODataFieldMapping<TenantInfoFilterField> for TenantODataMapper {
 /// for future REST handlers that want to surface the per-deployment
 /// cap, but the repo seam itself uses this constant to defend against
 /// builders that forget to clamp.
-const TENANT_LISTING_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 50,
-    max: 200,
-};
+const TENANT_LISTING_LIMIT_CFG: LimitCfg = LimitCfg::new(50, 200);
 
 /// Recursively scan an `$filter` AST for any reference to a named
 /// column. Used by [`list_children`] to detect whether the caller has

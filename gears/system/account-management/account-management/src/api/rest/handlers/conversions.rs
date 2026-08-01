@@ -97,7 +97,7 @@ pub async fn list_own_conversions(
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<OwnConversionRequestDto>>> {
     reject_non_odata_params(&extras)?;
-    let query = clamp_listing_top(query, svc.max_listing_top());
+    let query = clamp_listing_top(query, svc.max_listing_top())?;
     let page = svc.list_own_for_tenant(&ctx, tenant_id, &query).await?;
     Ok(Json(
         page.map_items(OwnConversionRequestDto::from_conversion),
@@ -230,7 +230,7 @@ pub async fn list_child_conversions(
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<ChildConversionRequestDto>>> {
     reject_non_odata_params(&extras)?;
-    let query = clamp_listing_top(query, svc.max_listing_top());
+    let query = clamp_listing_top(query, svc.max_listing_top())?;
     let page = svc.list_inbound_for_parent(&ctx, parent_id, &query).await?;
     Ok(Json(page.map_items(
         ChildConversionRequestDto::from_parent_projection,

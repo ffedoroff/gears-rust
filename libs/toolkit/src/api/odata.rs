@@ -9,6 +9,11 @@ use toolkit_odata::{CursorV1, Error as ODataError, ODataOrderBy, OrderKey, SortD
 pub use toolkit_odata::ODataQuery;
 // CursorV1 is available through the private import above for internal use
 
+// Re-export the shared page-size policy (ML-5024) so gears that depend on
+// `toolkit` but not directly on `toolkit-odata` (e.g. `oagw`) can reach
+// `resolve_page_size`/`LimitCfg` without adding a new Cargo dependency.
+pub use toolkit_odata::{LimitCfg, resolve_page_size};
+
 #[derive(Deserialize, Default)]
 pub struct ODataParams {
     #[serde(rename = "$filter")]

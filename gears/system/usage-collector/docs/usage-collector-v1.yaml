@@ -139,7 +139,7 @@ paths:
             pagination requires a uniform-direction, never-null keyset.
           schema:
             type: string
-        - name: $top
+        - name: limit
           in: query
           required: false
           description: Page size; server clamps to `[1, 1000]`.

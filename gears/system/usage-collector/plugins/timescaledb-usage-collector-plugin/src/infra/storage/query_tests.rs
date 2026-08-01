@@ -29,12 +29,17 @@ fn effective_page_size_allows_exactly_the_cap() {
 
 #[test]
 fn effective_page_size_floors_a_zero_top_to_one() {
-    // `$top=0` is a legal OData value the core gateway passes through
-    // unclamped. A resolved page size of 0 would drive `LIMIT 0+1 = 1`, fetch
-    // the look-ahead row, then `truncate(0)` — losing the page tail so
-    // `rows.last()` is `None` and the list path 500s with "non-empty page lost
-    // its tail". Floor to 1 (the smallest legal page) so both list paths stay
-    // sound regardless of a `$top=0` slipping past the gateway.
+    // `limit=0` can no longer reach here from an HTTP request — the core
+    // gateway's `resolve_page_size` rejects it before any plugin dispatch.
+    // It CAN still reach here from an in-process caller:
+    // `UsageCollectorLocalClient::list_usage_records` forwards the
+    // caller's `ODataQuery` verbatim to `Service::list_usage_records`,
+    // which never re-validates `limit` before plugin dispatch. A resolved
+    // page size of 0 would drive `LIMIT 0+1 = 1`, fetch the look-ahead
+    // row, then `truncate(0)` — losing the page tail so `rows.last()` is
+    // `None` and the list path 500s with "non-empty page lost its tail".
+    // Floor to 1 (the smallest legal page) so both list paths stay sound
+    // against that in-process caller.
     assert_eq!(effective_page_size(Some(0), DEFAULT), 1);
 }
 

@@ -773,18 +773,10 @@ where
 // Use unified pagination types from toolkit-odata
 pub use toolkit_odata::{Page, PageInfo};
 
-// Note: LimitCfg is imported at the top and re-exported from odata/mod.rs
-
-fn clamp_limit(req: Option<u64>, cfg: LimitCfg) -> u64 {
-    let mut l = req.unwrap_or(cfg.default);
-    if l == 0 {
-        l = 1;
-    }
-    if l > cfg.max {
-        l = cfg.max;
-    }
-    l
-}
+// Note: LimitCfg is imported at the top and re-exported from odata/mod.rs.
+// The former crate-local `clamp_limit` companion (ML-5024) is gone — its
+// policy now lives once in `toolkit_odata::resolve_page_size`, called
+// directly at the one call site below.
 
 /// One-shot pagination combiner that handles filter → cursor predicate → order → overfetch/trim → build cursors.
 ///
@@ -796,7 +788,7 @@ pub async fn paginate_with_odata<E, D, F, C>(
     q: &ODataQuery,
     fmap: &FieldMap<E>,
     tiebreaker: (&str, SortDir), // e.g. ("id", SortDir::Desc)
-    limit_cfg: LimitCfg,         // e.g. { default: 25, max: 1000 }
+    limit_cfg: LimitCfg,         // e.g. LimitCfg::new(25, 1000)
     model_to_domain: F,
 ) -> Result<Page<D>, ODataError>
 where
@@ -805,8 +797,19 @@ where
     F: Fn(E::Model) -> D + Copy,
     C: DBRunner,
 {
-    let limit = clamp_limit(q.limit, limit_cfg);
-    let fetch = limit + 1;
+    let limit = toolkit_odata::resolve_page_size(q.limit, limit_cfg)?.get();
+    // `limit` is bounded by `limit_cfg.max` (a `NonZeroU64`), but neither
+    // that type nor `LimitCfg::new` rejects `max == u64::MAX` — only zero
+    // is rejected. In every `LimitCfg` actually configured in this
+    // codebase `max` is a realistic cap (tens to low thousands), so this
+    // addition does not overflow in practice, but that is a property of
+    // today's call sites, not one the compiler or `LimitCfg::new`
+    // enforces. `saturating_add` avoids a wrapping overflow if that
+    // assumption is ever violated (`limit == u64::MAX`), but at that
+    // boundary `fetch == limit`, not `limit + 1` — the look-ahead row is
+    // silently not fetched, so `has_more` under-reports by exactly one
+    // item. See `limit_cfg_tests.rs` for the pinned edge case.
+    let fetch = limit.saturating_add(1);
 
     // Effective order derivation based on new policy
     let effective_order = if let Some(cur) = &q.cursor {

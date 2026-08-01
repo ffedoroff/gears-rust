@@ -279,6 +279,66 @@ async fn list_upstreams_with_pagination() {
     assert_eq!(arr.len(), 2);
 }
 
+// ML-5024: `limit=0` used to reach `.min(100) == 0` and hand the
+// in-memory repo `.take(0)`, returning `200 OK` with an always-empty
+// array — indistinguishable from "this tenant has zero upstreams". It is
+// now rejected as `400 InvalidArgument` via `resolve_page_size`. A
+// deliberate breaking change to the wire contract (owner's decision).
+#[tokio::test]
+async fn list_upstreams_zero_limit_returns_400() {
+    let h = AppHarness::builder().build().await;
+
+    let resp = h
+        .api_v1()
+        .list_upstreams()
+        .with_query("limit", "0")
+        .expect_status(400)
+        .await;
+
+    // Status alone does not distinguish "rejected because of `limit`"
+    // from any other 400 this endpoint could return — pin the
+    // violation's field so a regression that rejects for the wrong
+    // reason (or stops naming the offending parameter, ML-1520) still
+    // fails this test.
+    let field = resp
+        .json()
+        .get("context")
+        .and_then(|c| c.get("field_violations"))
+        .and_then(|fv| fv.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("field"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    assert_eq!(field.as_deref(), Some("limit"));
+}
+
+/// Same ML-5024 breaking change as [`list_upstreams_zero_limit_returns_400`],
+/// pinned separately because `GET /oagw/v1/routes` goes through its own
+/// `ListRoutesQuery` (`route.rs`), not `PaginationQuery` — the two used to
+/// duplicate the same unguarded `.min(100)` clamp independently.
+#[tokio::test]
+async fn list_routes_zero_limit_returns_400() {
+    let h = AppHarness::builder().build().await;
+
+    let resp = h
+        .api_v1()
+        .list_routes(None)
+        .with_query("limit", "0")
+        .expect_status(400)
+        .await;
+
+    let field = resp
+        .json()
+        .get("context")
+        .and_then(|c| c.get("field_violations"))
+        .and_then(|fv| fv.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("field"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    assert_eq!(field.as_deref(), Some("limit"));
+}
+
 // 7.13: Error mapper produces correct Problem Details.
 #[tokio::test]
 async fn error_mapper_produces_problem_details() {

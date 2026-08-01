@@ -237,8 +237,10 @@ fn lower_with_unknown_orderby_field_returns_validation_error() {
 #[test]
 fn lower_with_max_top_zero_floors_to_one_no_panic() {
     // Defensive: a deployment misconfigured with `max_listing_top = 0`
-    // must NOT panic inside `clamp(1, 0)`. The seam floors max_top to 1
-    // and falls back to the SDK MAX_TOP cap via subsequent clamps.
+    // must NOT panic inside `LimitCfg::new` (`default`/`max` must be
+    // non-zero). The seam floors max_top to 1 before building the
+    // `LimitCfg`, so a caller-supplied `limit` above that floor is
+    // clamped down to it rather than the seam panicking.
     let query = ODataQuery {
         limit: Some(10),
         ..ODataQuery::default()
@@ -248,5 +250,23 @@ fn lower_with_max_top_zero_floors_to_one_no_panic() {
     assert!(
         lowered.pagination.top() >= 1,
         "floored top must satisfy IdpUserPagination::top >= 1 invariant"
+    );
+}
+
+#[test]
+fn lower_with_explicit_zero_limit_is_rejected() {
+    // ML-5024/ML-1520: `resolve_page_size` rejects an explicit `limit=0`
+    // rather than silently coercing it to `1` — a deliberate unification
+    // with `clamp_listing_top` (`handlers/common.rs`), replacing this
+    // endpoint's previous bespoke `clamp(1, max_top)` which absorbed a
+    // `0` without telling the caller.
+    let query = ODataQuery {
+        limit: Some(0),
+        ..ODataQuery::default()
+    };
+    let err = lower_odata_to_list_users_query(query, 200).expect_err("limit=0 must be rejected");
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected Validation, got {err:?}"
     );
 }

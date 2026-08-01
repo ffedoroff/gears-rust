@@ -325,10 +325,7 @@ impl ODataFieldMapping<ConversionRequestFilterField> for ConversionRequestODataM
 /// `listing.max_top` accessor remains for future REST handlers that
 /// want to surface the per-deployment cap; the repo seam itself uses
 /// this constant to defend against builders that forget to clamp.
-const CONVERSION_LISTING_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 50,
-    max: 200,
-};
+const CONVERSION_LISTING_LIMIT_CFG: LimitCfg = LimitCfg::new(50, 200);
 
 // ---------------------------------------------------------------------------
 // Free functions implementing each ConversionRepo method.

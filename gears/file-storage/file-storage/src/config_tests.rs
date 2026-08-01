@@ -65,6 +65,26 @@ fn validate_rejects_zero_sweep_interval_when_sweep_enabled() {
     );
 }
 
+/// Both bounds reach `LimitCfg::new` on every list request, and that
+/// constructor panics on a zero bound. Rejecting at boot turns a
+/// panic-per-request into a startup error the operator can read.
+#[test]
+fn validate_rejects_zero_page_size_bounds() {
+    for (default_page_size, max_page_size) in [(0, 100), (25, 0), (0, 0)] {
+        let cfg = FileStorageConfig {
+            default_page_size,
+            max_page_size,
+            require_signing_key_seed: false,
+            ..FileStorageConfig::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "default_page_size={default_page_size}, max_page_size={max_page_size} \
+             must be rejected: a zero bound panics in LimitCfg::new per request"
+        );
+    }
+}
+
 #[test]
 fn validate_accepts_positive_sweep_interval_when_sweep_enabled() {
     let cfg = FileStorageConfig {

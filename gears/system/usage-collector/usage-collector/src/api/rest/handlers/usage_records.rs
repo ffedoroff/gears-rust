@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::extract::{Extension, Path, Query};
 use toolkit::api::canonical_prelude::*;
 use toolkit_canonical_errors::Problem;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{LimitCfg, ODataQuery, Page as ODataPage, resolve_page_size};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     AggregationSpec, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, ResourceRef,
@@ -168,14 +168,19 @@ pub async fn handle_get_usage_record(
 /// for exactly that purpose — and the service rejects an absent or
 /// one-sided window with `400 InvalidArgument`
 /// (`MISSING_TIME_WINDOW`) before any plugin dispatch. `$filter` /
-/// `$orderby` / `$top` / `cursor` flow through the standard [`OData`]
-/// extractor.
+/// `$orderby` / `limit` / `cursor` flow through the standard [`OData`]
+/// extractor. `$top` is not an accepted alias for `limit` — it is not on
+/// the parameter allowlist at all, so a caller sending it gets `400
+/// InvalidArgument` for an unrecognised query parameter (ML-9126).
 ///
 /// Gateway-side guards applied before the service is invoked:
 ///
-/// * **`$top` cap** — `ODataQuery.limit` is bounded by [`MAX_PAGE_SIZE`].
-///   A caller passing `?$top=1000000` receives a `400 InvalidArgument`
-///   so they cannot silently misinterpret a clamped page as complete.
+/// * **`limit` bound** — resolved through [`toolkit_odata::resolve_page_size`]
+///   against a default/max of 25/[`MAX_PAGE_SIZE`] (ML-5024). An absent
+///   `limit` becomes 25; `limit=0` is rejected as `400 InvalidArgument`;
+///   a `limit` above [`MAX_PAGE_SIZE`] is silently clamped down to it
+///   rather than rejected — the shared policy's deliberate upper-bound
+///   clamp, matching every other migrated call site.
 /// * **Cursor validation** — when a `cursor` is present, the toolkit's
 ///   [`validate_cursor_against`] confirms it was minted under the same
 ///   `$filter` AST and `$orderby` projection; mismatches surface as
@@ -359,9 +364,14 @@ fn prepare_list_request(
 /// Maximum number of records the gateway will request from the plugin
 /// in a single page per
 /// `cpt-cf-usage-collector-dod-usage-query-constraint-nfr-thresholds`.
-/// A caller-supplied `limit` above this ceiling is rejected with 400
-/// `InvalidArgument` (never silently clamped) so the plugin cannot be
-/// coaxed into unbounded reads.
+///
+/// ML-5024: a caller-supplied `limit` above this ceiling is **clamped**
+/// down to it by [`toolkit_odata::resolve_page_size`], not rejected — the
+/// plugin never sees an unbounded read either way, but the caller now gets
+/// a full (if capped) page instead of a 400. This is a deliberate change
+/// from the pre-ML-5024 behavior (reject above cap): every other migrated
+/// call site clamps, and this endpoint had no requirement to be the one
+/// exception.
 pub const MAX_PAGE_SIZE: u64 = 1000;
 
 /// Maximum number of distinct `metadata.<key>` filters accepted on a
@@ -378,11 +388,18 @@ pub const MAX_METADATA_FILTER_VALUES: usize = 32;
 /// `$`-prefixed `OData` parameters (parsed by the toolkit `OData`
 /// extractor) and the non-`OData` scalars the toolkit also accepts.
 /// `limit` is the only page-size parameter the toolkit extractor reads
-/// (`ODataParams` in `toolkit::api::odata` has no `$top` field). `$top` is
-/// listed here only so the allow-list does not reject it outright; the
-/// extractor drops it, so a caller sending `$top` silently gets the default
-/// page size. Do not document `$top` as an accepted alias — it is not one.
-const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$select", "$top", "limit", "cursor"];
+/// (`ODataParams` in `toolkit::api::odata` has no `$top` field).
+///
+/// ML-9126: `$top` is deliberately absent from this list. It used to be
+/// listed here "so the allow-list does not reject it outright", which
+/// meant the extractor silently dropped it and a caller sending `$top`
+/// silently got the default page size instead of the limit they thought
+/// they were setting — a caller error that looked like success. `$top` is
+/// now unrecognised on this path like any other typo'd parameter: it fails
+/// [`reject_unknown_list_params`] with `400 InvalidArgument`, telling the
+/// caller their parameter had no effect instead of leaving them to
+/// discover it from a page size that didn't match what they asked for.
+const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$select", "limit", "cursor"];
 
 /// Typed query parameters carrying SDK values that are NOT part of the
 /// `OData` surface.
@@ -402,9 +419,10 @@ const METADATA_PREFIX: &str = "metadata.";
 const CANONICAL_TIEBREAKER_FIELDS: &[&str] = &["created_at", "id"];
 
 /// Apply gateway-side guards on the parsed [`ODataQuery`]:
-/// 1. reject `limit > MAX_PAGE_SIZE` as `InvalidArgument` (no silent
-///    clamp; a caller asking for more rows than the page-size cap MUST
-///    be told so they can paginate explicitly);
+/// 1. resolve `limit` through [`toolkit_odata::resolve_page_size`] against
+///    a default of 25 and a max of [`MAX_PAGE_SIZE`] (ML-5024): absent
+///    becomes 25, `0` is `InvalidArgument`, and above [`MAX_PAGE_SIZE`] is
+///    clamped down to it (not rejected — see [`MAX_PAGE_SIZE`]'s doc);
 /// 2. normalize `$orderby` so the effective order always ends in the
 ///    canonical unique `(created_at, id)` suffix — on the empty-order
 ///    path this defaults to `(created_at asc, id asc)`, and on an
@@ -419,23 +437,15 @@ const CANONICAL_TIEBREAKER_FIELDS: &[&str] = &["created_at", "id"];
 // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-odata-parse
 // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-cursor-validate
 fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalError> {
-    // 1. $top cap. Reject above the cap so the caller observes the
-    //    boundary rather than silently receiving a truncated page that
-    //    looks complete.
-    match query.limit {
-        Some(l) if l > MAX_PAGE_SIZE => {
-            return Err(UsageRecordResource::invalid_argument()
-                .with_field_violation(
-                    "$top",
-                    format!("$top must be <= {MAX_PAGE_SIZE}, got {l}"),
-                    "VALIDATION",
-                )
-                .create());
-        }
-        // Within the cap: keep the caller's $top unchanged.
-        Some(_) => {}
-        None => query.limit = Some(MAX_PAGE_SIZE),
-    }
+    // 1. Resolve `limit` through the shared policy (ML-5024). `Some(0)` is
+    //    `Error::InvalidLimit` (field-tagged `limit`, not `$top` — ML-1520);
+    //    absent becomes the endpoint default of 25; above `MAX_PAGE_SIZE` is
+    //    clamped down to it rather than rejected.
+    query.limit = Some(
+        resolve_page_size(query.limit, LimitCfg::new(25, MAX_PAGE_SIZE))
+            .map_err(CanonicalError::from)?
+            .get(),
+    );
 
     // 2. $orderby normalization: ensure a unique keyset suffix.
     //

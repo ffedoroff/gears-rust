@@ -94,8 +94,20 @@ impl UpstreamRepository for InMemoryUpstreamRepo {
 
         all.sort_by_key(|u| u.id);
 
+        // Structural assertion, not a page-size policy — see the matching
+        // comment in `route_repo.rs::list`. The repository rejects only
+        // `top == 0`; the upper bound belongs to the REST edge
+        // (`PaginationQuery::to_list_query`).
+        if query.top == 0 {
+            return Err(RepositoryError::Validation {
+                // "limit", not "top" — see the matching comment in
+                // `route_repo.rs::list` for why.
+                field: "limit",
+                detail: "list query top must be non-zero".to_string(),
+            });
+        }
         let skip = query.skip as usize;
-        let top = query.top as usize;
+        let top = usize::try_from(query.top).unwrap_or(usize::MAX);
         Ok(all.into_iter().skip(skip).take(top).collect())
     }
 

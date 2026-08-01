@@ -75,10 +75,9 @@ fn build_service(
     rag_config: RagConfig,
 ) -> TestAttachmentService {
     let db = mock_db_provider(db);
-    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg {
-        default: 20,
-        max: 100,
-    }));
+    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg::new(
+        20, 100,
+    )));
     let attachment_repo = Arc::new(OrmAttachmentRepository);
     let vector_store_repo = Arc::new(OrmVectorStoreRepository);
     let provider_resolver = test_provider_resolver(&(Arc::clone(&oagw) as _));
@@ -124,10 +123,9 @@ fn build_service_with_metrics(
     metrics: Arc<dyn crate::domain::ports::MiniChatMetricsPort>,
 ) -> TestAttachmentService {
     let db = mock_db_provider(db);
-    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg {
-        default: 20,
-        max: 100,
-    }));
+    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg::new(
+        20, 100,
+    )));
     let attachment_repo = Arc::new(OrmAttachmentRepository);
     let vector_store_repo = Arc::new(OrmVectorStoreRepository);
     let provider_resolver = test_provider_resolver(&(Arc::clone(&oagw) as _));
@@ -2078,10 +2076,9 @@ fn build_service_azure(
     rag_config: RagConfig,
 ) -> TestAttachmentService {
     let db = mock_db_provider(db);
-    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg {
-        default: 20,
-        max: 100,
-    }));
+    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg::new(
+        20, 100,
+    )));
     let attachment_repo = Arc::new(OrmAttachmentRepository);
     let vector_store_repo = Arc::new(OrmVectorStoreRepository);
     let provider_resolver = dual_provider_resolver(&(Arc::clone(&oagw) as _));
@@ -2727,10 +2724,9 @@ async fn test_upload_limits_ccm_tighter_than_configmap() {
         AttachmentService::new(
             db_prov_arc,
             Arc::new(OrmAttachmentRepository),
-            Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg::new(
+                20, 100,
+            ))),
             Arc::new(OrmVectorStoreRepository),
             Arc::new(NoopOutboxEnqueuer),
             mock_tenant_only_enforcer(),

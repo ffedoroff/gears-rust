@@ -31,10 +31,7 @@ use crate::infra::storage::odata_mapper::GroupODataMapper;
 use crate::infra::storage::type_repo::TypeRepository;
 
 /// Default `OData` pagination limits for groups.
-const GROUP_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 25,
-    max: 200,
-};
+const GROUP_LIMIT_CFG: LimitCfg = LimitCfg::new(25, 200);
 
 /// Sort-signature epoch for hierarchy offset cursors (`/descendants`,
 /// `/ancestors`).
@@ -201,6 +198,25 @@ impl GroupRepository {
         // paginate" response.
         let offset = Self::decode_offset_cursor(query)?;
 
+        // ML-5024: was `query.limit.unwrap_or(25).min(200)` — no lower
+        // bound, so `limit=0` produced a page with `limit: 0` and (below,
+        // via the identical clamp at the old second call site) an empty
+        // `items` with `next_cursor` re-encoding the *same* offset the
+        // caller just requested. A consumer that followed `next_cursor`
+        // mechanically would spin forever on an all-empty page that never
+        // advances. The arithmetic is real, but `limit=0` was never
+        // reachable from an HTTP request here: `query` arrives via the
+        // canonical `OData` extractor (`OData(query)` in
+        // `api/rest/handlers/groups.rs`), which already rejects
+        // `limit=0` with `400` before this method — or even the handler
+        // body — ever runs (`toolkit::api::odata::extract_odata_query`).
+        // This clamp closes a latent mine for an in-process caller that
+        // builds an `ODataQuery` directly (e.g. `GroupService`/
+        // `GroupRepository` invoked from another gear or a test, bypassing
+        // the REST extractor) — `resolve_page_size` rejects `Some(0)`
+        // outright instead of silently emitting that non-advancing cursor.
+        let limit = toolkit_odata::resolve_page_size(query.limit, GROUP_LIMIT_CFG)?.get();
+
         let group_ids: Vec<Uuid> = group_depths.iter().map(|(id, _)| *id).collect();
         if group_ids.is_empty() {
             return Ok(Page {
@@ -208,7 +224,7 @@ impl GroupRepository {
                 page_info: toolkit_odata::PageInfo {
                     next_cursor: None,
                     prev_cursor: None,
-                    limit: query.limit.unwrap_or(25).min(200),
+                    limit,
                 },
             });
         }
@@ -258,8 +274,7 @@ impl GroupRepository {
                 .then_with(|| a.id.cmp(&b.id))
         });
 
-        let limit_val = query.limit.unwrap_or(25).min(200);
-        let limit_usize = limit_val as usize;
+        let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
         let total = results.len();
         let items: Vec<ResourceGroupWithDepth> =
             results.into_iter().skip(offset).take(limit_usize).collect();
@@ -289,7 +304,7 @@ impl GroupRepository {
             page_info: toolkit_odata::PageInfo {
                 next_cursor,
                 prev_cursor,
-                limit: limit_val,
+                limit,
             },
         })
     }

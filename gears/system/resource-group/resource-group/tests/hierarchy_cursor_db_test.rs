@@ -279,7 +279,7 @@ fn assert_rejected(
         Err(DomainError::Validation { .. }) => {}
         Err(other) => panic!("expected DomainError::Validation, got {other:?}"),
         Ok(page) => panic!(
-            "expected the malformed cursor to be rejected, got a successful page: {:?}",
+            "expected the query to be rejected, got a successful page: {:?}",
             page.items.iter().map(|i| i.id).collect::<Vec<_>>()
         ),
     }
@@ -458,6 +458,42 @@ async fn hierarchy_cursor_unknown_direction_rejected() {
     cursor.d = "sideways".to_owned();
     let query = ODataQuery::new().with_limit(2).with_cursor(cursor);
 
+    assert_rejected(
+        repo.get_descendants(&conn, &scope, fixture.root.id, &query)
+            .await,
+    );
+}
+
+/// ML-5024: `limit=0` must be rejected, not silently accepted as "give me
+/// the smallest possible page" — a defense-in-depth pin for an
+/// **in-process** caller, not a reachable-from-HTTP defect fix.
+///
+/// This test builds `ODataQuery::new().with_limit(0)` directly and calls
+/// `GroupRepository::get_descendants` below the REST layer, bypassing the
+/// canonical `OData` extractor (`toolkit::api::odata::extract_odata_query`)
+/// that the real `GET .../descendants` / `.../ancestors` handlers go
+/// through — that extractor already rejects `limit=0` with `400` before a
+/// real HTTP request ever reaches this repository method. What this test
+/// pins is `build_hierarchy_page`'s own guard against a caller that
+/// constructs the query some other way: before `resolve_page_size`, it
+/// computed `query.limit.unwrap_or(25).min(200)`, which has no lower
+/// bound, so a `limit=0` request clamped to `0`, produced an empty
+/// `items`, and — because `offset.checked_add(0) == Some(offset)` and
+/// `offset < total` still holds whenever there is at least one more row —
+/// minted a `next_cursor` encoding the *same* offset the caller just
+/// requested. An in-process consumer that mechanically follows
+/// `next_cursor` (as the two positive pagination-walk tests above do)
+/// would have spun forever on an all-empty page that never advances.
+#[tokio::test]
+async fn hierarchy_zero_limit_rejected_not_stuck_at_the_same_offset() {
+    let db = common::test_db().await;
+    let tenant_id = Uuid::now_v7();
+    let fixture = build_fixture(&db, tenant_id).await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let repo = GroupRepository;
+
+    let query = ODataQuery::new().with_limit(0);
     assert_rejected(
         repo.get_descendants(&conn, &scope, fixture.root.id, &query)
             .await,

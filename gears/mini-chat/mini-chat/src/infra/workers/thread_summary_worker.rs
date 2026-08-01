@@ -719,10 +719,7 @@ mod tests {
             ),
             message_repo: Arc::new(
                 crate::infra::db::repo::message_repo::MessageRepository::new(
-                    toolkit_db::odata::LimitCfg {
-                        default: 20,
-                        max: 100,
-                    },
+                    toolkit_db::odata::LimitCfg::new(20, 100),
                 ),
             ),
             outbox_enqueuer: Arc::new(test_helpers::RecordingOutboxEnqueuer::new()),
@@ -1075,10 +1072,7 @@ mod tests {
         };
 
         let repo = crate::infra::db::repo::message_repo::MessageRepository::new(
-            toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            },
+            toolkit_db::odata::LimitCfg::new(20, 100),
         );
         let conn = db.conn().unwrap();
         let scope = AccessScope::for_tenant(tenant_id);

@@ -3370,6 +3370,65 @@ async fn create_route_overlap_same_path_priority_method_returns_conflict() {
     );
 }
 
+/// ML-5024 regression: `check_route_overlap` fetches "every route on this
+/// (tenant, upstream)" via `ListQuery { top: u32::MAX, .. }`
+/// (`validation.rs`). If the repository clamps `top` to its own listing
+/// ceiling instead of only rejecting `0`, `u32::MAX` silently becomes that
+/// ceiling: with more than the ceiling's worth of routes on one (tenant,
+/// upstream), the overlap check only ever sees an arbitrary subset
+/// (`sort_by_key(|r| r.id)` on a random `Uuid`, unrelated to
+/// path/priority/method), so a duplicate `(path, priority, method)`
+/// outside that subset is created without a 409 — reintroducing the
+/// non-deterministic data-plane matching this check exists to prevent.
+///
+/// Deterministic reproduction: every route below gets an explicit,
+/// pre-assigned id (`CreateRouteRequest::id`, used elsewhere for
+/// GTS-instance provisioning), so the sort-by-id order is fully under the
+/// test's control regardless of `Uuid::new_v4()` randomness. The "real"
+/// route the candidate duplicates is given the numerically largest id, so
+/// it sorts last and falls outside any `top`-clamped prefix of the list.
+#[tokio::test]
+async fn create_route_overlap_beyond_first_hundred_returns_conflict() {
+    let svc = make_service();
+    let tenant = Uuid::new_v4();
+    let ctx = test_ctx(tenant);
+
+    let u = svc
+        .create_upstream(&ctx, make_create_upstream_ip("openai"))
+        .await
+        .unwrap();
+
+    // 100 filler routes, each with a distinct path so none of them overlap
+    // with each other or with the routes created below. Ids 0..100 are the
+    // smallest possible under `Uuid`'s ordering.
+    for i in 0..100u128 {
+        let mut req = make_create_route(u.id);
+        req.id = Some(Uuid::from_u128(i));
+        req.match_rules.http.as_mut().unwrap().path = format!("/v1/filler-{i}");
+        svc.create_route(&ctx, req).await.unwrap();
+    }
+
+    // The route the candidate below will duplicate. Its id
+    // (`u128::MAX`) is numerically larger than all 100 filler ids, so it
+    // sorts last among the 101 routes on this upstream.
+    let mut existing_req = make_create_route(u.id);
+    existing_req.id = Some(Uuid::from_u128(u128::MAX));
+    svc.create_route(&ctx, existing_req).await.unwrap();
+
+    // Candidate duplicates the last-sorted route's (path, priority,
+    // method) on the same upstream. Correct behavior: 409 Conflict,
+    // regardless of how many other routes exist on the upstream.
+    let err = svc
+        .create_route(&ctx, make_create_route(u.id))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Conflict { .. }),
+        "expected Conflict (route overlap beyond the repo's old top-100 \
+         clamp), got: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn create_route_different_method_no_conflict() {
     let svc = make_service();

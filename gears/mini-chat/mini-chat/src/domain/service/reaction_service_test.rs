@@ -25,10 +25,7 @@ use crate::domain::service::ChatService;
 // ── Test Helpers ──
 
 fn limit_cfg() -> toolkit_db::odata::LimitCfg {
-    toolkit_db::odata::LimitCfg {
-        default: 20,
-        max: 100,
-    }
+    toolkit_db::odata::LimitCfg::new(20, 100)
 }
 
 fn build_chat_service(

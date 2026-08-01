@@ -210,10 +210,7 @@ impl SessionRepo for SeaSessionRepo {
             Cow::Borrowed(query)
         };
 
-        let limit_cfg = LimitCfg {
-            default: u64::from(DEFAULT_PAGE_SIZE),
-            max: u64::from(MAX_PAGE_SIZE),
-        };
+        let limit_cfg = LimitCfg::new(u64::from(DEFAULT_PAGE_SIZE), u64::from(MAX_PAGE_SIZE));
 
         paginate_odata::<SessionQueryFilterField, SessionODataMapper, _, _, _, _>(
             base_query,

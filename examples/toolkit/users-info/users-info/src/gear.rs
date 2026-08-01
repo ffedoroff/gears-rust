@@ -63,6 +63,7 @@ impl Gear for UsersInfo {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         // Load gear configuration using new API
         let cfg: UsersInfoConfig = ctx.config_or_default()?;
+        cfg.validate()?;
         debug!(
             "Loaded users_info config: default_page_size={}, max_page_size={}",
             cfg.default_page_size, cfg.max_page_size

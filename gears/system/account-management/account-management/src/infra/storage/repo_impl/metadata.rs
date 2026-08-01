@@ -116,10 +116,7 @@ impl ODataFieldMapping<MetadataEntryFilterField> for MetadataODataMapper {
 /// share one fallback page size. `max = 200` matches
 /// `IdpUserPagination::MAX_TOP` to keep the platform-wide ceiling
 /// uniform across CRUD surfaces.
-const METADATA_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 50,
-    max: 200,
-};
+const METADATA_LIMIT_CFG: LimitCfg = LimitCfg::new(50, 200);
 
 /// Retry budget for the SELECT-then-INSERT race when
 /// `with_serializable_retry` cannot absorb it (PG READ COMMITTED /

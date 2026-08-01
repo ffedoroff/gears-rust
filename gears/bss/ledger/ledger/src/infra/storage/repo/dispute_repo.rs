@@ -273,10 +273,7 @@ impl DisputeRepo {
             &conn,
             &query,
             ("dispute_id", SortDir::Asc),
-            LimitCfg {
-                default: 25,
-                max: 200,
-            },
+            LimitCfg::new(25, 200),
             |m| m,
         )
         .await

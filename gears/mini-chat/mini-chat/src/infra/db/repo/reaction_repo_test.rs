@@ -26,10 +26,7 @@ fn scope() -> AccessScope {
 }
 
 fn limit_cfg() -> LimitCfg {
-    LimitCfg {
-        default: 20,
-        max: 100,
-    }
+    LimitCfg::new(20, 100)
 }
 
 async fn test_db() -> Db {

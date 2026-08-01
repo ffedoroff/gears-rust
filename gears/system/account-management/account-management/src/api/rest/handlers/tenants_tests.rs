@@ -199,7 +199,8 @@ fn list_tenant_children_clamps_top_before_calling_service() {
     );
 
     let caller_query = ODataQuery::new().with_limit(500);
-    let clamped = clamp_listing_top(caller_query, svc.max_list_children_top());
+    let clamped = clamp_listing_top(caller_query, svc.max_list_children_top())
+        .expect("over-cap $top is clamped, not rejected");
 
     assert_eq!(
         clamped.limit,
@@ -210,21 +211,20 @@ fn list_tenant_children_clamps_top_before_calling_service() {
 }
 
 #[test]
-fn list_tenant_children_clamp_defaults_unset_caller_limit_to_operator_cap() {
-    // Sibling pin: a caller that omits `$top` entirely must still
-    // inherit the operator-tuned cap rather than the repo-level
-    // absolute ceiling (`*_LISTING_LIMIT_CFG.max = 200`). The
-    // handler signature `OData(query)` makes the unset case the
-    // most common one in practice (the OpenAPI default is "no
-    // limit"); without the handler-side clamp the service would
-    // receive `limit = None` and fall back to the repo ceiling.
+fn list_tenant_children_clamp_defaults_unset_caller_limit_to_25() {
+    // ML-5024: a caller that omits `$top` entirely gets the DNA canon
+    // default of 25, not the operator-tuned cap and not the repo-level
+    // absolute ceiling (`*_LISTING_LIMIT_CFG.max = 200`). The handler
+    // signature `OData(query)` makes the unset case the most common one
+    // in practice (the OpenAPI default is "no limit").
     let svc = build_service_with_listing_cap(50);
     let caller_query = ODataQuery::new();
-    let clamped = clamp_listing_top(caller_query, svc.max_list_children_top());
+    let clamped = clamp_listing_top(caller_query, svc.max_list_children_top())
+        .expect("no limit is not an error");
 
     assert_eq!(
         clamped.limit,
-        Some(50),
-        "unset $top must default to the operator-tunable cap, not the repo ceiling",
+        Some(25),
+        "unset $top must default to 25, not the operator-tunable cap or the repo ceiling",
     );
 }

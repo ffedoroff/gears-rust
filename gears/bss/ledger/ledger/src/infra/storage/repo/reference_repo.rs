@@ -29,10 +29,7 @@ use crate::odata::AccountInfoFilterField;
 /// Per-endpoint pagination bounds for `GET /bss-ledger/v1/accounts`. The chart
 /// of accounts is small per tenant, so the platform-standard default 25 still
 /// keeps the common read one round-trip.
-const ACCOUNT_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 25,
-    max: 200,
-};
+const ACCOUNT_LIMIT_CFG: LimitCfg = LimitCfg::new(25, 200);
 
 /// SeaORM-backed reference-data repository.
 #[derive(Clone)]

@@ -482,18 +482,60 @@ async fn list_files_filters_by_owner() {
     assert!(empty.is_empty());
 }
 
-/// `GET /files/{id}/versions` must cap at `ServiceConfig::max_page_size` even
-/// when a file has more versions than that — both with no explicit `limit`
-/// (clamped to `max_page_size`) and with an explicit `limit` above
-/// `max_page_size` — and must return the newest page (P2 2.2).
+/// ML-5024: `limit=0` used to reach `min(0, max_page_size) == 0`, handing
+/// the repo `LIMIT 0` and returning `200 OK` with an always-empty `Vec` —
+/// indistinguishable from "this owner genuinely has zero files". It is now
+/// rejected as `DomainError::Validation` (400 at the REST boundary) so the
+/// caller sees their `limit=0` was invalid instead of silently getting a
+/// page that looks like "no files" regardless of what actually exists.
+/// This is a deliberate breaking change to the wire contract (owner's
+/// decision, ML-5024).
+#[tokio::test]
+async fn list_files_rejects_zero_limit() {
+    let (svc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let owner = Uuid::now_v7();
+    let mut nf = new_file();
+    nf.owner_id = owner;
+    svc.create_file(&ctx, nf, None).await.unwrap();
+
+    let err = svc
+        .list_files(
+            &ctx,
+            OwnerFilter {
+                owner_kind: OwnerKind::User,
+                owner_id: owner,
+            },
+            Some(0),
+            0,
+        )
+        .await
+        .unwrap_err();
+    let DomainError::Validation { field, .. } = &err else {
+        panic!("limit=0 must be rejected as Validation, got {err:?}");
+    };
+    // Status/variant alone does not distinguish "rejected because of
+    // `limit`" from any other Validation this method could raise — pin
+    // the field name too.
+    assert_eq!(field, "limit");
+}
+
+/// `GET /files/{id}/versions` with no explicit `limit` must return
+/// `default_page_size` items (ML-5024's `resolve_page_size(None, cfg) ==
+/// cfg.default.min(cfg.max)`), and an explicit `limit` above
+/// `max_page_size` must still clamp down to `max_page_size` — and both
+/// must return the newest page (P2 2.2).
 #[tokio::test]
 async fn list_versions_caps_at_max_page_size() {
-    // `default_page_size == max_page_size` so the no-explicit-limit case
-    // below exercises the `max_page_size` cap directly (per the plan: "call
-    // `list_versions` with no explicit limit, assert the returned length
-    // equals `max_page_size`").
+    // `default_page_size != max_page_size` is deliberate: with the two
+    // equal, the no-explicit-limit assertion below cannot tell correct
+    // behavior (`None` resolves to `default_page_size`) apart from the
+    // ML-5024 regression this suite exists to catch (`None` resolving
+    // straight to `max_page_size`, the pre-ML-5024 "absent limit serves
+    // the largest page" behavior) — both would produce the same length.
+    let default_page_size = 6u64;
     let max_page_size = 10u64;
-    let (svc, dp, _store) = build_service_with_page_sizes(max_page_size, max_page_size).await;
+    let (svc, dp, _store) = build_service_with_page_sizes(default_page_size, max_page_size).await;
     let ctx = ctx(Uuid::now_v7());
 
     let total = max_page_size + 5;
@@ -530,28 +572,45 @@ async fn list_versions_caps_at_max_page_size() {
         "sanity: seeded max_page_size + 5"
     );
 
-    // No explicit limit → clamps to max_page_size (primary outcome).
+    // No explicit limit → resolves to `default_page_size`, NOT
+    // `max_page_size` (primary outcome; this is the assertion that would
+    // catch a regression to the pre-ML-5024 "absent limit serves the max"
+    // policy now that the two bounds differ).
     let page = svc.list_versions(&ctx, t0.file_id, None, 0).await.unwrap();
-    assert_eq!(page.len() as u64, max_page_size);
+    assert_eq!(page.len() as u64, default_page_size);
 
-    // Secondary artifact: the page is exactly the newest `max_page_size`
-    // versions, newest-first — the last `max_page_size` created ids, in
+    // Secondary artifact: the page is exactly the newest `default_page_size`
+    // versions, newest-first — the last `default_page_size` created ids, in
     // reverse creation order.
     let expected: Vec<Uuid> = created
         .iter()
         .rev()
-        .take(usize::try_from(max_page_size).expect("max_page_size fits usize"))
+        .take(usize::try_from(default_page_size).expect("default_page_size fits usize"))
         .copied()
         .collect();
     let actual: Vec<Uuid> = page.iter().map(|v| v.version_id).collect();
     assert_eq!(actual, expected, "must be the newest-first page");
 
-    // A caller-supplied limit above max_page_size is still clamped.
+    // A caller-supplied limit above max_page_size is still clamped to
+    // max_page_size, not default_page_size.
     let clamped = svc
         .list_versions(&ctx, t0.file_id, Some(max_page_size + 100), 0)
         .await
         .unwrap();
     assert_eq!(clamped.len() as u64, max_page_size);
+
+    // ML-5024: `limit=0` used to reach `min(0, max_page_size) == 0` and
+    // return `200 OK` with an always-empty page (identical to "no more
+    // versions"). It is now rejected as `DomainError::Validation` — a
+    // deliberate breaking change to the wire contract (owner's decision).
+    let err = svc
+        .list_versions(&ctx, t0.file_id, Some(0), 0)
+        .await
+        .unwrap_err();
+    let DomainError::Validation { field, .. } = &err else {
+        panic!("limit=0 must be rejected as Validation, got {err:?}");
+    };
+    assert_eq!(field, "limit");
 }
 
 // ── P2 2.7: delete_version vs bind race cannot dangle `files.content_id` ────

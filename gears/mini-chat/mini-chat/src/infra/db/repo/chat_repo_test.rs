@@ -13,10 +13,7 @@ use super::ChatRepository;
 type Db = Arc<DBProvider<toolkit_db::DbError>>;
 
 fn limit_cfg() -> LimitCfg {
-    LimitCfg {
-        default: 20,
-        max: 100,
-    }
+    LimitCfg::new(20, 100)
 }
 
 async fn test_db() -> Db {

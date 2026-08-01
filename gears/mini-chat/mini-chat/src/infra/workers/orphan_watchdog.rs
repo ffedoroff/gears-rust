@@ -268,10 +268,7 @@ mod tests {
 
         let db = mock_db_provider(inmem_db().await);
         let turn_repo = Arc::new(TurnRepo);
-        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        }));
+        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100)));
 
         let finalization_svc = Arc::new(FinalizationService::new(
             Arc::clone(&db),

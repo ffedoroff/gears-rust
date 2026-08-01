@@ -2,6 +2,7 @@
 pub mod builder;
 pub mod errors;
 pub mod filter;
+pub mod limit_cfg;
 pub mod limits;
 pub(crate) mod odata_filters;
 mod odata_parse;
@@ -11,6 +12,7 @@ pub mod problem_mapping;
 pub mod schema;
 
 pub use builder::QueryBuilder;
+pub use limit_cfg::{LimitCfg, resolve_page_size};
 pub use limits::ODataLimits;
 pub use page::{Page, PageInfo};
 pub use pagination::{normalize_filter_for_hash, short_filter_hash};
@@ -276,7 +278,7 @@ impl std::fmt::Display for ODataOrderBy {
 /// - `InvalidFilter` / `InvalidOrderByField` / cursor errors / cursor-vs-query
 ///   mismatches / `InvalidLimit` / `OrderWithCursor` → canonical
 ///   `InvalidArgument` (HTTP 400), with the offending parameter surfaced as
-///   a `field_violation` (`$filter`, `$orderby`, `$top`, or `cursor`).
+///   a `field_violation` (`$filter`, `$orderby`, `limit`, or `cursor`).
 /// - `Db` / `ParsingUnavailable` → canonical `Internal` (HTTP 500).
 ///
 /// Callers that convert straight to `CanonicalError` get this for free via

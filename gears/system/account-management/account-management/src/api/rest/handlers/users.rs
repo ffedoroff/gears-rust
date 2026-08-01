@@ -22,6 +22,7 @@ use toolkit::api::canonical_prelude::*;
 use toolkit::api::odata::OData;
 use toolkit_odata::ODataQuery;
 use toolkit_odata::filter::convert_expr_to_filter_node;
+use toolkit_odata::{LimitCfg, resolve_page_size};
 use toolkit_security::SecurityContext;
 
 use crate::api::rest::dto::{UserCreateRequestDto, UserDto, UserUpdateRequestDto};
@@ -65,7 +66,9 @@ pub async fn list_users(
 ///   `DomainError::Validation` → HTTP 400).
 /// - `$orderby`: forwarded unchanged when non-empty; the service
 ///   injects the default order + `id ASC` tiebreaker when `None`.
-/// - `limit`: clamped to `[1, max_top]`; defaults to
+/// - `limit`: resolved via [`resolve_page_size`] against
+///   `[1, max_top]` — an explicit `0` is rejected (`DomainError::Validation`),
+///   an over-cap value is clamped down to `max_top`; defaults to
 ///   [`IdpUserPagination::DEFAULT_TOP`] (50) when omitted.
 /// - `cursor`: encoded via [`toolkit_odata::CursorV1::encode`] and
 ///   forwarded as an opaque string; the `IdP` plugin decodes per its own
@@ -81,23 +84,36 @@ pub(super) fn lower_odata_to_list_users_query(
     max_top: u32,
 ) -> Result<SdkListUsersQuery, DomainError> {
     // Defensive floor: a misconfigured deployment that sets
-    // `max_listing_top = 0` would otherwise panic at `clamp(1, 0)` and
-    // surface every caller-supplied `limit` as a 500. Treat it as "no
-    // operator cap configured" and let the SDK's MAX_TOP=200 take over.
+    // `max_listing_top = 0` would otherwise make `LimitCfg::new` panic
+    // (`default`/`max` must be non-zero) and surface every
+    // caller-supplied `limit` as a 500. Treat it as "no operator cap
+    // configured" and let the SDK's own `MAX_TOP` (200, enforced by
+    // `IdpUserPagination::new` below) take over.
     let max_top = max_top.max(1);
-    let top = match query.limit {
-        Some(n) => {
-            // `ODataQuery::limit` is `u64`; clamp to `[1, max_top]` and
-            // narrow to `u32` (the SDK pagination width). The `.max(1)`
-            // floor stops a caller-supplied `0` from short-circuiting
-            // into a false-negative empty page on plugins that honor
-            // the literal value, and `u32::try_from` cannot fail after
-            // the upper clamp because `max_top: u32`.
-            let clamped = n.clamp(1, u64::from(max_top));
-            u32::try_from(clamped).unwrap_or(max_top)
-        }
-        None => IdpUserPagination::DEFAULT_TOP.min(max_top),
-    };
+    // ML-5024/ML-1520: resolve `top` through the shared
+    // `resolve_page_size` policy — the same one `clamp_listing_top`
+    // (`handlers/common.rs`) applies to every other AM listing endpoint
+    // — instead of this endpoint's own bespoke `clamp(1, max_top)`, which
+    // silently coerced an explicit `limit=0` to `1` instead of rejecting
+    // it. Unifying the *zero* handling is the point; the endpoint's
+    // *default* is deliberately kept at `IdpUserPagination::DEFAULT_TOP`
+    // (50) — `/users` and `/tenants/{id}/children`
+    // (`clamp_listing_top`'s `DEFAULT_LISTING_TOP` = 25) are allowed to
+    // disagree on the default page size, and nobody has decided to change
+    // that here.
+    let cfg = LimitCfg::new(
+        u64::from(IdpUserPagination::DEFAULT_TOP).min(u64::from(max_top)),
+        u64::from(max_top),
+    );
+    let top = resolve_page_size(query.limit, cfg)
+        .map_err(|err| DomainError::Validation {
+            detail: format!("list_users: invalid limit: {err}"),
+        })?
+        .get();
+    // `top` is bounded by `cfg.max == u64::from(max_top)`, so this cannot
+    // overflow `u32` in practice — `unwrap_or(max_top)` only guards a
+    // bound that should never actually be hit.
+    let top = u32::try_from(top).unwrap_or(max_top);
     // Capture the cursor's encoded order BEFORE consuming the cursor
     // into the opaque string the plugin expects. On continuation
     // requests the OData extractor rejects `cursor + $orderby` at

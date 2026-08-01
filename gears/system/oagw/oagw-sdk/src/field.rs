@@ -188,6 +188,15 @@ pub const INVALID_CONTENT_LENGTH: &str = "INVALID_CONTENT_LENGTH";
 /// configured rewrite rules (resulting URI fails `http::Uri` parsing).
 pub const INVALID_REWRITTEN_URI: &str = "INVALID_REWRITTEN_URI";
 
+// ---------------------------------------------------------------------------
+// Pagination validation
+// ---------------------------------------------------------------------------
+
+/// A caller-supplied `limit` (control-plane list pagination) is `0`, which
+/// is rejected rather than silently coerced to the smallest legal page
+/// (ML-5024, via `toolkit_odata::resolve_page_size`).
+pub const INVALID_LIMIT: &str = "INVALID_LIMIT";
+
 #[cfg(test)]
 mod tests {
     use super::*;

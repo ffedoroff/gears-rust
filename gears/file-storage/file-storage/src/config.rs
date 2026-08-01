@@ -256,6 +256,22 @@ impl FileStorageConfig {
                  enable_background_sweep is true"
             );
         }
+        // Both page-size bounds reach `LimitCfg::new` on every list request
+        // (`domain/service/read_ops.rs`), and that constructor panics on a
+        // zero bound by design — a zero page size is a deployment bug, not a
+        // per-request condition. Without this guard the bug would surface as a
+        // panic per request instead of a refusal to boot; with it, the operator
+        // gets the message here. `default > max` is not rejected: the shared
+        // policy clamps the default to the maximum, which is a coherent
+        // outcome rather than an unusable one.
+        if self.default_page_size == 0 || self.max_page_size == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: default_page_size and max_page_size must be > 0 \
+                 (got default_page_size={}, max_page_size={})",
+                self.default_page_size,
+                self.max_page_size
+            );
+        }
         // A missing signing_key_seed makes gear init mint an ephemeral per-boot
         // key; in a multi-replica deployment each replica would get a
         // different key, breaking signed URLs across replicas. Require an

@@ -69,6 +69,17 @@ impl ODataLimits {
 
     /// Validate a $top value against limits.
     ///
+    /// **Contradicts the platform policy** (ML-5024): [`crate::resolve_page_size`]
+    /// *clamps* an over-cap request down to the configured maximum and only
+    /// rejects `0`; this method does the opposite — it *rejects* anything
+    /// over `max_top` and has no opinion on `0`. `ODataLimits` and this
+    /// method are public but currently unused by any call site in this
+    /// workspace (`rg validate_top` turns up nothing outside this file).
+    /// Do not read its presence as sanctioning the reject-over-cap
+    /// policy, and do not wire it up without reconciling that conflict
+    /// first — removing it is a separate, deliberate decision, not an
+    /// accident to fix opportunistically here.
+    ///
     /// # Errors
     /// Returns `Error::InvalidLimit` if the top value exceeds the maximum allowed.
     pub fn validate_top(&self, top: usize) -> Result<(), Error> {

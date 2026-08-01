@@ -695,10 +695,9 @@ mod tests {
         let handler = AttachmentCleanupHandler::new(
             Arc::new(crate::domain::service::test_helpers::NoopFileStorage),
             db_provider,
-            crate::infra::db::repo::chat_repo::ChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            }),
+            crate::infra::db::repo::chat_repo::ChatRepository::new(
+                toolkit_db::odata::LimitCfg::new(20, 100),
+            ),
             5,
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             None, // anthropic_files_client — Anthropic cleanup is exercised separately
@@ -721,10 +720,9 @@ mod tests {
         let handler = AttachmentCleanupHandler::new(
             Arc::new(crate::domain::service::test_helpers::NoopFileStorage),
             db_provider,
-            crate::infra::db::repo::chat_repo::ChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            }),
+            crate::infra::db::repo::chat_repo::ChatRepository::new(
+                toolkit_db::odata::LimitCfg::new(20, 100),
+            ),
             5,
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             None, // anthropic_files_client — Anthropic cleanup is exercised separately
@@ -779,10 +777,9 @@ mod tests {
             Arc::new(NoopFileStorage),
             Arc::new(NoopVectorStoreProvider),
             db_provider,
-            crate::infra::db::repo::chat_repo::ChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            }),
+            crate::infra::db::repo::chat_repo::ChatRepository::new(
+                toolkit_db::odata::LimitCfg::new(20, 100),
+            ),
             5,
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             None, // anthropic_files_client — Anthropic cleanup is exercised separately
@@ -830,11 +827,9 @@ mod tests {
         let db_provider = mock_db_provider(db.clone());
 
         // Create and soft-delete a chat
-        let chat_repo =
-            crate::infra::db::repo::chat_repo::ChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            });
+        let chat_repo = crate::infra::db::repo::chat_repo::ChatRepository::new(
+            toolkit_db::odata::LimitCfg::new(20, 100),
+        );
         let tenant_id = uuid::Uuid::new_v4();
         let user_id = uuid::Uuid::new_v4();
         let chat_id = uuid::Uuid::new_v4();
@@ -940,11 +935,9 @@ mod tests {
     /// Create a soft-deleted chat in the DB.
     async fn seed_deleted_chat(db: &Arc<DbProvider>) -> (uuid::Uuid, uuid::Uuid) {
         use crate::domain::repos::ChatRepository as _;
-        let chat_repo =
-            crate::infra::db::repo::chat_repo::ChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            });
+        let chat_repo = crate::infra::db::repo::chat_repo::ChatRepository::new(
+            toolkit_db::odata::LimitCfg::new(20, 100),
+        );
         let tenant_id = uuid::Uuid::new_v4();
         let chat_id = uuid::Uuid::new_v4();
         let scope = toolkit_security::AccessScope::allow_all();
@@ -1012,10 +1005,9 @@ mod tests {
             Arc::new(FailingFileStorage),
             Arc::new(NoopVectorStoreProvider),
             Arc::clone(&db_provider),
-            crate::infra::db::repo::chat_repo::ChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            }),
+            crate::infra::db::repo::chat_repo::ChatRepository::new(
+                toolkit_db::odata::LimitCfg::new(20, 100),
+            ),
             5, // max_attempts
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             None, // anthropic_files_client
@@ -1065,10 +1057,9 @@ mod tests {
             Arc::new(FailingFileStorage),
             Arc::new(NoopVectorStoreProvider),
             Arc::clone(&db_provider),
-            crate::infra::db::repo::chat_repo::ChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            }),
+            crate::infra::db::repo::chat_repo::ChatRepository::new(
+                toolkit_db::odata::LimitCfg::new(20, 100),
+            ),
             1, // max_attempts = 1 → immediately terminal
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             None, // anthropic_files_client

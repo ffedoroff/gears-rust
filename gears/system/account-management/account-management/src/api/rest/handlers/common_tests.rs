@@ -11,22 +11,26 @@ use crate::domain::error::DomainError;
 use toolkit_odata::ODataQuery;
 
 #[test]
-fn clamp_listing_top_defaults_unset_limit_to_operator_cap() {
-    // A caller that omits `$top` should inherit the operator-tuned
-    // cap rather than the repo-level absolute ceiling. Without this,
-    // a deployment with `listing.max_top = 25` would still issue an
-    // unbounded query to the repo and rely on the repo-level
-    // `*_LISTING_LIMIT_CFG.max = 200` -- bypassing the per-deployment
-    // policy.
+fn clamp_listing_top_defaults_unset_limit_to_25_not_operator_cap() {
+    // ML-5024: a caller that omits `$top` now gets the DNA canon
+    // default of 25, not the operator-tuned cap. Before this change,
+    // omitting `$top` against `listing.max_top = 25` and against
+    // `listing.max_top = 200` produced two different default page
+    // sizes for the same "no preference" request -- the default was
+    // silently equal to whatever cap happened to be configured.
     let query = ODataQuery::new();
-    let clamped = clamp_listing_top(query, 25);
-    assert_eq!(clamped.limit, Some(25));
+    let clamped = clamp_listing_top(query, 200).expect("no limit is not an error");
+    assert_eq!(
+        clamped.limit,
+        Some(25),
+        "must default to 25 even though the operator cap is 200",
+    );
 }
 
 #[test]
 fn clamp_listing_top_caps_oversized_caller_limit_to_operator_cap() {
     let query = ODataQuery::new().with_limit(500);
-    let clamped = clamp_listing_top(query, 25);
+    let clamped = clamp_listing_top(query, 25).expect("clamp, not reject");
     assert_eq!(clamped.limit, Some(25));
 }
 
@@ -35,7 +39,7 @@ fn clamp_listing_top_preserves_smaller_caller_limit() {
     // A caller-supplied `$top` BELOW the cap is preserved verbatim --
     // the clamp is an upper bound, not a forced default.
     let query = ODataQuery::new().with_limit(10);
-    let clamped = clamp_listing_top(query, 25);
+    let clamped = clamp_listing_top(query, 25).expect("within cap is not an error");
     assert_eq!(clamped.limit, Some(10));
 }
 
@@ -46,8 +50,46 @@ fn clamp_listing_top_with_max_cap_allows_repo_absolute_ceiling() {
     // no-op for in-range caller values -- preserve the documented
     // default behaviour.
     let query = ODataQuery::new().with_limit(50);
-    let clamped = clamp_listing_top(query, 200);
+    let clamped = clamp_listing_top(query, 200).expect("within cap is not an error");
     assert_eq!(clamped.limit, Some(50));
+}
+
+#[test]
+fn clamp_listing_top_defaults_to_operator_cap_when_cap_is_below_25() {
+    // Edge case the plain "default is 25" rule cannot ignore: an
+    // operator who has tightened `listing.max_top` below 25 must not
+    // see the "no preference" default silently exceed their own cap.
+    let query = ODataQuery::new();
+    let clamped = clamp_listing_top(query, 10).expect("no limit is not an error");
+    assert_eq!(clamped.limit, Some(10));
+}
+
+#[test]
+fn clamp_listing_top_rejects_explicit_zero() {
+    // ML-5024: this branch is defense-in-depth, not a wire-reachable fix
+    // — the `OData` extractor already rejects `limit=0` with `400` before
+    // any handler runs, so an HTTP caller never reaches this function
+    // with `query.limit == Some(0)`. What this pins is the in-process
+    // path: a caller that builds an `ODataQuery` directly and hands it to
+    // `clamp_listing_top` used to see `$top=0` pass through unclamped
+    // (`0.min(cap) == 0`), handing the repo `LIMIT 0` and an
+    // always-empty page that looked like a successful, if odd, request.
+    // It is now a `400 InvalidArgument` via `DomainError::Validation`.
+    let query = ODataQuery::new().with_limit(0);
+    let err = clamp_listing_top(query, 25).expect_err("limit=0 must be rejected");
+    assert!(matches!(err, DomainError::Validation { .. }));
+}
+
+#[test]
+fn clamp_listing_top_zero_operator_cap_does_not_panic() {
+    // Defensive floor: a misconfigured `listing.max_top = 0` must not
+    // panic inside `LimitCfg::new` (`default`/`max` must be non-zero) and
+    // turn every listing request into a 500. Treated as "no operator cap
+    // configured" — mirrors the `max_top.max(1)` floor in
+    // `handlers/users.rs::lower_odata_to_list_users_query`.
+    let query = ODataQuery::new();
+    let clamped = clamp_listing_top(query, 0).expect("zero operator cap must not panic or reject");
+    assert_eq!(clamped.limit, Some(1));
 }
 
 #[test]

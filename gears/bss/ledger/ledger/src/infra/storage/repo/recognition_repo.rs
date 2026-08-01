@@ -1549,10 +1549,7 @@ impl RecognitionRepo {
             &conn,
             &query,
             ("run_id", SortDir::Asc),
-            LimitCfg {
-                default: 25,
-                max: 200,
-            },
+            LimitCfg::new(25, 200),
             |m| m,
         )
         .await

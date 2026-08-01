@@ -239,15 +239,13 @@ impl Gear for MiniChatGear {
         let provider_resolver = Arc::new(ProviderResolver::new(&gateway, cfg.providers));
 
         let repos = Repositories {
-            chat: Arc::new(ChatRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            chat: Arc::new(ChatRepository::new(toolkit_db::odata::LimitCfg::new(
+                20, 100,
+            ))),
             attachment: Arc::new(AttachmentRepository),
-            message: Arc::new(MessageRepository::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            message: Arc::new(MessageRepository::new(toolkit_db::odata::LimitCfg::new(
+                20, 100,
+            ))),
             quota: Arc::new(QuotaUsageRepository),
             turn: Arc::new(TurnRepository),
             reaction: Arc::new(ReactionRepository),
@@ -570,10 +568,7 @@ impl RunnableCapability for MiniChatGear {
                     crate::infra::workers::cleanup_worker::AttachmentCleanupHandler::new(
                         Arc::clone(&od.file_storage),
                         Arc::clone(&od.db),
-                        ChatRepository::new(toolkit_db::odata::LimitCfg {
-                            default: 20,
-                            max: 100,
-                        }),
+                        ChatRepository::new(toolkit_db::odata::LimitCfg::new(20, 100)),
                         max_cleanup_attempts,
                         Arc::clone(&od.metrics),
                         od.anthropic_files_client.clone(),
@@ -585,10 +580,7 @@ impl RunnableCapability for MiniChatGear {
                         Arc::clone(&od.file_storage),
                         Arc::clone(&od.vector_store_prov),
                         Arc::clone(&od.db),
-                        ChatRepository::new(toolkit_db::odata::LimitCfg {
-                            default: 20,
-                            max: 100,
-                        }),
+                        ChatRepository::new(toolkit_db::odata::LimitCfg::new(20, 100)),
                         max_cleanup_attempts,
                         Arc::clone(&od.metrics),
                         od.anthropic_files_client.clone(),
@@ -602,10 +594,7 @@ impl RunnableCapability for MiniChatGear {
                                 db: Arc::clone(&od.db),
                                 thread_summary_repo: Arc::new(ThreadSummaryRepository),
                                 message_repo: Arc::new(MessageRepository::new(
-                                    toolkit_db::odata::LimitCfg {
-                                        default: 20,
-                                        max: 100,
-                                    },
+                                    toolkit_db::odata::LimitCfg::new(20, 100),
                                 )),
                                 outbox_enqueuer: Arc::clone(&od.enqueuer)
                                     as Arc<dyn crate::domain::repos::OutboxEnqueuer>,

@@ -68,6 +68,15 @@ async fn list_children_clamps_top_to_service_max() {
     // a request that asks for half a million rows must be silently
     // clamped to 200, surfaced through the `page_info.limit` field on
     // the response.
+    //
+    // Uses `limit=`, not `$top=`: the toolkit OData extractor
+    // (`ODataParams` in `toolkit::api::odata`) has no `$top` field, so a
+    // `$top=999999` query parameter is silently dropped before it ever
+    // reaches `query.limit` — this test would otherwise be exercising
+    // the *absent-limit* default instead of the over-cap clamp it is
+    // named for. `reject_non_odata_params` accepting `$top` (any
+    // `$`-prefixed key passes) is a separate, already-tracked defect
+    // this test deliberately does not exercise.
     let h = setup_sqlite().await.expect("sqlite");
     let root = Uuid::new_v4();
     seed_root(&h, root).await;
@@ -77,7 +86,7 @@ async fn list_children_clamps_top_to_service_max() {
 
     let req = json_request(
         "GET",
-        &format!("/account-management/v1/tenants/{root}/children?$top=999999"),
+        &format!("/account-management/v1/tenants/{root}/children?limit=999999"),
         None,
         ctx_for(root),
     );
@@ -90,7 +99,7 @@ async fn list_children_clamps_top_to_service_max() {
     assert_eq!(
         u32::try_from(limit).expect("limit fits in u32"),
         max_top,
-        "handler-side clamp must rewrite oversize $top to the service max",
+        "handler-side clamp must rewrite oversize limit to the service max",
     );
 }
 

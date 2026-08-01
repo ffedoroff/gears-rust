@@ -135,7 +135,7 @@ use toolkit_security::AccessScope;
 /// # Default Behavior
 ///
 /// - Tiebreaker: `("id", SortDir::Desc)` - ensures stable pagination
-/// - Limits: `{ default: 25, max: 1000 }` - reasonable defaults for most APIs
+/// - Limits: `LimitCfg::new(25, 1000)` - reasonable defaults for most APIs
 #[must_use]
 pub struct OPager<'a, E, C>
 where
@@ -180,10 +180,7 @@ where
             fmap,
             // Sane defaults that work for most use cases
             tiebreaker: ("id", SortDir::Desc),
-            limits: LimitCfg {
-                default: 25,
-                max: 1000,
-            },
+            limits: LimitCfg::new(25, 1000),
         }
     }
 
@@ -223,8 +220,14 @@ where
     /// ```ignore
     /// pager.limits(10, 100)  // Smaller pages for this endpoint
     /// ```
+    ///
+    /// # Panics
+    /// Panics if `default` or `max` is zero — see [`LimitCfg::new`]. Both are
+    /// per-endpoint constants, so a zero is a programming error rather than a
+    /// per-request condition; a client-supplied `limit=0` is a separate case
+    /// and surfaces as `Error::InvalidLimit` instead.
     pub fn limits(mut self, default: u64, max: u64) -> Self {
-        self.limits = LimitCfg { default, max };
+        self.limits = LimitCfg::new(default, max);
         self
     }
 

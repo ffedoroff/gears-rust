@@ -64,7 +64,9 @@ pub async fn list_upstreams(
     Extension(ctx): Extension<SecurityContext>,
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    let query = pagination.to_list_query();
+    let query = pagination
+        .to_list_query()
+        .map_err(|e| domain_error_to_problem(e, "/oagw/v1/upstreams"))?;
     let upstreams = state
         .cp
         .list_upstreams(&ctx, &query)

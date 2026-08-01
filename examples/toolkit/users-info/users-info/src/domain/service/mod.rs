@@ -168,12 +168,20 @@ impl Default for ServiceConfig {
 }
 
 impl ServiceConfig {
+    /// # Panics
+    /// Panics (inside `LimitCfg::new`) if `default_page_size == 0` or
+    /// `max_page_size == 0`. `gear.rs::init` never hits this: it runs
+    /// [`crate::config::UsersInfoConfig::validate`] (which rejects both
+    /// bounds at zero) before copying them into a `ServiceConfig`. Both
+    /// fields are `pub`, so a caller that constructs `ServiceConfig`
+    /// directly — bypassing gear init — is responsible for the same
+    /// non-zero invariant; this method does not (re-)validate `self`.
     #[must_use]
     pub fn limit_cfg(&self) -> LimitCfg {
-        LimitCfg {
-            default: u64::from(self.default_page_size),
-            max: u64::from(self.max_page_size),
-        }
+        LimitCfg::new(
+            u64::from(self.default_page_size),
+            u64::from(self.max_page_size),
+        )
     }
 }
 

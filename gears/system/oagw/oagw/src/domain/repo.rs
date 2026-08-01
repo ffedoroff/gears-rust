@@ -22,6 +22,32 @@ pub enum RepositoryError {
     #[error("internal: {0}")]
     #[allow(dead_code)]
     Internal(String),
+    /// A `ListQuery` the caller handed the repository directly failed the
+    /// repository's own structural assertion — currently only `top == 0`
+    /// (ML-5024). In-process callers (this gear's own SDK client trait
+    /// impl, `domain::services::client`, and `check_route_overlap`'s
+    /// "give me every route on this upstream" `top: u32::MAX` query) can
+    /// build a `ListQuery` without going through the REST
+    /// `PaginationQuery` extractor, so the repository still rejects the
+    /// one shape that can never be sane: `top == 0` would silently look
+    /// like "zero rows exist" instead of surfacing the caller's bug.
+    ///
+    /// The repository does **not** re-impose an upper bound here — that
+    /// policy belongs to the REST edge (`PaginationQuery::to_list_query`,
+    /// `ListRoutesQuery`). Clamping `top` inside the repository would make
+    /// an in-process caller that legitimately wants an unbounded read
+    /// (like the route/upstream overlap check) silently see an arbitrary
+    /// truncated subset once an upstream has more rows than the clamp,
+    /// which is a correctness bug, not a resource-limit concern.
+    ///
+    /// `field` names the *wire* parameter the violation corresponds to
+    /// (e.g. `"limit"` for `top == 0`, per the ML-1520 convention that the
+    /// wire name is `limit`, not the internal `ListQuery::top` field) so
+    /// `DomainError`'s `From<RepositoryError>` impl can surface it on the
+    /// wire instead of hardcoding a name that may not match the actual
+    /// violation.
+    #[error("invalid list query: {detail}")]
+    Validation { field: &'static str, detail: String },
 }
 
 // ---------------------------------------------------------------------------

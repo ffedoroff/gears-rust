@@ -43,7 +43,7 @@ pub async fn list_metadata(
     Path(tenant_id): Path<Uuid>,
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<TenantMetadataEntryDto>>> {
-    let query = clamp_listing_top(query, svc.max_listing_top());
+    let query = clamp_listing_top(query, svc.max_listing_top())?;
     let page = svc.list_metadata(&ctx, tenant_id, &query).await?;
     Ok(Json(page.map_items(|entry| {
         TenantMetadataEntryDto::from_entry(tenant_id, entry)

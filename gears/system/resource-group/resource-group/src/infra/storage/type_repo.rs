@@ -25,10 +25,7 @@ use crate::infra::storage::entity::{
 use crate::infra::storage::odata_mapper::TypeODataMapper;
 
 /// Default `OData` pagination limits for types.
-const TYPE_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 25,
-    max: 200,
-};
+const TYPE_LIMIT_CFG: LimitCfg = LimitCfg::new(25, 200);
 
 /// System-level access scope (no tenant/resource filtering).
 fn system_scope() -> AccessScope {

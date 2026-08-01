@@ -32,26 +32,17 @@ const DEBIT_SIDE: &str = "DR";
 
 /// Per-endpoint pagination bounds for `GET /bss-ledger/v1/journal-lines`
 /// (preserves the foundation's `DEFAULT_LINE_LIMIT` / `MAX_LINE_LIMIT`).
-const LINE_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 25,
-    max: 200,
-};
+const LINE_LIMIT_CFG: LimitCfg = LimitCfg::new(25, 200);
 
 /// Per-endpoint pagination bounds for `GET /bss-ledger/v1/journal-entries` (the
 /// entry-HEADER list, R5). One header per posted entry, so the same generous
 /// default as the line list keeps the common single-page read one round-trip.
-const ENTRY_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 25,
-    max: 200,
-};
+const ENTRY_LIMIT_CFG: LimitCfg = LimitCfg::new(25, 200);
 
 /// Per-endpoint pagination bounds for `GET /bss-ledger/v1/balances`. The chart
 /// of accounts is small per tenant; a generous default keeps the common
 /// single-page read one round-trip.
-const BALANCE_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 25,
-    max: 200,
-};
+const BALANCE_LIMIT_CFG: LimitCfg = LimitCfg::new(25, 200);
 
 /// Inject a default keyset order on a bare list (no `$orderby`, no cursor) so
 /// `paginate_odata` resolves a stable order. `field` is the entity's default

@@ -1057,10 +1057,7 @@ mod tests {
         let svc = FinalizationService::new(
             db,
             Arc::new(TurnRepo),
-            Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100))),
             Arc::new(MockQuotaSettler),
             outbox.clone(),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
@@ -1080,10 +1077,7 @@ mod tests {
         let svc = FinalizationService::new(
             db,
             Arc::new(TurnRepo),
-            Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100))),
             Arc::new(MockQuotaSettler),
             outbox.clone(),
             metrics,
@@ -1356,10 +1350,7 @@ mod tests {
         let svc = FinalizationService::new(
             Arc::clone(&db),
             Arc::new(TurnRepo),
-            Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100))),
             Arc::new(FailingQuotaSettler),
             Arc::new(RecordingOutboxEnqueuer::new()),
             Arc::new(crate::domain::ports::metrics::NoopMetrics),

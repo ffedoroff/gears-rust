@@ -102,8 +102,12 @@ impl From<Error> for CanonicalError {
                 )
                 .create(),
 
+            // ML-1520: the wire parameter is `limit`, not `$top` — `$top`
+            // is never accepted as an alias by the canonical extractor (see
+            // `toolkit::api::odata`), so pointing callers at `$top` named a
+            // parameter that does not exist.
             InvalidLimit => OdataError::invalid_argument()
-                .with_field_violation("$top", "Invalid limit parameter", "INVALID_LIMIT")
+                .with_field_violation("limit", "Invalid limit parameter", "INVALID_LIMIT")
                 .create(),
 
             // Surface both halves of the conflict so a client filtering by
@@ -254,11 +258,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_limit_keys_to_top() {
+    fn invalid_limit_keys_to_limit() {
+        // ML-1520: the offending parameter is `limit` (the toolkit-odata /
+        // toolkit-db wire name), not `$top` — `$top` was never accepted as
+        // an alias by the canonical extractor, so surfacing it in the
+        // violation pointed callers at a parameter that does not exist.
         let p = wire(Error::InvalidLimit);
         let violations = field_violations(&p);
         assert_eq!(violations.len(), 1);
-        assert_violation(&violations[0], "$top", "INVALID_LIMIT");
+        assert_violation(&violations[0], "limit", "INVALID_LIMIT");
     }
 
     #[test]

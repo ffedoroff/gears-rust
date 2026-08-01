@@ -90,8 +90,31 @@ impl RouteRepository for InMemoryRouteRepo {
 
         routes.sort_by_key(|r| r.id);
 
+        // Structural assertion, not a page-size policy: the repository
+        // does not own an upper bound on `top` — that belongs to the REST
+        // edge (`PaginationQuery::to_list_query` / `ListRoutesQuery`).
+        // `check_route_overlap` legitimately asks for "every route on this
+        // (tenant, upstream)" via `top: u32::MAX`; clamping that down here
+        // would make it silently sample an arbitrary subset once an
+        // upstream has more routes than some repo-chosen ceiling,
+        // reintroducing non-deterministic overlap detection. `top == 0` is
+        // rejected outright because nothing sane ever wants "zero rows"
+        // from a paginated list — `take(0)` would hide that caller bug
+        // behind an always-empty page instead of surfacing it.
+        if query.top == 0 {
+            return Err(RepositoryError::Validation {
+                // "limit", not "top": if this ever surfaces on the wire
+                // (`DomainError::Validation`'s `From<RepositoryError>` puts
+                // `field` straight into a `field_violation`), it must name
+                // the wire parameter a caller actually sent, matching the
+                // ML-1520 convention everywhere else in this gear — not the
+                // internal `ListQuery::top` field name.
+                field: "limit",
+                detail: "list query top must be non-zero".to_string(),
+            });
+        }
         let skip = query.skip as usize;
-        let top = query.top as usize;
+        let top = usize::try_from(query.top).unwrap_or(usize::MAX);
         Ok(routes.into_iter().skip(skip).take(top).collect())
     }
 

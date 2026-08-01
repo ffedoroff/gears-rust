@@ -61,7 +61,7 @@ pub(super) fn register_usage_record_routes(
         .query_param_typed(
             "limit",
             false,
-            "Page size hint (rejected with 400 if above 1000)",
+            "Page size hint (default 25; above 1000 is clamped to 1000, not rejected; 0 is rejected with 400)",
             "integer",
         )
         .query_param("cursor", false, "Opaque CursorV1 continuation token")

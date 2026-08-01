@@ -33,12 +33,25 @@ pub const MAX_PAGE_SIZE: u64 = 1000;
 /// the look-ahead + `next_cursor` still yield a correct, resumable page, just
 /// a smaller one than an out-of-contract caller asked for.
 ///
-/// The **lower** bound of 1 is not cosmetic: `$top=0` is a legal `OData` value
-/// the core gateway forwards unclamped, and a resolved page size of 0 would
-/// drive `LIMIT 0+1 = 1` then `truncate(0)` on the look-ahead read — leaving
-/// `rows.last()` `None` on a non-empty table and 500-ing both list paths at
-/// `encode_next_cursor`. Flooring to the smallest legal page (1) keeps the
-/// look-ahead invariant intact without the plugin minting a `4xx`.
+/// The **lower** bound of 1 guards against `requested == Some(0)` reaching
+/// this function (ML-5024). That path is closed for HTTP callers: there is
+/// no `$top` field on the core gateway's `OData` extractor at all, and the
+/// gateway's `limit` is resolved through `toolkit_odata::resolve_page_size`,
+/// which rejects `limit=0` outright before any plugin dispatch. It is
+/// **not** closed for in-process callers: `UsageCollectorLocalClient`
+/// (`usage-collector/src/domain/local_client.rs`) implements
+/// `UsageCollectorClientV1::list_usage_records` by forwarding the caller's
+/// `ODataQuery` straight to `Service::list_usage_records`
+/// (`domain/service.rs`), which runs `require_bounded_time_window` and
+/// `compose_query_with_scope` (`domain/query.rs`) — neither touches
+/// `limit` — before dispatching to this plugin's SPI. A caller on that
+/// path that builds `ODataQuery::new().with_limit(0)` directly still
+/// arrives here with `requested == Some(0)`, so this floor is a live guard
+/// for that path, not a leftover: a resolved page size of 0 would drive
+/// `LIMIT 0+1 = 1` then `truncate(0)` on the look-ahead read — leaving
+/// `rows.last()` `None` on a non-empty table and 500-ing both list paths
+/// at `encode_next_cursor`. Flooring to the smallest legal page (1) keeps
+/// the look-ahead invariant intact without the plugin minting a `4xx`.
 #[must_use]
 pub fn effective_page_size(requested: Option<u64>, default_page_size: u64) -> u64 {
     requested

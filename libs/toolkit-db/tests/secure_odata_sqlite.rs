@@ -247,6 +247,16 @@ async fn paginate_odata_works_with_secure_conn() {
         .expect("fetch");
 
     assert_eq!(page.items.len(), 2, "page size");
+    // 4 rows seeded, limit=2: the look-ahead fetch (`limit + 1` rows) must
+    // see the 3rd row and report more via `next_cursor`. Checking only
+    // `items.len()` above would stay green even if the look-ahead seam
+    // (`limit.saturating_add(1)` in `core.rs` / `sea_orm_filter.rs`) were
+    // replaced with a plain `limit` fetch — that regression truncates the
+    // page to the same length but silently drops `has_more`/`next_cursor`.
+    assert!(
+        page.page_info.next_cursor.is_some(),
+        "4 rows with limit=2 must report a next_cursor"
+    );
 }
 
 /// ML-8967 regression: `sea_orm_filter::paginate_odata` must reject a
@@ -304,10 +314,7 @@ async fn paginate_odata_rejects_asymmetric_filter_hash_cursor() {
             &conn,
             &query,
             ("id", SortDir::Desc),
-            LimitCfg {
-                default: 25,
-                max: 200,
-            },
+            LimitCfg::new(25, 200),
             |m| (m.name, m.score),
         )
         .await;
@@ -353,10 +360,7 @@ async fn paginate_odata_accepts_its_own_cursor_under_the_same_filter() {
         &conn,
         &filtered_query(),
         ("id", SortDir::Desc),
-        LimitCfg {
-            default: 25,
-            max: 200,
-        },
+        LimitCfg::new(25, 200),
         |m: ent::Model| m,
     )
     .await
@@ -380,10 +384,7 @@ async fn paginate_odata_accepts_its_own_cursor_under_the_same_filter() {
         &conn,
         &filtered_query().with_cursor(cursor),
         ("id", SortDir::Desc),
-        LimitCfg {
-            default: 25,
-            max: 200,
-        },
+        LimitCfg::new(25, 200),
         |m: ent::Model| m,
     )
     .await

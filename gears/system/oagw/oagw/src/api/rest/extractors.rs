@@ -1,4 +1,5 @@
 use oagw_sdk::field;
+use toolkit::api::odata::{LimitCfg, resolve_page_size};
 use toolkit_canonical_errors::Problem;
 use uuid::Uuid;
 
@@ -30,6 +31,10 @@ pub fn parse_gts_id(gts_str: &str, expected_schema: &str, instance: &str) -> Res
 }
 
 /// Pagination query parameters.
+///
+/// Naming note: the wire field is `limit` (not `top`); [`default_top`]
+/// predates that rename and was left as-is rather than touched for a pure
+/// rename — the field it defaults, `limit`, is what actually matters.
 #[derive(Debug, serde::Deserialize)]
 pub struct PaginationQuery {
     #[serde(default = "default_top")]
@@ -42,11 +47,36 @@ fn default_top() -> u32 {
     50
 }
 
+/// Deployment-wide default/max page size for control-plane list endpoints
+/// (ML-5024). `default` and [`default_top`] are kept at `50` by
+/// convention, not by any runtime equivalence: `PaginationQuery::limit` is
+/// a plain `u32` (not `Option`), so `#[serde(default = "default_top")]`
+/// always populates it — from the query string when present, from
+/// [`default_top`] otherwise — before [`PaginationQuery::to_list_query`]
+/// calls [`resolve_page_size`] with `Some(...)`. `resolve_page_size`'s
+/// `None` branch is structurally unreachable from this call site; nothing
+/// here re-checks that the two constants agree if one of them drifts.
+const PAGINATION_LIMIT_CFG: LimitCfg = LimitCfg::new(50, 100);
+
 impl PaginationQuery {
-    pub fn to_list_query(&self) -> ListQuery {
-        ListQuery {
-            top: self.limit.min(100),
+    /// # Errors
+    /// Returns [`DomainError::Validation`] if `limit` is `0`.
+    pub fn to_list_query(&self) -> Result<ListQuery, DomainError> {
+        let top =
+            resolve_page_size(Some(u64::from(self.limit)), PAGINATION_LIMIT_CFG).map_err(|e| {
+                DomainError::Validation {
+                    field: "limit",
+                    reason: field::INVALID_LIMIT,
+                    detail: e.to_string(),
+                    instance: String::new(),
+                }
+            })?;
+        Ok(ListQuery {
+            // `top` is bounded by `PAGINATION_LIMIT_CFG.max == 100`, well
+            // within `u32`; `unwrap_or(u32::MAX)` is unreachable in
+            // practice and only avoids a panic if that bound ever changes.
+            top: u32::try_from(top.get()).unwrap_or(u32::MAX),
             skip: self.offset,
-        }
+        })
     }
 }

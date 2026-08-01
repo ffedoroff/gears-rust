@@ -239,7 +239,7 @@ pub async fn list_tenant_children(
     Path(tenant_id): Path<Uuid>,
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<TenantDto>>> {
-    let query = clamp_listing_top(query, svc.max_list_children_top());
+    let query = clamp_listing_top(query, svc.max_list_children_top())?;
     let page = svc.list_children(&ctx, tenant_id, &query).await?;
     Ok(Json(page.map_items(TenantDto::from_sdk_tenant)))
 }

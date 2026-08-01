@@ -33,17 +33,11 @@ async fn setup() -> (
     let ctx = test_security_ctx(tenant_id);
 
     let chat_repo = Arc::new(repo::chat_repo::ChatRepository::new(
-        toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        },
+        toolkit_db::odata::LimitCfg::new(20, 100),
     ));
     let turn_repo = Arc::new(repo::turn_repo::TurnRepository);
     let message_repo = Arc::new(repo::message_repo::MessageRepository::new(
-        toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        },
+        toolkit_db::odata::LimitCfg::new(20, 100),
     ));
 
     // Create a chat first
@@ -726,17 +720,11 @@ async fn delete_success_emits_metrics() {
     let ctx = test_security_ctx(tenant_id);
 
     let chat_repo = Arc::new(repo::chat_repo::ChatRepository::new(
-        toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        },
+        toolkit_db::odata::LimitCfg::new(20, 100),
     ));
     let turn_repo = Arc::new(repo::turn_repo::TurnRepository);
     let message_repo = Arc::new(repo::message_repo::MessageRepository::new(
-        toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        },
+        toolkit_db::odata::LimitCfg::new(20, 100),
     ));
 
     let chat_id = Uuid::now_v7();
@@ -820,17 +808,11 @@ async fn setup_with_audit() -> (
     let ctx = test_security_ctx(tenant_id);
 
     let chat_repo = Arc::new(repo::chat_repo::ChatRepository::new(
-        toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        },
+        toolkit_db::odata::LimitCfg::new(20, 100),
     ));
     let turn_repo = Arc::new(repo::turn_repo::TurnRepository);
     let message_repo = Arc::new(repo::message_repo::MessageRepository::new(
-        toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        },
+        toolkit_db::odata::LimitCfg::new(20, 100),
     ));
 
     let chat_id = Uuid::now_v7();
@@ -1029,17 +1011,11 @@ async fn setup_tenant_only_authz(
     let tenant_id = Uuid::new_v4();
 
     let chat_repo = Arc::new(repo::chat_repo::ChatRepository::new(
-        toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        },
+        toolkit_db::odata::LimitCfg::new(20, 100),
     ));
     let turn_repo = Arc::new(repo::turn_repo::TurnRepository);
     let message_repo = Arc::new(repo::message_repo::MessageRepository::new(
-        toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        },
+        toolkit_db::odata::LimitCfg::new(20, 100),
     ));
 
     let chat_id = Uuid::now_v7();

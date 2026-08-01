@@ -692,10 +692,7 @@ impl AdjustmentRepo {
             &conn,
             &query,
             ("refund_id", SortDir::Asc),
-            LimitCfg {
-                default: 25,
-                max: 200,
-            },
+            LimitCfg::new(25, 200),
             |m| m,
         )
         .await
@@ -779,10 +776,7 @@ impl AdjustmentRepo {
             &conn,
             &query,
             ("credit_note_id", SortDir::Asc),
-            LimitCfg {
-                default: 25,
-                max: 200,
-            },
+            LimitCfg::new(25, 200),
             |m| m,
         )
         .await
@@ -865,10 +859,7 @@ impl AdjustmentRepo {
             &conn,
             &query,
             ("debit_note_id", SortDir::Asc),
-            LimitCfg {
-                default: 25,
-                max: 200,
-            },
+            LimitCfg::new(25, 200),
             |m| m,
         )
         .await

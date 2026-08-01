@@ -1,6 +1,7 @@
 //! Read-only queries (file, metadata, versions) and version-lifecycle operations
 //! (download URL issuance, version listing, restore, and deletion).
 
+use toolkit::api::odata::{LimitCfg, resolve_page_size};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -43,6 +44,16 @@ impl FileService {
     }
 
     /// List files for a mandatory owner filter, offset-paginated.
+    ///
+    /// # Panics
+    /// Panics (inside `LimitCfg::new`) if `self.cfg.default_page_size == 0`
+    /// or `self.cfg.max_page_size == 0`. `FileStorageGear::init` never hits
+    /// this: it runs `FileStorageConfig::validate()` (which rejects both
+    /// bounds at zero) before building the `ServiceConfig` this value comes
+    /// from. A caller that constructs `FileService::new` directly —
+    /// bypassing gear init, e.g. from a test harness or an alternate
+    /// bootstrap — is responsible for the same non-zero invariant; `new`
+    /// itself does not (re-)validate `cfg`.
     pub async fn list_files(
         &self,
         ctx: &SecurityContext,
@@ -70,9 +81,15 @@ impl FileService {
                 .authorize(ctx, actions::ADMIN_POLICY, "", None)
                 .await?;
         }
-        let limit = limit
-            .unwrap_or(self.cfg.default_page_size)
-            .min(self.cfg.max_page_size);
+        let limit = resolve_page_size(
+            limit,
+            LimitCfg::new(self.cfg.default_page_size, self.cfg.max_page_size),
+        )
+        .map_err(|e| DomainError::Validation {
+            field: "limit".to_owned(),
+            message: e.to_string(),
+        })?
+        .get();
         self.store
             .list_files(&Self::tenant_scope(ctx), owner, limit, offset)
             .await
@@ -149,6 +166,10 @@ impl FileService {
     /// `GET /files/{id}/versions`: list a page of a file's versions, newest
     /// first, offset-paginated and capped at `ServiceConfig::max_page_size`
     /// (P2 2.2 — closes the unbounded-listing amplification surface).
+    ///
+    /// # Panics
+    /// Same non-zero-bound requirement on `self.cfg.{default,max}_page_size`
+    /// as [`Self::list_files`] — see its `# Panics` section.
     pub async fn list_versions(
         &self,
         ctx: &SecurityContext,
@@ -162,9 +183,15 @@ impl FileService {
             .authorizer
             .authorize(ctx, actions::READ, &file.gts_file_type, Some(file_id))
             .await?;
-        let limit = limit
-            .unwrap_or(self.cfg.default_page_size)
-            .min(self.cfg.max_page_size);
+        let limit = resolve_page_size(
+            limit,
+            LimitCfg::new(self.cfg.default_page_size, self.cfg.max_page_size),
+        )
+        .map_err(|e| DomainError::Validation {
+            field: "limit".to_owned(),
+            message: e.to_string(),
+        })?
+        .get();
         self.store.list_versions_page(file_id, limit, offset).await
     }
 

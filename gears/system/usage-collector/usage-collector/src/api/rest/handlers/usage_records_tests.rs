@@ -1093,7 +1093,7 @@ async fn get_happy_path_returns_200_with_record_body() {
 }
 
 // ---------------------------------------------------------------------------
-// prepare_list_query — $top clamp, $orderby default, cursor validate
+// prepare_list_query — limit resolution (ML-5024), $orderby default, cursor validate
 // ---------------------------------------------------------------------------
 
 mod prepare_list_query_tests {
@@ -1124,21 +1124,36 @@ mod prepare_list_query_tests {
         }
     }
 
+    fn extract_first_field_violation_field(err: &CanonicalError) -> Option<String> {
+        let CanonicalError::InvalidArgument { ctx, .. } = err else {
+            return None;
+        };
+        match ctx {
+            InvalidArgumentV1::FieldViolations { field_violations } => {
+                field_violations.first().map(|v| v.field.clone())
+            }
+            _ => None,
+        }
+    }
+
     #[test]
-    fn limit_above_max_page_size_is_rejected_as_invalid_argument() {
-        // A silent clamp would hand the caller a partial page that
-        // looks complete; reject so paginators surface the cap.
+    fn limit_above_max_page_size_is_clamped_to_max() {
+        // ML-5024: the shared `resolve_page_size` policy clamps an
+        // over-cap `limit` down to `cfg.max` rather than rejecting it —
+        // a deliberate change from the pre-ML-5024 behavior (reject above
+        // cap), matching every other migrated call site.
+        //
+        // The pre-migration version of this test asserted two properties
+        // of the (then-)error path: the `CanonicalError` variant and the
+        // violation's `reason`. Post-migration this path no longer
+        // produces an error at all, so there is nothing analogous to
+        // assert here beyond the resolved value — the reason/field-naming
+        // axis this test used to cover now lives on the sibling error
+        // case, `zero_limit_is_rejected_as_invalid_argument` below.
         let mut q = ODataQuery::new();
         q.limit = Some(5_000);
-        let err = prepare_list_query(q).expect_err("limit > cap must be rejected");
-        assert!(
-            matches!(err, CanonicalError::InvalidArgument { .. }),
-            "limit > MAX_PAGE_SIZE must surface as InvalidArgument, got {err:?}",
-        );
-        assert_eq!(
-            extract_first_field_violation_reason(&err).as_deref(),
-            Some("VALIDATION"),
-        );
+        let out = prepare_list_query(q).expect("limit above cap is clamped, not rejected");
+        assert_eq!(out.limit, Some(MAX_PAGE_SIZE));
     }
 
     #[test]
@@ -1158,12 +1173,40 @@ mod prepare_list_query_tests {
     }
 
     #[test]
-    fn missing_limit_defaults_to_max_page_size() {
+    fn missing_limit_defaults_to_25_not_max_page_size() {
+        // ML-5024: the endpoint default is the DNA canon 25
+        // (`guidelines/DNA/REST/PAGINATION.md`), not `MAX_PAGE_SIZE` — a
+        // default equal to the max meant every caller who omitted `limit`
+        // got the largest page the endpoint would ever serve.
         let out = prepare_list_query(ODataQuery::new()).expect("ok");
         assert_eq!(
             out.limit,
-            Some(MAX_PAGE_SIZE),
-            "absent limit defaults to MAX_PAGE_SIZE so the plugin never sees an unbounded read",
+            Some(25),
+            "absent limit must default to 25, not MAX_PAGE_SIZE",
+        );
+    }
+
+    #[test]
+    fn zero_limit_is_rejected_as_invalid_argument() {
+        let mut q = ODataQuery::new();
+        q.limit = Some(0);
+        let err = prepare_list_query(q).expect_err("limit=0 must be rejected");
+        assert!(
+            matches!(err, CanonicalError::InvalidArgument { .. }),
+            "limit=0 must surface as InvalidArgument, got {err:?}",
+        );
+        // ML-1520: the violation must name `limit` (the actual wire
+        // parameter), not `$top` — pin both the field and the reason so a
+        // regression that reintroduces the `$top` field name, or drops the
+        // `INVALID_LIMIT` tag clients branch on, fails here rather than
+        // only being caught by the toolkit-odata-level unit test.
+        assert_eq!(
+            extract_first_field_violation_field(&err).as_deref(),
+            Some("limit"),
+        );
+        assert_eq!(
+            extract_first_field_violation_reason(&err).as_deref(),
+            Some("INVALID_LIMIT"),
         );
     }
 
@@ -1711,11 +1754,14 @@ mod parse_required_gts_id_tests {
 // ---------------------------------------------------------------------------
 // reject_unknown_aggregate_params — aggregate allowlist is STRICTER than list
 //
-// The list path admits `$top`, `cursor`, `$select`, and `limit`; the
-// aggregate path intentionally rejects them (the aggregation result is
-// not paginated and the projection is fixed). Verify the asymmetry
-// directly — a regression that copy-pasted the list allowlist into the
-// aggregate validator would not be caught by any other test.
+// The list path admits `cursor`, `$select`, and `limit`; the aggregate
+// path intentionally rejects them (the aggregation result is not
+// paginated and the projection is fixed). Verify the asymmetry directly —
+// a regression that copy-pasted the list allowlist into the aggregate
+// validator would not be caught by any other test. `$top` is deliberately
+// NOT in this list: it is rejected on BOTH paths (ML-9126), so it is not
+// an example of list/aggregate asymmetry any more — see
+// `top_query_parameter_returns_400_as_unknown` for the list-path case.
 // ---------------------------------------------------------------------------
 
 mod reject_unknown_aggregate_params_tests {
@@ -1743,13 +1789,32 @@ mod reject_unknown_aggregate_params_tests {
         // NOT on `AGGREGATE_ODATA_PARAMS`. The aggregate validator MUST
         // reject them — silent admission would let a caller paginate an
         // unpaginated endpoint and ship an inconsistent wire contract.
-        for forbidden in ["$top", "cursor", "$select", "limit", "$orderby"] {
+        for forbidden in ["cursor", "$select", "limit", "$orderby"] {
             assert!(
                 reject_unknown_aggregate_params(&[p(forbidden, "v")]).is_err(),
                 "`{forbidden}` MUST be rejected on the aggregate path - \
                  list-only OData parameters cannot leak through here",
             );
         }
+    }
+
+    #[test]
+    fn top_query_parameter_is_rejected_on_aggregate_path() {
+        // ML-9126: `$top` is rejected on BOTH the list and aggregate
+        // paths, so it was deliberately pulled out of
+        // `list_only_params_are_rejected_on_aggregate_path` above (that
+        // loop demonstrates list/aggregate ASYMMETRY; `$top` is symmetric,
+        // not an example of it). But that leaves no test in this module
+        // pinning `$top` against `reject_unknown_aggregate_params`
+        // directly: the list-path pin
+        // (`top_query_parameter_returns_400_as_unknown`) exercises a
+        // different validator entirely. Without this, someone adding
+        // `$top` to `AGGREGATE_ODATA_PARAMS` by mistake would leave every
+        // test in this file green.
+        assert!(
+            reject_unknown_aggregate_params(&[p("$top", "10")]).is_err(),
+            "`$top` MUST be rejected on the aggregate path (ML-9126)",
+        );
     }
 
     #[test]
@@ -1998,6 +2063,52 @@ mod handle_list_usage_records_tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn top_query_parameter_returns_400_as_unknown() {
+        // ML-9126: `$top` is not on `OUR_ODATA_PARAMS` any more — a
+        // caller sending it MUST see a 400 for an unrecognised parameter,
+        // not have it silently dropped by the toolkit OData extractor
+        // (which has no `$top` field on `ODataParams` in the first place)
+        // while the request quietly falls back to the default page size.
+        let service = service_no_plugin();
+
+        let response = handle_list_usage_records(
+            Extension(SecurityContext::anonymous()),
+            Extension(service),
+            Query(vec![
+                ("gts_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
+                ("$top".to_owned(), "10".to_owned()),
+            ]),
+            OData(ODataQuery::new()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Status alone does not distinguish "rejected because of `$top`"
+        // from any other 400 on this handler (missing `gts_id`, malformed
+        // filter, ...) — pin the violation's `field` so a regression that
+        // rejects for the wrong reason (or stops naming the offending
+        // parameter) still fails this test.
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("Problem body collected");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("Problem body is JSON");
+        let violation = body
+            .get("context")
+            .and_then(|c| c.get("field_violations"))
+            .and_then(|fv| fv.as_array())
+            .and_then(|arr| arr.first())
+            .expect("InvalidArgument envelope carries field_violations[0]");
+        assert_eq!(
+            violation.get("field").and_then(serde_json::Value::as_str),
+            Some("$top"),
+            "the violation MUST name `$top` as the offending parameter",
+        );
     }
 
     #[tokio::test]

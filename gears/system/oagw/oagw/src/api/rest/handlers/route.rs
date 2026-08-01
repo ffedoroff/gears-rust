@@ -7,7 +7,7 @@ use toolkit_security::SecurityContext;
 
 use crate::api::rest::dto::{CreateRouteRequest, RouteResponse, UpdateRouteRequest};
 use crate::api::rest::error::domain_error_to_problem;
-use crate::api::rest::extractors::parse_gts_id;
+use crate::api::rest::extractors::{PaginationQuery, parse_gts_id};
 use crate::domain::gts_helpers as gts;
 use crate::domain::model::Route;
 use crate::gear::AppState;
@@ -87,10 +87,21 @@ pub async fn list_routes(
             |id| parse_gts_id(id, gts::UPSTREAM_SCHEMA, instance),
         )
         .transpose()?;
-    let query = crate::domain::model::ListQuery {
-        top: params.limit.min(100),
-        skip: params.offset,
-    };
+    // ML-5024: delegate to the single `PaginationQuery::to_list_query`
+    // policy instead of a second, independently-drifted `.min(100)` clamp
+    // that (like the one in `extractors.rs`) had no lower bound. This
+    // struct keeps its own `limit`/`offset` fields (it also carries
+    // `upstream_id`, which `PaginationQuery` does not), so the two field
+    // sets are copied across rather than merged via `#[serde(flatten)]` —
+    // flatten support for axum's query-string deserializer is inconsistent
+    // enough across versions that it is not worth the risk for two `u32`
+    // fields.
+    let query = PaginationQuery {
+        limit: params.limit,
+        offset: params.offset,
+    }
+    .to_list_query()
+    .map_err(|e| domain_error_to_problem(e, instance))?;
     let routes = state
         .cp
         .list_routes(&ctx, upstream_uuid, &query)

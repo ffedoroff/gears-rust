@@ -2171,10 +2171,7 @@ mod tests {
 
         let provider_resolver = Arc::new(ProviderResolver::single_provider(provider));
         let turn_repo = Arc::new(TurnRepo);
-        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        }));
+        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100)));
         let finalization = Arc::new(FinalizationService::new(
             Arc::clone(&db),
             Arc::clone(&turn_repo),
@@ -2237,10 +2234,7 @@ mod tests {
             db,
             turn_repo,
             message_repo,
-            Arc::new(OrmChatRepo::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            Arc::new(OrmChatRepo::new(toolkit_db::odata::LimitCfg::new(20, 100))),
             mock_enforcer(),
             provider_resolver,
             crate::config::StreamingConfig::default(),
@@ -2912,10 +2906,7 @@ mod tests {
             Arc::new(crate::domain::ports::metrics::NoopMetrics);
         let provider_resolver = Arc::new(ProviderResolver::single_provider(provider));
         let turn_repo = Arc::new(TurnRepo);
-        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        }));
+        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100)));
         let finalization = Arc::new(FinalizationService::new(
             Arc::clone(&db),
             Arc::clone(&turn_repo),
@@ -2980,10 +2971,7 @@ mod tests {
             db,
             turn_repo,
             message_repo,
-            Arc::new(OrmChatRepo::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            Arc::new(OrmChatRepo::new(toolkit_db::odata::LimitCfg::new(20, 100))),
             mock_enforcer(),
             provider_resolver,
             crate::config::StreamingConfig::default(),
@@ -3356,10 +3344,7 @@ mod tests {
             .expect("create turn");
 
         let turn_repo_arc = Arc::new(TurnRepo);
-        let message_repo_arc = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        }));
+        let message_repo_arc = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100)));
         let finalization_svc = Arc::new(FinalizationService::new(
             Arc::clone(&db),
             Arc::clone(&turn_repo_arc),
@@ -3536,10 +3521,7 @@ mod tests {
             .expect("create turn");
 
         let turn_repo_arc = Arc::new(TurnRepo);
-        let message_repo_arc = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        }));
+        let message_repo_arc = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100)));
         let finalization_svc = Arc::new(FinalizationService::new(
             Arc::clone(&db),
             Arc::clone(&turn_repo_arc),
@@ -3714,10 +3696,7 @@ mod tests {
             .expect("create turn");
 
         let turn_repo_arc = Arc::new(TurnRepo);
-        let message_repo_arc = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        }));
+        let message_repo_arc = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100)));
         let finalization_svc = Arc::new(FinalizationService::new(
             Arc::clone(&db),
             Arc::clone(&turn_repo_arc),
@@ -3896,10 +3875,7 @@ mod tests {
 
         let provider_resolver = Arc::new(ProviderResolver::single_provider(provider));
         let turn_repo = Arc::new(TurnRepo);
-        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        }));
+        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100)));
         let finalization = Arc::new(FinalizationService::new(
             Arc::clone(&db),
             Arc::clone(&turn_repo),
@@ -3933,10 +3909,7 @@ mod tests {
             db,
             turn_repo,
             message_repo,
-            Arc::new(OrmChatRepo::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            Arc::new(OrmChatRepo::new(toolkit_db::odata::LimitCfg::new(20, 100))),
             mock_enforcer(),
             provider_resolver,
             crate::config::StreamingConfig::default(),
@@ -5543,10 +5516,7 @@ mod tests {
 
         let provider_resolver = Arc::new(ProviderResolver::single_provider(provider));
         let turn_repo = Arc::new(TurnRepo);
-        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
-            default: 20,
-            max: 100,
-        }));
+        let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg::new(20, 100)));
         let finalization = Arc::new(FinalizationService::new(
             Arc::clone(&db),
             Arc::clone(&turn_repo),
@@ -5596,10 +5566,7 @@ mod tests {
             db,
             turn_repo,
             message_repo,
-            Arc::new(OrmChatRepo::new(toolkit_db::odata::LimitCfg {
-                default: 20,
-                max: 100,
-            })),
+            Arc::new(OrmChatRepo::new(toolkit_db::odata::LimitCfg::new(20, 100))),
             mock_enforcer(),
             provider_resolver,
             crate::config::StreamingConfig::default(),

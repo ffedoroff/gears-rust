@@ -22,10 +22,7 @@ use crate::infra::storage::entity::resource_group_membership::{
 use crate::infra::storage::odata_mapper::MembershipODataMapper;
 
 /// Default `OData` pagination limits for memberships.
-const MEMBERSHIP_LIMIT_CFG: LimitCfg = LimitCfg {
-    default: 25,
-    max: 200,
-};
+const MEMBERSHIP_LIMIT_CFG: LimitCfg = LimitCfg::new(25, 200);
 
 /// System-level access scope (no tenant/resource filtering).
 fn system_scope() -> AccessScope {

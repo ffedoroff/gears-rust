@@ -258,6 +258,12 @@ impl From<RepositoryError> for DomainError {
                 detail,
             },
             RepositoryError::Internal(message) => Self::Internal { message },
+            RepositoryError::Validation { field, detail } => Self::Validation {
+                field,
+                reason: field::INVALID_LIMIT,
+                detail,
+                instance: String::new(),
+            },
         }
     }
 }

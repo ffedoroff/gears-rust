@@ -22,10 +22,9 @@ fn build_service_with_enforcer(
     enforcer: authz_resolver_sdk::PolicyEnforcer,
 ) -> ChatService<OrmChatRepository, OrmAttachmentRepository, MockThreadSummaryRepo> {
     let db = mock_db_provider(db);
-    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg {
-        default: 20,
-        max: 100,
-    }));
+    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg::new(
+        20, 100,
+    )));
 
     ChatService::new(
         db,
@@ -582,10 +581,9 @@ async fn get_chat_message_count_reflects_inserted_messages() {
 
     let db = inmem_db().await;
     let db_provider = mock_db_provider(db);
-    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg {
-        default: 20,
-        max: 100,
-    }));
+    let chat_repo = Arc::new(OrmChatRepository::new(toolkit_db::odata::LimitCfg::new(
+        20, 100,
+    )));
 
     let svc = ChatService::new(
         Arc::clone(&db_provider),
@@ -616,10 +614,7 @@ async fn get_chat_message_count_reflects_inserted_messages() {
     // Insert messages via repo directly
     let scope = AccessScope::for_tenant(tenant_id);
     let conn = db_provider.conn().expect("conn failed");
-    let message_repo = OrmMessageRepository::new(toolkit_db::odata::LimitCfg {
-        default: 20,
-        max: 100,
-    });
+    let message_repo = OrmMessageRepository::new(toolkit_db::odata::LimitCfg::new(20, 100));
     let request_id = Uuid::new_v4();
 
     message_repo
