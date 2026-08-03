@@ -1094,20 +1094,43 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             let result = Self::force_delete_subtree(group_repo, tx, group_id).await;
             result
         } else {
-            // Non-force: check children and memberships
+            // Non-force: collect *both* blocker classes before returning a
+            // single rejection. DESIGN.md:1320 requires the response to name
+            // children **and/or** memberships; returning as soon as the
+            // children check failed made the "or" half unreachable -- a
+            // group blocked by both only ever reported the children, never
+            // the memberships alongside them.
             let children = Self::get_direct_children(tx, group_id).await?;
-            let has_memberships = group_repo.has_memberships(tx, group_id).await?;
-            if !children.is_empty() {
-                return Err(DomainError::conflict_active_references(format!(
-                    "Cannot delete group '{group_id}': has {} child group(s). Use force=true to cascade.",
-                    children.len()
-                )));
-            }
+            let membership_count = group_repo.count_memberships(tx, group_id).await?;
 
-            if has_memberships {
-                return Err(DomainError::conflict_active_references(format!(
-                    "Cannot delete group '{group_id}': has active memberships. Use force=true to cascade."
-                )));
+            if !children.is_empty() || membership_count > 0 {
+                let (visible_child_ids, has_hidden_children) =
+                    Self::classify_children_for_delete(tx, &children).await?;
+
+                let mut blockers = Vec::new();
+                if !visible_child_ids.is_empty() {
+                    blockers.push(format!("{} child group(s)", visible_child_ids.len()));
+                }
+                if has_hidden_children {
+                    // No id, no exact count -- see
+                    // `classify_children_for_delete`'s doc comment for why a
+                    // tenant-typed child can be named neither individually
+                    // nor by an exact hidden count.
+                    blockers.push("additional child group(s) in another tenant".to_owned());
+                }
+                if membership_count > 0 {
+                    blockers.push(format!("{membership_count} membership(s)"));
+                }
+                // Reachable only via `!children.is_empty() || membership_count
+                // > 0`, and every child is classified into exactly one of
+                // `visible_child_ids` / `has_hidden_children` below, so
+                // `blockers` always has at least one entry here.
+                let message = format!(
+                    "Cannot delete group '{group_id}': blocked by {}. Use force=true to cascade.",
+                    blockers.join(" and ")
+                );
+                return Err(DomainError::conflict_active_references(message)
+                    .with_blocking_entity_ids(visible_child_ids));
             }
 
             // Delete closure rows, then the group
@@ -1340,6 +1363,72 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             .all(conn)
             .await
             .map_err(|e| DomainError::database(e.to_string()))
+    }
+
+    /// Split `children` (read under `AccessScope::allow_all()` by
+    /// [`Self::get_direct_children`]) into the ids that are safe to disclose
+    /// in a `delete_group` rejection and a flag for the ones that are not.
+    ///
+    /// **Why this split exists.** A tenant-typed child's `id` *is* a
+    /// `tenant_id` (`create_group_inner`'s `effective_tenant_id`
+    /// derivation), and such a child is exempt from the cross-tenant
+    /// parent-check on create (`create_group_inner`'s `is_tenant_type`
+    /// guard), so it can legitimately sit under a parent belonging to a
+    /// *different* tenant than the child itself. Naming that id in an error
+    /// response would hand the caller a foreign tenant's identifier; RG does
+    /// not own tenant data and must not be the one to disclose it
+    /// (DESIGN.md:1331-1337, mirrors the VHP-2345 anti-oracle rule elsewhere
+    /// in this file). Non-tenant-typed children carry no such risk: they
+    /// necessarily share `parent_id`'s tenant, and `parent_id` already
+    /// passed the scope-checked preflight in `delete_group_inner`.
+    ///
+    /// The second return value is deliberately a `bool`, not a count: even
+    /// the *number* of hidden tenant-typed children would let a caller
+    /// binary-search a foreign tenant's fan-out under a shared parent. It
+    /// only says "there are more blockers than what's listed above".
+    ///
+    /// **Why the rejection names children but only counts memberships.** The
+    /// two blocker classes carry different risks, so `DESIGN.md:1320`'s "list
+    /// of blocking entities" is satisfied asymmetrically on purpose. A
+    /// membership's identity *is* the triple `(group_id, resource_type,
+    /// resource_id)` with no surrogate id, so listing memberships would build
+    /// the leak `DESIGN.md:1326` names outright — "an existence oracle for any
+    /// guessed `(resource_type, resource_id)`" — letting a caller probe
+    /// guessed resources and read existence off the list. A non-tenant-typed
+    /// child's id discloses nothing the caller cannot already see. Hence ids
+    /// here, a count in [`GroupRepositoryTrait::count_memberships`]. The
+    /// asymmetry is the requirement, not an unfinished half of it.
+    async fn classify_children_for_delete(
+        tx: &impl DBRunner,
+        children: &[crate::infra::storage::entity::resource_group::Model],
+    ) -> Result<(Vec<String>, bool), DomainError> {
+        let mut visible_child_ids = Vec::with_capacity(children.len());
+        let mut has_hidden_children = false;
+        let mut tenant_type_by_gts_id: std::collections::HashMap<i16, bool> =
+            std::collections::HashMap::new();
+
+        for child in children {
+            // Resolving a type path is a DB round-trip, so memoize per
+            // `gts_type_id`: siblings very often share a type, and the
+            // rejection path must not fan out one query per child.
+            let is_tenant_type =
+                if let Some(&cached) = tenant_type_by_gts_id.get(&child.gts_type_id) {
+                    cached
+                } else {
+                    let type_path = Self::resolve_type_path_from_id(tx, child.gts_type_id).await?;
+                    let is_tenant_type = validation::is_tenant_type_code(&type_path);
+                    tenant_type_by_gts_id.insert(child.gts_type_id, is_tenant_type);
+                    is_tenant_type
+                };
+
+            if is_tenant_type {
+                has_hidden_children = true;
+            } else {
+                visible_child_ids.push(child.id.to_string());
+            }
+        }
+
+        Ok((visible_child_ids, has_hidden_children))
     }
 
     /// Resolve a type ID to its GTS path.

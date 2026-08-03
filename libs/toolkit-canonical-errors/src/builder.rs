@@ -520,6 +520,26 @@ impl<Resource> ResourceErrorBuilder<Resource, HasPreconditionViolations> {
             .push(PreconditionViolation::new(type_, subject, description));
         self
     }
+
+    /// Attach blocking-entity identifiers to the most-recently-pushed
+    /// precondition violation. Use when the emitter can name the specific
+    /// entities preventing the operation (e.g. child resources blocking a
+    /// delete); omit when there is nothing safe or specific to list.
+    ///
+    /// Silently noop if the violation list is empty — the typestate already
+    /// guarantees at least one violation is present on
+    /// `HasPreconditionViolations`, so this branch is unreachable in normal
+    /// use. Mirrors `with_quota_violation_retry_after_seconds` above.
+    #[must_use]
+    pub fn with_precondition_violation_blocking_entity_ids(
+        mut self,
+        ids: impl Into<Vec<String>>,
+    ) -> Self {
+        if let Some(last) = self.context.0.last_mut() {
+            last.blocking_entity_ids = ids.into();
+        }
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------

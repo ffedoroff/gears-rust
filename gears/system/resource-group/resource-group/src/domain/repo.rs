@@ -226,11 +226,26 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         new_parent_id: Option<Uuid>,
     ) -> Result<(), DomainError>;
 
-    async fn has_memberships<C: DBRunner>(
+    /// Count how many memberships a group has.
+    ///
+    /// A non-force delete blocked by memberships reports this count alongside
+    /// any blocking children (see `group_service::delete_group_inner`).
+    ///
+    /// **A count is the most this may ever return, deliberately.** A
+    /// membership's identity *is* the triple `(group_id, resource_type,
+    /// resource_id)` — there is no surrogate id (`api/rest/dto.rs`,
+    /// `MembershipDto`). Listing those triples in a delete rejection would
+    /// build exactly the leak `DESIGN.md:1326` forbids: "an existence oracle
+    /// for any guessed `(resource_type, resource_id)`", because a caller
+    /// could probe guessed resources and learn from the list whether they
+    /// exist. So `DESIGN.md:1320`'s "list of blocking entities" is satisfied
+    /// with identifiers for *children* and a count for memberships — the
+    /// asymmetry is required, not an unfinished half. Do not "complete" it.
+    async fn count_memberships<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
-    ) -> Result<bool, DomainError>;
+    ) -> Result<u64, DomainError>;
 
     async fn delete_memberships<C: DBRunner>(
         &self,

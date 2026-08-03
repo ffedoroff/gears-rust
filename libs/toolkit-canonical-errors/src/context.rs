@@ -61,6 +61,18 @@ pub struct PreconditionViolationV1 {
     pub type_: String,
     pub subject: String,
     pub description: String,
+    /// Identifiers of the entities that block this precondition, when the
+    /// emitter can name specific blockers (e.g. the child resources
+    /// preventing a delete). Empty when the precondition has no
+    /// individually-identifiable blockers, or when disclosing them would
+    /// leak information the emitter does not own (e.g. an identifier from a
+    /// tenant the caller has no grant for) -- `description` still carries a
+    /// human-readable summary either way.
+    ///
+    /// Additive: absent on the wire deserializes to an empty list, so older
+    /// emitters that never set this field stay wire-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocking_entity_ids: Vec<String>,
 }
 
 impl PreconditionViolationV1 {
@@ -74,7 +86,20 @@ impl PreconditionViolationV1 {
             type_: type_.into(),
             subject: subject.into(),
             description: description.into(),
+            blocking_entity_ids: Vec::new(),
         }
+    }
+
+    /// Attach the identifiers of the entities blocking this precondition.
+    ///
+    /// Kept separate from [`Self::new`] so the three-argument constructor
+    /// every existing `with_precondition_violation` call site already uses
+    /// keeps compiling unchanged -- this field is opt-in, not part of the
+    /// base triple.
+    #[must_use]
+    pub fn with_blocking_entity_ids(mut self, ids: impl Into<Vec<String>>) -> Self {
+        self.blocking_entity_ids = ids.into();
+        self
     }
 }
 

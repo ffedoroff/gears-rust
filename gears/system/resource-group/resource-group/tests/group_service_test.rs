@@ -923,6 +923,9 @@ async fn group_delete_leaf() {
 }
 
 /// TC-GRP-13: Delete with children no force.
+///
+/// ML-6248: the rejection must carry the blocking child's id in the typed
+/// `blocking_entity_ids` list, not just a count in the message.
 #[tokio::test]
 async fn group_delete_with_children_no_force() {
     let db = common::test_db().await;
@@ -936,7 +939,7 @@ async fn group_delete_with_children_no_force() {
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
-    let _child = common::create_child_group(
+    let child = common::create_child_group(
         &group_svc,
         &ctx,
         &child_type.code,
@@ -951,14 +954,46 @@ async fn group_delete_with_children_no_force() {
         .await
         .unwrap_err();
 
+    match err {
+        DomainError::ConflictActiveReferences {
+            message,
+            blocking_entity_ids,
+        } => {
+            assert!(
+                message.contains("1 child group(s)"),
+                "expected the message to name the blocking child count, got: {message}"
+            );
+            assert_eq!(
+                blocking_entity_ids,
+                vec![child.id.to_string()],
+                "the blocking child's id must be listed in the typed field"
+            );
+        }
+        other => panic!("Expected ConflictActiveReferences, got: {other:?}"),
+    }
+
+    // Secondary artifact: the rejected delete must not have touched the row.
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let survived = RgEntity::find()
+        .filter(RgColumn::Id.eq(root.id))
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .expect("query");
     assert!(
-        matches!(err, DomainError::ConflictActiveReferences { ref message } if message.contains("child group(s)")),
-        "Expected ConflictActiveReferences with 'child group(s)', got: {err:?}"
+        survived.is_some(),
+        "root group must survive a rejected delete"
     );
 }
 
 /// TC-GRP-14: Delete with memberships no force.
 /// Insert membership rows directly via SeaORM.
+///
+/// ML-6248: the rejection must carry the actual membership count (previously
+/// a bare `bool`), and the (empty, since there are no children) typed
+/// `blocking_entity_ids` list.
 #[tokio::test]
 async fn group_delete_with_memberships_no_force() {
     let db = common::test_db().await;
@@ -1001,10 +1036,258 @@ async fn group_delete_with_memberships_no_force() {
         .await
         .unwrap_err();
 
-    assert!(
-        matches!(err, DomainError::ConflictActiveReferences { ref message } if message.contains("memberships")),
-        "Expected ConflictActiveReferences with 'memberships', got: {err:?}"
+    match err {
+        DomainError::ConflictActiveReferences {
+            message,
+            blocking_entity_ids,
+        } => {
+            assert!(
+                message.contains("1 membership(s)"),
+                "expected the message to name the actual membership count, got: {message}"
+            );
+            assert!(
+                blocking_entity_ids.is_empty(),
+                "no children exist, so the typed list must be empty: {blocking_entity_ids:?}"
+            );
+        }
+        other => panic!("Expected ConflictActiveReferences, got: {other:?}"),
+    }
+}
+
+/// ML-6248: a group blocked by children **and** memberships simultaneously
+/// must report both classes in a single rejection. Before this fix, the
+/// children check returned immediately, so the "and/or" DESIGN.md:1320
+/// requires was unreachable for the "and" case -- a caller blocked by both
+/// only ever learned about the children.
+#[tokio::test]
+async fn group_delete_with_children_and_memberships_reports_both() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "org").await;
+    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+
+    let root =
+        common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
+    let child = common::create_child_group(
+        &group_svc,
+        &ctx,
+        &child_type.code,
+        root.id,
+        "Child",
+        tenant_id,
+    )
+    .await;
+
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let root_type_id = GtsTypeEntity::find()
+        .filter(GtsTypeColumn::SchemaId.eq(&root_type.code))
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .expect("query gts_type")
+        .expect("type row exists")
+        .id;
+    let membership = membership_entity::ActiveModel {
+        group_id: Set(root.id),
+        gts_type_id: Set(root_type_id),
+        resource_id: Set("resource-1".to_owned()),
+        ..Default::default()
+    };
+    secure_insert::<MembershipEntity>(membership, &scope, &conn)
+        .await
+        .expect("insert membership");
+
+    let err = group_svc
+        .delete_group(&ctx, root.id, false)
+        .await
+        .unwrap_err();
+
+    match err {
+        DomainError::ConflictActiveReferences {
+            message,
+            blocking_entity_ids,
+        } => {
+            assert!(
+                message.contains("1 child group(s)"),
+                "single rejection must still name the blocking child: {message}"
+            );
+            assert!(
+                message.contains("1 membership(s)"),
+                "single rejection must also name the blocking membership: {message}"
+            );
+            assert_eq!(
+                blocking_entity_ids,
+                vec![child.id.to_string()],
+                "the blocking child's id must be listed"
+            );
+        }
+        other => panic!("Expected ConflictActiveReferences, got: {other:?}"),
+    }
+}
+
+/// ML-6248: every non-tenant-typed child's id is present in the typed
+/// `blocking_entity_ids` list, not just the count.
+#[tokio::test]
+async fn group_delete_lists_all_non_tenant_child_ids() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "org").await;
+    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+
+    let root =
+        common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
+    let first_child = common::create_child_group(
+        &group_svc,
+        &ctx,
+        &child_type.code,
+        root.id,
+        "ChildA",
+        tenant_id,
+    )
+    .await;
+    let second_child = common::create_child_group(
+        &group_svc,
+        &ctx,
+        &child_type.code,
+        root.id,
+        "ChildB",
+        tenant_id,
+    )
+    .await;
+
+    let err = group_svc
+        .delete_group(&ctx, root.id, false)
+        .await
+        .unwrap_err();
+
+    match err {
+        DomainError::ConflictActiveReferences {
+            message,
+            blocking_entity_ids,
+        } => {
+            assert!(
+                message.contains("2 child group(s)"),
+                "expected message to report both children, got: {message}"
+            );
+            let mut ids = blocking_entity_ids;
+            ids.sort();
+            let mut expected = vec![first_child.id.to_string(), second_child.id.to_string()];
+            expected.sort();
+            assert_eq!(ids, expected, "both children's ids must be listed");
+        }
+        other => panic!("Expected ConflictActiveReferences, got: {other:?}"),
+    }
+}
+
+/// ML-6248, anti-leak: a tenant-typed child hanging under a parent of a
+/// *different* tenant (legal per `create_group_inner`'s `is_tenant_type`
+/// exemption from the cross-tenant parent check) must not have its id, nor
+/// an exact hidden count, disclosed in the rejection -- DESIGN.md:1331-1337.
+/// Only an anonymous "there are more blockers" signal is allowed.
+#[tokio::test]
+async fn group_delete_does_not_leak_tenant_typed_child_id() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&type_svc, "org").await;
+
+    // A tenant-typed child type: code starts with `TENANT_RG_TYPE_PATH`, so
+    // `create_group_inner` derives `effective_tenant_id = group_id` for any
+    // group of this type -- a brand-new tenant, distinct from `root`'s.
+    let tenant_child_code = format!(
+        "{}x.test.tn.i{}.v1~",
+        resource_group_sdk::TENANT_RG_TYPE_PATH,
+        Uuid::now_v7().as_simple()
     );
+    type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: tenant_child_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![root_type.code.clone()],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create tenant-typed child type");
+
+    let root =
+        common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
+    let tenant_child = common::create_child_group(
+        &group_svc,
+        &ctx,
+        &tenant_child_code,
+        root.id,
+        "TenantChild",
+        tenant_id,
+    )
+    .await;
+
+    // Sanity: this is a genuine cross-tenant hierarchy, not an accidental
+    // same-tenant one that would make the anti-leak assertions below
+    // vacuous. `effective_tenant_id = group_id` for a tenant-typed group
+    // (`create_group_inner`), so the stored `tenant_id` must equal the
+    // child's own id and differ from the root's tenant.
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let stored_child = RgEntity::find()
+        .filter(RgColumn::Id.eq(tenant_child.id))
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .expect("query")
+        .expect("tenant-typed child row exists");
+    assert_eq!(
+        stored_child.tenant_id, tenant_child.id,
+        "tenant-typed child must open its own tenant scope"
+    );
+    assert_ne!(
+        stored_child.tenant_id, tenant_id,
+        "the child's tenant must differ from the root's for this test to be meaningful"
+    );
+
+    let err = group_svc
+        .delete_group(&ctx, root.id, false)
+        .await
+        .unwrap_err();
+
+    match err {
+        DomainError::ConflictActiveReferences {
+            message,
+            blocking_entity_ids,
+        } => {
+            assert!(
+                blocking_entity_ids.is_empty(),
+                "a tenant-typed child's id must never be disclosed: {blocking_entity_ids:?}"
+            );
+            assert!(
+                !message.contains(&tenant_child.id.to_string()),
+                "the tenant-typed child's id must not appear in the message either: {message}"
+            );
+            assert!(
+                !message.contains("1 child group(s)"),
+                "an exact hidden count is itself a cross-tenant oracle: {message}"
+            );
+            assert!(
+                message.contains("another tenant"),
+                "expected an anonymous hidden-blocker signal, got: {message}"
+            );
+        }
+        other => panic!("Expected ConflictActiveReferences, got: {other:?}"),
+    }
 }
 
 /// TC-GRP-15: Force delete subtree.

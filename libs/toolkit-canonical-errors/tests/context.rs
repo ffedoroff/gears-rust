@@ -37,6 +37,60 @@ fn precondition_violation_serialization() {
     assert_eq!(json["description"], "Must have zero users");
 }
 
+/// `blocking_entity_ids` is opt-in: `new()` leaves it empty, and an empty
+/// list is omitted from the wire form entirely (`skip_serializing_if`) --
+/// there's no "empty array" ever sent, so old consumers that don't know the
+/// field see the same shape as before this field existed.
+#[test]
+fn precondition_violation_blocking_entity_ids_default_is_omitted_from_wire() {
+    let v = PreconditionViolation::new("STATE", "tenant.users", "Must have zero users");
+    assert!(v.blocking_entity_ids.is_empty());
+
+    let json = serde_json::to_value(&v).unwrap();
+    assert!(
+        json.get("blocking_entity_ids").is_none(),
+        "empty blocking_entity_ids must not appear on the wire: {json}"
+    );
+}
+
+/// `with_blocking_entity_ids` populates the field, and a populated field
+/// round-trips through serialize -> deserialize unchanged.
+#[test]
+fn precondition_violation_blocking_entity_ids_round_trips_when_set() {
+    let v = PreconditionViolation::new("STATE", "active_references", "has blockers")
+        .with_blocking_entity_ids(vec!["child-1".to_owned(), "child-2".to_owned()]);
+
+    let json = serde_json::to_value(&v).unwrap();
+    assert_eq!(
+        json["blocking_entity_ids"],
+        serde_json::json!(["child-1", "child-2"])
+    );
+
+    let restored: PreconditionViolation = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        restored.blocking_entity_ids,
+        vec!["child-1".to_owned(), "child-2".to_owned()]
+    );
+}
+
+/// Wire compatibility: a JSON payload produced by an emitter that predates
+/// this field (no `blocking_entity_ids` key at all) must still deserialize,
+/// with the field defaulting to empty.
+#[test]
+fn precondition_violation_deserializes_pre_existing_wire_payload_without_the_field() {
+    let old_wire = serde_json::json!({
+        "type": "STATE",
+        "subject": "active_references",
+        "description": "has blockers"
+    });
+
+    let restored: PreconditionViolation = serde_json::from_value(old_wire).unwrap();
+    assert_eq!(restored.type_, "STATE");
+    assert_eq!(restored.subject, "active_references");
+    assert_eq!(restored.description, "has blockers");
+    assert!(restored.blocking_entity_ids.is_empty());
+}
+
 // =========================================================================
 // Per-category context serialization tests
 // =========================================================================

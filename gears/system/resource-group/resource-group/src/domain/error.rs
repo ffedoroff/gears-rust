@@ -34,8 +34,19 @@ pub enum DomainError {
     #[error("Allowed parents violation: {message}")]
     AllowedParentTypesViolation { message: String },
 
+    /// `blocking_entity_ids` names the specific entities blocking the
+    /// operation, when the caller knows them and it is safe to disclose
+    /// them (see `group_service::delete_group_inner`'s anti-leak
+    /// filtering). Empty for callers that only have a count, not
+    /// individual identifiers (e.g. `type_service::delete_type_in_tx`) --
+    /// mirrors `toolkit_canonical_errors::PreconditionViolationV1`'s field
+    /// of the same name and purpose, which this maps to at the REST
+    /// boundary (`api::rest::error`).
     #[error("Active references exist: {message}")]
-    ConflictActiveReferences { message: String },
+    ConflictActiveReferences {
+        message: String,
+        blocking_entity_ids: Vec<String>,
+    },
 
     #[error("Group not found: {id}")]
     GroupNotFound { id: uuid::Uuid },
@@ -182,7 +193,28 @@ impl DomainError {
     pub fn conflict_active_references(message: impl Into<String>) -> Self {
         Self::ConflictActiveReferences {
             message: message.into(),
+            blocking_entity_ids: Vec::new(),
         }
+    }
+
+    /// Attach the identifiers of the entities blocking the operation.
+    ///
+    /// Kept separate from [`Self::conflict_active_references`] so that
+    /// constructor's single-argument signature keeps compiling unchanged
+    /// for callers that only have a count (e.g. `type_service`) --
+    /// mirrors why `PreconditionViolationV1::with_blocking_entity_ids` is
+    /// separate from its own constructor. Silently a no-op if `self` is
+    /// not `ConflictActiveReferences`.
+    #[must_use]
+    pub fn with_blocking_entity_ids(mut self, ids: impl Into<Vec<String>>) -> Self {
+        if let Self::ConflictActiveReferences {
+            blocking_entity_ids,
+            ..
+        } = &mut self
+        {
+            *blocking_entity_ids = ids.into();
+        }
+        self
     }
 
     #[must_use]

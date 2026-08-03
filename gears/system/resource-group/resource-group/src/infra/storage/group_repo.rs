@@ -1082,12 +1082,12 @@ impl GroupRepositoryTrait for GroupRepository {
         Ok(())
     }
 
-    /// Check if a group has any memberships.
-    async fn has_memberships<C: DBRunner>(
+    /// Count how many memberships a group has.
+    async fn count_memberships<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
-    ) -> Result<bool, DomainError> {
+    ) -> Result<u64, DomainError> {
         let scope = system_scope();
         let count = MembershipEntity::find()
             .filter(membership_entity::Column::GroupId.eq(group_id))
@@ -1096,7 +1096,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .count(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
-        Ok(count > 0)
+        Ok(count)
     }
 
     /// Delete all memberships for a group.

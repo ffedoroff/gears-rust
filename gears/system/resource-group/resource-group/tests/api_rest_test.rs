@@ -2420,6 +2420,89 @@ async fn rest_delete_group_force_returns_204() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
+/// ML-6248: DELETE group with children (no `force`) returns 400 with the
+/// blocking child's id in `context.violations[0].blocking_entity_ids`, not
+/// just a bare count buried in `detail`/`description`. Mirrors
+/// `delete_type_active_references_returns_400`'s shape checks, which cover
+/// the analogous type-delete path but not group-delete.
+#[tokio::test]
+async fn rest_delete_group_with_children_returns_400_with_blocking_ids() {
+    let (router, type_svc, group_svc, _) = build_shared_router().await;
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+
+    let rt = create_self_ref_type(&type_svc, "delch").await;
+
+    let parent = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: rt.clone(),
+                name: "Parent".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+
+    let child = group_svc
+        .create_group(
+            &ctx,
+            resource_group_sdk::CreateGroupRequest {
+                id: None,
+                code: rt,
+                name: "Child".to_owned(),
+                parent_id: Some(parent.id),
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "DELETE",
+        &format!("/resource-group/v1/groups/{}", parent.id),
+        None,
+        tenant_id,
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    let body = assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
+
+    let violations = body["context"]["violations"]
+        .as_array()
+        .expect("context.violations must be present");
+    assert!(
+        !violations.is_empty(),
+        "expected at least one precondition violation: {body}"
+    );
+    assert_eq!(violations[0]["subject"], "active_references");
+    assert_eq!(violations[0]["type"], "STATE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("child group(s)")),
+        "expected violation description to explain the active-reference conflict: {body}"
+    );
+    assert_eq!(
+        violations[0]["blocking_entity_ids"],
+        serde_json::json!([child.id.to_string()]),
+        "expected the blocking child's id in the typed list: {body}"
+    );
+
+    // The rejected DELETE must leave the parent (and child) where it was.
+    let survived = group_svc.get_group_unscoped(parent.id).await;
+    assert!(
+        survived.is_ok(),
+        "parent group whose delete was rejected must still exist"
+    );
+}
+
 /// TC-REST-08: GET group hierarchy returns 200 with depth fields.
 #[tokio::test]
 async fn rest_get_group_hierarchy_returns_200() {

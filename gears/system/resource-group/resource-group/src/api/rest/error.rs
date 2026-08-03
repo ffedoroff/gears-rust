@@ -90,12 +90,16 @@ impl From<DomainError> for CanonicalError {
                 )
                 .create(),
             // ⚠ wire change accepted in the migration plan: 409 → 400.
-            DomainError::ConflictActiveReferences { message } => RgError::failed_precondition()
+            DomainError::ConflictActiveReferences {
+                message,
+                blocking_entity_ids,
+            } => RgError::failed_precondition()
                 .with_precondition_violation(
                     precondition::ACTIVE_REFERENCES_SUBJECT,
                     message,
                     precondition::STATE_TYPE,
                 )
+                .with_precondition_violation_blocking_entity_ids(blocking_entity_ids)
                 .create(),
             // ⚠ wire change accepted in the migration plan: 409 → 400.
             DomainError::LimitViolation { message } => RgError::failed_precondition()
