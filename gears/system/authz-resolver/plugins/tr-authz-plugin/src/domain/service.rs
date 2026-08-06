@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::{
-    BarrierMode as AuthzBarrierMode, Constraint, EvaluationRequest, EvaluationResponse,
+    BarrierMode as AuthzBarrierMode, Capability, Constraint, EvaluationRequest, EvaluationResponse,
     EvaluationResponseContext, InGroupPredicate, InGroupSubtreePredicate, InPredicate, Predicate,
     TenantMode,
 };
@@ -136,7 +136,12 @@ impl Service {
         // malformed, the group predicate cannot be compiled; fail-closed to
         // avoid silently widening scope to tenant-wide access.
         if response.decision
-            && Self::append_group_predicates(&mut response, &request.resource.properties).is_err()
+            && Self::append_group_predicates(
+                &mut response,
+                &request.resource.properties,
+                &request.context.capabilities,
+            )
+            .is_err()
         {
             warn!("tr-authz: malformed group scoping properties -- deny");
             return Self::deny();
@@ -392,22 +397,54 @@ impl Service {
     fn append_group_predicates(
         response: &mut EvaluationResponse,
         props: &std::collections::HashMap<String, serde_json::Value>,
+        capabilities: &[Capability],
     ) -> Result<(), ()> {
         let Some(Constraint { predicates }) = response.context.constraints.get_mut(0) else {
             return Ok(());
         };
+        // A group predicate compiles to a subquery against
+        // `resource_group_membership` / `resource_group_closure` in the
+        // *calling gear's* database. Those tables are canonical to the RG
+        // gear and are not projected to domain services, so emitting the
+        // predicate for a PEP that did not declare the matching capability
+        // hands it SQL against a table it does not have -- a query error at
+        // execution time rather than a decision. `Capability`'s own
+        // docstring already states the contract ("Services without access
+        // should omit these capabilities -- the PDP will degrade group
+        // predicates to explicit `In`"); this is the PDP side of it.
+        //
+        // Degradation is not implemented here: this plugin builds group
+        // predicates from request-context ids and has no PIP with which to
+        // expand them into explicit resource ids. Omitting the predicate
+        // leaves the tenant constraint in place, which is narrower than
+        // group scoping would have been, never wider -- so dropping it
+        // cannot widen access.
         if let Some(group_ids) = props.get("group_ids") {
             let ids = Self::parse_uuid_array(group_ids).ok_or(())?;
             if !ids.is_empty() {
-                predicates.push(Predicate::InGroup(InGroupPredicate::new("id", ids)));
+                if capabilities.contains(&Capability::GroupMembership) {
+                    predicates.push(Predicate::InGroup(InGroupPredicate::new("id", ids)));
+                } else {
+                    debug!(
+                        "tr-authz: caller did not declare GroupMembership -- \
+                         omitting InGroup predicate"
+                    );
+                }
             }
         }
         if let Some(ancestor_ids) = props.get("ancestor_group_ids") {
             let ids = Self::parse_uuid_array(ancestor_ids).ok_or(())?;
             if !ids.is_empty() {
-                predicates.push(Predicate::InGroupSubtree(InGroupSubtreePredicate::new(
-                    "id", ids,
-                )));
+                if capabilities.contains(&Capability::GroupHierarchy) {
+                    predicates.push(Predicate::InGroupSubtree(InGroupSubtreePredicate::new(
+                        "id", ids,
+                    )));
+                } else {
+                    debug!(
+                        "tr-authz: caller did not declare GroupHierarchy -- \
+                         omitting InGroupSubtree predicate"
+                    );
+                }
             }
         }
         Ok(())

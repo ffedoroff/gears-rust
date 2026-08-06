@@ -6,7 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::models::{Action, Resource, Subject};
 use authz_resolver_sdk::{
-    EvaluationRequest, EvaluationRequestContext, EvaluationResponse, Predicate, TenantContext,
+    Capability, EvaluationRequest, EvaluationRequestContext, EvaluationResponse, Predicate,
+    TenantContext,
 };
 use tenant_resolver_sdk::{
     GetAncestorsOptions, GetAncestorsResponse, GetDescendantsOptions, GetDescendantsResponse,
@@ -361,6 +362,9 @@ async fn group_predicates_from_request_properties() {
         "ancestor_group_ids".to_owned(),
         serde_json::json!([g1.to_string()]),
     );
+    // Group predicates are emitted only to a PEP that declared it can
+    // execute them -- see `group_predicates_omitted_without_capabilities`.
+    req.context.capabilities = vec![Capability::GroupMembership, Capability::GroupHierarchy];
 
     let resp = svc.evaluate(&req).await;
     assert!(resp.decision);
@@ -500,6 +504,42 @@ fn parse_uuid_value(v: &serde_json::Value) -> Uuid {
 }
 
 // ── R1: single, root_id, root_only ─────────────────────────────────────
+/// The mirror of `group_predicates_from_request_properties`: a caller
+/// that declared neither capability gets no group predicate at all.
+///
+/// Emitting one would hand a PEP without `resource_group_membership` /
+/// `resource_group_closure` a subquery over tables it does not have --
+/// a query error at execution time rather than a decision. Dropping the
+/// predicate leaves the tenant constraint in place, which is narrower
+/// than group scoping, never wider.
+#[tokio::test]
+async fn group_predicates_omitted_without_capabilities() {
+    let t1 = Uuid::now_v7();
+    let mock = MockTenantResolver::with_tenants(t1, vec![]);
+    let svc = Service::new(Arc::new(mock));
+
+    let g1 = Uuid::now_v7();
+    let mut req = make_request(t1);
+    req.resource
+        .properties
+        .insert("group_ids".to_owned(), serde_json::json!([g1.to_string()]));
+    req.resource.properties.insert(
+        "ancestor_group_ids".to_owned(),
+        serde_json::json!([g1.to_string()]),
+    );
+    assert!(
+        req.context.capabilities.is_empty(),
+        "precondition: the caller declares no group capability"
+    );
+
+    let resp = svc.evaluate(&req).await;
+    assert!(resp.decision, "omitting a group predicate is not a denial");
+
+    let preds = &resp.context.constraints[0].predicates;
+    assert_eq!(preds.len(), 1, "tenant constraint only: {preds:?}");
+    assert!(matches!(&preds[0], Predicate::In(_)));
+}
+
 #[tokio::test]
 async fn r1_partner_reads_customer_task_root_only() {
     let (svc, [_r, t1, t2, _t3, _t4]) = setup_svc();
