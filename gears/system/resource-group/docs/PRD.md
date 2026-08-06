@@ -457,6 +457,16 @@ Entity deletion **MUST** be rejected if active references/memberships prevent sa
 
 Group data seeding (populating group hierarchy) is **optional** and deployment-specific. It can be performed via plugin data migration, manual database administration, or RG API calls. When performed, seeding **MUST** validate parent-child links and type compatibility. Repeated runs **MUST** be idempotent.
 
+#### Accept a Caller-Supplied Group Identifier
+
+- [ ] `p1` - **ID**: `cpt-cf-resource-group-fr-caller-supplied-identifier`
+
+Group creation **MUST** accept an optional caller-supplied `id` and, when present, persist it verbatim as the group's primary key. Two callers depend on this: seeding, which needs stable identity across repeated runs, and migration from an external system, which needs the identifier that system already assigned.
+
+- A collision on the identifier **MUST** surface as a typed already-exists conflict (HTTP 409), never as an opaque database failure, and the response **MUST NOT** vary according to whether the occupying group is within the caller's scope.
+- A group of a tenant type takes its own `id` as its `tenant_id` (see `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`). A caller-supplied identifier on such a group is therefore a caller-supplied **tenant** identifier, and is governed by the tenant-import rules owned by Account Management (`cpt-cf-account-management-fr-tenant-import-external-id`) — in particular the prohibition on reusing an identifier the platform has previously issued. RG **MUST** enforce that prohibition for tenant-typed groups; it does not own the rule.
+- Supplying an identifier **MUST NOT** widen the caller's authorization. Until an identifier-ownership policy is agreed, an explicit `id` combined with a target tenant other than the caller's own **MUST** be rejected; this is a deliberate stopgap and **MUST** be replaced once that policy exists.
+
 #### Enforce Tenant Scope in Ownership-Graph Profile
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-tenant-scope-ownership-graph`

@@ -378,6 +378,23 @@ The system **MUST** allow an authenticated parent tenant administrator to create
 
 - **Rationale**: Creating sub-tenants is the core operation that builds the organizational hierarchy for all tenant models.
 
+#### Import a Tenant with Its Externally Assigned Identifier
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-fr-tenant-import-external-id`
+
+**Actors**: `cpt-cf-account-management-actor-platform-admin`, `cpt-cf-account-management-actor-tenant-admin`
+
+The system **MUST** allow a tenant to be created with an identifier supplied by the caller, so that a tenant migrated from another system keeps the identifier that system assigned to it. The identifier **MUST** be stored verbatim; the system **MUST NOT** derive, rewrite, or namespace it. This is the reason `CreateTenantRequest` carries `child_id` as a caller-supplied value rather than allocating one server-side.
+
+Four constraints apply to every such creation:
+
+1. **Placement is authorized independently of the identifier.** Supplying an identifier **MUST NOT** widen what the caller may do. The parent under which the tenant is created is authorized on its own merits, exactly as it is when the system allocates the identifier itself.
+2. **Identifiers are never reused.** A creation whose identifier belongs to any tenant the platform has ever issued — active, suspended, soft-deleted, or hard-deleted — **MUST** be rejected. Reuse would silently re-point every audit record, external reference, and cached authorization decision that still names that identifier at an unrelated tenant. Enforcing this requires the platform to retain retired identifiers beyond the lifetime of the tenant row itself.
+3. **The collision response discloses nothing.** Rejection **MUST** be a single deterministic already-exists error carrying only the identifier the caller already supplied. It **MUST NOT** differ in status, code, or wording according to whether the occupying tenant is visible to the caller — otherwise the endpoint becomes an existence oracle over the whole tenant tree.
+4. **Import is an operation, not a side effect.** The requirement authorizes preserving an identifier during creation. It does not authorize choosing an arbitrary identifier for a tenant that has no external origin, and it does not authorize writing any other field of an existing tenant.
+
+- **Rationale**: Tenants arrive from systems the platform did not create — an acquired product, a predecessor installation, a customer's own directory — and their identifiers are already embedded in contracts, exports, and downstream references that the migration cannot rewrite. Re-issuing identifiers at the boundary would force every one of those references to be remapped, which is exactly the failure mode migration is meant to avoid. Accepting an external identifier is therefore a product requirement, not an implementation convenience; the four constraints above are what make it safe, since a caller-chosen primary key otherwise leaks existence and permits reuse of a retired tenant's identity.
+
 #### Tenant Hierarchy Depth Limit
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-fr-hierarchy-depth-limit`
