@@ -117,6 +117,19 @@ pub mod rg_tables {
     pub const MEMBERSHIP_RESOURCE_ID: &str = "resource_id";
     /// Column in membership table: the group the resource belongs to.
     pub const MEMBERSHIP_GROUP_ID: &str = "group_id";
+    /// Column in membership table: the surrogate id of the resource's GTS
+    /// type. Part of the primary key `(group_id, gts_type_id,
+    /// resource_id)`, so a predicate that omits it can match a
+    /// same-`resource_id` row of a different type.
+    pub const MEMBERSHIP_GTS_TYPE_ID: &str = "gts_type_id";
+
+    /// GTS type table, mapping a type path to the surrogate id the
+    /// membership table stores.
+    pub const TYPE_TABLE: &str = "gts_type";
+    /// Column in the type table: the surrogate id.
+    pub const TYPE_ID: &str = "id";
+    /// Column in the type table: the GTS type path, unique.
+    pub const TYPE_SCHEMA_ID: &str = "schema_id";
 
     /// Closure table for group hierarchy.
     pub const CLOSURE_TABLE: &str = "resource_group_closure";
@@ -264,16 +277,52 @@ impl InScopeFilter {
 pub struct InGroupScopeFilter {
     property: String,
     group_ids: Vec<ScopeValue>,
+    gts_type: Option<String>,
 }
 
 impl InGroupScopeFilter {
-    /// Create a group membership scope filter.
+    /// Create a group membership scope filter with no resource-type
+    /// discriminator.
+    ///
+    /// Membership rows are keyed by `(group_id, gts_type_id, resource_id)`,
+    /// so a filter built this way can match a same-`resource_id` row of a
+    /// *different* GTS type than the membership was recorded for. Prefer
+    /// [`Self::with_gts_type`] wherever the caller knows which resource
+    /// type it is scoping — which a PEP always does, since it named one to
+    /// the PDP.
     #[must_use]
     pub fn new(property: impl Into<String>, group_ids: Vec<ScopeValue>) -> Self {
         Self {
             property: property.into(),
             group_ids,
+            gts_type: None,
         }
+    }
+
+    /// Create a group membership scope filter restricted to one GTS
+    /// resource type.
+    #[must_use]
+    pub fn with_gts_type(
+        property: impl Into<String>,
+        group_ids: Vec<ScopeValue>,
+        gts_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            property: property.into(),
+            group_ids,
+            gts_type: Some(gts_type.into()),
+        }
+    }
+
+    /// The GTS resource type this filter is restricted to, if any.
+    ///
+    /// `None` means "type unknown": the compiled predicate must behave as
+    /// it did before the discriminator existed rather than silently
+    /// narrowing to some default.
+    #[inline]
+    #[must_use]
+    pub fn gts_type(&self) -> Option<&str> {
+        self.gts_type.as_deref()
     }
 
     /// The authorization property name.
@@ -296,16 +345,42 @@ impl InGroupScopeFilter {
 pub struct InGroupSubtreeScopeFilter {
     property: String,
     ancestor_ids: Vec<ScopeValue>,
+    gts_type: Option<String>,
 }
 
 impl InGroupSubtreeScopeFilter {
-    /// Create a group subtree scope filter.
+    /// Create a group subtree scope filter with no resource-type
+    /// discriminator. See [`InGroupScopeFilter::new`] for why that is the
+    /// weaker form.
     #[must_use]
     pub fn new(property: impl Into<String>, ancestor_ids: Vec<ScopeValue>) -> Self {
         Self {
             property: property.into(),
             ancestor_ids,
+            gts_type: None,
         }
+    }
+
+    /// Create a group subtree scope filter restricted to one GTS resource
+    /// type.
+    #[must_use]
+    pub fn with_gts_type(
+        property: impl Into<String>,
+        ancestor_ids: Vec<ScopeValue>,
+        gts_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            property: property.into(),
+            ancestor_ids,
+            gts_type: Some(gts_type.into()),
+        }
+    }
+
+    /// The GTS resource type this filter is restricted to, if any.
+    #[inline]
+    #[must_use]
+    pub fn gts_type(&self) -> Option<&str> {
+        self.gts_type.as_deref()
     }
 
     /// The authorization property name.
@@ -454,6 +529,32 @@ impl ScopeFilter {
     #[must_use]
     pub fn in_group(property: impl Into<String>, group_ids: Vec<ScopeValue>) -> Self {
         Self::InGroup(InGroupScopeFilter::new(property, group_ids))
+    }
+
+    /// Group membership filter restricted to one GTS resource type.
+    #[must_use]
+    pub fn in_group_of_type(
+        property: impl Into<String>,
+        group_ids: Vec<ScopeValue>,
+        gts_type: impl Into<String>,
+    ) -> Self {
+        Self::InGroup(InGroupScopeFilter::with_gts_type(
+            property, group_ids, gts_type,
+        ))
+    }
+
+    /// Group subtree filter restricted to one GTS resource type.
+    #[must_use]
+    pub fn in_group_subtree_of_type(
+        property: impl Into<String>,
+        ancestor_ids: Vec<ScopeValue>,
+        gts_type: impl Into<String>,
+    ) -> Self {
+        Self::InGroupSubtree(InGroupSubtreeScopeFilter::with_gts_type(
+            property,
+            ancestor_ids,
+            gts_type,
+        ))
     }
 
     /// Create a group subtree filter.

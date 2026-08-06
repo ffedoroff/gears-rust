@@ -122,58 +122,39 @@ where
                 // non-UUID resource_col. Casting a column that is already
                 // text-typed is a harmless no-op on both Postgres and SQLite.
                 //
-                // VHP-2344 defect B (deliberately NOT fixed here): the
-                // membership table's primary key is the triple `(group_id,
-                // gts_type_id, resource_id)`, but this subquery only filters
-                // on `group_id` -- two resources of different GTS types that
-                // happen to share the same `resource_id` string are
-                // indistinguishable here, so the predicate can in principle
-                // match a same-ID resource of a *different* GTS type than the
-                // one the group membership was recorded for.
+                // VHP-2344 defect B: the membership primary key is the
+                // triple `(group_id, gts_type_id, resource_id)`, but a
+                // subquery filtered on `group_id` alone cannot tell two
+                // resources of different GTS types apart when they share a
+                // `resource_id` string -- and `resource_id` is TEXT,
+                // deliberately untyped, so collisions are ordinary.
                 //
-                // Disambiguating on `gts_type_id` would need the entity's GTS
-                // type at the point this condition is compiled. `ScopableEntity`
-                // does expose `type_col()`, but it resolves to a per-ROW
-                // column (see `file.rs`: `gts_file_type: String`, a GTS
-                // type-path that can vary per file, not a fixed value for the
-                // whole entity) -- so using it here would require a
-                // *correlated* subquery (an `EXISTS` referencing the outer
-                // row's `type_col()` and joining `gts_type.schema_id`) rather
-                // than the current uncorrelated `IN`, a materially bigger
-                // rewrite of every filter variant in this function. Worse,
-                // `type_col()` is declared by exactly one entity in the whole
-                // monorepo (`file.rs`), and file-storage's own database does
-                // not host `resource_group_membership`/`gts_type` at all --
-                // per `rg_tables`' own docs, those tables are canonical to the
-                // RG gear's database and not projected to domain services. So
-                // the one case the entity-local column could disambiguate is
-                // not reachable in practice, while every other scoped entity
-                // in the codebase declares `no_type` and has nothing to
-                // disambiguate with.
+                // The discriminator arrives on the filter, not from the
+                // entity: `ScopeFilter::in_group_of_type` carries the GTS
+                // resource type the PEP named to the PDP for this very
+                // request (`PolicyEnforcer::access_scope` -> `ResourceType::
+                // name`). Taking it from there keeps the uncorrelated `IN`
+                // shape -- reading the entity's own `type_col()` would have
+                // forced a correlated `EXISTS`, and only one entity in the
+                // monorepo declares that column at all.
                 //
-                // The information that WOULD generically resolve this -- which
-                // GTS type the group-membership predicate concerns -- lives on
-                // the PDP/PEP wire contract instead: `InGroupPredicate` /
-                // `InGroupSubtreePredicate` (authz-resolver-sdk) and their
-                // mirrors `InGroupScopeFilter` / `InGroupSubtreeScopeFilter`
-                // (toolkit-security) carry only a property name and group/
-                // ancestor IDs, with no resource-type discriminator (see
-                // `tr-authz-plugin`'s `append_group_predicates`, which builds
-                // these predicates from request-context group IDs alone,
-                // agnostic of the resource kind being authorized). Threading
-                // a GTS type through would mean extending that public
-                // contract, which is out of scope for this fix (breaking
-                // `toolkit-security`'s public API is explicitly disallowed
-                // here). Left as a follow-up requiring a PDP/PEP contract
-                // change; tracked under VHP-2344.
+                // `gts_type() == None` means the caller did not say, and the
+                // predicate then behaves exactly as it did before the
+                // discriminator existed rather than narrowing to a guess.
                 let group_values = scope_values_to_sea_values(gf.group_ids());
-                let subquery = Query::select()
+                let mut subquery = Query::select()
                     .column(Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID))
                     .from(Alias::new(rg_tables::MEMBERSHIP_TABLE))
                     .and_where(
                         Expr::col(Alias::new(rg_tables::MEMBERSHIP_GROUP_ID)).is_in(group_values),
                     )
                     .to_owned();
+                // Defect B: without the type discriminator the subquery
+                // matches any membership row sharing the `resource_id`
+                // string, whatever GTS type it was recorded for.
+                if let Some(t) = gf.gts_type() {
+                    subquery.and_where(gts_type_id_eq(t));
+                }
                 and_cond = and_cond.add(
                     col.into_expr()
                         .cast_as(Alias::new("text"))
@@ -187,9 +168,9 @@ where
                 //                          WHERE ancestor_id IN (...)
                 //                        ))
                 //
-                // Same `uuid = text` cast (defect A) and same un-fixed
-                // cross-GTS-type ambiguity (defect B) as `InGroup` above --
-                // see the extended comment there for the full rationale.
+                // Same `uuid = text` cast (defect A) and same GTS-type
+                // discriminator (defect B) as `InGroup` above -- see the
+                // extended comment there for the full rationale.
                 let ancestor_values = scope_values_to_sea_values(sf.ancestor_ids());
                 let closure_subquery = Query::select()
                     .column(Alias::new(rg_tables::CLOSURE_DESCENDANT_ID))
@@ -199,7 +180,7 @@ where
                             .is_in(ancestor_values),
                     )
                     .to_owned();
-                let membership_subquery = Query::select()
+                let mut membership_subquery = Query::select()
                     .column(Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID))
                     .from(Alias::new(rg_tables::MEMBERSHIP_TABLE))
                     .and_where(
@@ -207,6 +188,11 @@ where
                             .in_subquery(closure_subquery),
                     )
                     .to_owned();
+                // Defect B, subtree branch -- same discriminator as the
+                // `InGroup` branch above.
+                if let Some(t) = sf.gts_type() {
+                    membership_subquery.and_where(gts_type_id_eq(t));
+                }
                 and_cond = and_cond.add(
                     col.into_expr()
                         .cast_as(Alias::new("text"))
@@ -256,6 +242,29 @@ where
         }
     }
     Some(and_cond)
+}
+
+/// `gts_type_id = (SELECT id FROM gts_type WHERE schema_id = <path>)`.
+///
+/// Resolution happens inside SQL rather than ahead of the query, which is
+/// a deliberate departure from the "resolve a string domain identifier
+/// before the query" rule in `docs/toolkit_unified_system/14_security_review_checklist.md`
+/// (S5.2). That rule assumes the caller *can* resolve: here it cannot.
+/// `gts_type_id` is a surrogate private to the resource-group database,
+/// and the PEP applying this filter generally lives in another gear that
+/// has no way to map a GTS path onto it.
+///
+/// An unknown path therefore yields no row, the comparison is never true,
+/// and the predicate matches nothing. That is the safe direction for an
+/// authorization filter -- it denies rather than widens -- but it is a
+/// silent denial, so it is stated here rather than left to be discovered.
+fn gts_type_id_eq(gts_type: &str) -> sea_orm::sea_query::SimpleExpr {
+    let type_subquery = Query::select()
+        .column(Alias::new(rg_tables::TYPE_ID))
+        .from(Alias::new(rg_tables::TYPE_TABLE))
+        .and_where(Expr::col(Alias::new(rg_tables::TYPE_SCHEMA_ID)).eq(gts_type))
+        .to_owned();
+    Expr::col(Alias::new(rg_tables::MEMBERSHIP_GTS_TYPE_ID)).in_subquery(type_subquery)
 }
 
 #[cfg(test)]
@@ -442,6 +451,71 @@ mod tests {
             cond_str.contains("func: Cast") && cond_str.contains(r#"Custom("text")"#),
             "InGroup must CAST the entity column to text before comparing against \
              resource_id, got: {cond_str}"
+        );
+    }
+
+    /// VHP-2344 defect B: a filter carrying a GTS resource type must
+    /// restrict the membership subquery to that type, so a
+    /// same-`resource_id` row of another type cannot satisfy it.
+    #[test]
+    fn test_in_group_of_type_restricts_membership_to_that_gts_type() {
+        let group_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+            ScopeFilter::in_group_of_type(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(group_id)],
+                "gts.cf.core.files.file.v1~",
+            ),
+        ])]);
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("gts_type_id"),
+            "typed InGroup must discriminate on gts_type_id, got: {cond_str}"
+        );
+        assert!(
+            cond_str.contains("gts_type") && cond_str.contains("schema_id"),
+            "the type path must be resolved through gts_type.schema_id, got: {cond_str}"
+        );
+    }
+
+    /// The untyped constructor stays as it was: a caller that does not
+    /// know the resource type gets the pre-existing behaviour rather than
+    /// a silent narrowing to some default type.
+    #[test]
+    fn test_in_group_without_type_does_not_discriminate() {
+        let group_id = uuid::Uuid::new_v4();
+        let scope =
+            AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::in_group(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(group_id)],
+            )])]);
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            !cond_str.contains("gts_type_id"),
+            "untyped InGroup must not add a type discriminator, got: {cond_str}"
+        );
+    }
+
+    /// Same discriminator on the subtree variant, which reaches the
+    /// membership table through the closure subquery.
+    #[test]
+    fn test_in_group_subtree_of_type_restricts_membership_to_that_gts_type() {
+        let ancestor_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+            ScopeFilter::in_group_subtree_of_type(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(ancestor_id)],
+                "gts.cf.core.files.file.v1~",
+            ),
+        ])]);
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("resource_group_closure") && cond_str.contains("gts_type_id"),
+            "typed InGroupSubtree must keep the closure subquery and add the type \
+             discriminator, got: {cond_str}"
         );
     }
 

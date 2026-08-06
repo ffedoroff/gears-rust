@@ -184,6 +184,44 @@ impl ScopableEntity for closure_ent::Entity {
     }
 }
 
+/// Mirror of resource-group's `gts_type` table -- the surrogate the
+/// membership row stores, and the only way to turn the GTS path a
+/// `ScopeFilter` carries into it.
+mod gts_type_ent {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "gts_type")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: i16,
+        pub schema_id: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+impl ScopableEntity for gts_type_ent::Entity {
+    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
+        None
+    }
+    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
+        None
+    }
+    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
+        None
+    }
+    fn type_col() -> Option<<Self as EntityTrait>::Column> {
+        None
+    }
+    fn resolve_property(_property: &str) -> Option<<Self as EntityTrait>::Column> {
+        None
+    }
+}
+
 struct CreateFixtures;
 
 impl mig::MigrationName for CreateFixtures {
@@ -220,6 +258,11 @@ CREATE TABLE IF NOT EXISTS resource_group_closure (
     descendant_id UUID NOT NULL,
     PRIMARY KEY (ancestor_id, descendant_id)
 );
+
+CREATE TABLE IF NOT EXISTS gts_type (
+    id SMALLINT PRIMARY KEY,
+    schema_id TEXT NOT NULL UNIQUE
+);
                 ",
             )
             .await?;
@@ -231,6 +274,7 @@ CREATE TABLE IF NOT EXISTS resource_group_closure (
             .get_connection()
             .execute_unprepared(
                 r"
+DROP TABLE IF EXISTS gts_type;
 DROP TABLE IF EXISTS resource_group_closure;
 DROP TABLE IF EXISTS resource_group_membership;
 DROP TABLE IF EXISTS secure_group_scope_pg_resource;
@@ -267,6 +311,15 @@ async fn seed_membership(
         resource_id: Set(resource_id.to_string()),
     };
     secure_insert::<membership_ent::Entity>(am, &AccessScope::allow_all(), conn).await?;
+    Ok(())
+}
+
+async fn seed_gts_type(conn: &impl DBRunner, id: i16, schema_id: &str) -> Result<(), ScopeError> {
+    let am = gts_type_ent::ActiveModel {
+        id: Set(id),
+        schema_id: Set(schema_id.to_owned()),
+    };
+    secure_insert::<gts_type_ent::Entity>(am, &AccessScope::allow_all(), conn).await?;
     Ok(())
 }
 
@@ -398,6 +451,167 @@ async fn in_group_subtree_filter_executes_on_postgres() -> Result<()> {
              defect A (uuid = text mismatch) is unfixed: {e}"
         ),
     }
+
+    Ok(())
+}
+
+// === VHP-2344 defect B: cross-GTS-type ambiguity ===
+
+/// Defect B: `resource_group_membership` is keyed by the triple
+/// `(group_id, gts_type_id, resource_id)`, but a subquery filtered on
+/// `group_id` alone cannot tell two resources of different GTS types apart
+/// when they share a `resource_id` string. `resource_id` is `TEXT` and
+/// deliberately untyped, so a collision is ordinary rather than exotic --
+/// two gears may legitimately use the same identifier for objects of their
+/// own kinds.
+///
+/// The scenario below is the minimal one that distinguishes a fixed
+/// implementation from a broken one: **one** resource row, **one** group,
+/// and a membership recorded for a *different* GTS type than the one the
+/// caller is scoping. The unfixed predicate matches it (the group and the
+/// resource_id both line up); the fixed predicate does not.
+///
+/// Only a real backend can settle this. SQLite would agree with either
+/// implementation here, because both produce valid SQL -- unlike defect A,
+/// which SQLite hid by silently coercing types. What is at stake is the
+/// *result set*, not whether the statement parses, which is why the shape
+/// assertions in `cond.rs`'s unit tests cannot discharge it either.
+#[tokio::test]
+async fn in_group_of_type_excludes_a_same_id_resource_of_another_type() -> Result<()> {
+    let dut = common::bring_up_postgres().await?;
+    let db = connect_db(&dut.url, ConnectOpts::default()).await?;
+    run_migrations_for_testing(&db, vec![Box::new(CreateFixtures)]).await?;
+
+    let conn = db.conn().context("acquire db conn")?;
+
+    const FILE_TYPE: &str = "gts.cf.core.files.file.v1~";
+    const NOTE_TYPE: &str = "gts.cf.core.notes.note.v1~";
+    let file_type_id: i16 = 1;
+    let note_type_id: i16 = 2;
+
+    seed_gts_type(&conn, file_type_id, FILE_TYPE)
+        .await
+        .context("seed file type")?;
+    seed_gts_type(&conn, note_type_id, NOTE_TYPE)
+        .await
+        .context("seed note type")?;
+
+    let tenant_id = Uuid::new_v4();
+    let group_id = Uuid::new_v4();
+    // One identifier, shared by two conceptually different objects. The
+    // scoped entity holds the file; the membership row was recorded for the
+    // note.
+    let shared_id = Uuid::new_v4();
+
+    seed_resource(&conn, shared_id, tenant_id)
+        .await
+        .context("seed resource row")?;
+    seed_membership(&conn, group_id, note_type_id, shared_id)
+        .await
+        .context("seed membership for the OTHER gts type")?;
+
+    // Scoping files: the only membership row in this group belongs to a
+    // note, so nothing may come back.
+    let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+        ScopeFilter::in_group_of_type(
+            pep_properties::RESOURCE_ID,
+            vec![ScopeValue::Uuid(group_id)],
+            FILE_TYPE,
+        ),
+    ])]);
+
+    let rows = resource_ent::Entity::find()
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
+        .await
+        .context(
+            "typed InGroup must produce SQL PostgreSQL accepts -- a gts_type_id \
+             comparison against the gts_type subquery is smallint = smallint",
+        )?;
+
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    assert!(
+        ids.is_empty(),
+        "VHP-2344 defect B: a membership recorded for {NOTE_TYPE} must not satisfy a \
+         filter scoping {FILE_TYPE}, even though both name resource_id {shared_id}; \
+         got: {ids:?}"
+    );
+
+    // Control: the same query for the type the membership *was* recorded
+    // for must still return the row. Without this, an implementation that
+    // matched nothing at all would pass the assertion above.
+    let note_scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+        ScopeFilter::in_group_of_type(
+            pep_properties::RESOURCE_ID,
+            vec![ScopeValue::Uuid(group_id)],
+            NOTE_TYPE,
+        ),
+    ])]);
+    let note_rows = resource_ent::Entity::find()
+        .secure()
+        .scope_with(&note_scope)
+        .all(&conn)
+        .await
+        .context("typed InGroup for the matching type")?;
+    assert_eq!(
+        note_rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![shared_id],
+        "the discriminator must not over-restrict: the membership's own type must match"
+    );
+
+    Ok(())
+}
+
+/// An unresolvable GTS path matches nothing rather than erroring or
+/// matching everything.
+///
+/// This is the documented consequence of resolving the path inside SQL --
+/// see `gts_type_id_eq` in `cond.rs` for why the resolution cannot happen
+/// before the query, and `14_security_review_checklist.md` S5.2 for the
+/// rule it departs from. Fail-closed is the safe direction for an
+/// authorization filter, but it is silent, so it is pinned here.
+#[tokio::test]
+async fn in_group_of_unknown_type_matches_nothing() -> Result<()> {
+    let dut = common::bring_up_postgres().await?;
+    let db = connect_db(&dut.url, ConnectOpts::default()).await?;
+    run_migrations_for_testing(&db, vec![Box::new(CreateFixtures)]).await?;
+
+    let conn = db.conn().context("acquire db conn")?;
+
+    let tenant_id = Uuid::new_v4();
+    let group_id = Uuid::new_v4();
+    let resource_id = Uuid::new_v4();
+    seed_gts_type(&conn, 1, "gts.cf.core.files.file.v1~")
+        .await
+        .context("seed file type")?;
+    seed_resource(&conn, resource_id, tenant_id)
+        .await
+        .context("seed resource row")?;
+    seed_membership(&conn, group_id, 1, resource_id)
+        .await
+        .context("seed membership row")?;
+
+    let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+        ScopeFilter::in_group_of_type(
+            pep_properties::RESOURCE_ID,
+            vec![ScopeValue::Uuid(group_id)],
+            "gts.cf.core.nonesuch.v1~",
+        ),
+    ])]);
+
+    let rows = resource_ent::Entity::find()
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
+        .await
+        .context("an unregistered type must not make the statement invalid")?;
+
+    assert!(
+        rows.is_empty(),
+        "an unresolvable GTS path must deny, not widen: {:?}",
+        rows.iter().map(|r| r.id).collect::<Vec<_>>()
+    );
 
     Ok(())
 }
