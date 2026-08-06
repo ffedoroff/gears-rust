@@ -51,9 +51,6 @@ pub enum DomainError {
     #[error("Group not found: {id}")]
     GroupNotFound { id: uuid::Uuid },
 
-    #[error("Group already exists: {id}")]
-    GroupAlreadyExists { id: uuid::Uuid },
-
     /// Target tenant from an explicit `CreateGroupRequest::tenant_id` is
     /// outside the caller's `create`-action `AccessScope` (VHP-2162).
     ///
@@ -220,11 +217,6 @@ impl DomainError {
     #[must_use]
     pub fn group_not_found(id: uuid::Uuid) -> Self {
         Self::GroupNotFound { id }
-    }
-
-    #[must_use]
-    pub fn group_already_exists(id: uuid::Uuid) -> Self {
-        Self::GroupAlreadyExists { id }
     }
 
     #[must_use]

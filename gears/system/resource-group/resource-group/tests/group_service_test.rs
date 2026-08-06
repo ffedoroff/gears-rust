@@ -3077,7 +3077,7 @@ async fn get_group_unscoped_missing_is_not_found() {
 #[tokio::test]
 async fn group_create_duplicate_id_is_already_exists() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let tenant_a = Uuid::now_v7();
@@ -3092,6 +3092,7 @@ async fn group_create_duplicate_id_is_already_exists() {
         code: root_type.code.clone(),
         name: name.to_owned(),
         parent_id: None,
+        tenant_id: None,
         metadata: None,
     };
 
@@ -3129,7 +3130,7 @@ async fn group_create_duplicate_id_is_already_exists() {
 #[tokio::test]
 async fn group_create_duplicate_id_same_tenant_is_already_exists() {
     let db = common::test_db().await;
-    let type_svc = TypeService::new(db.clone(), Arc::new(TypeRepository));
+    let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
 
     let tenant = Uuid::now_v7();
@@ -3142,6 +3143,7 @@ async fn group_create_duplicate_id_same_tenant_is_already_exists() {
         code: root_type.code.clone(),
         name: name.to_owned(),
         parent_id: None,
+        tenant_id: None,
         metadata: None,
     };
 

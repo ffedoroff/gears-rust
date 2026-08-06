@@ -124,11 +124,6 @@ impl From<DomainError> for CanonicalError {
             DomainError::DuplicateMembership { key, message } => {
                 RgError::already_exists(message).with_resource(key).create()
             }
-            DomainError::GroupAlreadyExists { id } => {
-                RgError::already_exists(format!("Resource group with id '{id}' already exists"))
-                    .with_resource(id.to_string())
-                    .create()
-            }
             // VHP-2345: the conflicting root's **id never reaches the wire**.
             // It comes from `find_root_id_with_type_prefix`, which deliberately
             // bypasses `SecureORM` (tenant-root uniqueness is a forest-wide
