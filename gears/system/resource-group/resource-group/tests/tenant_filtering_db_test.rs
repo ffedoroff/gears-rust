@@ -438,7 +438,11 @@ async fn group_based_in_group_predicate_produces_combined_scope() {
     let authz: Arc<dyn AuthZResolverClient> = Arc::new(GroupScopingAuthZ {
         allowed_group_ids: vec![group_a, group_b],
     });
-    let enforcer = PolicyEnforcer::new(authz);
+    // The InGroup predicate compiles to a subquery over
+    // `resource_group_membership`; a PEP that does not declare the
+    // capability is refused it (fail-closed). RG hosts that table.
+    let enforcer = PolicyEnforcer::new(authz)
+        .with_capabilities(vec![authz_resolver_sdk::Capability::GroupMembership]);
     let ctx = make_ctx(tenant_id);
 
     let scope = enforcer

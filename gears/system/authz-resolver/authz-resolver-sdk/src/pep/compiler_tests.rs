@@ -30,7 +30,7 @@ fn no_require_constraints_empty_returns_allow_all() {
         context: EvaluationResponseContext::default(),
     };
 
-    let scope = compile_to_access_scope(&response, false, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, false, DEFAULT_PROPS, &[], None).unwrap();
     assert!(scope.is_unconstrained());
 }
 
@@ -49,7 +49,7 @@ fn no_require_constraints_with_constraints_compiles_them() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, false, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, false, DEFAULT_PROPS, &[], None).unwrap();
     assert!(!scope.is_unconstrained());
     assert_eq!(
         scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
@@ -64,7 +64,7 @@ fn decision_true_require_constraints_empty_returns_error() {
         context: EvaluationResponseContext::default(),
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(matches!(
         result,
         Err(ConstraintCompileError::ConstraintsRequiredButAbsent)
@@ -88,7 +88,7 @@ fn single_tenant_eq_constraint() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     assert_eq!(
         scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
         &[uuid(T1)]
@@ -119,7 +119,7 @@ fn multiple_tenants_in_constraint() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     assert_eq!(
         scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
         &[uuid(T1), uuid(T2)]
@@ -141,7 +141,7 @@ fn resource_id_eq_constraint() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     assert!(
         scope
             .all_uuid_values_for(pep_properties::OWNER_TENANT_ID)
@@ -180,7 +180,7 @@ fn multiple_constraints_produce_or_scope() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     // Each constraint is a separate ScopeConstraint (ORed)
     assert_eq!(scope.constraints().len(), 2);
     // Both tenants accessible
@@ -203,7 +203,7 @@ fn unknown_predicate_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(matches!(
         result,
         Err(ConstraintCompileError::AllConstraintsFailed { .. })
@@ -236,7 +236,7 @@ fn mixed_known_and_unknown_constraints() {
     };
 
     // Should succeed - the second constraint compiled
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     assert_eq!(
         scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
         &[uuid(T2)]
@@ -264,7 +264,7 @@ fn both_tenant_and_resource_in_single_constraint() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     // Single constraint with both properties (AND)
     assert_eq!(scope.constraints().len(), 1);
     assert_eq!(
@@ -307,7 +307,7 @@ fn mixed_shape_constraints_produce_or_scope() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     assert_eq!(scope.constraints().len(), 2);
     // First constraint has 2 filters (AND), second has 1 filter
     assert_eq!(scope.constraints()[0].filters().len(), 2);
@@ -334,7 +334,14 @@ fn in_group_predicate_compiles_to_in_group_filter() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        &[Capability::GroupMembership],
+        None,
+    )
+    .unwrap();
     assert_eq!(scope.constraints().len(), 1);
     let filter = &scope.constraints()[0].filters()[0];
     assert!(
@@ -362,7 +369,14 @@ fn in_group_subtree_predicate_compiles_to_subtree_filter() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        &[Capability::GroupHierarchy],
+        None,
+    )
+    .unwrap();
     assert_eq!(scope.constraints().len(), 1);
     let filter = &scope.constraints()[0].filters()[0];
     assert!(
@@ -394,7 +408,14 @@ fn tenant_plus_in_group_in_single_constraint() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        &[Capability::GroupMembership],
+        None,
+    )
+    .unwrap();
     assert_eq!(scope.constraints().len(), 1);
     // Constraint should have 2 filters: In(tenant) AND InGroup(resource)
     assert_eq!(scope.constraints()[0].filters().len(), 2);
@@ -418,7 +439,7 @@ fn supported_properties_validation() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, limited_props);
+    let result = compile_to_access_scope(&response, true, limited_props, &[], None);
     assert!(matches!(
         result,
         Err(ConstraintCompileError::AllConstraintsFailed { .. })
@@ -442,7 +463,7 @@ fn empty_in_values_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(
         matches!(
             result,
@@ -469,7 +490,7 @@ fn empty_in_group_ids_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(
         matches!(
             result,
@@ -500,7 +521,7 @@ fn in_tenant_subtree_predicate_compiles_to_subtree_filter_respecting_barriers() 
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     assert_eq!(scope.constraints().len(), 1);
     let filter = &scope.constraints()[0].filters()[0];
     match filter {
@@ -533,7 +554,7 @@ fn in_tenant_subtree_predicate_ignore_barriers_propagates_to_filter() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     let filter = &scope.constraints()[0].filters()[0];
     match filter {
         ScopeFilter::InTenantSubtree(sf) => {
@@ -569,7 +590,7 @@ fn in_tenant_subtree_with_descendant_status_compiles_to_smallint_filter() {
         },
     };
 
-    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS).unwrap();
+    let scope = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None).unwrap();
     let filter = &scope.constraints()[0].filters()[0];
     match filter {
         ScopeFilter::InTenantSubtree(sf) => {
@@ -604,7 +625,7 @@ fn in_tenant_subtree_non_uuid_root_bool_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(
         matches!(
             result,
@@ -634,7 +655,7 @@ fn in_tenant_subtree_non_uuid_root_int_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(
         matches!(
             result,
@@ -664,7 +685,7 @@ fn in_tenant_subtree_non_uuid_root_string_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(
         matches!(
             result,
@@ -694,7 +715,7 @@ fn in_tenant_subtree_non_uuid_root_null_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(
         matches!(
             result,
@@ -724,7 +745,7 @@ fn in_tenant_subtree_non_uuid_root_array_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(
         matches!(
             result,
@@ -751,12 +772,78 @@ fn empty_in_group_subtree_ancestor_ids_fails_constraint() {
         },
     };
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None);
     assert!(
         matches!(
             result,
             Err(ConstraintCompileError::AllConstraintsFailed { .. })
         ),
         "empty InGroupSubtree ancestor_ids must fail-closed, got: {result:?}"
+    );
+}
+
+// === Capability gating on group predicates ===
+
+/// A PEP that never declared `GroupMembership` has no
+/// `resource_group_membership` table to join against, so a predicate that
+/// would compile to a subquery over it must be refused rather than turned
+/// into SQL that fails at execution time. A rejected constraint is
+/// fail-closed; an unexecutable one is not.
+#[test]
+fn in_group_predicate_without_capability_fails_closed() {
+    use crate::constraints::InGroupPredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![Predicate::InGroup(InGroupPredicate {
+                    property: pep_properties::RESOURCE_ID.to_owned(),
+                    group_ids: vec![jid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")],
+                })],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let err = compile_to_access_scope(&response, true, DEFAULT_PROPS, &[], None)
+        .expect_err("InGroup without GroupMembership must fail closed");
+    assert!(
+        matches!(err, ConstraintCompileError::AllConstraintsFailed { .. }),
+        "expected AllConstraintsFailed, got: {err:?}"
+    );
+}
+
+/// Same rule for the subtree variant, which additionally needs
+/// `resource_group_closure`. Declaring `GroupMembership` alone is not
+/// enough -- the two capabilities gate different tables.
+#[test]
+fn in_group_subtree_predicate_without_capability_fails_closed() {
+    use crate::constraints::InGroupSubtreePredicate;
+
+    let response = EvaluationResponse {
+        decision: true,
+        context: EvaluationResponseContext {
+            constraints: vec![Constraint {
+                predicates: vec![Predicate::InGroupSubtree(InGroupSubtreePredicate {
+                    property: pep_properties::RESOURCE_ID.to_owned(),
+                    ancestor_ids: vec![jid("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")],
+                })],
+            }],
+            ..Default::default()
+        },
+    };
+
+    let err = compile_to_access_scope(
+        &response,
+        true,
+        DEFAULT_PROPS,
+        &[Capability::GroupMembership],
+        None,
+    )
+    .expect_err("InGroupSubtree without GroupHierarchy must fail closed");
+    assert!(
+        matches!(err, ConstraintCompileError::AllConstraintsFailed { .. }),
+        "expected AllConstraintsFailed, got: {err:?}"
     );
 }

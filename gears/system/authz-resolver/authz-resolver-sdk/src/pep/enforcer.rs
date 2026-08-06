@@ -405,6 +405,13 @@ impl PolicyEnforcer {
             &response,
             require,
             resource.supported_properties,
+            &self.capabilities,
+            // The GTS resource type this PEP just named to the PDP. It is
+            // what disambiguates a membership row keyed by
+            // `(group_id, gts_type_id, resource_id)` from a same-id row of
+            // another type -- and the PEP has always known it, the value
+            // was simply dropped on the way into the compiler.
+            Some(resource.name()),
         )?)
     }
 }

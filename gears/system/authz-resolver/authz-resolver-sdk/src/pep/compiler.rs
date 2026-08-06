@@ -37,7 +37,7 @@
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue};
 
 use crate::constraints::{Constraint, Predicate};
-use crate::models::{BarrierMode, EvaluationResponse};
+use crate::models::{BarrierMode, Capability, EvaluationResponse};
 
 /// Error during constraint compilation.
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +79,8 @@ pub fn compile_to_access_scope(
     response: &EvaluationResponse,
     require_constraints: bool,
     supported_properties: &[&str],
+    capabilities: &[Capability],
+    resource_type: Option<&str>,
 ) -> Result<AccessScope, ConstraintCompileError> {
     // Step 1: Handle empty constraints based on require_constraints flag.
     if response.context.constraints.is_empty() {
@@ -93,7 +95,12 @@ pub fn compile_to_access_scope(
     let mut fail_reasons: Vec<String> = Vec::new();
 
     for constraint in &response.context.constraints {
-        match compile_constraint(constraint, supported_properties) {
+        match compile_constraint(
+            constraint,
+            supported_properties,
+            capabilities,
+            resource_type,
+        ) {
             Ok(sc) => constraints.push(sc),
             Err(reason) => {
                 tracing::warn!(
@@ -127,6 +134,8 @@ pub fn compile_to_access_scope(
 fn compile_constraint(
     constraint: &Constraint,
     supported_properties: &[&str],
+    capabilities: &[Capability],
+    resource_type: Option<&str>,
 ) -> Result<ScopeConstraint, String> {
     let mut filters = Vec::new();
 
@@ -151,6 +160,20 @@ fn compile_constraint(
                 (p.property.as_str(), ScopeFilter::r#in(&p.property, values))
             }
             Predicate::InGroup(p) => {
+                // A group predicate compiles to a subquery against
+                // `resource_group_membership` in this gear's own database.
+                // A PEP that did not declare `GroupMembership` has no such
+                // table, so compiling it would emit SQL that errors at
+                // execution time instead of producing a decision. Refuse
+                // here: a rejected constraint is fail-closed, an
+                // unexecutable one is not.
+                if !capabilities.contains(&Capability::GroupMembership) {
+                    return Err(format!(
+                        "InGroup predicate on '{}' received without the GroupMembership \
+                         capability being declared (fail-closed)",
+                        p.property
+                    ));
+                }
                 let group_ids: Vec<ScopeValue> = p
                     .group_ids
                     .iter()
@@ -164,10 +187,22 @@ fn compile_constraint(
                 }
                 (
                     p.property.as_str(),
-                    ScopeFilter::in_group(&p.property, group_ids),
+                    resource_type.map_or_else(
+                        || ScopeFilter::in_group(&p.property, group_ids.clone()),
+                        |t| ScopeFilter::in_group_of_type(&p.property, group_ids.clone(), t),
+                    ),
                 )
             }
             Predicate::InGroupSubtree(p) => {
+                // Same rule as `InGroup`, against `resource_group_closure`
+                // plus `resource_group_membership`.
+                if !capabilities.contains(&Capability::GroupHierarchy) {
+                    return Err(format!(
+                        "InGroupSubtree predicate on '{}' received without the GroupHierarchy \
+                         capability being declared (fail-closed)",
+                        p.property
+                    ));
+                }
                 let ancestor_ids: Vec<ScopeValue> = p
                     .ancestor_ids
                     .iter()
@@ -181,7 +216,16 @@ fn compile_constraint(
                 }
                 (
                     p.property.as_str(),
-                    ScopeFilter::in_group_subtree(&p.property, ancestor_ids),
+                    resource_type.map_or_else(
+                        || ScopeFilter::in_group_subtree(&p.property, ancestor_ids.clone()),
+                        |t| {
+                            ScopeFilter::in_group_subtree_of_type(
+                                &p.property,
+                                ancestor_ids.clone(),
+                                t,
+                            )
+                        },
+                    ),
                 )
             }
             Predicate::InTenantSubtree(p) => {

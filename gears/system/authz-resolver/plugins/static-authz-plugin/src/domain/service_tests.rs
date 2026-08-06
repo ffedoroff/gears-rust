@@ -186,7 +186,7 @@ fn empty_constraint_set_compiles_to_allow_all_when_constraints_are_not_required(
     let service = Service::new();
     let response = service.evaluate(&make_request(false, Some(tenant_id)));
 
-    let scope = compile_to_access_scope(&response, false, &[]).expect("compiles");
+    let scope = compile_to_access_scope(&response, false, &[], &[], None).expect("compiles");
 
     assert!(scope.is_unconstrained());
 }
@@ -200,7 +200,7 @@ fn empty_constraint_set_is_denied_by_the_pep_compiler_when_constraints_are_requi
     let service = Service::new();
     let response = service.evaluate(&make_request(true, Some(tenant_id)));
 
-    let err = compile_to_access_scope(&response, true, &[]).expect_err("fails closed");
+    let err = compile_to_access_scope(&response, true, &[], &[], None).expect_err("fails closed");
 
     assert!(
         matches!(err, ConstraintCompileError::ConstraintsRequiredButAbsent),
@@ -260,8 +260,9 @@ fn require_constraints_false_still_clamps_when_only_the_subtree_predicate_binds(
 
     // Composition guard: dropping the dead baseline must not widen the compiled
     // scope to `allow_all`.
-    let scope = compile_to_access_scope(&response, false, &[pep_properties::RESOURCE_ID])
-        .expect("compiles");
+    let scope =
+        compile_to_access_scope(&response, false, &[pep_properties::RESOURCE_ID], &[], None)
+            .expect("compiles");
     assert!(!scope.is_unconstrained());
     assert_eq!(scope.constraints().len(), 1);
 }
