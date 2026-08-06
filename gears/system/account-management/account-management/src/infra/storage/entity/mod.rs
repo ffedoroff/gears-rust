@@ -7,6 +7,7 @@
 pub mod am_leases;
 pub mod conversion_requests;
 pub mod tenant_closure;
+pub mod tenant_id_tombstone;
 pub mod tenant_idp_metadata;
 pub mod tenant_metadata;
 pub mod tenants;

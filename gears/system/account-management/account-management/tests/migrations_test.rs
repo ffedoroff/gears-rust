@@ -192,13 +192,14 @@ async fn m0006_up_down_up_roundtrip_preserves_audit_columns() {
     .await
     .expect("audit columns exist after first up");
 
-    // Roll back three steps — m0008 (drop `integrity_check_runs`), m0007
-    // (`am_leases`), then m0006 (the audit columns under test). SeaORM's
-    // tracker (`seaql_migrations`) is the source of truth for "which is
-    // last"; m0007/m0008 landed after m0006 (AM lease port), so the step
-    // count was bumped 1 → 3. A further migration after m0008 would shift
-    // this again and the test would need updating alongside.
-    Migrator::down(&db, Some(3))
+    // Roll back four steps — m0009 (`tenant_id_tombstone`), m0008 (drop
+    // `integrity_check_runs`), m0007 (`am_leases`), then m0006 (the audit
+    // columns under test). SeaORM's tracker (`seaql_migrations`) is the
+    // source of truth for "which is last"; each migration that lands after
+    // m0006 pushes this count up by one — 1 → 3 for the AM lease port,
+    // 3 → 4 for the tenant-identifier tombstone. A further migration after
+    // m0009 would shift it again and the test would need updating alongside.
+    Migrator::down(&db, Some(4))
         .await
         .expect("down to pre-m0006");
 

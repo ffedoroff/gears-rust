@@ -29,6 +29,7 @@ mod common;
 
 use std::time::Duration;
 
+use account_management::domain::error::DomainError;
 use account_management::domain::tenant::TenantRepo;
 use account_management::domain::tenant::closure::build_activation_rows;
 use account_management::domain::tenant::model::{NewTenant, TenantStatus};
@@ -655,6 +656,105 @@ async fn hard_delete_one_cleans_tenant_and_closure_rows() {
         !surviving.contains(&leaf),
         "leaf tenant must not survive hard-delete"
     );
+}
+
+// ---------------------------------------------------------------------
+// Identifier retirement — a hard-deleted tenant's id is recorded in
+// `tenant_id_tombstone` and can never be issued again
+// (`cpt-cf-account-management-fr-tenant-import-external-id`,
+// constraint 2).
+//
+// This matters because tenant identifiers are caller-supplied on the
+// import path: once the `tenants` row is gone, its primary key no
+// longer guards uniqueness, and an import that reused the identifier
+// would silently re-point every audit record, external reference and
+// cached authorization decision that still names it at an unrelated
+// tenant.
+//
+// The reuse is attempted through `insert_provisioning`, which is the
+// single transactional entry point for a new tenant row — covering the
+// bootstrap-root, child-create and import paths in one place.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_deleted_tenant_id_cannot_be_reused() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    let leaf = Uuid::new_v4();
+    seed_root_directly(&h, root).await;
+    create_active_child(&h, leaf, root, "leaf", false, 1).await;
+
+    let scheduled_at = OffsetDateTime::now_utc();
+    h.repo
+        .schedule_deletion(
+            &allow_all(),
+            leaf,
+            Uuid::nil(),
+            scheduled_at,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .expect("schedule_deletion");
+
+    let worker_id = Uuid::new_v4();
+    stamp_retention_claim(&h.provider, leaf, worker_id, scheduled_at)
+        .await
+        .expect("stamp retention claim");
+
+    let outcome = h
+        .repo
+        .hard_delete_one(&allow_all(), leaf, worker_id)
+        .await
+        .expect("hard_delete_one");
+    assert_eq!(outcome, HardDeleteOutcome::Cleaned);
+    assert!(
+        fetch_tenant(&h.provider, leaf).await.unwrap().is_none(),
+        "precondition: the tenants row is gone, so its primary key no \
+         longer prevents reuse"
+    );
+
+    // Re-creating a tenant under the same id must be refused.
+    let reused = NewTenant {
+        id: leaf,
+        parent_id: Some(root),
+        name: "imported-under-a-retired-id".to_owned(),
+        self_managed: false,
+        tenant_type_uuid: tenant_type_uuid(),
+        depth: 1,
+    };
+    let err = h
+        .repo
+        .insert_provisioning(&allow_all(), &reused)
+        .await
+        .expect_err("a retired tenant id must not be reusable");
+
+    match &err {
+        DomainError::AlreadyExists { detail } => {
+            assert!(
+                detail.contains(&leaf.to_string()),
+                "rejection must name the identifier the caller supplied: {detail}"
+            );
+            // Constraint 3: the response carries nothing the caller did
+            // not already know. Anything about when or under what name
+            // the identifier was retired would make this an existence
+            // oracle over tenant history.
+            assert!(
+                !detail.contains("imported-under-a-retired-id")
+                    && !detail.contains(&root.to_string()),
+                "rejection must not disclose retirement details: {detail}"
+            );
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+
+    // And the refusal is durable, not a one-shot: the tombstone is
+    // still there for the next attempt.
+    let err_again = h
+        .repo
+        .insert_provisioning(&allow_all(), &reused)
+        .await
+        .expect_err("the tombstone must outlive a single rejected attempt");
+    assert!(matches!(err_again, DomainError::AlreadyExists { .. }));
 }
 
 // ---------------------------------------------------------------------

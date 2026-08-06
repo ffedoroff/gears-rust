@@ -22,7 +22,8 @@ use crate::domain::tenant::closure::ClosureRow;
 use crate::domain::tenant::model::{NewTenant, TenantModel, TenantStatus};
 use crate::domain::tenant::retention::{HardDeleteEligibility, HardDeleteOutcome};
 use crate::infra::storage::entity::{
-    conversion_requests, tenant_closure, tenant_idp_metadata, tenant_metadata, tenants,
+    conversion_requests, tenant_closure, tenant_id_tombstone, tenant_idp_metadata, tenant_metadata,
+    tenants,
 };
 
 use super::TenantRepoImpl;
@@ -116,6 +117,45 @@ pub(super) async fn insert_provisioning(
                         }
                         .into());
                     }
+                }
+
+                // Identifiers are never reused
+                // (`cpt-cf-account-management-fr-tenant-import-external-id`,
+                // constraint 2). `tenants.id` stops guarding this the
+                // moment a hard delete removes the row, and the identifier
+                // here is caller-supplied on the import path, so a retired
+                // one would otherwise be accepted and silently re-point
+                // every audit record and external reference that still
+                // names it. Checked inside the same SERIALIZABLE TX as the
+                // INSERT, so a concurrent hard delete cannot retire the
+                // identifier between the probe and the write.
+                //
+                // The rejection carries only the identifier the caller
+                // already supplied (constraint 3): a message that revealed
+                // when or by whom the identifier was retired would make
+                // this endpoint an existence oracle over the tenant
+                // history.
+                let retired = tenant_id_tombstone::Entity::find()
+                    .secure()
+                    // The tombstone table is
+                    // `no_tenant/no_resource/no_owner/no_type` and holds
+                    // identifiers of tenants that no longer exist, so there
+                    // is nothing for a caller scope to clamp on. A narrowed
+                    // scope here would resolve to "no row" and let the
+                    // reuse through — the precise failure this guard exists
+                    // to prevent.
+                    .scope_with(&AccessScope::allow_all())
+                    .filter(Condition::all().add(tenant_id_tombstone::Column::Id.eq(tenant_id)))
+                    .one(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?;
+                if retired.is_some() {
+                    return Err(DomainError::AlreadyExists {
+                        detail: format!(
+                            "tenant id {tenant_id} has already been issued and cannot be reused"
+                        ),
+                    }
+                    .into());
                 }
 
                 let now = OffsetDateTime::now_utc();
@@ -1130,6 +1170,55 @@ pub(super) async fn hard_delete_one(
                     .exec(tx)
                     .await
                     .map_err(map_scope_to_tx)?;
+
+                // Retire the identifier in the same transaction that
+                // frees it. Deleting the `tenants` row is what makes
+                // the primary key available again; the tombstone is
+                // what keeps it from being handed out
+                // (`cpt-cf-account-management-fr-tenant-import-external-id`,
+                // constraint 2). Writing it anywhere but here would
+                // leave a window in which the identifier is free.
+                //
+                // `on_conflict ... do_nothing` keeps the whole
+                // hard-delete path idempotent: `HardDeleteOutcome::
+                // Cleaned` is already returned for an absent row, and a
+                // retry that reaches this insert a second time must not
+                // turn a completed cleanup into a primary-key error.
+                //
+                // `allow_all` for the same reason as every other write
+                // in this TX — the table is
+                // `no_tenant/no_resource/no_owner/no_type`, so there is
+                // nothing to clamp, and this is the system-actor
+                // retention path.
+                // Probe-then-insert rather than `on_conflict(do_nothing)`:
+                // sea_orm surfaces a no-op conflicting insert as
+                // `DbErr::RecordNotInserted`, which would turn a retried
+                // cleanup into an error. The enclosing TX is SERIALIZABLE,
+                // so there is no window between the probe and the insert.
+                let already_retired = tenant_id_tombstone::Entity::find()
+                    .secure()
+                    .scope_with(&AccessScope::allow_all())
+                    .filter(Condition::all().add(tenant_id_tombstone::Column::Id.eq(id)))
+                    .one(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?;
+                if already_retired.is_none() {
+                    use sea_orm::ActiveValue;
+                    let tombstone = tenant_id_tombstone::ActiveModel {
+                        id: ActiveValue::Set(id),
+                        retired_at: ActiveValue::Set(OffsetDateTime::now_utc()),
+                    };
+                    tenant_id_tombstone::Entity::insert(tombstone)
+                        .secure()
+                        // scope_unchecked for the same reason as the
+                        // `tenants` INSERT: an INSERT cannot clamp on a row
+                        // that does not exist yet.
+                        .scope_unchecked(&AccessScope::allow_all())
+                        .map_err(map_scope_to_tx)?
+                        .exec(tx)
+                        .await
+                        .map_err(map_scope_to_tx)?;
+                }
                 Ok(HardDeleteOutcome::Cleaned)
             })
         })

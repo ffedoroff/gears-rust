@@ -40,6 +40,11 @@
 //!   `domain::integrity_check::coordinator`). PK on `key` lets
 //!   future singleton coordination domains slot in without schema
 //!   work; today the only key is `"hierarchy_integrity"`.
+//! * `m0009_create_tenant_id_tombstone` — `tenant_id_tombstone`, the
+//!   permanent record of retired tenant identifiers. Written inside the
+//!   hard-delete TX and probed on create so an identifier the platform
+//!   has already issued can never be handed out again
+//!   (`cpt-cf-account-management-fr-tenant-import-external-id`).
 //! * `m0008_drop_integrity_check_runs` — drops the legacy
 //!   `integrity_check_runs` table from `m0003`. The coordinator
 //!   above is the only coordination primitive going forward; the
@@ -55,6 +60,7 @@ pub mod m0005_tenant_metadata_indexes;
 pub mod m0006_add_conversion_audit_comments;
 pub mod m0007_create_am_leases;
 pub mod m0008_drop_integrity_check_runs;
+pub mod m0009_create_tenant_id_tombstone;
 
 pub struct Migrator;
 
@@ -70,6 +76,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0006_add_conversion_audit_comments::Migration),
             Box::new(m0007_create_am_leases::Migration),
             Box::new(m0008_drop_integrity_check_runs::Migration),
+            Box::new(m0009_create_tenant_id_tombstone::Migration),
         ]
     }
 }
