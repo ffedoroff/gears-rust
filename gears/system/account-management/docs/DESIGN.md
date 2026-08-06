@@ -1330,6 +1330,34 @@ The physical schema in [migration.sql](./migration.sql) must preserve these inva
 - Conversion lifecycle state is separated from `tenants` so dual-consent history, expiry, and retention can evolve independently of core tenant CRUD.
 - The public contract depends on stable resource projections for administrative reads — Billing and other integrators consume versioned AM APIs rather than the underlying storage. Tenant Resolver is the single platform consumer that reads AM-owned storage directly, and does so over a read-only database role scoped to `tenants` and `tenant_closure`; the canonical closure shape is the contract.
 
+#### Table: `tenant_id_tombstone`
+
+Tenant identifiers the platform has issued and retired. Written inside the
+hard-delete transaction; never pruned, because an identifier that becomes
+reusable defeats the purpose (`cpt-cf-account-management-fr-tenant-import-external-id`).
+
+| Column       | Type        | Description                                |
+| ------------ | ----------- | ------------------------------------------ |
+| `id`         | UUID        | the retired tenant identifier (PK)         |
+| `retired_at` | TIMESTAMPTZ | when it left circulation (forensics only)  |
+
+#### Global tables — who may change them
+
+Entities declared with all four `no_*` markers carry no tenant column, so
+row-level scoping cannot protect them: `.secure().scope_with(scope)` on
+such an entity is a no-op, and the gate above it is the only protection
+(security checklist S2.1/S2.2). Each one therefore has to name its writer.
+
+| Table | Who may change it |
+| --- | --- |
+| `tenant_id_tombstone` | Nobody directly — no API surface. Rows are appended by `hard_delete_one` inside the hard-delete transaction, on the system-actor retention path, and are never updated or deleted. |
+| `tenant_closure` | Maintained transactionally by `TenantRepoImpl` alongside the owning `tenants` write; no independent write path exists. |
+| `am_leases` | The hierarchy-integrity coordinator (`infra::lease`) only. |
+
+The two rows below `tenant_id_tombstone` predate checklist item S2.1 and
+are listed here to make the set complete, not because this change
+introduced them.
+
 ### 3.8 Error Codes Reference
 
 All errors follow the platform RFC 9457 Problem Details format and the

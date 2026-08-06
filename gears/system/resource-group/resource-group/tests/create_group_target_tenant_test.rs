@@ -585,6 +585,27 @@ async fn deleted_tenant_group_id_cannot_be_reused() {
         .await
         .expect("force delete the tenant-typed group");
 
+    // Direct table read rather than an inference from the rejection
+    // below: a scope bug could produce the same rejection for the wrong
+    // reason (`12_unit_testing.md`, "Direct DB assertions").
+    {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use toolkit_db::secure::SecureEntityExt;
+        let conn = db.conn().expect("conn");
+        let row = resource_group::infra::storage::entity::rg_tenant_id_tombstone::Entity::find()
+            .filter(
+                resource_group::infra::storage::entity::rg_tenant_id_tombstone::Column::Id
+                    .eq(tenant_node_id),
+            )
+            .secure()
+            .scope_with(&toolkit_security::AccessScope::allow_all())
+            .one(&conn)
+            .await
+            .expect("read tombstone")
+            .expect("deleting a tenant-typed group must record its identifier as retired");
+        assert_eq!(row.id, tenant_node_id);
+    }
+
     let err = group_svc
         .create_group_unscoped(
             CreateGroupRequest {

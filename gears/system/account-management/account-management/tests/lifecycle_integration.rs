@@ -713,6 +713,14 @@ async fn hard_deleted_tenant_id_cannot_be_reused() {
          longer prevents reuse"
     );
 
+    // Direct table read, not an inference from the rejection below: a
+    // scope bug could produce the same rejection for the wrong reason.
+    let tombstone = fetch_tenant_id_tombstone(&h.provider, leaf)
+        .await
+        .unwrap()
+        .expect("hard delete must record the identifier as retired");
+    assert_eq!(tombstone.id, leaf);
+
     // Re-creating a tenant under the same id must be refused.
     let reused = NewTenant {
         id: leaf,

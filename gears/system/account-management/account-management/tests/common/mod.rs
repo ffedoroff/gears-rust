@@ -56,7 +56,9 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use account_management::Migrator;
-use account_management::infra::storage::entity::{am_leases, tenant_closure, tenants};
+use account_management::infra::storage::entity::{
+    am_leases, tenant_closure, tenant_id_tombstone, tenants,
+};
 use account_management::infra::storage::repo_impl::{AmDbProvider, TenantRepoImpl};
 
 /// Status code constants matching `domain::tenant::model::TenantStatus`'s
@@ -537,6 +539,30 @@ pub async fn fetch_all_tenant_rows(provider: &Arc<AmDbProvider>) -> Result<Vec<t
 }
 
 /// Read one tenant row for direct status assertions.
+/// Read a `tenant_id_tombstone` row directly.
+///
+/// Direct table read on purpose: proving a write through a later
+/// service-level rejection only shows the effect, and a scope bug could
+/// produce the same rejection for the wrong reason
+/// (`12_unit_testing.md`, "Direct DB assertions").
+pub async fn fetch_tenant_id_tombstone(
+    provider: &Arc<AmDbProvider>,
+    id: Uuid,
+) -> Result<Option<tenant_id_tombstone::Model>> {
+    let conn = provider
+        .conn()
+        .map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
+    let allow = allow_all();
+    let row = tenant_id_tombstone::Entity::find()
+        .filter(tenant_id_tombstone::Column::Id.eq(id))
+        .secure()
+        .scope_with(&allow)
+        .one(&conn)
+        .await
+        .map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
+    Ok(row)
+}
+
 pub async fn fetch_tenant(
     provider: &Arc<AmDbProvider>,
     id: Uuid,

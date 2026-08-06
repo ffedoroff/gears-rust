@@ -1282,6 +1282,33 @@ Compatibility note:
 - AuthZ predicates require only `ancestor_id/descendant_id`.
 - `depth` is additional metadata for ordered hierarchy reads.
 
+#### Table: `rg_tenant_id_tombstone`
+
+Tenant identifiers this gear has issued and retired. Written inside the
+delete transaction; never pruned.
+
+| Column       | Type        | Description                                |
+| ------------ | ----------- | ------------------------------------------ |
+| `id`         | UUID        | the retired tenant identifier (PK)         |
+| `retired_at` | TIMESTAMPTZ | when it left circulation (forensics only)  |
+
+#### Global tables — who may change them
+
+Entities declared with all four `no_*` markers carry no tenant column, so
+row-level scoping cannot protect them: `.secure().scope_with(scope)` on
+such an entity is a no-op, and the gate above it is the only protection
+(security checklist S2.1/S2.2). Each one therefore has to name its writer.
+
+| Table | Who may change it |
+| --- | --- |
+| `rg_tenant_id_tombstone` | Nobody directly — no API surface. Rows are appended by `force_delete_subtree` inside the delete transaction, under the `delete` gate on the group being removed, and are never updated or deleted. |
+| `gts_type`, `gts_type_allowed_parent`, `gts_type_allowed_membership` | The type-registry REST surface, gated by `PolicyEnforcer` on `RG_TYPE_RESOURCE` (VHP-2342). |
+| `resource_group_closure`, `resource_group_membership` | Maintained transactionally by `GroupService` / `MembershipService`; both are reached only through the gated group and membership operations, never directly. |
+
+The three rows below `rg_tenant_id_tombstone` predate checklist item S2.1
+and are listed here to make the set complete, not because this change
+introduced them.
+
 ### 3.8 Query Profile Enforcement
 
 Config:
