@@ -13,7 +13,9 @@ use resource_group_sdk::odata::GroupFilterField;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
-use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
+use toolkit_db::secure::{
+    DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
+};
 use toolkit_odata::{CursorV1, ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -26,6 +28,7 @@ use crate::infra::storage::entity::{
     resource_group::{self as rg_entity, Entity as ResourceGroupEntity},
     resource_group_closure::{self as closure_entity, Entity as ClosureEntity},
     resource_group_membership::{self as membership_entity, Entity as MembershipEntity},
+    rg_tenant_id_tombstone::{self as tombstone_entity, Entity as TombstoneEntity},
 };
 use crate::infra::storage::odata_mapper::GroupODataMapper;
 use crate::infra::storage::type_repo::TypeRepository;
@@ -1190,5 +1193,98 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
 
         Ok(models.into_iter().map(|m| (m.id, m.schema_id)).collect())
+    }
+
+    async fn retire_tenant_identifiers<C: DBRunner>(
+        &self,
+        db: &C,
+        ids: &[Uuid],
+    ) -> Result<(), DomainError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        // A tenant node is exactly a row whose `tenant_id` equals its own
+        // `id` -- that is what `create_group_inner`'s
+        // `effective_tenant_id` derivation produces for a tenant-typed
+        // code, and no other row can satisfy it, because a non-tenant
+        // group's `tenant_id` names a *different* row. Testing the
+        // invariant directly avoids joining `gts_type` and re-parsing the
+        // type path on the delete path.
+        let tenant_nodes: Vec<Uuid> = ResourceGroupEntity::find()
+            .filter(rg_entity::Column::Id.is_in(ids.to_vec()))
+            .filter(Expr::col(rg_entity::Column::TenantId).equals(rg_entity::Column::Id))
+            .secure()
+            // Structural sweep over the ids the caller is already
+            // deleting; a narrowed scope here would hide a tenant node
+            // from the tombstone while still deleting it, which is the
+            // exact leak this method exists to close.
+            .scope_with(&AccessScope::allow_all())
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        if tenant_nodes.is_empty() {
+            return Ok(());
+        }
+
+        // Skip the ones already recorded so a transaction retry cannot
+        // turn a completed retirement into a primary-key error. The
+        // caller runs SERIALIZABLE, so there is no window between the
+        // read and the insert.
+        let already: std::collections::HashSet<Uuid> = TombstoneEntity::find()
+            .filter(tombstone_entity::Column::Id.is_in(tenant_nodes.clone()))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        let now = time::OffsetDateTime::now_utc();
+        let rows: Vec<tombstone_entity::ActiveModel> = tenant_nodes
+            .into_iter()
+            .filter(|id| !already.contains(id))
+            .map(|id| tombstone_entity::ActiveModel {
+                id: Set(id),
+                retired_at: Set(now),
+            })
+            .collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        TombstoneEntity::insert_many(rows)
+            .secure()
+            // scope_unchecked: an INSERT cannot clamp on rows that do not
+            // exist yet.
+            .scope_unchecked(&AccessScope::allow_all())
+            .map_err(|e| DomainError::database(e.to_string()))?
+            .exec(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn is_tenant_identifier_retired<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<bool, DomainError> {
+        let found = TombstoneEntity::find()
+            .filter(tombstone_entity::Column::Id.eq(id))
+            .secure()
+            // `allow_all` deliberately: a narrowed scope would resolve to
+            // "no row" and admit the reuse this probe exists to refuse.
+            .scope_with(&AccessScope::allow_all())
+            .one(db)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(found.is_some())
     }
 }

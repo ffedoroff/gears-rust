@@ -526,6 +526,154 @@ async fn explicit_id_with_same_tenant_still_succeeds() {
     assert_eq!(group.id, id);
 }
 
+// -- Tenant-identifier retirement --
+
+/// A tenant-typed group's `id` *is* a `tenant_id`, so deleting one
+/// retires a tenant identifier. Once the row is gone the primary key
+/// stops guarding it and `CreateGroupRequest::id` lets a caller name it
+/// again -- so the identifier is recorded in `rg_tenant_id_tombstone`
+/// inside the delete transaction and refused on every later create.
+///
+/// Without this, an import could take over the identity of a tenant that
+/// no longer exists, silently re-pointing every audit record and external
+/// reference that still names it.
+///
+/// Scope note: this covers identifiers *this gear* retired. AM keeps the
+/// mirror-image record for its own (`tenant_id_tombstone`); neither can
+/// see the other while RG has no dependency on AM.
+#[tokio::test]
+async fn deleted_tenant_group_id_cannot_be_reused() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_type = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: unique_tenant_type_code(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .expect("create tenant type");
+
+    let tenant_node_id = Uuid::now_v7();
+    // The node's own id *is* its tenant id, so the caller that may delete
+    // it is one scoped to that tenant -- not to some unrelated one.
+    let ctx = common::make_ctx(tenant_node_id);
+    let created = group_svc
+        .create_group_unscoped(
+            CreateGroupRequest {
+                id: Some(tenant_node_id),
+                code: tenant_type.code.clone(),
+                name: "TenantToRetire".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_node_id,
+        )
+        .await
+        .expect("create tenant-typed group");
+    // Precondition for the whole test: the group's id really is its
+    // tenant id, which is what makes deleting it retire an identifier.
+    assert_eq!(created.id, tenant_node_id);
+    assert_eq!(created.hierarchy.tenant_id, tenant_node_id);
+
+    group_svc
+        .delete_group(&ctx, tenant_node_id, true)
+        .await
+        .expect("force delete the tenant-typed group");
+
+    let err = group_svc
+        .create_group_unscoped(
+            CreateGroupRequest {
+                id: Some(tenant_node_id),
+                code: tenant_type.code.clone(),
+                name: "ReusingARetiredIdentifier".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_node_id,
+        )
+        .await
+        .expect_err("a retired tenant identifier must not be reusable");
+
+    match &err {
+        DomainError::GroupAlreadyExists { id } => assert_eq!(*id, tenant_node_id),
+        other => panic!("expected GroupAlreadyExists, got {other:?}"),
+    }
+
+    // Durable, not one-shot.
+    let err_again = group_svc
+        .create_group_unscoped(
+            CreateGroupRequest {
+                id: Some(tenant_node_id),
+                code: tenant_type.code,
+                name: "SecondAttempt".to_owned(),
+                parent_id: None,
+                tenant_id: None,
+                metadata: None,
+            },
+            tenant_node_id,
+        )
+        .await
+        .expect_err("the tombstone must outlive a single rejected attempt");
+    assert!(matches!(err_again, DomainError::GroupAlreadyExists { .. }));
+}
+
+/// The tombstone is scoped to tenant *identifiers*: deleting an ordinary
+/// group must not retire its id, or every deleted department would burn a
+/// UUID that is not a tenant id at all.
+#[tokio::test]
+async fn deleted_ordinary_group_id_is_not_retired() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let root_type = common::create_root_type(&type_svc, "vhp2343r").await;
+
+    let group_id = Uuid::now_v7();
+    group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: Some(group_id),
+                code: root_type.code.clone(),
+                name: "OrdinaryGroup".to_owned(),
+                parent_id: None,
+                tenant_id: Some(tenant_id),
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("create ordinary group");
+
+    group_svc
+        .delete_group(&ctx, group_id, true)
+        .await
+        .expect("force delete the ordinary group");
+
+    group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest {
+                id: Some(group_id),
+                code: root_type.code,
+                name: "SameIdAgain".to_owned(),
+                parent_id: None,
+                tenant_id: Some(tenant_id),
+                metadata: None,
+            },
+            tenant_id,
+        )
+        .await
+        .expect("an ordinary group id is reusable after deletion");
+}
+
 // -- create_group_unscoped: seeding's trusted internal path --
 
 /// Seeding always calls `create_group_unscoped` with `req.tenant_id: None`

@@ -764,6 +764,26 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let is_tenant_type = validation::is_tenant_type_code(&req.code);
         let effective_tenant_id = if is_tenant_type { group_id } else { tenant_id };
 
+        // A tenant-typed group issues a tenant identifier: its own `id`
+        // becomes its `tenant_id`. Identifiers are never reissued, so a
+        // create that names one this gear has already retired must be
+        // refused — otherwise every audit record, external reference and
+        // cached authorization decision still naming it would silently
+        // re-point at an unrelated tenant.
+        //
+        // Checked inside the create transaction so a concurrent delete
+        // cannot retire the identifier between this probe and the INSERT.
+        // The rejection carries only the identifier the caller supplied:
+        // disclosing when or under what name it was retired would turn
+        // this endpoint into an oracle over deleted tenants.
+        if is_tenant_type
+            && group_repo
+                .is_tenant_identifier_retired(tx, group_id)
+                .await?
+        {
+            return Err(DomainError::group_already_exists(group_id));
+        }
+
         if let Some(parent_id) = req.parent_id {
             let parent = group_repo
                 .find_model_by_id(tx, parent_id)
@@ -1326,6 +1346,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         let all_ids: Vec<Uuid> = std::iter::once(root_id)
             .chain(descendants_with_depth.iter().map(|(id, _depth)| *id))
             .collect();
+
+        // Retire the tenant identifiers among these ids before the rows
+        // go away. Deleting a tenant-typed group frees its `id`, and that
+        // `id` is a `tenant_id` — so this has to happen inside the same
+        // transaction, and it has to read `resource_group` while the rows
+        // are still there.
+        group_repo.retire_tenant_identifiers(conn, &all_ids).await?;
 
         group_repo.delete_memberships_many(conn, &all_ids).await?;
         group_repo

@@ -270,6 +270,31 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         db: &C,
         type_ids: &[i16],
     ) -> Result<std::collections::HashMap<i16, String>, DomainError>;
+
+    /// Record, as retired, every identifier in `ids` that names a tenant
+    /// node — a row whose `tenant_id` equals its own `id`.
+    ///
+    /// Called from the delete path with the full set of ids about to be
+    /// removed, inside the same transaction: deleting the row is what
+    /// frees the primary key, so the tombstone has to be written where
+    /// no window exists between the two.
+    ///
+    /// Ids that do not name a tenant node are ignored. Already-retired
+    /// ids are left alone, so the call is idempotent under transaction
+    /// retry.
+    async fn retire_tenant_identifiers<C: DBRunner>(
+        &self,
+        db: &C,
+        ids: &[Uuid],
+    ) -> Result<(), DomainError>;
+
+    /// Whether `id` was previously issued as a tenant identifier by this
+    /// gear and has since been retired.
+    async fn is_tenant_identifier_retired<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<bool, DomainError>;
 }
 
 #[async_trait]
