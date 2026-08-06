@@ -201,7 +201,7 @@ fn make_enforcer() -> PolicyEnforcer {
 //
 // `gts_type` is a platform-global table (no `tenant_id` column), and
 // `TypeService`'s gate discards the `AccessScope` it computes regardless of
-// shape, so every gate call uses `require_constraints(false)` (VHP-2342) to
+// shape, so every gate call uses `require_constraints(false)` to
 // also accept this permit-with-zero-constraints PDP shape (`decision: true,
 // constraints: []`). This is *a* valid PDP response, not the only one --
 // real PDP plugins instead attach a baseline `In(OWNER_TENANT_ID)`
@@ -308,19 +308,19 @@ async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
 }
 
 /// Router wired with a deny-all enforcer for the type-registry routes only
-/// -- used by the VHP-2342 rejection tests below.
+/// -- used by the rejection tests below.
 async fn build_test_router_type_denied() -> (Router, Arc<TypeService<TypeRepository>>) {
     build_test_router_with_type_enforcer(make_type_enforcer_deny()).await
 }
 
-// ── Mock AuthZ: target-tenant echo (VHP-2162) ───────────────────────────
+// ── Mock AuthZ: target-tenant echo ───────────────────────────
 
 /// Permits any target tenant by echoing back whatever `owner_tenant_id`
 /// resource property the caller sent, as an `In` constraint.
 ///
 /// Models "the policy grants access to this specific tenant" and, as a
 /// side effect, proves `GroupService::create_group` actually forwards the
-/// resolved target tenant to the PDP (VHP-2162): if it didn't, this mock
+/// resolved target tenant to the PDP: if it didn't, this mock
 /// would fall back to `Uuid::nil()` and the foreign-tenant-succeeds tests
 /// below would fail.
 struct TargetTenantAllowAuthZ;
@@ -355,7 +355,7 @@ impl AuthZResolverClient for TargetTenantAllowAuthZ {
 }
 
 /// Permits, but the sole constraint is `InTenantSubtree` rooted at a
-/// caller-chosen tenant -- exercises VHP-2162's documented fail-closed
+/// caller-chosen tenant -- exercises the documented fail-closed
 /// limitation at the HTTP layer: even when the target tenant equals the
 /// constraint's own root, `AccessScope::contains_uuid` cannot resolve
 /// subtree membership for this filter variant, so the request is denied.
@@ -726,7 +726,7 @@ async fn delete_type_active_references_returns_400() {
     );
 }
 
-// ── Type CRUD AuthZ Tests (VHP-2342) ────────────────────────────────────
+// ── Type CRUD AuthZ Tests ────────────────────────────────────
 //
 // Before this fix, all five `/types-registry/v1/types` routes were
 // `.authenticated()`-only: any caller with a valid JWT -- from any tenant --
@@ -829,7 +829,7 @@ async fn delete_type_denied_returns_403() {
     assert_problem_shape(resp, StatusCode::FORBIDDEN).await;
 }
 
-/// HTTP-level regression proof for VHP-2342's actual defect (not just the
+/// HTTP-level regression proof for the actual defect (not just the
 /// artificial no-constraints mock the rest of this file's type routes are
 /// wired with by default). Wires the type-registry routes with
 /// `AllowAllAuthZ` -- the tenant-scoping mock that attaches a baseline
@@ -892,9 +892,9 @@ async fn create_group_returns_201() {
     assert_eq!(body["hierarchy"]["tenant_id"], tenant_id.to_string());
 }
 
-/// VHP-2345: creating a group with an `id` that collides with an existing
+/// creating a group with an `id` that collides with an existing
 /// group's primary key must come back as a typed 409 `already_exists`, not
-/// a raw 500. VHP-2343's owner decision keeps client-supplied `id` accepted
+/// a raw 500. the owner decision keeps client-supplied `id` accepted
 /// as-is on create — capture is not blocked by this fix.
 #[tokio::test]
 async fn create_group_duplicate_id_returns_409() {
@@ -949,10 +949,10 @@ async fn create_group_duplicate_id_returns_409() {
     assert_eq!(body["context"]["resource_name"], dup_id.to_string());
 }
 
-// ── Group create: explicit target tenant (VHP-2162) ─────────────────────
+// ── Group create: explicit target tenant ─────────────────────
 
 /// Omitted `tenant_id` in the request body is byte-for-byte the
-/// pre-VHP-2162 wire shape: the created group lands in the caller's own
+/// pre- wire shape: the created group lands in the caller's own
 /// (JWT-derived) tenant.
 #[tokio::test]
 async fn rest_create_group_tenant_id_omitted_returns_201() {
@@ -1024,7 +1024,7 @@ async fn rest_create_group_tenant_id_same_as_caller_returns_201() {
 }
 
 /// A foreign `tenant_id` covered by the compiled `AccessScope` succeeds --
-/// the platform-admin / onboarding use case VHP-2162 exists for.
+/// the platform-admin / onboarding use case exists for.
 #[tokio::test]
 async fn rest_create_group_foreign_tenant_id_allowed_returns_201() {
     let (router, type_svc) = build_test_router_with_group_enforcer(PolicyEnforcer::new(Arc::new(
@@ -1066,7 +1066,7 @@ async fn rest_create_group_foreign_tenant_id_allowed_returns_201() {
 /// A foreign `tenant_id` NOT covered by the compiled `AccessScope` (the
 /// realistic tenant-clamp shape every PDP plugin in this repo returns)
 /// comes back 404, matching the shape of "tenant doesn't exist" -- not 403,
-/// per the anti-oracle rule this mirrors from the VHP-2341 membership
+/// per the anti-oracle rule this mirrors from the membership
 /// gates.
 #[tokio::test]
 async fn rest_create_group_foreign_tenant_id_denied_returns_404() {
@@ -1102,7 +1102,7 @@ async fn rest_create_group_foreign_tenant_id_denied_returns_404() {
 
 /// An `AccessScope` built only from an `InTenantSubtree` constraint is
 /// rejected fail-closed at the HTTP layer too, even when the target tenant
-/// is literally the constraint's own root (VHP-2162's documented
+/// is literally the constraint's own root (the documented
 /// limitation -- see `GroupService::create_group`'s doc comment).
 #[tokio::test]
 async fn rest_create_group_in_tenant_subtree_scope_returns_404() {
@@ -1181,7 +1181,7 @@ async fn rest_create_group_tenant_typed_with_explicit_tenant_id_returns_400() {
 }
 
 /// An explicit `id` combined with a cross-tenant target is rejected (400)
-/// as a VHP-2343 stopgap, even under a policy that would otherwise permit
+/// as a stopgap, even under a policy that would otherwise permit
 /// the target tenant.
 #[tokio::test]
 async fn rest_create_group_explicit_id_with_foreign_tenant_returns_400() {
@@ -1286,7 +1286,7 @@ async fn rest_create_group_tenant_id_conflicts_with_parent_returns_400() {
     let text = body.to_string();
     assert!(
         !text.contains(&tenant_a.to_string()) && !text.contains(&tenant_b.to_string()),
-        "problem body must not leak tenant ids (VHP-2345 style): {text}"
+        "problem body must not leak tenant ids (style): {text}"
     );
 }
 
@@ -1577,7 +1577,7 @@ async fn rest_post_membership_returns_201() {
     assert_no_surrogate_ids(&body);
 }
 
-/// VHP-2345 regression: a second `POST` of the same membership composite
+/// regression: a second `POST` of the same membership composite
 /// key must still come back as a typed 409 conflict, now that
 /// `MembershipRepository::insert` classifies the duplicate via
 /// `toolkit_db::secure::is_unique_violation` instead of a substring match
@@ -2012,10 +2012,10 @@ async fn rest_get_memberships_returns_200() {
 }
 
 // =========================================================================
-// VHP-2341: membership operations must respect the caller's tenant scope
+// membership operations must respect the caller's tenant scope
 // =========================================================================
 
-/// VHP-2341: POST membership into a cross-tenant group returns 404 (looks
+/// POST membership into a cross-tenant group returns 404 (looks
 /// not-found, not a distinguishable "forbidden").
 #[tokio::test]
 async fn rest_post_membership_cross_tenant_returns_404() {
@@ -2080,7 +2080,7 @@ async fn rest_post_membership_cross_tenant_returns_404() {
     assert_problem_shape(resp, StatusCode::NOT_FOUND).await;
 }
 
-/// VHP-2341: DELETE membership from a cross-tenant group returns 404, and
+/// DELETE membership from a cross-tenant group returns 404, and
 /// the membership survives.
 #[tokio::test]
 async fn rest_delete_membership_cross_tenant_returns_404() {
@@ -2161,7 +2161,7 @@ async fn rest_delete_membership_cross_tenant_returns_404() {
     assert_no_surrogate_ids(&body);
 }
 
-/// VHP-2341: GET memberships is tenant-scoped -- tenant A must not see
+/// GET memberships is tenant-scoped -- tenant A must not see
 /// tenant B's membership rows in the list response.
 #[tokio::test]
 async fn rest_get_memberships_is_tenant_scoped() {
@@ -2780,7 +2780,7 @@ fn item_ids(body: &serde_json::Value) -> std::collections::BTreeSet<String> {
 }
 
 // =========================================================================
-// VHP-1977: re-parent cycle detection (REST-level regression coverage)
+// re-parent cycle detection (REST-level regression coverage)
 // =========================================================================
 //
 // `move_group_internal_impl` (src/domain/group_service.rs) detects cycles via
@@ -2798,7 +2798,7 @@ fn item_ids(body: &serde_json::Value) -> std::collections::BTreeSet<String> {
 // (see `rest_update_group_rejects_parent_id_field`) and can no longer reach
 // cycle detection at all.
 
-/// VHP-1977: moving a group under its own descendant returns 400 with a
+/// moving a group under its own descendant returns 400 with a
 /// `hierarchy` precondition violation.
 #[tokio::test]
 async fn rest_move_group_under_descendant_returns_400_cycle() {
@@ -2867,7 +2867,7 @@ async fn rest_move_group_under_descendant_returns_400_cycle() {
     );
 }
 
-/// VHP-1977: moving a group under itself returns 400 with a `hierarchy`
+/// moving a group under itself returns 400 with a `hierarchy`
 /// precondition violation.
 #[tokio::test]
 async fn rest_move_group_self_parent_returns_400_cycle() {
@@ -4112,7 +4112,7 @@ async fn rest_route_smoke_all_endpoints_registered() {
 }
 
 // =========================================================================
-// VHP-1954: membership `$filter` client errors must be 400, not 500
+// membership `$filter` client errors must be 400, not 500
 // =========================================================================
 //
 // `list_memberships` (`membership_repo.rs`) used to fold every failure out
@@ -4125,7 +4125,7 @@ async fn rest_route_smoke_all_endpoints_registered() {
 // is `Uuid` -- exactly the shape the ticket's reporter hit (they quoted the
 // UUID; the e2e smoke test S10 does not, which is why it stayed green).
 
-/// VHP-1954: `$filter=group_id eq '<uuid>'` (quoted) must return 400, not
+/// `$filter=group_id eq '<uuid>'` (quoted) must return 400, not
 /// 500 -- a caller mistake, not a backend fault.
 #[tokio::test]
 async fn rest_get_memberships_quoted_uuid_filter_returns_400_not_500() {
@@ -4146,7 +4146,7 @@ async fn rest_get_memberships_quoted_uuid_filter_returns_400_not_500() {
     assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
-/// VHP-1954 regression guard: the wire-correct *bare* UUID
+/// regression guard: the wire-correct *bare* UUID
 /// `$filter=group_id eq <uuid>` (no quotes) must keep returning 200 --
 /// pinning that the 400 fix above doesn't also start rejecting the shape
 /// e2e smoke test S10 (and every well-formed client) actually sends.
@@ -4193,7 +4193,7 @@ async fn rest_get_memberships_bare_uuid_filter_returns_200() {
 // instead of 400).
 // =========================================================================
 
-/// VHP-1954 classifier proof (1/2): `$orderby` on a field
+/// classifier proof (1/2): `$orderby` on a field
 /// `MembershipFilterField` doesn't declare passes the extractor
 /// (`parse_orderby` only validates syntax, not field names -- see
 /// `libs/toolkit/src/api/odata.rs`) and fails *inside*
@@ -4215,7 +4215,7 @@ async fn rest_get_memberships_unknown_orderby_field_returns_400_not_500() {
     assert_problem_shape(resp, StatusCode::BAD_REQUEST).await;
 }
 
-/// VHP-1954 classifier proof (2/2): a cursor whose embedded filter hash
+/// classifier proof (2/2): a cursor whose embedded filter hash
 /// (`cursor.f`) doesn't match the current request's `$filter` hash fails
 /// *inside* `paginate_odata_collect` with `ODataError::FilterMismatch` -- a
 /// client replaying a cursor minted under a different filter, not a
@@ -4926,7 +4926,7 @@ async fn rest_move_group_without_parent_id_key_returns_400() {
 }
 
 /// `POST /move` targeting a parent in another tenant is refused, and the
-/// refusal must not disclose the foreign tenant's id (VHP-2345 anti-oracle:
+/// refusal must not disclose the foreign tenant's id (anti-oracle:
 /// the caller supplies `parent_id` directly, so echoing the owning tenant
 /// back would turn this endpoint into a cross-tenant probe).
 #[tokio::test]

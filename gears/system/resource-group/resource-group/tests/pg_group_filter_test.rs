@@ -1,7 +1,7 @@
 #![cfg(feature = "integration")]
 // Created: 2026-07-29 by Constructor Tech
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
-//! PostgreSQL-backed reproduction of VHP-1731's failure mode, for
+//! PostgreSQL-backed reproduction of the failure mode, for
 //! `list_groups`' own `type` `$filter` -- mirrors
 //! `pg_membership_filter_test.rs`, which covers the same concern for
 //! `list_memberships`.
@@ -25,7 +25,7 @@
 //! resolve), SQLite's lenient type affinity would tolerate the mismatch
 //! and silently return an empty page; real PostgreSQL rejects the
 //! comparison outright ("operator does not exist: smallint = text"),
-//! exactly like the membership half of VHP-1731 the fix already covers.
+//! exactly like the membership half of the fix already covers.
 //!
 //! **Why a Rust `testcontainers` test, not pytest E2E:** this is a
 //! deliberate, written-down deviation from
@@ -147,7 +147,7 @@ macro_rules! pg_fixture_or_skip {
     };
 }
 
-/// VHP-1731 (groups side): filtering `list_groups` by `type` against real
+/// (groups side): filtering `list_groups` by `type` against real
 /// PostgreSQL. Before `resolve_type_filter_node` existed (and if a future
 /// change to the now-shared implementation ever dropped the
 /// `GroupFilterField::Type` guard), the repository would compare the raw
@@ -195,7 +195,7 @@ async fn list_groups_resolves_type_filter_on_postgres() {
         Err(DomainError::Database(db_err)) => {
             panic!(
                 "list_groups returned a raw DB error for the type filter -- the \
-                 SMALLINT/string type mismatch (VHP-1731) regressed on the groups path: \
+                 SMALLINT/string type mismatch regressed on the groups path: \
                  {db_err}"
             );
         }

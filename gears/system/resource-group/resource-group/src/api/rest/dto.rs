@@ -249,7 +249,7 @@ pub struct CreateGroupDto {
     pub name: String,
     /// Parent group ID (null for root groups).
     pub parent_id: Option<Uuid>,
-    /// Optional target tenant for the created group (VHP-2162).
+    /// Optional target tenant for the created group.
     ///
     /// If omitted, the tenant scope is derived from the caller's own
     /// `SecurityContext` -- today's unchanged default behavior. If present

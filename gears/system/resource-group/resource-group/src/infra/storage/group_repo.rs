@@ -367,7 +367,7 @@ impl GroupRepositoryTrait for GroupRepository {
     /// callers that only need an `AuthZ` visibility gate plus the raw model
     /// (e.g. `add_membership_in_tx`/`remove_membership_in_tx`) get both
     /// from this single query instead of `find_by_id` + `find_model_by_id`
-    /// (VHP-2341 audit finding (a)).
+    /// (audit finding (a)).
     async fn find_model_by_id_scoped<C: DBRunner>(
         &self,
         db: &C,
@@ -620,13 +620,13 @@ impl GroupRepositoryTrait for GroupRepository {
         toolkit_db::secure::secure_insert::<ResourceGroupEntity>(model, &scope, db)
             .await
             .map_err(|e| {
-                // VHP-2345: a unique-constraint violation on `resource_group.id`
+                // a unique-constraint violation on `resource_group.id`
                 // means the caller-supplied (or seeding-replayed) `id` already
                 // exists. Classify via `ScopeError::is_unique_violation` --
                 // SQLSTATE-based first (`sea_orm::SqlErr`), string fallback
                 // second -- rather than a bespoke substring check here, so
                 // Postgres and SQLite both land on the same typed variant.
-                // VHP-2343 deliberately keeps accepting the client-supplied
+                // deliberately keeps accepting the client-supplied
                 // `id` as-is; this only turns the resulting collision into a
                 // clean 409 instead of an opaque `Database` (500).
                 if e.is_unique_violation() {

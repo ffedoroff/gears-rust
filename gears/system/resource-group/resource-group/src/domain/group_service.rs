@@ -124,14 +124,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // whose path starts with `TENANT_RG_TYPE_PATH` opens a new tenant scope.
         let is_tenant = validation::is_tenant_type_code(&req.code);
 
-        // VHP-2162: a tenant-typed group's effective tenant is always its
+        // a tenant-typed group's effective tenant is always its
         // own (generated) id -- see `create_group_inner`'s
         // `effective_tenant_id` derivation. A caller-supplied `tenant_id` on
         // such a request can never be consulted, so treat it as a
         // contradiction rather than silently discarding it.
         Self::reject_tenant_id_on_tenant_type(is_tenant, req.tenant_id)?;
 
-        // VHP-2162: resolve the target tenant for this create. Omitted
+        // resolve the target tenant for this create. Omitted
         // `tenant_id` (`None`) is today's unchanged default: target == the
         // caller's own tenant (`tenant_id`, derived by the REST handler from
         // `SecurityContext::subject_tenant_id`). A present `tenant_id` lets
@@ -139,27 +139,27 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // tenant other than their own, subject to the AuthZ checks below.
         let target_tenant_id = req.tenant_id.unwrap_or(tenant_id);
 
-        // VHP-2343 guardrail: a client-supplied `id` is already accepted
+        // guardrail: a client-supplied `id` is already accepted
         // as-is on create (owner decision, tracked separately under
-        // VHP-2343 -- no derived-id, no id_seed, no restriction to tenant
+        // - no derived-id, no id_seed, no restriction to tenant
         // types). Combined with an explicit cross-tenant target, that
         // identity-capture gap gets strictly worse: today a captured id
         // lands in the attacker's own tenant; letting `tenant_id` differ
         // too would let it be planted directly inside a tenant the caller
         // does not belong to. Reject the combination outright -- a stopgap,
-        // not a fix for VHP-2343 -- until an identifier-ownership policy
+        // not a fix, until an identifier-ownership policy
         // exists.
         if req.id.is_some() && target_tenant_id != tenant_id {
             return Err(DomainError::validation(
                 "id and tenant_id cannot both be set on group creation: an explicit id \
                  combined with a cross-tenant target is not accepted while identifier \
-                 ownership policy is undecided (VHP-2343)"
+                 ownership policy is undecided"
                     .to_owned(),
             ));
         }
 
         // AuthZ gate with provisioning context. `owner_tenant_id` now also
-        // carries the *target* tenant (VHP-2162) alongside the pre-existing
+        // carries the *target* tenant alongside the pre-existing
         // `is_tenant`/`parent_id` properties, so a policy that keys off it
         // can decide whether this caller may create groups in that tenant --
         // mirrors account-management's `authz_scope` helper
@@ -190,35 +190,24 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 .await
                 .map_err(DomainError::from)?;
 
-        // VHP-2162: when the target tenant differs from the caller's own
-        // token tenant, re-verify it against the *compiled* `AccessScope` --
-        // do not rely solely on the PDP's `decision: true`. This is
-        // defense-in-depth: a policy misconfiguration that grants "create"
-        // unconditionally must not translate into an unbounded cross-tenant
-        // create. When the target equals the caller's own tenant (the
-        // common case, including every request that omits `tenant_id`),
-        // this block is skipped entirely -- byte-for-byte the pre-VHP-2162
-        // behavior.
+        // When the target tenant differs from the caller's own, re-verify
+        // it against the compiled `AccessScope` rather than trusting the
+        // PDP's `decision: true` alone: a policy that grants "create"
+        // unconditionally must not become an unbounded cross-tenant create.
+        // Skipped when the target is the caller's own tenant, so the common
+        // path is unchanged.
         //
-        // **`InTenantSubtree` limitation (deliberate, not a bug).**
-        // `AccessScope::contains_uuid` cannot resolve subtree membership --
-        // per `toolkit_security::access_scope::ScopeFilter::values`'s
-        // documented write-path limitation, it always returns `false` for an
-        // `InTenantSubtree` filter, because doing so would require a
-        // DB-backed lookup against `tenant_closure` (owned by Account
-        // Management; this crate has no dependency on it). A caller whose
-        // only grant for the target tenant is an `InTenantSubtree`
-        // constraint (e.g. "parent tenant admins may manage descendant
-        // tenants") is therefore denied here even when `target_tenant_id` is
-        // genuinely inside that subtree. This is a conservative fail-closed
-        // choice over trusting an unverifiable claim; lifting it would
-        // require RG to gain a dependency on AM's `tenant_closure`, which is
-        // out of scope for this change.
+        // Deliberate limitation: `contains_uuid` always returns `false` for
+        // an `InTenantSubtree` filter, because resolving subtree membership
+        // needs `tenant_closure`, which AM owns and this crate does not
+        // depend on. A caller whose only grant is such a filter is denied
+        // even when the target is genuinely inside the subtree -- fail-closed
+        // over trusting an unverifiable claim.
         if target_tenant_id != tenant_id {
             let permitted = scope.is_unconstrained()
                 || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, target_tenant_id);
             if !permitted {
-                // Not-found shape, not forbidden (mirrors the VHP-2341
+                // Not-found shape, not forbidden (mirrors the
                 // membership gates in `membership_service.rs`): a tenant the
                 // caller has no grant for must be indistinguishable from a
                 // tenant that does not exist -- this gear owns no tenant
@@ -656,7 +645,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// `create_group_inner` as the public path; only the `PolicyEnforcer`
     /// gate is skipped.
     ///
-    /// **`tenant_id` vs `req.tenant_id` (VHP-2162).** `tenant_id` is the
+    /// **`tenant_id` vs `req.tenant_id`.** `tenant_id` is the
     /// caller-trusted target tenant -- seeding already resolved it before
     /// calling in (see `seeding::seed_groups`, which always passes
     /// `req.tenant_id: None`). If `req.tenant_id` is *also* set and
@@ -727,7 +716,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// `validate_metadata_via_gts` before opening this transaction (RG-09):
     /// it's a cross-gear `ClientHub` call, not a DB read to make atomic.
     ///
-    /// **`tenant_id` parameter (VHP-2162).** This is the already-resolved
+    /// **`tenant_id` parameter.** This is the already-resolved
     /// *target* tenant, not necessarily the caller's own token tenant:
     /// `create_group` folds an authorized `req.tenant_id` override into this
     /// value (already AuthZ-gated against the caller's `AccessScope`)
@@ -807,7 +796,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
             // Skip tenant enforcement for tenant-typed groups — they intentionally
             // create a new tenant scope (tenant_id = group.id != parent.tenant_id).
             if !is_tenant_type && parent.tenant_id != tenant_id {
-                // VHP-2345: generic message -- do not interpolate the
+                // generic message -- do not interpolate the
                 // parent's tenant_id. The caller supplies `parent_id`
                 // directly, so echoing the foreign tenant_id back would
                 // turn this endpoint into a cross-tenant oracle: probe an
@@ -817,7 +806,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
                 // message below. Real values stay in this debug log only.
                 //
                 // `tenant_id` here is the resolved *target* tenant
-                // (VHP-2162), which for the default (no explicit
+                //, which for the default (no explicit
                 // `CreateGroupRequest::tenant_id`) case is exactly the
                 // caller's own tenant -- so this also covers the
                 // conflict-with-parent rule for an explicit cross-tenant
@@ -1404,7 +1393,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// *different* tenant than the child itself. Naming that id in an error
     /// response would hand the caller a foreign tenant's identifier; RG does
     /// not own tenant data and must not be the one to disclose it
-    /// (DESIGN.md:1331-1337, mirrors the VHP-2345 anti-oracle rule elsewhere
+    /// (DESIGN.md:1331-1337, mirrors the anti-oracle rule elsewhere
     /// in this file). Non-tenant-typed children carry no such risk: they
     /// necessarily share `parent_id`'s tenant, and `parent_id` already
     /// passed the scope-checked preflight in `delete_group_inner`.
@@ -1492,7 +1481,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     }
 
     /// Reject an explicit `tenant_id` on a tenant-typed group create
-    /// request (VHP-2162).
+    /// request.
     ///
     /// A tenant-typed group's effective tenant is always its own generated
     /// id (see `create_group_inner`'s `effective_tenant_id` derivation) --

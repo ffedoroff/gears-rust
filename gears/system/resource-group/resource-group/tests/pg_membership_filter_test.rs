@@ -1,7 +1,7 @@
 #![cfg(feature = "integration")]
 // Created: 2026-07-29 by Constructor Tech
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
-//! PostgreSQL-backed reproduction of VHP-1731's actual reported symptom.
+//! PostgreSQL-backed reproduction of the actual reported symptom.
 //!
 //! `list_memberships`' `resource_type` `$filter` used to compare a GTS
 //! type-path string directly against the SMALLINT `gts_type_id` column
@@ -139,7 +139,7 @@ macro_rules! pg_fixture_or_skip {
     };
 }
 
-/// VHP-1731: filtering `list_memberships` by `resource_type` against real
+/// filtering `list_memberships` by `resource_type` against real
 /// PostgreSQL. Before the fix, the repository compared the raw GTS
 /// type-path string against the SMALLINT `gts_type_id` column --
 /// PostgreSQL rejects that comparison outright as a genuine DB error
@@ -194,22 +194,22 @@ async fn list_memberships_resolves_resource_type_filter_on_postgres() {
         Err(DomainError::Database(db_err)) => {
             panic!(
                 "list_memberships returned a raw DB error for the resource_type \
-                 filter -- the SMALLINT/string type mismatch (VHP-1731) is unfixed: {db_err}"
+                 filter -- the SMALLINT/string type mismatch is unfixed: {db_err}"
             );
         }
         Err(other) => panic!("unexpected error: {other}"),
     }
 }
 
-/// VHP-2341: `list_memberships`' tenant scoping (a correlated EXISTS
+/// `list_memberships`' tenant scoping (a correlated EXISTS
 /// subquery against `resource_group`, since the membership entity itself
 /// declares `no_tenant`) must actually filter rows on a real database, not
 /// just SQLite. Two tenants each get a group with one membership; a scope
 /// constrained to tenant A must return only A's row, and vice versa for B.
 ///
-/// This is the one piece of VHP-2341 that specifically needs Postgres:
+/// This is the one piece that specifically needs Postgres:
 /// SQLite's lenient typing/planner can mask a query that would be rejected
-/// or silently mis-plan on a real engine (see VHP-1731's `resource_type`
+/// or silently mis-plan on a real engine (see the `resource_type`
 /// filter for a concrete precedent of exactly that gap in this same repo).
 #[tokio::test(flavor = "multi_thread")]
 async fn list_memberships_is_tenant_scoped_on_postgres() {

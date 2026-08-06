@@ -230,7 +230,7 @@ fn gts_type_path_trims_and_lowercases() {
     assert_eq!(path.unwrap().as_str(), gts_id!("cf.core.rg.type.v1~"));
 }
 
-// -- CreateGroupRequest.tenant_id (VHP-2162) --
+// -- CreateGroupRequest.tenant_id --
 
 /// Omitted `tenant_id` -> no `"tenantId"` key on the wire (backward
 /// compatibility: existing SDK callers that never set this field see no

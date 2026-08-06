@@ -24,7 +24,7 @@ use crate::domain::validation;
 ///
 /// `supported_properties` deliberately lists only `owner_tenant_id`.
 ///
-/// # VHP-2341: scope source for the group tenant-gate
+/// #: scope source for the group tenant-gate
 ///
 /// `add_membership_in_tx` / `remove_membership_in_tx` / `list_memberships`
 /// all need to know whether the *target group* is inside the caller's
@@ -159,7 +159,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     /// membership and returns `TenantIncompatibility` instead of a raw failure.
     ///
     /// `scope` gates the target group against the caller's `AccessScope`
-    /// (VHP-2341) — see `add_membership_in_tx`. `add_membership_unscoped`
+    /// — see `add_membership_in_tx`. `add_membership_unscoped`
     /// passes `AccessScope::allow_all()` so seeding/internal callers keep
     /// seeing every tenant, matching its pre-existing contract.
     async fn add_membership_inner(
@@ -223,7 +223,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceGroupMembership, DomainError> {
-        // AuthZ gate (VHP-2341) + raw model read, in one query
+        // AuthZ gate + raw model read, in one query
         // (N+1 audit finding (a)): the target group must be inside the
         // caller's scope before its raw model is used below, but the gate
         // doesn't need a resolved SDK model (with its type path), only the
@@ -236,7 +236,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // all, never a distinguishable "forbidden") -- but the previous
         // separate `find_by_id` (gate) + `find_model_by_id` (raw read) pair
         // collapses into this single call. Runs inside this transaction
-        // (not before it), per VHP-2341's requirement that the gate share
+        // (not before it), per the requirement that the gate share
         // the SERIALIZABLE isolation the rest of the check sees.
         let group_model = group_repo
             .find_model_by_id_scoped(tx, scope, group_id)
@@ -277,7 +277,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // Collect distinct tenant_ids from existing memberships (existing_tenants)
 
         if !existing_tenants.is_empty() && !existing_tenants.contains(&group_model.tenant_id) {
-            // VHP-2345: the message must not name the tenants this resource is
+            // the message must not name the tenants this resource is
             // already linked in. `existing_tenants` is collected under the
             // *system* scope (the invariant is global by construction --
             // `get_existing_membership_tenant_ids` has to see every tenant to
@@ -407,7 +407,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         resource_type: &str,
         resource_id: &str,
     ) -> Result<(), DomainError> {
-        // AuthZ gate (VHP-2341): same gate as `add_membership_in_tx`, via
+        // AuthZ gate: same gate as `add_membership_in_tx`, via
         // `find_model_by_id_scoped` -- the group is not otherwise looked up
         // at all on this path (the delete below goes straight to
         // `membership_repo` by composite key), so without this the caller
@@ -464,7 +464,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .map_err(DomainError::from)?;
 
         let conn = self.conn()?;
-        // VHP-2341: the real caller scope now reaches the repo (it used to
+        // the real caller scope now reaches the repo (it used to
         // be discarded, so every caller saw every tenant's rows). See
         // `MembershipRepository::list_memberships` for how tenant filtering
         // is applied despite the membership entity having no scopable
@@ -487,7 +487,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
     /// skipped; the caller supplies any subject/tenant `OData` filter.
     ///
     /// Passes `AccessScope::allow_all()` to the repo, which keeps this
-    /// path's query shape exactly as it was before VHP-2341 (no join added).
+    /// path's query shape exactly as it was before (no join added).
     pub async fn list_memberships_unscoped(
         &self,
         query: &ODataQuery,

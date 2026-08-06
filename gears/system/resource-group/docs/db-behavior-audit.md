@@ -60,7 +60,7 @@ behaves correctly. It did not.
 
 ### Findings added after this report
 
-The table above is the first pass. A second N+1 pass and the VHP-2341 tenant-scope
+The table above is the first pass. A second N+1 pass and the tenant-scope
 work added two findings that code comments reference by letter rather than by
 `RG-NN`, so a reader arriving from the code will not find them above:
 
@@ -172,10 +172,10 @@ Why the deviation stands:
 - **A diagnosis pytest cannot give.** Each of the three narrower suites
   reproduces a real Postgres-dialect rejection —
   `pg_membership_filter_test.rs` / `pg_group_filter_test.rs`: "operator
-  does not exist: smallint = text" (VHP-1731, comparing the wire-level GTS
+  does not exist: smallint = text" (comparing the wire-level GTS
   type-path string against the SMALLINT `gts_type_id` column);
   `secure_group_scope_postgres.rs`: "operator does not exist: uuid = text"
-  (VHP-2344 defect A, comparing a `TEXT` membership column against a
+  (the `uuid = text` defect, comparing a `TEXT` membership column against a
   `Uuid` resource column). A pytest test hitting the same regression
   through HTTP would only ever observe the resulting 500 status code —
   these tests surface, in the failure message should the guard ever

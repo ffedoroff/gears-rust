@@ -221,7 +221,7 @@ pub struct CreateGroupRequest {
     /// Parent group ID (null for root groups).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Uuid>,
-    /// Optional target tenant for the created group (VHP-2162).
+    /// Optional target tenant for the created group.
     ///
     /// If omitted, the tenant scope is derived from the caller's own
     /// `SecurityContext` -- today's unchanged default behavior. If present

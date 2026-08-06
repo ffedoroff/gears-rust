@@ -846,7 +846,7 @@ async fn type_repo_insert_duplicate_on_postgres_yields_clean_already_exists(
     );
 }
 
-// VHP-2345: real-Postgres coverage for the `resource_group.id` unique-key
+// real-Postgres coverage for the `resource_group.id` unique-key
 // classification path.
 
 /// `create_group` with an explicit `id` that collides with an already-inserted

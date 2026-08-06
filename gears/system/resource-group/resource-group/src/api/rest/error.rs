@@ -39,10 +39,10 @@ impl From<DomainError> for CanonicalError {
                     .with_resource(id.to_string())
                     .create()
             }
-            // VHP-2162: a target tenant outside the caller's `create`
+            // a target tenant outside the caller's `create`
             // AccessScope maps to `not_found`, not `permission_denied` --
             // see `DomainError::TenantNotFound`'s doc for the anti-oracle
-            // rationale (mirrors the VHP-2341 membership gates below).
+            // rationale (mirrors the membership gates below).
             DomainError::TenantNotFound { tenant_id } => {
                 RgError::not_found(format!("Tenant '{tenant_id}' was not found"))
                     .with_resource(tenant_id.to_string())
@@ -58,7 +58,7 @@ impl From<DomainError> for CanonicalError {
                     .with_resource(code)
                     .create()
             }
-            // VHP-2345: primary-key collision on `resource_group.id` (VHP-2343
+            // primary-key collision on `resource_group.id` (
             // deliberately keeps client-supplied `id` accepted on create) —
             // typed 409 instead of falling through to the `Database` (500) arm.
             DomainError::GroupAlreadyExists { id } => {
@@ -124,7 +124,7 @@ impl From<DomainError> for CanonicalError {
             DomainError::DuplicateMembership { key, message } => {
                 RgError::already_exists(message).with_resource(key).create()
             }
-            // VHP-2345: the conflicting root's **id never reaches the wire**.
+            // the conflicting root's **id never reaches the wire**.
             // It comes from `find_root_id_with_type_prefix`, which deliberately
             // bypasses `SecureORM` (tenant-root uniqueness is a forest-wide
             // invariant and has to see every tenant), so the existing root can

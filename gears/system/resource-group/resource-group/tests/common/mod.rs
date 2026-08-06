@@ -248,7 +248,7 @@ impl AuthZResolverClient for DenyAllAuthZ {
 /// `gts_type` is a platform-global table (no `tenant_id` column), and
 /// `TypeService`'s `RG_TYPE_RESOURCE` gate discards the `AccessScope` it
 /// gets back regardless of shape, so every gate call uses
-/// `require_constraints(false)` (VHP-2342) to also accept this
+/// `require_constraints(false)` to also accept this
 /// permit-with-zero-constraints PDP shape (`decision: true, constraints:
 /// []`). This is *a* valid PDP response, not the only one: real PDP plugins
 /// (`static-authz-plugin`, `tr-authz-plugin`) instead attach a baseline
@@ -346,14 +346,14 @@ pub fn make_enforcer() -> PolicyEnforcer {
 }
 
 /// Build an allow-all-no-constraints `PolicyEnforcer` for `TypeService`
-/// (VHP-2342) -- see [`AllowAllNoConstraintsAuthZ`].
+/// -- see [`AllowAllNoConstraintsAuthZ`].
 pub fn make_type_enforcer() -> PolicyEnforcer {
     let authz: Arc<dyn AuthZResolverClient> = Arc::new(AllowAllNoConstraintsAuthZ);
     PolicyEnforcer::new(authz)
 }
 
 /// Build a deny-all `PolicyEnforcer`, for proving `TypeService`'s gate
-/// actually rejects when wired to a denying PDP (VHP-2342).
+/// actually rejects when wired to a denying PDP.
 pub fn make_type_enforcer_deny() -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(DenyAllAuthZ))
 }
@@ -361,7 +361,7 @@ pub fn make_type_enforcer_deny() -> PolicyEnforcer {
 // -- Service construction helpers (TypeService) --
 
 /// Build a `TypeService` from a DB provider using the allow-all-no-constraints
-/// enforcer (VHP-2342). Fixture helpers below use the unscoped entry points,
+/// enforcer. Fixture helpers below use the unscoped entry points,
 /// so this enforcer is a sane default rather than a load-bearing choice.
 pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
     TypeService::new(db, make_type_enforcer(), Arc::new(TypeRepository))

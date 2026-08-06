@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 #![cfg(all(feature = "integration", feature = "pg"))]
 
-//! Real-PostgreSQL reproduction of VHP-2344 defect A.
+//! Real-PostgreSQL reproduction of the `uuid = text` defect.
 //!
 //! `ScopeFilter::InGroup` / `ScopeFilter::InGroupSubtree` compile to a
 //! subquery that compares `resource_group_membership.resource_id` (`TEXT`,
@@ -336,7 +336,7 @@ async fn seed_closure(
     Ok(())
 }
 
-/// VHP-2344 defect A, `InGroup` branch: the resource's `Uuid` primary key
+/// the `uuid = text` defect, `InGroup` branch: the resource's `Uuid` primary key
 /// must be comparable against `resource_group_membership.resource_id`
 /// (`TEXT`) without PostgreSQL rejecting the query outright, and the filter
 /// must return exactly the resource holding a membership row in the scoped
@@ -387,7 +387,7 @@ async fn in_group_filter_executes_on_postgres() -> Result<()> {
             );
         }
         Err(e) => panic!(
-            "ScopeFilter::InGroup produced SQL PostgreSQL rejected -- VHP-2344 defect A \
+            "ScopeFilter::InGroup produced SQL PostgreSQL rejected -- the `uuid = text` defect \
              (uuid = text mismatch between the entity's resource column and \
              resource_group_membership.resource_id) is unfixed: {e}"
         ),
@@ -396,7 +396,7 @@ async fn in_group_filter_executes_on_postgres() -> Result<()> {
     Ok(())
 }
 
-/// VHP-2344 defect A, `InGroupSubtree` branch: same `uuid = text` mismatch,
+/// the `uuid = text` defect, `InGroupSubtree` branch: same `uuid = text` mismatch,
 /// reached through the closure-table subquery instead of a direct group list.
 #[tokio::test]
 async fn in_group_subtree_filter_executes_on_postgres() -> Result<()> {
@@ -447,7 +447,7 @@ async fn in_group_subtree_filter_executes_on_postgres() -> Result<()> {
             );
         }
         Err(e) => panic!(
-            "ScopeFilter::InGroupSubtree produced SQL PostgreSQL rejected -- VHP-2344 \
+            "ScopeFilter::InGroupSubtree produced SQL PostgreSQL rejected -- \
              defect A (uuid = text mismatch) is unfixed: {e}"
         ),
     }
@@ -455,7 +455,7 @@ async fn in_group_subtree_filter_executes_on_postgres() -> Result<()> {
     Ok(())
 }
 
-// === VHP-2344 defect B: cross-GTS-type ambiguity ===
+// === the cross-type membership defect: cross-GTS-type ambiguity ===
 
 /// Defect B: `resource_group_membership` is keyed by the triple
 /// `(group_id, gts_type_id, resource_id)`, but a subquery filtered on
@@ -533,7 +533,7 @@ async fn in_group_of_type_excludes_a_same_id_resource_of_another_type() -> Resul
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
     assert!(
         ids.is_empty(),
-        "VHP-2344 defect B: a membership recorded for {NOTE_TYPE} must not satisfy a \
+        "the cross-type membership defect: a membership recorded for {NOTE_TYPE} must not satisfy a \
          filter scoping {FILE_TYPE}, even though both name resource_id {shared_id}; \
          got: {ids:?}"
     );

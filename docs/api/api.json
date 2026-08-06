@@ -705,7 +705,7 @@
             ]
           },
           "tenant_id": {
-            "description": "Optional target tenant for the created group (VHP-2162).\n\nIf omitted, the tenant scope is derived from the caller's own\n`SecurityContext` -- today's unchanged default behavior. If present\nand different from the caller's own tenant, the create succeeds only\nwhen the caller's `create`-action `AccessScope` actually covers the\ntarget tenant (platform-admin / onboarding use case); otherwise the\nrequest is rejected as though the target tenant did not exist.\nRejected as a contradiction for tenant-typed groups: their effective\ntenant is always `group.id`.",
+            "description": "Optional target tenant for the created group.\n\nIf omitted, the tenant scope is derived from the caller's own\n`SecurityContext` -- today's unchanged default behavior. If present\nand different from the caller's own tenant, the create succeeds only\nwhen the caller's `create`-action `AccessScope` actually covers the\ntarget tenant (platform-admin / onboarding use case); otherwise the\nrequest is rejected as though the target tenant did not exist.\nRejected as a contradiction for tenant-typed groups: their effective\ntenant is always `group.id`.",
             "format": "uuid",
             "type": [
               "string",

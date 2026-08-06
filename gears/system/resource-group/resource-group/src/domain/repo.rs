@@ -39,7 +39,7 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
     /// caller's tenant?") and the raw model do both in one query instead of
     /// `find_by_id` (which pays for an unconditional `resolve_type_path`
     /// the gate never needed) followed by a second, separate
-    /// `find_model_by_id` (VHP-2341 audit finding (a): redundant-io).
+    /// `find_model_by_id` (audit finding (a): redundant-io).
     async fn find_model_by_id_scoped<C: DBRunner>(
         &self,
         db: &C,
@@ -429,7 +429,7 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
     /// List memberships, filtered to `scope`.
     ///
     /// `resource_group_membership` declares `#[secure(no_tenant, no_resource,
-    /// no_owner, no_type)]` (VHP-2341) -- `scope` cannot be applied directly
+    /// no_owner, no_type)]` -- `scope` cannot be applied directly
     /// to it via `.scope_with()` (every constrained scope would resolve to
     /// deny-all). Implementations must filter via the owning
     /// `resource_group` row instead. Pass `AccessScope::allow_all()` for the

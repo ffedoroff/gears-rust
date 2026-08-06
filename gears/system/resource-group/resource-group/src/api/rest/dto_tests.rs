@@ -150,7 +150,7 @@ fn dto_create_group_no_id_maps_to_none() {
     assert!(req.id.is_none());
 }
 
-// TC-DTO-05d (VHP-2162): Caller-supplied `tenant_id` is deserialized from
+// TC-DTO-05d: Caller-supplied `tenant_id` is deserialized from
 // the snake_case wire key and passed through to the SDK request.
 #[test]
 fn dto_create_group_tenant_id_passthrough() {
@@ -168,7 +168,7 @@ fn dto_create_group_tenant_id_passthrough() {
     assert_eq!(req.tenant_id, Some(tenant_id));
 }
 
-// TC-DTO-05e (VHP-2162): Omitted `tenant_id` maps to `None` in the SDK
+// TC-DTO-05e: Omitted `tenant_id` maps to `None` in the SDK
 // request -- byte-for-byte today's behavior (the service falls back to the
 // caller's own `SecurityContext` tenant).
 #[test]

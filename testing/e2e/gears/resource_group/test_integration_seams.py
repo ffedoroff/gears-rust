@@ -615,14 +615,14 @@ async def test_membership_filter_wiring(
         assert any(m["resource_id"] == "res-2" for m in items)
 
 
-# ── S10b: Membership filter by resource_type (VHP-1731) ─────────────────
+# ── S10b: Membership filter by resource_type ─────────────────
 
 
 async def test_membership_filter_by_resource_type(
     rg_base_url, rg_headers, create_type, create_group,
 ):
     """Seam: OData $filter on `resource_type` -- GTS type-path string ->
-    SMALLINT surrogate resolution at the persistence boundary (VHP-1731).
+    SMALLINT surrogate resolution at the persistence boundary.
 
     `resource_type` is exposed on the wire as a GTS type-path string but
     stored as the SMALLINT `gts_type_id` column; the repository must resolve
@@ -631,7 +631,7 @@ async def test_membership_filter_by_resource_type(
     `group_id`, so this seam -- resolve-then-filter for `resource_type` --
     was never exercised end-to-end.
 
-    NOTE: added alongside a fix for VHP-1954/VHP-1731; not run locally (no
+    NOTE: added alongside a fix for/; not run locally (no
     live cluster in this environment) -- verify against a real deployment.
     """
     member_type_a = await create_type("s10ta")
@@ -671,13 +671,13 @@ async def test_membership_filter_by_resource_type(
         )
 
 
-# ── S10c: Quoted-UUID $filter must be 400, not 500 (VHP-1954) ───────────
+# ── S10c: Quoted-UUID $filter must be 400, not 500 ───────────
 
 
 async def test_membership_filter_group_id_quoted_uuid_returns_400(
     rg_base_url, rg_headers,
 ):
-    """Seam: client-caused $filter errors -> 400, not 500 (VHP-1954).
+    """Seam: client-caused $filter errors -> 400, not 500.
 
     The OData grammar only parses a *bare* hex8-4-4-4-12 UUID literal as
     `Value::Uuid`; the same literal wrapped in single quotes parses as
@@ -687,7 +687,7 @@ async def test_membership_filter_group_id_quoted_uuid_returns_400(
     a client mistake into a 500; S10 above never caught it because it always
     sends the bare (unquoted) form.
 
-    NOTE: added alongside a fix for VHP-1954/VHP-1731; not run locally (no
+    NOTE: added alongside a fix for/; not run locally (no
     live cluster in this environment) -- verify against a real deployment.
     """
     some_uuid = str(uuid.uuid4())

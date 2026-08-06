@@ -31,7 +31,7 @@ pub struct SeedResult {
 ///
 /// Seeding runs at gear init, before any caller `SecurityContext` exists —
 /// same rationale as `seed_groups` below. Uses the dedicated `*_unscoped`
-/// entry points on `TypeService` (VHP-2342): domain invariants (placement
+/// entry points on `TypeService`: domain invariants (placement
 /// invariant, hierarchy safety, parent/membership existence) still run,
 /// only the `PolicyEnforcer` gate is skipped.
 pub async fn seed_types<TR: TypeRepositoryTrait>(
@@ -137,7 +137,7 @@ pub async fn seed_groups<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait>(
                     parent_id: seed.parent_id,
                     // Seeding always resolves the target tenant via the
                     // trusted `seed.tenant_id` argument to
-                    // `create_group_unscoped` below (VHP-2162) -- never via
+                    // `create_group_unscoped` below -- never via
                     // this field, so it stays `None` here.
                     tenant_id: None,
                     metadata: seed.metadata.clone(),

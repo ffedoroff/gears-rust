@@ -19,12 +19,12 @@ pub enum DomainError {
     /// Raised by `GroupRepository::insert` when the insert hits a
     /// unique-constraint violation on `resource_group.id` — the caller
     /// supplied (via `CreateGroupRequest::id`) or seeding replayed an `id`
-    /// that already exists. VHP-2343's owner decision keeps client-supplied
+    /// that already exists. the owner decision keeps client-supplied
     /// `id` on create as-is (no derived-id, no `id_seed` — that policy
     /// question is out of scope here); this variant only turns the
     /// resulting primary-key collision into a typed conflict instead of an
     /// opaque `Database` (HTTP 500). Maps to canonical `already_exists`
-    /// (HTTP 409) with `id` as the `resource_name` (VHP-2345).
+    /// (HTTP 409) with `id` as the `resource_name`.
     #[error("Group already exists: {id}")]
     GroupAlreadyExists { id: uuid::Uuid },
 
@@ -52,7 +52,7 @@ pub enum DomainError {
     GroupNotFound { id: uuid::Uuid },
 
     /// Target tenant from an explicit `CreateGroupRequest::tenant_id` is
-    /// outside the caller's `create`-action `AccessScope` (VHP-2162).
+    /// outside the caller's `create`-action `AccessScope`.
     ///
     /// Deliberately mirrors `GroupNotFound`'s shape rather than
     /// `AccessDenied`: a foreign tenant the caller has no grant for must be
@@ -60,7 +60,7 @@ pub enum DomainError {
     /// not own tenant data (that's Account Management's `tenants` /
     /// `tenant_closure`), so it can never legitimately claim to know the
     /// difference between "real tenant, no grant" and "no such tenant" --
-    /// the same anti-oracle principle the VHP-2341 membership gates
+    /// the same anti-oracle principle the membership gates
     /// established (see `membership_service.rs`). Maps to canonical
     /// `not_found` (HTTP 404). The echoed `tenant_id` is the caller's own
     /// request payload, so echoing it back discloses nothing the caller did
@@ -96,7 +96,7 @@ pub enum DomainError {
     /// **tenant type path**, not `existing_root_id`: that id is found by a
     /// deliberately unscoped, forest-wide query, so it can name a group --
     /// and, since a tenant-type group's `id` *is* its `tenant_id`, a tenant --
-    /// the caller has no grant for (VHP-2345). The field is retained for
+    /// the caller has no grant for. The field is retained for
     /// logging and for in-process callers that already see every tenant; it
     /// never reaches the wire.
     #[error("Tenant root already exists (id={existing_root_id}): {detail}")]
@@ -116,7 +116,7 @@ pub enum DomainError {
     /// key. The conflicting tenant set is collected under the system scope
     /// (the invariant is forest-wide), so naming it would disclose foreign
     /// tenants to any caller who can guess a `(resource_type, resource_id)`
-    /// pair (VHP-2345). See `MembershipService::add_membership_in_tx`.
+    /// pair. See `MembershipService::add_membership_in_tx`.
     #[error("Tenant incompatibility: {message}")]
     TenantIncompatibility { message: String },
 
@@ -327,7 +327,7 @@ impl From<toolkit_db::DbError> for DomainError {
 /// backend fault, so it must map to `Validation`, not `Database`.
 ///
 /// Used by every list repository of this gear — `list_memberships`
-/// (VHP-1954), `list_groups` and `list_types` (ML-7391) — so a malformed
+///, `list_groups` and `list_types` (ML-7391) — so a malformed
 /// `$filter` (unknown field, type mismatch, bad `$orderby` field, stale
 /// cursor) surfaces as 400 instead of being folded into a blanket 500
 /// alongside actual DB failures.

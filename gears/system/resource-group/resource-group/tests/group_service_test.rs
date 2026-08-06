@@ -297,7 +297,7 @@ async fn group_create_cross_tenant_parent() {
         matches!(err, DomainError::Validation { .. }),
         "Expected Validation with tenant mismatch, got: {err:?}"
     );
-    // VHP-2345: the message must not disclose the parent's (tenant A's)
+    // the message must not disclose the parent's (tenant A's)
     // tenant_id -- across a tenant boundary that value is exactly the
     // "cross-tenant oracle" a caller could otherwise use `parent_id` to
     // probe for. Assert the *value* is absent, not merely that some new
@@ -313,8 +313,8 @@ async fn group_create_cross_tenant_parent() {
 
 /// TC-GRP-23b: Create group with an `id` that collides with an existing
 /// group's primary key -> typed `GroupAlreadyExists`, not a raw `Database`
-/// (500). VHP-2343's owner decision keeps the client-supplied `id` accepted
-/// as-is on create (no derived-id); VHP-2345 only turns the resulting
+/// (500). the owner decision keeps the client-supplied `id` accepted
+/// as-is on create (no derived-id) only turns the resulting
 /// primary-key collision into a typed conflict.
 #[tokio::test]
 async fn group_create_duplicate_id_returns_typed_conflict() {
@@ -3167,7 +3167,7 @@ async fn group_create_duplicate_id_same_tenant_is_already_exists() {
 // list_groups `type` $filter coverage (fe2d609e generalization follow-up)
 // =========================================================================
 //
-// `fe2d609e` (VHP-1954/1731) lifted `resolve_type_filter_node` out of
+// `fe2d609e` (/1731) lifted `resolve_type_filter_node` out of
 // `GroupRepository` and into `TypeRepository`, generic over the caller's
 // filter-field enum, so `GroupRepository::list_groups` now calls the exact
 // same tree-walk `MembershipRepository::list_memberships` does instead of

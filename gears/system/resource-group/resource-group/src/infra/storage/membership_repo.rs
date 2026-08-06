@@ -49,7 +49,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
         // GTS type-path string values to SMALLINT IDs in the typed
         // FilterNode -- BEFORE paginate_odata. Mirrors
         // `GroupRepository::list_groups`; the tree walk itself is shared via
-        // `TypeRepository::resolve_type_filter_node` (VHP-1731).
+        // `TypeRepository::resolve_type_filter_node`.
         let resolved_filter = if let Some(ast) = query.filter.as_deref() {
             let validated =
                 toolkit_odata::filter::convert_expr_to_filter_node::<MembershipFilterField>(ast)
@@ -66,68 +66,26 @@ impl MembershipRepositoryTrait for MembershipRepository {
             None
         };
 
-        // Build base query with the resolved filter applied manually.
+        // Tenant scoping runs against `resource_group`, not against
+        // `resource_group_membership`: the membership entity is
+        // `#[secure(no_tenant, no_resource, no_owner, no_type)]`, so
+        // `.secure().scope_with(scope)` on it resolves to deny-all for
+        // every constrained caller rather than to a per-tenant filter.
         //
-        // VHP-2341: `resource_group_membership` declares `#[secure(no_tenant,
-        // no_resource, no_owner, no_type)]` (see its entity file) --
-        // `Scopable`'s generated `resolve_property` returns `None` for
-        // *every* property on that shape, so calling
-        // `.secure().scope_with(scope)` directly on `MembershipEntity` with
-        // the caller's real (constrained) scope would resolve to deny-all
-        // for every caller, not a per-tenant filter -- an empty list for
-        // everyone, not tenant isolation. Tenant scoping instead has to run
-        // against `resource_group`, which DOES declare
-        // `tenant_col = "tenant_id"` (see `resource_group.rs`).
+        // A JOIN is not usable: both tables carry a `gts_type_id` column,
+        // and the generic OData helpers emit unqualified column
+        // references, so the predicate becomes ambiguous once the two
+        // share a `FROM`. A correlated `EXISTS` keeps the outer `FROM`
+        // single-table and still narrows per row, via
+        // `resource_group.id = resource_group_membership.group_id`.
         //
-        // A plain SQL JOIN on `group_id = id` was tried first and rejected:
-        // both tables happen to have a `gts_type_id` column (the group's
-        // own GTS type vs. the member resource's GTS type), and
-        // `resource_type` `$filter`/cursor predicates are built by the
-        // generic `toolkit_db::odata` helpers via `Expr::col(column)` --
-        // an *unqualified* column reference. That's unambiguous against a
-        // single-table `FROM`, but once `resource_group` is joined into the
-        // same top-level query, `"gts_type_id"` is ambiguous between the two
-        // tables and every backend (SQLite included) rejects the query.
-        // Rewriting the generic OData helpers to always table-qualify was
-        // rejected as out of scope and riskier than this gear's own fix.
+        // Note this is correlated on purpose: `SecureSelect::
+        // scope_via_exists` is uncorrelated and would only ask whether any
+        // group is in scope, not whether *this* membership's group is.
         //
-        // Instead, tenant scoping runs as a **correlated EXISTS subquery**
-        // with its own, separate `FROM resource_group` -- the outer query's
-        // `FROM` stays `resource_group_membership` only, so the ambiguity
-        // above cannot occur (the outer `$filter`/cursor/order-by columns
-        // are only ever resolved against the single outer table). The
-        // subquery's `WHERE` correlates back to the specific membership row
-        // via `resource_group.id = resource_group_membership.group_id`
-        // (table-qualified with `Expr::col((Entity, Column)).equals(..)`,
-        // so it never collides with the subquery's own unqualified
-        // scope-condition columns either), then ANDs in the ordinary
-        // `SecureSelect` scope condition for `resource_group` -- built via
-        // the same public `.secure().scope_with(scope)` API every other
-        // repo in this gear uses, not a hand-rolled `Condition`.
-        //
-        // `toolkit_db::secure` has no public helper that returns a bare
-        // `Condition` for an arbitrary entity outside a `SecureSelect`
-        // chain, and the existing `SecureSelect::scope_via_exists::<J>`
-        // helper is deliberately *uncorrelated* (see its doc comment in
-        // `libs/toolkit-db/src/secure/select.rs`): it would check whether
-        // *any* group in scope exists at all, not whether *this
-        // membership's* group is in scope -- exactly the trap VHP-2341
-        // warns about. Extending `toolkit-db`'s public API with a
-        // correlated-EXISTS or bare-`Condition` builder was considered and
-        // rejected: `.secure().scope_with(scope).into_inner().into_query()`
-        // (all public `SecureSelect`/`QueryTrait` API) plus a manually
-        // built `Expr::exists(..)` wrapper is sufficient, so no library
-        // change is needed for this gear-local fix.
-        //
-        // This is still exactly one SQL statement per page -- a subquery
-        // inside the same statement's `WHERE`, not a second round trip.
-        //
-        // Skipped for an unconstrained scope (`list_memberships_unscoped`:
-        // the in-process AuthZ-plugin read path and seeding) so that path's
-        // query shape is untouched by this fix -- an unconstrained scope
-        // adds no filter either way, so the subquery would be a pure no-op
-        // there; omitting it keeps its SQL text (and query-count baseline)
-        // exactly as it was before VHP-2341.
+        // Skipped for an unconstrained scope so the unscoped read path
+        // keeps its exact previous SQL -- the subquery would be a no-op
+        // there anyway.
         let base_query = if scope.is_unconstrained() {
             MembershipEntity::find().secure().scope_with(scope)
         } else {
@@ -169,7 +127,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
 
         // Any remaining `paginate_odata` failure (bad `$orderby` field, stale
         // cursor, filter/order mismatch, or a genuine DB error) is
-        // classified by `DomainError::from` (VHP-1954): client-caused query
+        // classified by `DomainError::from`: client-caused query
         // rejections map to `Validation` (400), backend failures stay
         // `Database` (500).
         let page = paginate_odata::<MembershipFilterField, MembershipODataMapper, _, _, _, _>(
@@ -239,7 +197,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
         toolkit_db::secure::secure_insert::<MembershipEntity>(model, &scope, db)
             .await
             .map_err(|e| {
-                // VHP-2345: same duplicate-key classification as
+                // same duplicate-key classification as
                 // `GroupRepository::insert` -- `ScopeError::is_unique_violation`
                 // (SQLSTATE first, string fallback second) instead of a
                 // gear-local substring match on "duplicate key" / "UNIQUE

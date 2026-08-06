@@ -153,7 +153,7 @@ tenant — which makes those ids, by construction, not the caller's to learn. Na
 turned this endpoint into a cross-tenant existence oracle: supply any
 `(resource_type, resource_id)` and read back which tenants hold it, in direct conflict
 with the security-review rule against identifiers of inaccessible objects in error
-messages. Real values are logged at `debug` (VHP-2345).
+messages. Real values are logged at `debug`.
 
 **Steps**:
 1. [x] - `p1` - DB: SELECT rgm.group_id, rg.tenant_id FROM resource_group_membership rgm JOIN resource_group rg ON rgm.group_id = rg.id WHERE rgm.gts_type_id = {resource_type_id} AND rgm.resource_id = {resource_id} — find existing memberships for this resource - `inst-tenant-check-1`

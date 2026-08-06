@@ -113,7 +113,7 @@ pub struct TypeService<TR: TypeRepositoryTrait> {
 impl<TR: TypeRepositoryTrait> TypeService<TR> {
     /// Create a new `TypeService` with the given database provider and
     /// `PolicyEnforcer` for `AuthZ` enforcement on the type-registry CRUD
-    /// surface (VHP-2342).
+    /// surface.
     #[must_use]
     pub fn new(db: Arc<DbProvider>, enforcer: PolicyEnforcer, type_repo: Arc<TR>) -> Self {
         Self {

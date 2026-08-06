@@ -257,7 +257,7 @@ async fn membership_add_tenant_incompatibility() {
         "expected TenantIncompatibility, got: {err:?}"
     );
 
-    // T1.2 (VHP-2345): the message must not name the tenants involved, nor the
+    // T1.2: the message must not name the tenants involved, nor the
     // resource key. `get_existing_membership_tenant_ids` collects the existing
     // tenant set under the *system* scope -- it has to, the invariant is
     // forest-wide -- so those ids are not the caller's to learn. Interpolating
@@ -281,7 +281,7 @@ async fn membership_add_tenant_incompatibility() {
     );
 }
 
-// TC-MBR-06b: VHP-2341 -- add_membership into a cross-tenant group is
+// TC-MBR-06b: - add_membership into a cross-tenant group is
 // rejected as if the group didn't exist (no existence leak across tenants).
 #[tokio::test]
 async fn membership_add_cross_tenant_group_not_found() {
@@ -362,7 +362,7 @@ async fn membership_remove_existing() {
     );
 }
 
-// TC-MBR-07b: VHP-2341 -- remove_membership from a cross-tenant group is
+// TC-MBR-07b: - remove_membership from a cross-tenant group is
 // rejected as if the group didn't exist, and the membership survives.
 #[tokio::test]
 async fn membership_remove_cross_tenant_group_not_found() {
@@ -637,7 +637,7 @@ async fn membership_same_resource_multiple_groups_same_tenant() {
     assert!(group_ids.contains(&group2.id));
 }
 
-// TC-MBR-14b: VHP-2341 -- list_memberships is tenant-scoped: tenant A must
+// TC-MBR-14b: - list_memberships is tenant-scoped: tenant A must
 // not see tenant B's membership rows, and must still see its own.
 #[tokio::test]
 async fn membership_list_is_tenant_scoped() {
@@ -718,7 +718,7 @@ async fn membership_list_empty() {
 }
 
 // =========================================================================
-// VHP-1731: `resource_type` $filter must resolve the GTS type path to its
+// `resource_type` $filter must resolve the GTS type path to its
 // SMALLINT surrogate id
 // =========================================================================
 //

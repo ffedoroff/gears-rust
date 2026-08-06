@@ -71,28 +71,15 @@ where
         state: &S,
     ) -> impl core::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         async move {
-            // Reject a non-JSON body up front, mirroring what `axum::Json`
-            // checks.
+            // Reject a non-JSON body up front, mirroring `axum::Json`.
             //
-            // **This is a 400, and `guidelines/DNA/REST/STATUS_CODES.md`
-            // requires 415 — a platform gap, not a gear preference.**
-            // `CanonicalError` has no category that maps to 415: its
-            // `status_code()` ladder covers 400/401/403/404/409/429/499/5xx and
-            // nothing else, and this extractor's `Rejection` is a
-            // `CanonicalError` precisely so every failure stays on the RFC-9457
-            // ladder (see this module's header). Minting a bare 415 outside
-            // that ladder would trade a wrong status for a non-canonical body,
-            // which is the worse of the two. The platform's own API Gateway
-            // made the same call in the same situation: its
-            // `mime_validation_middleware` answers an unsupported or missing
-            // `Content-Type` with a canonical `invalid_argument` (400) carrying
-            // `field_violations[0].reason = UNSUPPORTED_MEDIA_TYPE` /
-            // `MISSING_CONTENT_TYPE`, documenting that there is "no top-level
-            // `CanonicalError::*` constructor for this category". Fixing this
-            // properly means adding the category to
-            // `toolkit-canonical-errors`; until then the deviation is recorded
-            // in `docs/DESIGN.md` (§ "Strictness is the other half of the
-            // decision") rather than worked around here.
+            // This answers 400 where `STATUS_CODES.md` requires 415, because
+            // `CanonicalError` has no category that maps to 415 and this
+            // extractor keeps every failure on the RFC-9457 ladder. Minting a
+            // bare 415 would trade a wrong status for a non-canonical body.
+            // The API Gateway made the same call in the same situation. The
+            // fix belongs in `toolkit-canonical-errors`; until then the
+            // deviation is recorded in `docs/DESIGN.md`.
             if !is_json_content_type(&req) {
                 return Err(DomainError::validation(
                     "request body must be sent as application/json",

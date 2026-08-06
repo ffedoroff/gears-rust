@@ -1,12 +1,12 @@
 // Created: 2026-07-29 by Constructor Tech
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
-//! VHP-2162: create a resource group in an explicit target tenant.
+//! create a resource group in an explicit target tenant.
 //!
 //! `CreateGroupRequest::tenant_id` (optional) lets an authorized caller
 //! (platform admin / onboarding) create a group in a tenant other than the
 //! one derived from their own `SecurityContext`. Coverage:
 //!
-//! - omitted `tenant_id` -> byte-for-byte pre-VHP-2162 behavior
+//! - omitted `tenant_id` -> byte-for-byte the previous behavior
 //!   (`tenant_id_omitted_uses_caller_tenant`)
 //! - explicit `tenant_id` equal to the caller's own tenant -> no-op, same
 //!   outcome as omitted (`tenant_id_matches_caller_tenant_succeeds`)
@@ -21,14 +21,14 @@
 //!   literally the constraint's own root
 //!   (`in_tenant_subtree_scope_is_denied_fail_closed`)
 //! - explicit `tenant_id` conflicting with an explicit `parent_id`'s actual
-//!   tenant -> rejected, message does not leak tenant ids (VHP-2345 style)
+//!   tenant -> rejected, message does not leak tenant ids (style)
 //!   (`explicit_tenant_id_conflicting_with_parent_tenant_returns_validation_error`)
 //! - a tenant-typed group (`code` starting with `TENANT_RG_TYPE_PATH`) with
 //!   an explicit `tenant_id` is a contradiction, rejected outright
 //!   (`tenant_typed_group_with_explicit_tenant_id_returns_validation_error`)
 //! - an explicit `id` combined with a cross-tenant target is rejected as a
-//!   VHP-2343 stopgap, even when the `AccessScope` would otherwise permit
-//!   the target tenant
+//!   stopgap, even when the `AccessScope` would otherwise permit the
+//!   target tenant
 //!   (`explicit_id_with_foreign_tenant_id_returns_validation_error`)
 //! - `create_group_unscoped` (the seeding entry point): a `req.tenant_id`
 //!   that disagrees with the trusted `tenant_id` argument is a caller bug,
@@ -95,7 +95,7 @@ fn unique_tenant_type_code() -> String {
 ///
 /// This both models "the policy grants access to this specific tenant" and,
 /// as a side effect, proves `GroupService::create_group` actually forwards
-/// the resolved target tenant to the PDP (VHP-2162): if it didn't, this
+/// the resolved target tenant to the PDP: if it didn't, this
 /// mock would fall back to `Uuid::nil()` and every assertion below that a
 /// *specific* foreign `target_tenant` succeeded would fail.
 struct TargetTenantAllowAuthZ;
@@ -131,7 +131,7 @@ impl AuthZResolverClient for TargetTenantAllowAuthZ {
 
 /// Permits, but the sole constraint is `InTenantSubtree` rooted at a
 /// caller-chosen tenant. Models a policy shape like "tenant admins may
-/// manage their own tenant's subtree" -- exercises VHP-2162's documented
+/// manage their own tenant's subtree" -- exercises the documented
 /// fail-closed limitation: `AccessScope::contains_uuid` cannot resolve
 /// subtree membership for this filter variant (no DB-backed
 /// `tenant_closure` lookup in this gear), so the request is denied even
@@ -163,7 +163,7 @@ impl AuthZResolverClient for InTenantSubtreeOnlyAuthZ {
 
 // -- create_group: omitted / same-tenant tenant_id (backward compatibility) --
 
-/// Omitted `tenant_id` must be byte-for-byte the pre-VHP-2162 behavior:
+/// Omitted `tenant_id` must be byte-for-byte the previous behavior:
 /// target tenant == the caller's own tenant, no extra AuthZ round trip
 /// beyond the one `create_group` always performed.
 #[tokio::test]
@@ -202,7 +202,7 @@ async fn tenant_id_matches_caller_tenant_succeeds() {
     let db = common::test_db().await;
     let type_svc = common::make_type_service(db.clone());
     // `common::make_group_service` wires `AllowAllAuthZ`, which clamps the
-    // returned scope to the caller's own tenant -- if the extra VHP-2162
+    // returned scope to the caller's own tenant -- if the extra
     // check ran here, it would still pass (target == caller), but this test
     // pins that the common "explicit but same tenant" case behaves
     // identically to omission, not merely that it happens to also pass.
@@ -234,7 +234,7 @@ async fn tenant_id_matches_caller_tenant_succeeds() {
 
 /// A foreign target tenant covered by the compiled `AccessScope` (an `In`
 /// constraint containing it) succeeds -- the platform-admin / onboarding
-/// use case VHP-2162 exists for.
+/// use case exists for.
 #[tokio::test]
 async fn foreign_tenant_allowed_by_permissive_policy_succeeds() {
     let db = common::test_db().await;
@@ -310,7 +310,7 @@ async fn foreign_tenant_denied_by_default_policy_returns_tenant_not_found() {
 
 /// An `AccessScope` built only from an `InTenantSubtree` constraint can
 /// never be resolved by `AccessScope::contains_uuid` -- fail-closed by
-/// design (VHP-2162; see `GroupService::create_group`'s doc comment on the
+/// design (; see `GroupService::create_group`'s doc comment on the
 /// AuthZ gate). This holds even when the target tenant is literally the
 /// constraint's own `root_tenant_id`: the point is that this gear cannot
 /// verify subtree *membership* at all without a `tenant_closure` lookup it
@@ -359,7 +359,7 @@ async fn in_tenant_subtree_scope_is_denied_fail_closed() {
 /// An explicit `tenant_id` that conflicts with an explicit `parent_id`'s
 /// actual tenant is rejected, even when the `AccessScope` would otherwise
 /// permit the target tenant on its own. The rejection message must not
-/// leak either tenant's id (mirrors the VHP-2345 fix for the caller's-own-
+/// leak either tenant's id (mirrors the fix for the caller's-own-
 /// tenant case).
 #[tokio::test]
 async fn explicit_tenant_id_conflicting_with_parent_tenant_returns_validation_error() {
@@ -378,7 +378,7 @@ async fn explicit_tenant_id_conflicting_with_parent_tenant_returns_validation_er
         common::create_child_type(&type_svc, "vhp2162f-child", &[&root_type.code], &[]).await;
 
     // Root group lives in tenant_a (the `TargetTenantAllowAuthZ` mock
-    // permits any tenant, so this create is unaffected by VHP-2162).
+    // permits any tenant, so this create is unaffected by).
     let root = common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_a).await;
 
     let err = group_svc
@@ -402,7 +402,7 @@ async fn explicit_tenant_id_conflicting_with_parent_tenant_returns_validation_er
             assert!(
                 !message.contains(&tenant_a.to_string())
                     && !message.contains(&tenant_b.to_string()),
-                "message must not leak tenant ids (VHP-2345 style): {message}"
+                "message must not leak tenant ids (style): {message}"
             );
         }
         other => panic!("expected DomainError::Validation, got: {other:?}"),
@@ -453,10 +453,10 @@ async fn tenant_typed_group_with_explicit_tenant_id_returns_validation_error() {
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
-// -- create_group: VHP-2343 guardrail (explicit id + cross-tenant target) --
+// -- create_group: guardrail (explicit id + cross-tenant target) --
 
 /// An explicit `id` combined with a cross-tenant target is rejected as a
-/// VHP-2343 stopgap -- even when the `AccessScope` would otherwise permit
+/// stopgap -- even when the `AccessScope` would otherwise permit
 /// the target tenant. The rejection happens before the AuthZ round trip, so
 /// wiring a permissive mock here proves the guardrail is unconditional, not
 /// merely a side effect of a denial.
@@ -487,14 +487,14 @@ async fn explicit_id_with_foreign_tenant_id_returns_validation_error() {
             caller_tenant,
         )
         .await
-        .expect_err("id + cross-tenant target combination must be rejected (VHP-2343 guardrail)");
+        .expect_err("id + cross-tenant target combination must be rejected (guardrail)");
 
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
 /// Positive control for the guardrail above: an explicit `id` combined with
 /// a target tenant that equals the caller's own tenant is *not* a
-/// cross-tenant combination and must still succeed -- VHP-2343's own
+/// cross-tenant combination and must still succeed -- the own
 /// (separately tracked, unresolved) id-capture question is untouched by
 /// this guardrail.
 #[tokio::test]

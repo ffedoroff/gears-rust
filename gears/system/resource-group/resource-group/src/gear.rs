@@ -70,7 +70,7 @@ impl Gear for ResourceGroup {
         let type_repo = Arc::new(TypeRepository);
         let membership_repo = Arc::new(MembershipRepository);
 
-        // Create TypeService with PolicyEnforcer for AuthZ enforcement (VHP-2342)
+        // Create TypeService with PolicyEnforcer for AuthZ enforcement
         let type_service = Arc::new(TypeService::new(
             db.clone(),
             enforcer.clone(),

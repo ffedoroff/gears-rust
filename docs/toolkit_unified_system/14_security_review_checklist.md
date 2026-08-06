@@ -25,7 +25,7 @@ For the mechanics behind these rules see [`06_authn_authz_secure_orm.md`](./06_a
   `let _scope = …` and no `let _ = enforcer.access_scope(…)`.
   *Violation:* `membership_service.rs` computed the scope in all three membership operations and
   discarded it — a caller in tenant A could add members to, remove members from, and list rows of
-  tenant B (VHP-2341).
+  tenant B.
 
 - **S1.2** The diff contains no `AccessScope::allow_all()`, and no local helper returning it,
   outside of (a) gear-init seeding, (b) the named prefetch pattern in `06_authn_authz_secure_orm.md`,
@@ -62,7 +62,7 @@ For the mechanics behind these rules see [`06_authn_authz_secure_orm.md`](./06_a
   only protection.
   *Violation:* the GTS type registry took no `SecurityContext` at all, so any authenticated user of
   any tenant could rewrite the rules every resource group is validated against. One `PUT` emptying
-  `allowed_membership_types` stopped user additions platform-wide (VHP-2342).
+  `allowed_membership_types` stopped user additions platform-wide.
 
 - **S2.3** `ResourceType.supported_properties` for such a resource is **not empty**. Real PDP
   plugins attach a baseline `In(owner_tenant_id, …)` constraint to every permit, and the PEP

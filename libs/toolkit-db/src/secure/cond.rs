@@ -107,40 +107,22 @@ where
             }
             ScopeFilter::InGroup(gf) => {
                 // CAST(col AS text) IN (SELECT resource_id FROM resource_group_membership
-                //                        WHERE group_id IN (...))
+                //                        WHERE group_id IN (...) AND gts_type_id = ...)
                 //
-                // VHP-2344 defect A: `resource_id` is TEXT (see resource-group's
-                // `m20260306_000001_initial.rs`) -- deliberately untyped because
-                // GTS resource IDs are not always UUIDs. PostgreSQL does not
-                // implicitly cast `uuid = text`, so comparing a `Uuid` resource
-                // column (the common case, e.g. `file.rs`'s `file_id`) against
-                // `resource_id` failed outright. Cast the ENTITY's column to
-                // text instead of casting `resource_id` to uuid: the reverse
-                // cast would throw on every row whose GTS type uses a
-                // non-UUID resource_id, which is exactly the set of rows this
-                // predicate must still be able to match for entities with a
-                // non-UUID resource_col. Casting a column that is already
-                // text-typed is a harmless no-op on both Postgres and SQLite.
+                // The entity's column is cast to text, not `resource_id` to
+                // uuid: `resource_id` is TEXT because GTS resource ids are
+                // not always UUIDs, and the reverse cast would throw on
+                // every non-UUID row. PostgreSQL rejects `uuid = text`
+                // outright; casting an already-text column is a no-op.
                 //
-                // VHP-2344 defect B: the membership primary key is the
-                // triple `(group_id, gts_type_id, resource_id)`, but a
-                // subquery filtered on `group_id` alone cannot tell two
-                // resources of different GTS types apart when they share a
-                // `resource_id` string -- and `resource_id` is TEXT,
-                // deliberately untyped, so collisions are ordinary.
-                //
-                // The discriminator arrives on the filter, not from the
-                // entity: `ScopeFilter::in_group_of_type` carries the GTS
-                // resource type the PEP named to the PDP for this very
-                // request (`PolicyEnforcer::access_scope` -> `ResourceType::
-                // name`). Taking it from there keeps the uncorrelated `IN`
-                // shape -- reading the entity's own `type_col()` would have
-                // forced a correlated `EXISTS`, and only one entity in the
-                // monorepo declares that column at all.
-                //
-                // `gts_type() == None` means the caller did not say, and the
-                // predicate then behaves exactly as it did before the
-                // discriminator existed rather than narrowing to a guess.
+                // The type discriminator comes from the filter, which
+                // carries the GTS resource type the PEP named to the PDP
+                // for this request. Without it the membership key
+                // `(group_id, gts_type_id, resource_id)` is only half
+                // matched, and two resources of different types sharing a
+                // `resource_id` string become indistinguishable. `None`
+                // means the caller did not say, and the predicate then
+                // behaves as it did before the discriminator existed.
                 let group_values = scope_values_to_sea_values(gf.group_ids());
                 let mut subquery = Query::select()
                     .column(Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID))
@@ -438,7 +420,7 @@ mod tests {
             cond_str.contains("resource_id"),
             "InGroup condition must join on resource_id, got: {cond_str}"
         );
-        // VHP-2344 defect A regression guard: the entity's resource column
+        // the `uuid = text` defect regression guard: the entity's resource column
         // must be CAST to text before the IN-subquery comparison, since
         // `resource_group_membership.resource_id` is TEXT and PostgreSQL
         // does not implicitly cast `uuid = text`. This is a debug-print
@@ -454,7 +436,7 @@ mod tests {
         );
     }
 
-    /// VHP-2344 defect B: a filter carrying a GTS resource type must
+    /// the cross-type membership defect: a filter carrying a GTS resource type must
     /// restrict the membership subquery to that type, so a
     /// same-`resource_id` row of another type cannot satisfy it.
     #[test]
@@ -696,7 +678,7 @@ mod tests {
             cond_str.contains("resource_id"),
             "InGroupSubtree condition must join on resource_id, got: {cond_str}"
         );
-        // VHP-2344 defect A regression guard -- see the equivalent assertion
+        // the `uuid = text` defect regression guard -- see the equivalent assertion
         // in `test_in_group_filter_produces_subquery_condition` for the full
         // rationale (real-Postgres proof lives in
         // `secure_group_scope_postgres.rs`, `--features integration,pg`).

@@ -1,5 +1,5 @@
 // Created: 2026-07-29 by Constructor Tech
-//! VHP-2342: `AuthZ` gate coverage for the GTS type-registry CRUD surface.
+//! `AuthZ` gate coverage for the GTS type-registry CRUD surface.
 //!
 //! `/types-registry/v1/types` (list/create/read/update/delete) used to be
 //! `.authenticated()`-only: any caller from any tenant could rewrite global
@@ -86,7 +86,7 @@ use resource_group_sdk::{CreateTypeRequest, ResourceGroupClient, UpdateTypeReque
 /// `In(OWNER_TENANT_ID)` constraint on every allow decision, for every
 /// resource, regardless of whether that resource has a tenant column. See
 /// [`TenantClampAuthZ`] below for that shape -- it is the one that actually
-/// caught the VHP-2342 empty-`supported_properties` regression that this
+/// caught the empty-`supported_properties` regression that this
 /// mock's original doc comment ("the only sensible shape") missed.
 struct AllowAllNoConstraintsAuthZ;
 
@@ -135,7 +135,7 @@ impl AuthZResolverClient for DenyAllAuthZ {
 /// `tests/common/mod.rs`'s `AllowAllAuthZ` use for `GroupService`/
 /// `MembershipService`.
 ///
-/// This is the mock that exposes the VHP-2342 regression
+/// This is the mock that exposes the regression
 /// `AllowAllNoConstraintsAuthZ` above cannot: against an empty
 /// `supported_properties` list, `owner_tenant_id` is an "unsupported
 /// property" to the compiler, and since it is the *only* constraint on the
@@ -462,7 +462,7 @@ async fn access_scope_with_realistic_tenant_clamp_constraint_succeeds() {
         );
 }
 
-/// End-to-end regression proof for VHP-2342's actual defect: a PDP that
+/// End-to-end regression proof for the actual defect: a PDP that
 /// responds the way real plugins do (permit + baseline `In(OWNER_TENANT_ID)`
 /// constraint, see [`TenantClampAuthZ`]) must still permit all five gated
 /// `TypeService` actions. Before `RG_TYPE_RESOURCE` declared
@@ -533,7 +533,7 @@ async fn all_five_actions_succeed_with_realistic_tenant_clamp_constraint() {
 /// `seed_types` must succeed even when `TypeService` is wired with a
 /// deny-all enforcer: seeding runs at gear init, before any caller
 /// `SecurityContext` exists, and goes through the `*_unscoped` entry points
-/// which never consult the `PolicyEnforcer` (VHP-2342).
+/// which never consult the `PolicyEnforcer`.
 #[tokio::test]
 async fn seed_types_succeeds_with_deny_all_enforcer() {
     let db = common::test_db().await;

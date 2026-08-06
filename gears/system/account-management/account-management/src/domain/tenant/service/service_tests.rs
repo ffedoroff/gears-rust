@@ -3969,45 +3969,23 @@ async fn list_children_outside_caller_subtree_returns_not_found() {
 
 #[tokio::test]
 async fn create_tenant_outside_caller_subtree_rejected() {
-    // Symmetric to `list_children_outside_caller_subtree_returns_not_found`
-    // and the `get_tenant` / `update_tenant` / `delete_tenant` cross-
-    // subtree siblings above -- but for `create_tenant`'s parent-
-    // existence gate specifically.
+    // `create_tenant` sends `parent_id` to the PDP as `OWNER_TENANT_ID`,
+    // but a CREATE has no single target, so nothing forces the PDP's
+    // boolean decision to depend on that value: a policy may permit
+    // "create something" from subject and context alone and leave the
+    // scoping to the returned constraints. `ConstraintBearingAuthZResolver`
+    // models that shape -- always `decision: true`, with the compiled
+    // scope pinned to a fixed root.
     //
-    // `create_tenant`'s `authorize(CREATE, parent_id, None)` call sends
-    // `parent_id` to the PDP as `OWNER_TENANT_ID`, but CREATE has no
-    // single target (`resource_id=None`), so nothing about the PEP
-    // request shape forces a PDP's boolean `decision` to depend on the
-    // value of that property -- a policy is free to decide "this
-    // subject may create *something*" from subject/context alone and
-    // leave the actual scoping entirely to the returned constraints.
-    // `ConstraintBearingAuthZResolver` (`constraint_bearing_enforcer`)
-    // models exactly that shape: `decision: true` unconditionally, with
-    // the compiled scope pinned to a fixed root regardless of what
-    // `parent_id` the caller asks to create under.
+    // The caller here is authorized for `subtree(child)` only, and asks to
+    // create under `root`. The rejection must be the same `Validation`
+    // "parent tenant not found" a genuinely missing parent produces, so
+    // the call is not an existence oracle for out-of-scope ids.
     //
-    // Caller is authorized only for `subtree(child) = {child}`; the
-    // create request asks for a new tenant under `root`, which sits
-    // outside that scope. This MUST be rejected -- the same `Validation`
-    // "parent tenant not found" shape a genuinely missing parent
-    // produces, so the call is not a tenant-existence oracle for ids
-    // outside the caller's scope.
-    //
-    // Before the `let _scope` → `let scope` fix (and threading `scope`
-    // into the parent `find_by_id`), this call read the parent under
-    // `AccessScope::allow_all()` and SUCCEEDED despite `root` being
-    // outside the caller's authorized subtree -- `response.decision`
-    // alone does not validate `parent_id` for this PDP shape.
-    //
-    // Deliberately hand-rolled rather than reusing
-    // `make_cross_subtree_svc`: this test needs `.with_types_registry`
-    // wired on the *returned* `svc` (not just the setup service) so
-    // that, pre-fix, the call runs the saga to actual completion
-    // instead of tripping an unrelated `ServiceUnavailable` from
-    // `load_tenant_context`'s registry requirement at line ~832 —
-    // i.e. so the demonstrated pre-fix failure is "the create
-    // succeeded despite being out of scope", not an incidental gap in
-    // this fixture's wiring.
+    // Hand-rolled rather than reusing `make_cross_subtree_svc` because the
+    // returned `svc` needs `.with_types_registry`, so that pre-fix the saga
+    // reached completion instead of tripping an unrelated
+    // `ServiceUnavailable`.
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x501);
     let repo = Arc::new(FakeTenantRepo::with_root(root));

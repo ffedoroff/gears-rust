@@ -616,7 +616,7 @@ async fn trace_add_membership() {
         rec.dump()
     );
     // N+1 audit finding (a) fix: exactly 1 resource_group SELECT, not 2.
-    // Before this fix, `add_membership_in_tx` paid for the VHP-2341
+    // Before this fix, `add_membership_in_tx` paid for the
     // AuthZ tenant-scope gate (`group_repo.find_by_id`, a scoped SELECT
     // resource_group + an unconditional `resolve_type_path` SELECT
     // gts_type whose result the gate never used) *and* a separate
@@ -647,14 +647,14 @@ async fn trace_add_membership() {
          gate-only resolve_type_path), got {type_selects}:\n{}",
         rec.dump()
     );
-    // Total statement count: 9, matching the pre-VHP-2341 baseline (the
+    // Total statement count: 9, matching the pre- baseline (the
     // tenant gate is now free -- it rides along on find_model_by_id_scoped
     // instead of adding 2 extra statements on top).
     assert_eq!(
         rec.total(),
         9,
         "N+1 audit finding (a) regression: expected 9 total statements (back to \
-         the pre-VHP-2341-gate baseline), got {}:\n{}",
+         the pre-gate baseline), got {}:\n{}",
         rec.total(),
         rec.dump()
     );
@@ -691,9 +691,9 @@ async fn trace_remove_membership() {
         "remove_membership must run its writes inside a transaction:\n{}",
         rec.dump()
     );
-    // VHP-2341 baseline: exactly 1 resource_group SELECT, where there were 0
+    // baseline: exactly 1 resource_group SELECT, where there were 0
     // before that fix. `remove_membership_in_tx` never looked up the group
-    // at all pre-VHP-2341 (it went straight to `membership_repo` by
+    // at all pre- (it went straight to `membership_repo` by
     // composite key); the AuthZ tenant-scope gate adds exactly this one
     // scoped SELECT, not a loop. Unchanged by the N+1 audit finding (a)
     // fix below -- `find_by_id` already cost exactly 1 resource_group
@@ -703,7 +703,7 @@ async fn trace_remove_membership() {
     assert_eq!(
         rg_selects,
         1,
-        "VHP-2341 regression: expected exactly 1 resource_group SELECT (the \
+        " regression: expected exactly 1 resource_group SELECT (the \
          AuthZ tenant-scope gate), got {rg_selects}:\n{}",
         rec.dump()
     );
@@ -735,7 +735,7 @@ async fn trace_remove_membership() {
     );
 }
 
-/// `list_memberships`'s tenant scoping (VHP-2341) runs as a correlated EXISTS
+/// `list_memberships`'s tenant scoping runs as a correlated EXISTS
 /// subquery embedded in the page's single `SELECT`, not a second round trip
 /// and not one subquery evaluation per row (the DB engine evaluates the
 /// EXISTS per candidate row server-side, inside one statement -- there is no
@@ -772,7 +772,7 @@ async fn trace_list_memberships() {
     );
 
     snapshot_trace("list_memberships", &rec);
-    // VHP-2341 baseline: exactly 1 resource_group_membership SELECT for the
+    // baseline: exactly 1 resource_group_membership SELECT for the
     // whole page (the EXISTS subquery against resource_group lives inside
     // that single statement's WHERE clause, so it doesn't add a
     // resource_group_membership SELECT of its own, and -- crucially -- it
@@ -782,7 +782,7 @@ async fn trace_list_memberships() {
     assert_eq!(
         membership_selects,
         1,
-        "VHP-2341 regression: expected exactly 1 resource_group_membership \
+        " regression: expected exactly 1 resource_group_membership \
          SELECT for the page (no N+1 from the per-row tenant-scope subquery), \
          got {membership_selects}:\n{}",
         rec.dump()
@@ -1160,7 +1160,7 @@ async fn scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_valu
 
 /// Same guard as the one above, but through `list_memberships`'s
 /// `resource_type in (...)` filter -- `MembershipRepository::list_memberships`
-/// calls the exact same `resolve_type_filter_node` (VHP-1954/VHP-1731), so
+/// calls the exact same `resolve_type_filter_node`, so
 /// this is a second call site for the same fix, not a second
 /// implementation of it.
 async fn gts_type_selects_for_list_memberships_resource_type_in_filter(n: usize) -> usize {

@@ -119,22 +119,13 @@ pub(super) async fn insert_provisioning(
                     }
                 }
 
-                // Identifiers are never reused
-                // (`cpt-cf-account-management-fr-tenant-import-external-id`,
-                // constraint 2). `tenants.id` stops guarding this the
-                // moment a hard delete removes the row, and the identifier
-                // here is caller-supplied on the import path, so a retired
-                // one would otherwise be accepted and silently re-point
-                // every audit record and external reference that still
-                // names it. Checked inside the same SERIALIZABLE TX as the
-                // INSERT, so a concurrent hard delete cannot retire the
-                // identifier between the probe and the write.
-                //
-                // The rejection carries only the identifier the caller
-                // already supplied (constraint 3): a message that revealed
-                // when or by whom the identifier was retired would make
-                // this endpoint an existence oracle over the tenant
-                // history.
+                // Identifiers are never reused. `tenants.id` stops guarding
+                // that once a hard delete removes the row, and on the import
+                // path the identifier is caller-supplied, so a retired one
+                // would otherwise be accepted and silently re-point every
+                // reference that still names it. Probed in the same
+                // SERIALIZABLE transaction as the INSERT, and the rejection
+                // carries only the identifier the caller already supplied.
                 let retired = tenant_id_tombstone::Entity::find()
                     .secure()
                     // The tombstone table is
@@ -1171,25 +1162,11 @@ pub(super) async fn hard_delete_one(
                     .await
                     .map_err(map_scope_to_tx)?;
 
-                // Retire the identifier in the same transaction that
-                // frees it. Deleting the `tenants` row is what makes
-                // the primary key available again; the tombstone is
-                // what keeps it from being handed out
-                // (`cpt-cf-account-management-fr-tenant-import-external-id`,
-                // constraint 2). Writing it anywhere but here would
-                // leave a window in which the identifier is free.
+                // Retire the identifier in the same transaction that frees
+                // it: deleting the `tenants` row is what makes the primary
+                // key available again, and the tombstone is what keeps it
+                // from being handed out.
                 //
-                // `on_conflict ... do_nothing` keeps the whole
-                // hard-delete path idempotent: `HardDeleteOutcome::
-                // Cleaned` is already returned for an absent row, and a
-                // retry that reaches this insert a second time must not
-                // turn a completed cleanup into a primary-key error.
-                //
-                // `allow_all` for the same reason as every other write
-                // in this TX — the table is
-                // `no_tenant/no_resource/no_owner/no_type`, so there is
-                // nothing to clamp, and this is the system-actor
-                // retention path.
                 // Probe-then-insert rather than `on_conflict(do_nothing)`:
                 // sea_orm surfaces a no-op conflicting insert as
                 // `DbErr::RecordNotInserted`, which would turn a retried

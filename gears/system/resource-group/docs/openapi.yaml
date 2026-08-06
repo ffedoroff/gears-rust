@@ -1177,7 +1177,7 @@ components:
           - 'null'
         tenant_id:
           description: |-
-            Optional target tenant for the created group (VHP-2162).
+            Optional target tenant for the created group.
 
             If omitted, the tenant scope is derived from the caller's own
             `SecurityContext` -- today's unchanged default behavior. If present
