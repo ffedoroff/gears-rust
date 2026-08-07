@@ -55,7 +55,7 @@ depth-10 parent issued roughly 100 000 separate `INSERT`s.
 | RG-06 | n-plus-one | Medium-High | `group_repo.rs` `insert_ancestor_closure_rows` — one `INSERT` per ancestor | Fixed |
 | RG-07 | n-plus-one | Low-Medium | `type_repo.rs` — junction rows inserted one per allowed parent/membership type | Fixed |
 | RG-08 | redundant-io | Low-Medium | `group_repo.rs`/`type_repo.rs`/`membership_repo.rs` — insert discards the model it just got back, then re-reads the row by id | Partially fixed (insert paths; the `update_many` + re-read shape is left, see Deferred) |
-| RG-09 | external-call-in-tx | High | `group_service.rs` — a cross-gear `types_registry` call plus JSON-Schema compilation inside a `SERIALIZABLE` transaction, repeated on every retry | Fixed on the source branch; not in this one — transaction duration, not a query count |
+| RG-09 | external-call-in-tx | High | `group_service.rs` — a cross-gear `types_registry` call plus JSON-Schema compilation inside a `SERIALIZABLE` transaction, repeated on every retry | Fixed. Both entry points validate before `BEGIN`; the transaction-inner functions no longer take a `TypesRegistryClient`, so the call cannot return by accident. Guarded by a Section 4 rule |
 | RG-10 | n-plus-one | High | `group_service.rs` `force_delete_subtree` — ~4 statements per node | Fixed |
 | RG-11 | redundant-io | Low | `group_service.rs` — the same type resolved twice per create/update (`resolve_id` then `find_by_code`) | Fixed |
 | RG-12 | n-plus-one | Medium | `type_repo.rs` `list_types` — junction reads per row, so a page of N types costs `2N+1` queries. **Read path** — the only finding not on a write path | Fixed |

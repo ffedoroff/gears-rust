@@ -15,8 +15,9 @@
 //! does not.
 //!
 //! The `no-tx-write` class is asserted throughout: every operation test ends
-//! on [`QueryRecorder::writes_outside_tx`], and `no-retry-serializable` has
-//! its own source-scan rule in Section 4.
+//! on [`QueryRecorder::writes_outside_tx`]. `no-retry-serializable` and
+//! `external-call-in-tx` have source-scan rules in Section 4 — neither is
+//! observable as a statement count.
 //!
 //! Deliberately absent: the write-set narrowing checks, which belong to a
 //! fix this branch does not carry — a test asserting a fix that is not here
@@ -1201,10 +1202,52 @@ fn static_rule_passes_group_service_uses_retry() {
     );
 }
 
-// Section 5 -- contract-drift rules: a "contract" is a documented promise
-// (DESIGN.md) about observable behavior; where the code doesn't yet keep
-// it, the drift becomes an executable #[ignore]d assertion, not a comment.
-//
-// A third DESIGN.md promise (pool-level statement_timeout) is explicitly
-// scoped as a deployment concern with no code path to assert against
-// (checked toolkit_db::ConnectOpts in full), so it gets no test here.
+#[test]
+fn static_rule_metadata_schema_is_resolved_before_begin() {
+    let src = include_str!("../src/domain/group_service.rs");
+
+    // RG-09. Resolving the chained GTS schema is a network round-trip and the
+    // schema is then compiled; under an open transaction that time is
+    // snapshot lifetime, and every retry pays it again. The fix is structural
+    // rather than positional: the transaction-inner functions do not take a
+    // `TypesRegistryClient`, so the call cannot drift back inside. This rule
+    // asserts the parameter stays gone -- a positional check ("the call comes
+    // before `transaction_with_retry`") would pass again the moment someone
+    // reintroduced the argument and moved the call.
+    let inner_fns: Vec<&str> = src
+        .split("async fn ")
+        .filter(|f| f.starts_with("create_group_inner") || f.starts_with("update_group_inner"))
+        .collect();
+    // Without this the rule below would pass on an empty set -- a rename or a
+    // reshuffle would silently turn it into an assertion about nothing.
+    assert_eq!(
+        inner_fns.len(),
+        2,
+        "the scan should find create_group_inner and update_group_inner; \
+         found {} definition(s). Rename? Then update this rule with it.",
+        inner_fns.len()
+    );
+
+    let inner_taking_registry: Vec<&str> = inner_fns
+        .iter()
+        .filter(|f| {
+            let signature_end = f.find(") -> Result").unwrap_or(f.len());
+            f[..signature_end].contains("types_registry")
+        })
+        .map(|f| f.split('(').next().unwrap_or(f))
+        .collect();
+    assert!(
+        inner_taking_registry.is_empty(),
+        "these transaction-inner functions take a TypesRegistryClient, which \
+         puts an external call inside the transaction (RG-09): {inner_taking_registry:?}"
+    );
+
+    // Negative control: the validation must still happen somewhere. Without
+    // this, deleting the call outright would satisfy the rule above.
+    let calls = count_occurrences(src, "validate_metadata_via_gts(");
+    assert!(
+        calls >= 3,
+        "expected create_group, create_group_unscoped and update_group to each \
+         validate metadata before opening their transaction, found {calls} call(s)"
+    );
+}
