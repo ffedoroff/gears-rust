@@ -69,8 +69,20 @@ work added two findings that code comments reference by letter rather than by
 | (a) | redundant-io | `group_repo.rs` `find_model_by_id_scoped` — the membership tenant gate needed a scoped single-row read; reusing the unscoped `find_model_by_id` plus a separate scope check would have cost an extra statement per call (`repo.rs`, `membership_service.rs`) | Fixed |
 | (b) | n-plus-one | `type_repo.rs` — one `resolve_id` per value while resolving a type filter, and one violation lookup per candidate parent in the hierarchy safety check (slope 2.0) | Fixed: `collect_type_filter_paths` + a single `WHERE schema_id IN (...)`, and `find_groups_violating_removed_parents` |
 
+| (c) | n-plus-one | `group_service.rs` `classify_children_for_delete` — the non-force delete rejection resolved each blocking child's type path with its own `SELECT`, memoized per `gts_type_id`, so the cost grew with the number of *distinct* child types. Landed after this report, in the unfinished `name blocking children on delete` commit | Fixed: one `resolve_type_paths_batch` call, the helper three other call sites already use |
+
 Either give these `RG-16`/`RG-17` numbers or keep this table; what must not happen
 is a code comment pointing at an audit that does not mention the finding.
+
+Finding (c) is worth reading as a statement about the method rather than about
+the code. The detector did not miss it — nothing was watching. Of the ten scale
+tests, none covered `delete_group(force = false)`: the nine written during the
+audit covered create, move, force delete, the two `$filter` paths and the type
+operations, and the rejection path had no operation-level test at all. A defect
+introduced there afterwards was invisible by construction. The tenth test now
+exists and was validated the same way as the rest — the loop was restored, the
+test went from 17 statements at N=12 against 7 at N=2 to a clean failure, and
+the batch version brought both back to equal.
 
 ### Transaction-behaviour findings (`TX-nn`)
 

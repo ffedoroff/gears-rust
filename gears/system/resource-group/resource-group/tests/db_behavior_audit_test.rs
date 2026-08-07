@@ -1104,6 +1104,80 @@ async fn scale_force_delete_statements_do_not_grow_with_subtree_size() {
     );
 }
 
+/// Statements issued by a *rejected* non-force delete, with `n` children
+/// each of a distinct GTS type.
+///
+/// Distinct types on purpose: the classifier has to learn each child's type
+/// path to decide whether the child is nameable in the rejection, and a
+/// per-type lookup is the shape that scales. Children sharing one type would
+/// hide the defect behind the memoization the loop used to rely on.
+async fn total_statements_for_rejected_delete(n: usize) -> usize {
+    let (db, rec) = common::test_db_with_recorder().await;
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db.clone());
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    // The parent type first, then one child type per child, each naming the
+    // parent as its only allowed parent. Distinct child types are the point:
+    // see this helper's doc comment.
+    let parent_type = common::create_root_type(&type_svc, "rejdelp").await;
+    let root =
+        common::create_root_group(&group_svc, &ctx, &parent_type.code, "root", tenant_id).await;
+    for i in 0..n {
+        let child_type = common::create_child_type(
+            &type_svc,
+            &format!("rejdel{i}"),
+            &[parent_type.code.as_str()],
+            &[],
+        )
+        .await;
+        common::create_child_group(
+            &group_svc,
+            &ctx,
+            &child_type.code,
+            root.id,
+            &format!("child{i}"),
+            tenant_id,
+        )
+        .await;
+    }
+
+    rec.clear();
+    let err = group_svc
+        .delete_group(&ctx, root.id, false)
+        .await
+        .expect_err("a group with children must not be deletable without force");
+    assert!(
+        matches!(
+            err,
+            resource_group::domain::error::DomainError::ConflictActiveReferences { .. }
+        ),
+        "expected the blocking-children rejection, got: {err:?}"
+    );
+    rec.total()
+}
+
+/// The rejection path must cost the same whether one child blocks the delete
+/// or twelve of different types do. It used to resolve each distinct type
+/// with its own `SELECT`, memoized per `gts_type_id` -- which bounded the
+/// cost by the number of distinct types rather than removing the growth.
+///
+/// This case is the one the original audit did not have: nine scale tests
+/// covered create, move, force delete, the two `$filter` paths and the type
+/// operations, but nothing covered `delete_group(force = false)`, so the
+/// regression could land unseen.
+#[tokio::test]
+async fn scale_rejected_delete_statements_do_not_grow_with_child_type_count() {
+    let small = total_statements_for_rejected_delete(2).await;
+    let large = total_statements_for_rejected_delete(12).await;
+    assert_eq!(
+        small, large,
+        "the rejected-delete statement count must not scale with the number of \
+         distinct child types (small={small} at N=2, large={large} at N=12)"
+    );
+}
+
 /// N+1 audit finding (b) guard: `gts_type` SELECTs for a `type in (...)`
 /// `$filter` on `list_groups`, with `n` values in the list. No groups of
 /// any of these types are created -- this isolates

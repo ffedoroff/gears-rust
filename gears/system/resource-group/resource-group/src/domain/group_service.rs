@@ -1114,7 +1114,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
 
             if !children.is_empty() || membership_count > 0 {
                 let (visible_child_ids, has_hidden_children) =
-                    Self::classify_children_for_delete(tx, &children).await?;
+                    Self::classify_children_for_delete(group_repo, tx, &children).await?;
 
                 let mut blockers = Vec::new();
                 if !visible_child_ids.is_empty() {
@@ -1415,27 +1415,27 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
     /// here, a count in [`GroupRepositoryTrait::count_memberships`]. The
     /// asymmetry is the requirement, not an unfinished half of it.
     async fn classify_children_for_delete(
+        group_repo: &GR,
         tx: &impl DBRunner,
         children: &[crate::infra::storage::entity::resource_group::Model],
     ) -> Result<(Vec<String>, bool), DomainError> {
+        // One statement for the whole set: the type paths come back in a
+        // single `WHERE id IN (...)`, so the rejection path costs the same
+        // whether the group has one child or a thousand of distinct types.
+        let type_ids: Vec<i16> = children.iter().map(|c| c.gts_type_id).collect();
+        let type_paths = group_repo.resolve_type_paths_batch(tx, &type_ids).await?;
+
         let mut visible_child_ids = Vec::with_capacity(children.len());
         let mut has_hidden_children = false;
-        let mut tenant_type_by_gts_id: std::collections::HashMap<i16, bool> =
-            std::collections::HashMap::new();
 
         for child in children {
-            // Resolving a type path is a DB round-trip, so memoize per
-            // `gts_type_id`: siblings very often share a type, and the
-            // rejection path must not fan out one query per child.
-            let is_tenant_type =
-                if let Some(&cached) = tenant_type_by_gts_id.get(&child.gts_type_id) {
-                    cached
-                } else {
-                    let type_path = Self::resolve_type_path_from_id(tx, child.gts_type_id).await?;
-                    let is_tenant_type = validation::is_tenant_type_code(&type_path);
-                    tenant_type_by_gts_id.insert(child.gts_type_id, is_tenant_type);
-                    is_tenant_type
-                };
+            // A child whose type is missing from the map is treated as
+            // tenant-typed, i.e. unnameable. The FK on `gts_type_id` makes
+            // that unreachable, and if it ever happens the safe answer is to
+            // disclose less rather than more.
+            let is_tenant_type = type_paths
+                .get(&child.gts_type_id)
+                .is_none_or(|path| validation::is_tenant_type_code(path));
 
             if is_tenant_type {
                 has_hidden_children = true;
