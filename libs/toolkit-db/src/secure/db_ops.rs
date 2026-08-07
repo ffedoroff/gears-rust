@@ -299,6 +299,13 @@ where
 /// Scoping the *source* rows remains the caller's job: build the inner
 /// `SELECT` from a scoped query when the source table is scoped.
 ///
+/// # Returns
+///
+/// The number of rows the statement wrote, as the database counted them.
+/// Nothing here can derive it -- the rows never enter this process -- so a
+/// caller that needs the figure (a metric, a budget check) has to be given
+/// it.
+///
 /// # Errors
 ///
 /// - `ScopeError::Invalid` if `E` declares any scope column.
@@ -306,7 +313,7 @@ where
 pub async fn secure_insert_from_select<E>(
     stmt: &sea_orm::sea_query::InsertStatement,
     runner: &impl DBRunner,
-) -> Result<(), ScopeError>
+) -> Result<u64, ScopeError>
 where
     E: ScopableEntity + EntityTrait,
 {
@@ -321,17 +328,17 @@ where
         ));
     }
 
-    match DBRunnerInternal::as_seaorm(runner) {
+    let result = match DBRunnerInternal::as_seaorm(runner) {
         SeaOrmRunner::Conn(db) => {
             let backend = sea_orm::ConnectionTrait::get_database_backend(db);
-            sea_orm::ConnectionTrait::execute(db, backend.build(stmt)).await?;
+            sea_orm::ConnectionTrait::execute(db, backend.build(stmt)).await?
         }
         SeaOrmRunner::Tx(tx) => {
             let backend = sea_orm::ConnectionTrait::get_database_backend(tx);
-            sea_orm::ConnectionTrait::execute(tx, backend.build(stmt)).await?;
+            sea_orm::ConnectionTrait::execute(tx, backend.build(stmt)).await?
         }
-    }
-    Ok(())
+    };
+    Ok(result.rows_affected())
 }
 
 /// Bind-parameter budget for one statement, per backend.

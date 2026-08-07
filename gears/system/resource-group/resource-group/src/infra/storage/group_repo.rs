@@ -787,7 +787,7 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         child_id: Uuid,
         parent_id: Uuid,
-    ) -> Result<(), DomainError> {
+    ) -> Result<u64, DomainError> {
         // One statement for the whole ancestor chain: every row the parent
         // has as a descendant becomes a row for the child, one deeper. The
         // ancestors are neither fetched nor rebuilt here -- a create used to
@@ -813,9 +813,7 @@ impl GroupRepositoryTrait for GroupRepository {
 
         toolkit_db::secure::secure_insert_from_select::<ClosureEntity>(&insert, db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        Ok(())
+            .map_err(|e| DomainError::database(e.to_string()))
     }
 
     /// Get all descendants of a group (from closure table, excluding self-row).
@@ -1073,7 +1071,7 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         group_id: Uuid,
         new_parent_id: Option<Uuid>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<u64, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-1
         // Collect subtree: SELECT descendant_id FROM resource_group_closure
         // WHERE ancestor_id = group_id -- the group itself included, via its
@@ -1110,7 +1108,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-2
 
-        if let Some(parent_id) = new_parent_id {
+        let rows_written = if let Some(parent_id) = new_parent_id {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-3
             // Compute new ancestor paths from new parent: the closure rows
             // whose descendant is the new parent, i.e. its ancestors and its
@@ -1171,15 +1169,21 @@ impl GroupRepositoryTrait for GroupRepository {
                 .select_from(source)
                 .map_err(|e| DomainError::database(e.to_string()))?;
 
-            toolkit_db::secure::secure_insert_from_select::<ClosureEntity>(&insert, db)
-                .await
-                .map_err(|e| DomainError::database(e.to_string()))?;
+            let written =
+                toolkit_db::secure::secure_insert_from_select::<ClosureEntity>(&insert, db)
+                    .await
+                    .map_err(|e| DomainError::database(e.to_string()))?;
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-4
-        }
+            written
+        } else {
+            // Moving to root attaches no external ancestors, so there is
+            // nothing to insert.
+            0
+        };
 
         // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
         // RETURN: closure rows updated within transaction — commit handled by caller
-        Ok(())
+        Ok(rows_written)
         // @cpt-end:cpt-cf-resource-group-algo-entity-hier-closure-rebuild:p1:inst-closure-rebuild-5
     }
 
