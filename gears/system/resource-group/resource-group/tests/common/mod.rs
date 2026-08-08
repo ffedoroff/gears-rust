@@ -508,15 +508,24 @@ pub async fn assert_closure_matches_parent_links(conn: &impl toolkit_db::secure:
         }
     }
 
-    // Comparing sets rather than multisets is safe here, and only here:
-    // `resource_group_closure` is declared `PRIMARY KEY (ancestor_id,
-    // descendant_id)`, so the table cannot hold the same pair twice at any
-    // depth. Without that key this would have to compare lengths first --
-    // collapsing duplicates into a set would hide them.
     let actual: BTreeSet<(Uuid, Uuid, i32)> = rows
         .iter()
         .map(|r| (r.ancestor_id, r.descendant_id, r.depth))
         .collect();
+
+    // This helper's contract is "the closure table is *exactly* the transitive
+    // closure", and a set comparison cannot see a duplicated row. Today the
+    // schema makes one impossible -- `PRIMARY KEY (ancestor_id,
+    // descendant_id)`, declared in both backend branches of
+    // `m20260306_000001_initial.rs` (:72 Postgres, :149 SQLite) -- so this
+    // cannot fire. It stays because the invariant lives in string SQL that no
+    // compiler checks: a migration that weakened the key would otherwise
+    // silently collapse duplicates into the set below and pass.
+    assert_eq!(
+        rows.len(),
+        actual.len(),
+        "closure table holds duplicate (ancestor, descendant, depth) rows"
+    );
 
     let missing: Vec<_> = expected.difference(&actual).collect();
     let extra: Vec<_> = actual.difference(&expected).collect();
