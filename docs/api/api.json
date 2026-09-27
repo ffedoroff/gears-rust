@@ -1,46 +1,6 @@
 {
   "components": {
     "schemas": {
-      "AccessReadDto": {
-        "description": "One tenant's access for one setting.",
-        "properties": {
-          "effective": {
-            "$ref": "#/components/schemas/EffectiveAccessDto",
-            "description": "The strictest access on the tenant's chain."
-          },
-          "etag": {
-            "description": "The tag a mutation of this pair must present: the stored row's, or the\nabsent-state tag. Also sent as the `ETag` header.",
-            "type": "string"
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "stored": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/RestrictionDto",
-                "description": "The pair's own row, when one exists."
-              }
-            ]
-          },
-          "tenant_id": {
-            "description": "The tenant asked about.",
-            "format": "uuid",
-            "type": "string"
-          }
-        },
-        "required": [
-          "key",
-          "tenant_id",
-          "effective",
-          "etag"
-        ],
-        "type": "object"
-      },
       "AccountDto": {
         "description": "One chart-of-accounts row to seed.",
         "properties": {
@@ -1041,92 +1001,6 @@
         ],
         "type": "object"
       },
-      "AttachmentDetailDto": {
-        "description": "Full attachment details returned by the GET attachment endpoint.",
-        "properties": {
-          "content_type": {
-            "type": "string"
-          },
-          "created_at": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "doc_summary": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "error_code": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "filename": {
-            "type": "string"
-          },
-          "id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "img_thumbnail": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ImgThumbnailDto"
-              }
-            ]
-          },
-          "kind": {
-            "$ref": "#/components/schemas/AttachmentKindDto"
-          },
-          "size_bytes": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "status": {
-            "$ref": "#/components/schemas/AttachmentStatusDto"
-          },
-          "summary_updated_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "id",
-          "filename",
-          "content_type",
-          "size_bytes",
-          "status",
-          "kind",
-          "created_at"
-        ],
-        "type": "object"
-      },
-      "AttachmentKindDto": {
-        "description": "Attachment kind.",
-        "enum": [
-          "document",
-          "image"
-        ],
-        "type": "string"
-      },
-      "AttachmentStatusDto": {
-        "description": "Attachment lifecycle status.",
-        "enum": [
-          "pending",
-          "uploaded",
-          "ready",
-          "failed"
-        ],
-        "type": "string"
-      },
       "AttachmentSummaryDto": {
         "description": "Lightweight attachment metadata embedded in Message responses.",
         "properties": {
@@ -1148,10 +1022,10 @@
             ]
           },
           "kind": {
-            "$ref": "#/components/schemas/AttachmentKindDto"
+            "type": "string"
           },
           "status": {
-            "$ref": "#/components/schemas/AttachmentStatusDto"
+            "type": "string"
           }
         },
         "required": [
@@ -1399,77 +1273,6 @@
         ],
         "type": "object"
       },
-      "AuditRecordDto": {
-        "description": "One audit record, as `GET /settings-service/v1/settings/{key}/history`\nreturns it.",
-        "properties": {
-          "actor": {
-            "description": "Who did it, masked when the identity is PII the caller may not see.",
-            "type": "string"
-          },
-          "actor_masked": {
-            "description": "Whether `actor` carries the mask token.",
-            "type": "boolean"
-          },
-          "change_set_id": {
-            "description": "The change set the mutation was produced under.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "id": {
-            "description": "Record identity.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "occurred_at": {
-            "description": "When it happened.",
-            "type": "string"
-          },
-          "operation": {
-            "description": "`create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.",
-            "type": "string"
-          },
-          "outcome": {
-            "description": "`success` or `failure`.",
-            "type": "string"
-          },
-          "post_value": {
-            "description": "The value after, as recorded."
-          },
-          "pre_value": {
-            "description": "The value before, as recorded; a secret was recorded masked."
-          },
-          "request_id": {
-            "description": "The request that produced the record.",
-            "type": "string"
-          },
-          "tenant_id": {
-            "description": "The scope the record is about, or `null` for a record about the\nsetting's definition — the declaration created, changed, retired —\nwhich belongs to no tenant and appears in every scope's history.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "values_masked": {
-            "description": "Whether the recorded values were masked for this caller.",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "id",
-          "operation",
-          "actor",
-          "actor_masked",
-          "values_masked",
-          "outcome",
-          "request_id",
-          "occurred_at"
-        ],
-        "type": "object"
-      },
       "AuthConfig": {
         "properties": {
           "config": {
@@ -1572,44 +1375,6 @@
         ],
         "type": "object"
       },
-      "BatchChangeRequest": {
-        "description": "One change of `POST /settings/batch`.",
-        "properties": {
-          "if_match": {
-            "description": "The value state tag the caller last read for this scope — for a revert,\nthe tag of the row being cleared — or the literal `absent` for a first\nwrite. Required in effect: a change that omits it is rejected on its\nown with `if_match_required` while the rest of the batch proceeds. It\nis optional in the schema only so that one missing tag refuses one\nchange instead of the whole request.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "op": {
-            "description": "`set` or `revert`; absent is `set`, so a client written before the\nfield existed sends exactly what it sent before. An unrecognised word\nrefuses this change alone with `invalid`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tenant": {
-            "description": "The target tenant; absent, the caller's own.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "value": {
-            "description": "The new value, carried by a `set` and absent from a `revert`; a\nmismatch either way refuses this change alone with `invalid`. For a\n`secret`-trait setting this may instead be `{ \"pending_id\": \"…\" }`,\nnaming a secret staged earlier through `/secret-stage`: the staged\nentry is adopted and nothing is stored a second time. Any other shape\nis a value and validates as one — an explicit `null` included, which\nis a value and not the field's absence."
-          }
-        },
-        "required": [
-          "key"
-        ],
-        "type": "object"
-      },
       "BatchGetItemDto": {
         "additionalProperties": false,
         "description": "One key in a batch read.",
@@ -1656,87 +1421,6 @@
         },
         "required": [
           "items"
-        ],
-        "type": "object"
-      },
-      "BatchItemDto": {
-        "description": "One entry of a batch answer.",
-        "properties": {
-          "change": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/SetResultDto",
-                "description": "The change, when committed."
-              }
-            ]
-          },
-          "detail": {
-            "description": "The rejection in words.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "error": {
-            "description": "Why, when rejected — one of a fixed vocabulary: `invalid`,\n`if_match_required`, `stale`, `conflict`, `forbidden`, `retired`,\n`not_found`, `unavailable` or `error`.\n`retired` also covers a declaration retired after the client assembled\nthe change: the check runs again as each change commits.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "key": {
-            "description": "The setting key as requested.",
-            "type": "string"
-          },
-          "outcome": {
-            "description": "`committed` or `rejected`.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "key",
-          "outcome"
-        ],
-        "type": "object"
-      },
-      "BatchRequest": {
-        "description": "`POST /settings/batch`.",
-        "properties": {
-          "changes": {
-            "description": "At most five hundred changes, evaluated in order.",
-            "items": {
-              "$ref": "#/components/schemas/BatchChangeRequest"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "changes"
-        ],
-        "type": "object"
-      },
-      "BatchResultDto": {
-        "description": "A batch answer: one entry per change.",
-        "properties": {
-          "change_set_id": {
-            "description": "The change set every committed change carries.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "results": {
-            "description": "In request order.",
-            "items": {
-              "$ref": "#/components/schemas/BatchItemDto"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "change_set_id",
-          "results"
         ],
         "type": "object"
       },
@@ -2320,57 +2004,6 @@
         ],
         "type": "object"
       },
-      "CategoryDto": {
-        "description": "A category as returned to a caller.\n\nField naming is `snake_case`, applied by `#[toolkit_macros::api_dto]` rather\nthan chosen here: every gear's DTOs serialize the same way, so a client does\nnot have to know which service produced a payload.",
-        "properties": {
-          "description": {
-            "description": "Optional long-form description.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "domain_affinity": {
-            "description": "Optional domain this category belongs to.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "icon": {
-            "description": "Optional icon reference.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "id": {
-            "description": "Server-assigned identity, stable across a rename.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "key": {
-            "description": "The stable slug that becomes a setting key's category segment.",
-            "type": "string"
-          },
-          "name": {
-            "description": "Display name.",
-            "type": "string"
-          },
-          "sort_order": {
-            "description": "Ordering weight; lower sorts first.",
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "id",
-          "key",
-          "name",
-          "sort_order"
-        ],
-        "type": "object"
-      },
       "ChangeRecognitionScheduleRequest": {
         "description": "The `POST /recognition-schedules/{schedule_id}/changes` request body: change or\ncancel an ASC 606 recognition schedule (design §3.6 / §4.6). `{schedule_id}`\n(the ACTIVE schedule to change) comes from the PATH; the target seller ledger\nis the body's own `tenant_id` (tenant in body, not path — the vhp-core REST\nconvention); the `(entry, post)` PEP gate authorizes it (a change marks/mints\nschedule state). `change_id` is the idempotency key (a replay returns the prior\nresult, minting no second schedule). `action` is `\"cancel\"` | `\"replace\"`.\n`treatment` is the upstream modification-accounting decision: `\"prospective\"` /\n`\"separate_contract\"` apply; `\"catch_up\"` / unknown is rejected\n`MODIFICATION_TREATMENT_REVIEW` (the ledger never silently treats a\nmodification as prospective). `new_segments` is required for a `replace` (the\nNEW version's plan of the remaining deferred), ignored for a `cancel`.",
         "properties": {
@@ -2733,8 +2366,6 @@
         "description": "A citation extracted from provider annotations.",
         "properties": {
           "attachment_id": {
-            "description": "The attachment UUID (the provider file id before mapping).",
-            "format": "uuid",
             "type": [
               "string",
               "null"
@@ -2902,20 +2533,6 @@
           "composites_copied",
           "notices"
         ],
-        "type": "object"
-      },
-      "CloneRequest": {
-        "description": "`POST /settings/{key}/value/clone`: where to copy from.",
-        "properties": {
-          "from": {
-            "description": "The source tenant; absent, the caller's own tenant.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
         "type": "object"
       },
       "ClosePayerRequest": {
@@ -3701,51 +3318,6 @@
         ],
         "type": "object"
       },
-      "CreateCategoryRequest": {
-        "additionalProperties": false,
-        "description": "What a caller supplies to create a category.",
-        "properties": {
-          "description": {
-            "description": "Optional long-form description.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "domain_affinity": {
-            "description": "Optional domain affinity.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "icon": {
-            "description": "Optional icon reference.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "key": {
-            "description": "The stable slug. Validated before anything else touches it: 1 to 128\ncharacters, a GTS segment token — a lowercase letter or `_` first, then\nlowercase letters, digits and `_` — since every setting key declared\nunder the category is composed around it.",
-            "type": "string"
-          },
-          "name": {
-            "description": "Display name.",
-            "type": "string"
-          },
-          "sort_order": {
-            "description": "Ordering weight; defaults to 0 as DESIGN.md §4.7 specifies.",
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "key",
-          "name"
-        ],
-        "type": "object"
-      },
       "CreateChatReq": {
         "description": "Request DTO for creating a new chat.",
         "properties": {
@@ -3789,94 +3361,6 @@
           "tenant_id",
           "name",
           "country"
-        ],
-        "type": "object"
-      },
-      "CreateDeclarationRequest": {
-        "additionalProperties": false,
-        "description": "What an administrator supplies to declare a setting.\n\nThe key is not among the fields: the service composes it from the vendor,\nthe category's slug and the leaf name, so a caller cannot mint a key that\ndisagrees with where the setting is filed. `default_value` is mandatory --\nit is what makes resolution total -- and a setting with no meaningful\ndefault sends JSON `null` on a type that admits it; omitting the field is a\ndifferent thing and is refused.",
-        "properties": {
-          "anonymous_exposable": {
-            "description": "Whether the effective value may be served unauthenticated; `false` when\nabsent, and refused on a `pii` or `secret` setting.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "category_id": {
-            "description": "The category the setting is filed under; its slug rides in the key.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "data_classification": {
-            "description": "`public` or `pii`; `secret` is derived from the value type's trait and\nis refused here.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "default_value": {
-            "description": "The Schema Default. Mandatory, and an empty placeholder for a secret.\nKept as the request's own text until it is judged: a decimal a double\ncannot hold exactly is refused `value_not_canonical`, as a value write\nrefuses it, and only the text can tell — once parsed, the literal is\nalready the nearest double."
-          },
-          "description": {
-            "description": "Optional long-form description.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "domain_affinity": {
-            "description": "Optional administrative domain.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "licence_feature": {
-            "description": "Optional licence feature gating the setting in R2.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "mode": {
-            "description": "`standard` or `advanced`; `standard` when absent.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "description": "The leaf name: the last segment of the key, unique in the category.",
-            "type": "string"
-          },
-          "requires_step_up": {
-            "description": "Whether a write needs a fresh re-authentication; the protective `true`\nwhen absent.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "scope_class": {
-            "description": "`global`, `cascading` or `local`.",
-            "type": "string"
-          },
-          "value_type_id": {
-            "description": "The value type the default and every override validate against: one of\nthe catalogue under `gts.cf.core.settings.type_*~`, or a registered\nmodule-owned one.",
-            "type": "string"
-          },
-          "vendor": {
-            "description": "The vendor segment of the composed key.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "value_type_id",
-          "vendor",
-          "name",
-          "category_id",
-          "default_value",
-          "scope_class"
         ],
         "type": "object"
       },
@@ -4538,32 +4022,6 @@
           "display_name"
         ],
         "type": "object"
-      },
-      "CreatedDeclarationDto": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/DeclarationDto",
-            "description": "The declaration now live at the key."
-          },
-          {
-            "properties": {
-              "evolved": {
-                "description": "`true` when the setting's active declaration changed its value type,\nSchema Default or scope class and this call evolved it: the declaration\nreturned is the next major, under a new `key`, holding every value of\nthe previous one re-validated, and the previous major is retired.",
-                "type": "boolean"
-              },
-              "reactivated": {
-                "description": "`true` when the key held a retired declaration that this call revived,\nwith its retained values re-entering resolution.",
-                "type": "boolean"
-              }
-            },
-            "required": [
-              "reactivated",
-              "evolved"
-            ],
-            "type": "object"
-          }
-        ],
-        "description": "The response to a create: the declaration, and whether a retired one was\nrevived or the active one evolved rather than a new setting declared."
       },
       "CreditApplicationRequest": {
         "description": "The `POST /credit-applications` request body: ONE wire shape for both wallet\nkinds, discriminated by `kind` (`\"grant\"` | `\"apply\"`). The target seller\nledger is the body's own `tenant_id` (tenant in body, not path — the vhp-core\nREST convention); the `(credit_application, write)` PEP gate authorizes it.\n`scale` is advisory; the ledger resolves the authoritative per-line scale.\n\nThe kind-specific fields are all optional on the wire and validated in\n[`Self::into_sdk`]: a `grant` requires `amount_minor` + `credit_grant_event_type`\n(and ignores `targets`); an `apply` requires a non-empty `targets` (and ignores\nthe grant fields). A missing required field or an unknown `kind` is rejected\n`400 InvalidArgument` before the SDK type is built.",
@@ -5233,127 +4691,6 @@
         ],
         "type": "object"
       },
-      "DeclarationDto": {
-        "description": "A declaration as returned to a caller.\n\nCarries `key`, `value_type_id` and the resolved trait set, which is what the\nread surface is specified to render. The value type travels beside the key\nbecause the key no longer carries it: a setting key is a GTS *type* id\n(ADR-002), and which value type its default and overrides validate against\nis a separate fact of the declaration, not a half of its name.",
-        "properties": {
-          "anonymous_exposable": {
-            "description": "Whether the anonymous surface may show the value.",
-            "type": "boolean"
-          },
-          "category_id": {
-            "description": "Owning category.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "data_classification": {
-            "description": "`public`, `pii` or `secret`; `secret` is derived from the value type.",
-            "type": "string"
-          },
-          "default_value": {
-            "description": "The Schema Default every resolution chain ends in."
-          },
-          "description": {
-            "description": "Optional long-form description.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "domain_affinity": {
-            "description": "The administrative domain, when the declaration is bound to one.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "etag": {
-            "description": "The declaration's state tag, also sent as the `ETag` header.",
-            "type": "string"
-          },
-          "has_secret_trait": {
-            "description": "Whether the value type carries the `secret` trait.",
-            "type": "boolean"
-          },
-          "id": {
-            "description": "Server-assigned identity, stable across a re-key.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "key": {
-            "description": "The full setting key.",
-            "type": "string"
-          },
-          "last_change_at": {
-            "description": "When the definition last changed, RFC 3339.",
-            "type": "string"
-          },
-          "leaf_slug": {
-            "description": "The setting's own name slug, unique within its category.",
-            "type": "string"
-          },
-          "licence_feature": {
-            "description": "The licence feature that will gate this declaration once the License\nResolver exists. Reported, not enforced.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "mode": {
-            "description": "`standard` or `advanced`.",
-            "type": "string"
-          },
-          "owner_module": {
-            "description": "The contributing module, for module-contributed declarations.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "requires_step_up": {
-            "description": "Whether a value write needs a fresh re-authentication.",
-            "type": "boolean"
-          },
-          "scope_class": {
-            "description": "`global`, `cascading`, or `local`.",
-            "type": "string"
-          },
-          "source": {
-            "description": "`admin_authored` or `module_contributed`.",
-            "type": "string"
-          },
-          "status": {
-            "description": "`active` or `retired`.",
-            "type": "string"
-          },
-          "traits": {
-            "description": "The value type's effective traits, merged across its inheritance chain.\n\nAn empty object when the registry could not answer. Always present so a\nclient renders the same shape either way rather than branching on\nabsence."
-          },
-          "value_type_id": {
-            "description": "GTS id of the value type the default and every override validate against.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "key",
-          "leaf_slug",
-          "value_type_id",
-          "category_id",
-          "scope_class",
-          "mode",
-          "status",
-          "default_value",
-          "data_classification",
-          "has_secret_trait",
-          "requires_step_up",
-          "anonymous_exposable",
-          "source",
-          "last_change_at",
-          "etag",
-          "traits"
-        ],
-        "type": "object"
-      },
       "DeclareTaxonomyValueRequest": {
         "additionalProperties": false,
         "description": "The one value a `POST …/values` declares — the authored fields and nothing\nelse.\n\nIts own type rather than [`TaxonomyValueView`], which is what this route read\nuntil D-355 added two **read-only** fields to that view. A declare body could\nthen carry `edit_governed` / `references`, `authored_entry` would ignore\nthem, and `docs/api/api.json` would advertise two settable properties the\nserver discards — the failure `authored_entry` refuses six lines into itself\nfor the tax markers, on the argument that *\"a field that vanishes silently\nreads to the operator exactly like one that failed to save\"*. A field absent\nfrom the request type cannot vanish silently: it is refused by the parse.",
@@ -5447,7 +4784,7 @@
             "type": "string"
           },
           "type": {
-            "$ref": "#/components/schemas/DeltaKind"
+            "type": "string"
           }
         },
         "required": [
@@ -5455,14 +4792,6 @@
           "content"
         ],
         "type": "object"
-      },
-      "DeltaKind": {
-        "description": "Kind of a `delta` chunk.",
-        "enum": [
-          "text",
-          "reasoning"
-        ],
-        "type": "string"
       },
       "DenyReason": {
         "description": "Reason for an explicit deny from the PDP.",
@@ -5695,7 +5024,7 @@
             "type": "string"
           },
           "quota_decision": {
-            "$ref": "#/components/schemas/QuotaDecisionKind"
+            "type": "string"
           },
           "quota_warnings": {
             "items": {
@@ -5710,11 +5039,17 @@
             "type": "string"
           },
           "usage": {
-            "$ref": "#/components/schemas/Usage"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage"
+              }
+            ]
           }
         },
         "required": [
-          "usage",
           "effective_model",
           "selected_model",
           "quota_decision"
@@ -5822,39 +5157,6 @@
         ],
         "type": "object"
       },
-      "EditTurnRequest": {
-        "description": "Request DTO for `PATCH /chats/{id}/turns/{request_id}` (edit).",
-        "properties": {
-          "content": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "content"
-        ],
-        "type": "object"
-      },
-      "EffectiveAccessDto": {
-        "description": "The effective access and where it comes from.",
-        "properties": {
-          "access": {
-            "description": "`overridable`, `read_only` or `hidden`.",
-            "type": "string"
-          },
-          "supplied_by": {
-            "description": "The tenant whose row supplies it; absent for `overridable`.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "access"
-        ],
-        "type": "object"
-      },
       "EffectiveIntervalView": {
         "description": "One scheduled interval of a history record.",
         "properties": {
@@ -5917,108 +5219,6 @@
         "required": [
           "per_mime_max_bytes",
           "metadata_limits"
-        ],
-        "type": "object"
-      },
-      "EffectiveValueDto": {
-        "description": "The effective value at a scope, as `GET /settings-service/v1/settings/{key}`\nreturns it.",
-        "properties": {
-          "data_classification": {
-            "description": "`public`, `pii` or `secret`.",
-            "type": "string"
-          },
-          "etag": {
-            "description": "The value state tag of the requested scope's own row, or of the absent\nstate — what a write at this scope presents in `If-Match`. Also sent as\nthe `ETag` header.",
-            "type": "string"
-          },
-          "fallback": {
-            "description": "What this scope resolves to without a row of its own — the nearest\nvalid ancestor override, else the Schema Default — masked by the same\nrule as `value`. Equal to `value` when the scope holds no override: the\nsettings table's *Default* column, and what a revert would leave."
-          },
-          "fallback_scope": {
-            "description": "The scope that supplies the fallback; absent for a Schema Default.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "fallback_source": {
-            "description": "`inherited` or `schema_default`; never `own_override`.",
-            "type": "string"
-          },
-          "inheritance_trail": {
-            "description": "The scopes inspected, root to self, with setter identity.",
-            "items": {
-              "$ref": "#/components/schemas/TrailEntryDto"
-            },
-            "type": "array"
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "last_change_at": {
-            "description": "Recency of the effective value the caller sees: the later of the\ndeclaration's own change and the resolved row's.",
-            "type": "string"
-          },
-          "masked": {
-            "description": "Whether `value` and `fallback` carry the mask token rather than the\nvalue: one decision, made on the declaration's classification, for\nboth.",
-            "type": "boolean"
-          },
-          "needs_review": {
-            "description": "Present when the requested scope's own override is flagged for review;\nthe value above is then the fallthrough the resolver served.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "needs_review_detail": {
-            "description": "Why the own override is flagged.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "scope": {
-            "description": "The requested scope.",
-            "type": "string"
-          },
-          "source": {
-            "description": "`own_override`, `inherited` or `schema_default`.",
-            "type": "string"
-          },
-          "source_scope": {
-            "description": "The scope that supplied the value; absent for a Schema Default.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tenant_id": {
-            "description": "The requested scope as a tenant id; the root tenant's id is platform\nscope.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "traits": {
-            "description": "The value type's resolved trait set."
-          },
-          "value": {
-            "description": "The resolved value, masked by classification."
-          }
-        },
-        "required": [
-          "key",
-          "scope",
-          "tenant_id",
-          "value",
-          "source",
-          "fallback",
-          "fallback_source",
-          "traits",
-          "inheritance_trail",
-          "last_change_at",
-          "data_classification",
-          "masked",
-          "etag"
         ],
         "type": "object"
       },
@@ -6730,24 +5930,6 @@
         ],
         "type": "object"
       },
-      "FallbackResultDto": {
-        "description": "A revert or remove: the row is gone and the scope falls back.",
-        "properties": {
-          "change": {
-            "$ref": "#/components/schemas/SetResultDto",
-            "description": "The change as recorded."
-          },
-          "effective": {
-            "$ref": "#/components/schemas/EffectiveValueDto",
-            "description": "What the scope resolves to now."
-          }
-        },
-        "required": [
-          "change",
-          "effective"
-        ],
-        "type": "object"
-      },
       "FileDto": {
         "description": "File metadata response (`GET /files/{id}`, and the body of mutations).",
         "properties": {
@@ -6872,61 +6054,6 @@
           "timezone",
           "granularity",
           "fy_start"
-        ],
-        "type": "object"
-      },
-      "FlaggedOverrideDto": {
-        "description": "An override flagged for review, as the needs-review listing reports it.",
-        "properties": {
-          "etag": {
-            "description": "The override's value state tag — what a write correcting this row\npresents in `If-Match`.",
-            "type": "string"
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "last_change_at": {
-            "description": "When the override last changed.",
-            "type": "string"
-          },
-          "masked": {
-            "description": "Whether `value` carries the mask token.",
-            "type": "boolean"
-          },
-          "needs_review_detail": {
-            "description": "Why the override no longer validates.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "scope": {
-            "description": "Its scope path.",
-            "type": "string"
-          },
-          "set_by": {
-            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
-            "type": "string"
-          },
-          "tenant_id": {
-            "description": "The tenant whose override is flagged.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "value": {
-            "description": "The stored value, masked by classification."
-          }
-        },
-        "required": [
-          "key",
-          "tenant_id",
-          "scope",
-          "value",
-          "masked",
-          "last_change_at",
-          "set_by",
-          "etag"
         ],
         "type": "object"
       },
@@ -9453,15 +8580,6 @@
         ],
         "type": "object"
       },
-      "MessageRoleDto": {
-        "description": "Message author role.",
-        "enum": [
-          "user",
-          "assistant",
-          "system"
-        ],
-        "type": "string"
-      },
       "MetadataEntryDto": {
         "description": "One custom-metadata key/value pair.",
         "properties": {
@@ -9798,14 +8916,9 @@
             ]
           },
           "my_reaction": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ReactionKindDto",
-                "description": "The caller's reaction to this message; `null` when there is none."
-              }
+            "type": [
+              "string",
+              "null"
             ]
           },
           "output_tokens": {
@@ -9820,7 +8933,7 @@
             "type": "string"
           },
           "role": {
-            "$ref": "#/components/schemas/MessageRoleDto"
+            "type": "string"
           }
         },
         "required": [
@@ -9829,7 +8942,6 @@
           "role",
           "content",
           "attachments",
-          "my_reaction",
           "created_at"
         ],
         "type": "object"
@@ -9846,7 +8958,7 @@
             "type": "string"
           },
           "reaction": {
-            "$ref": "#/components/schemas/ReactionKindDto"
+            "type": "string"
           }
         },
         "required": [
@@ -9855,137 +8967,6 @@
           "created_at"
         ],
         "type": "object"
-      },
-      "MiniChatSseEvent": {
-        "description": "`OpenAPI` description of one SSE event of the `messages:stream`, retry and\nedit responses. Each event is sent as `event: <name>` and `data: <payload>`\n(JSON); `event` below is the SSE event name and `data` its payload. This\ntype only documents the wire format; `StreamEvent::into_sse_event` writes it.",
-        "oneOf": [
-          {
-            "properties": {
-              "data": {
-                "$ref": "#/components/schemas/StreamStartedData"
-              },
-              "event": {
-                "enum": [
-                  "stream_started"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "data",
-              "event"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "data": {
-                "$ref": "#/components/schemas/PingData"
-              },
-              "event": {
-                "enum": [
-                  "ping"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "data",
-              "event"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "data": {
-                "$ref": "#/components/schemas/DeltaData"
-              },
-              "event": {
-                "enum": [
-                  "delta"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "data",
-              "event"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "data": {
-                "$ref": "#/components/schemas/ToolData"
-              },
-              "event": {
-                "enum": [
-                  "tool"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "data",
-              "event"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "data": {
-                "$ref": "#/components/schemas/CitationsData"
-              },
-              "event": {
-                "enum": [
-                  "citations"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "data",
-              "event"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "data": {
-                "$ref": "#/components/schemas/DoneData"
-              },
-              "event": {
-                "enum": [
-                  "done"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "data",
-              "event"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "data": {
-                "$ref": "#/components/schemas/ErrorData"
-              },
-              "event": {
-                "enum": [
-                  "error"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "data",
-              "event"
-            ],
-            "type": "object"
-          }
-        ]
       },
       "MissingPartDto": {
         "description": "One part not yet uploaded (item 3.4).\n\n`upload_url` is present only while the session is still `in_progress` and\nunexpired; a terminal or expired session omits it.",
@@ -10049,7 +9030,7 @@
             "type": "string"
           },
           "tier": {
-            "$ref": "#/components/schemas/ModelTierDto"
+            "type": "string"
           }
         },
         "required": [
@@ -10076,14 +9057,6 @@
           "items"
         ],
         "type": "object"
-      },
-      "ModelTierDto": {
-        "description": "Model tier.",
-        "enum": [
-          "standard",
-          "premium"
-        ],
-        "type": "string"
       },
       "MoveMembershipRequest": {
         "description": "The body of `POST /customer-groups/{group}/members/{payerId}/move`.",
@@ -11185,24 +10158,6 @@
         ],
         "type": "object"
       },
-      "Page_AuditRecordDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/AuditRecordDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
       "Page_BalanceDto": {
         "properties": {
           "items": {
@@ -11226,24 +10181,6 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/BundleView"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_CategoryDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/CategoryDto"
             },
             "type": "array"
           },
@@ -11365,24 +10302,6 @@
         ],
         "type": "object"
       },
-      "Page_DeclarationDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/DeclarationDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
       "Page_DisputeView": {
         "properties": {
           "items": {
@@ -11424,6 +10343,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/ExceptionView"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_FileDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FileDto"
             },
             "type": "array"
           },
@@ -11653,11 +10590,11 @@
         ],
         "type": "object"
       },
-      "Page_RestrictionDto": {
+      "Page_RetentionRuleDto": {
         "properties": {
           "items": {
             "items": {
-              "$ref": "#/components/schemas/RestrictionDto"
+              "$ref": "#/components/schemas/RetentionRuleDto"
             },
             "type": "array"
           },
@@ -11676,42 +10613,6 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/ReviewThreadDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_SearchHitDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/SearchHitDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_SettingItemDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/SettingItemDto"
             },
             "type": "array"
           },
@@ -11838,6 +10739,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/UsersInfoUserDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_VersionDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/VersionDto"
             },
             "type": "array"
           },
@@ -12504,24 +11423,6 @@
         ],
         "type": "string"
       },
-      "PendingSecretDto": {
-        "description": "The answer to staging a secret: a token that stands in for the value, and\nwhen it stops standing in for it. Neither the plaintext nor the store\nreference.",
-        "properties": {
-          "expires_at": {
-            "description": "When the staged secret is swept, RFC 3339. After this the token is\nrefused and the credential-store entry is released.",
-            "type": "string"
-          },
-          "pending_id": {
-            "description": "The opaque, single-use token to send as the batch change's `value`,\nshaped `{ \"pending_id\": \"…\" }`.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "pending_id",
-          "expires_at"
-        ],
-        "type": "object"
-      },
       "PendingTaxonomyApprovalView": {
         "description": "A submitted taxonomy unit. The first three fields match a plan pending link.",
         "properties": {
@@ -12669,10 +11570,6 @@
         "required": [
           "pin_eligible"
         ],
-        "type": "object"
-      },
-      "PingData": {
-        "description": "Payload of the `ping` event: an empty JSON object (a unit struct would\nbe documented as `null`).",
         "type": "object"
       },
       "PinnedComponentView": {
@@ -15301,14 +14198,6 @@
         ],
         "type": "object"
       },
-      "QuotaDecisionKind": {
-        "description": "Quota decision reported in `done`.",
-        "enum": [
-          "allow",
-          "downgrade"
-        ],
-        "type": "string"
-      },
       "QuotaPeriod": {
         "description": "Quota period classification.",
         "enum": [
@@ -15519,14 +14408,6 @@
           "reject",
           "queue",
           "degrade"
-        ],
-        "type": "string"
-      },
-      "ReactionKindDto": {
-        "description": "Reaction value.",
-        "enum": [
-          "like",
-          "dislike"
         ],
         "type": "string"
       },
@@ -17187,40 +16068,6 @@
         },
         "type": "object"
       },
-      "RestrictionDto": {
-        "description": "A stored restriction row.",
-        "properties": {
-          "access": {
-            "description": "`read_only` or `hidden`.",
-            "type": "string"
-          },
-          "etag": {
-            "description": "The row's state tag, what a mutation of this pair must present.",
-            "type": "string"
-          },
-          "set_by": {
-            "description": "The administrator of a strict ancestor who recorded it: an\nadministrator's identity, masked for a caller not authorized for\nunmasked PII.",
-            "type": "string"
-          },
-          "tenant_id": {
-            "description": "The tenant restricted.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "updated_at": {
-            "description": "When it was last changed, RFC 3339.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "tenant_id",
-          "access",
-          "set_by",
-          "updated_at",
-          "etag"
-        ],
-        "type": "object"
-      },
       "ResubmitRequest": {
         "description": "A resubmit body carrying the preparer's edited intent (the stored `intent`\njsonb shape). The kind cannot change; the approval returns to `PENDING`.",
         "properties": {
@@ -18239,94 +17086,6 @@
         ],
         "type": "object"
       },
-      "SearchCategoryDto": {
-        "description": "The category a hit is filed under. Categories are flat, so this is the\nwhole breadcrumb.",
-        "properties": {
-          "id": {
-            "description": "Category identity.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "key": {
-            "description": "The category slug, as carried in the setting key.",
-            "type": "string"
-          },
-          "name": {
-            "description": "Display name.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "key",
-          "name"
-        ],
-        "type": "object"
-      },
-      "SearchHitDto": {
-        "description": "One search result. A declaration-level hit carries no scope; an override\nhit names the scope where the matched value is set.",
-        "properties": {
-          "category": {
-            "$ref": "#/components/schemas/SearchCategoryDto",
-            "description": "The category the setting is filed under."
-          },
-          "declaration_id": {
-            "description": "Identity of the declaration, for a follow-up read.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "description": {
-            "description": "The declaration's description, when it has one.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "leaf_slug": {
-            "description": "The setting's leaf name.",
-            "type": "string"
-          },
-          "matched_field": {
-            "description": "Which field matched: `key`, `description`, `category_name`,\n`default_value` or `value`.",
-            "type": "string"
-          },
-          "mode": {
-            "description": "`standard` or `advanced`, from the declaration. A tag for grouping,\nnever a filter — no hit is withheld by it.",
-            "type": "string"
-          },
-          "scope": {
-            "description": "The scope path where the matched override is set. Absent on a\ndeclaration-level hit.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tenant_id": {
-            "description": "The tenant owning that scope. Absent on a declaration-level hit.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "value": {
-            "description": "The matched stored value — the override for a `value` hit, the Schema\nDefault for a `default_value` hit — masked by classification exactly\nas a read would mask it. Absent for a hit on the key, description or\ncategory name."
-          }
-        },
-        "required": [
-          "key",
-          "declaration_id",
-          "leaf_slug",
-          "category",
-          "matched_field",
-          "mode"
-        ],
-        "type": "object"
-      },
       "SecretMetadataDto": {
         "description": "Access metadata returned alongside the secret value.",
         "properties": {
@@ -18600,136 +17359,6 @@
         ],
         "type": "object"
       },
-      "SetRestrictionRequest": {
-        "description": "`PUT /settings/{key}/permissions`: the access to store.",
-        "properties": {
-          "access": {
-            "description": "`read_only` or `hidden`; `overridable` is expressed by DELETE.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "access"
-        ],
-        "type": "object"
-      },
-      "SetResultDto": {
-        "description": "A committed change.",
-        "properties": {
-          "change_set_id": {
-            "description": "The change set the write belongs to.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "etag": {
-            "description": "The scope's new value state tag; the next write presents it.",
-            "type": "string"
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "masked": {
-            "description": "Whether the values carry the mask token.",
-            "type": "boolean"
-          },
-          "new_value": {
-            "description": "The value after, masked by classification; absent after a removal."
-          },
-          "old_value": {
-            "description": "The value before, masked by classification; absent when no row existed."
-          },
-          "operation": {
-            "description": "`create`, `change`, `revert` or `remove`.",
-            "type": "string"
-          },
-          "scope": {
-            "description": "The target scope path.",
-            "type": "string"
-          },
-          "tenant_id": {
-            "description": "The target as a tenant id.",
-            "format": "uuid",
-            "type": "string"
-          }
-        },
-        "required": [
-          "key",
-          "scope",
-          "tenant_id",
-          "masked",
-          "etag",
-          "change_set_id",
-          "operation"
-        ],
-        "type": "object"
-      },
-      "SetValueRequest": {
-        "description": "`PUT /settings/{key}/value`: the value to store.",
-        "properties": {
-          "value": {
-            "description": "The new value, validated against the declaration's value type. Kept as\ntext until the guards have seen it: a number is refused, not rounded."
-          }
-        },
-        "required": [
-          "value"
-        ],
-        "type": "object"
-      },
-      "SettingItemDto": {
-        "description": "One entry of the browse page: a key with its own outcome.",
-        "properties": {
-          "detail": {
-            "description": "What went wrong, for the failure outcomes.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "effective": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/EffectiveValueDto",
-                "description": "The effective value, when `outcome` is `resolved`."
-              }
-            ]
-          },
-          "flagged": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/FlaggedOverrideDto",
-                "description": "The flagged override, when `outcome` is `needs_review`."
-              }
-            ]
-          },
-          "key": {
-            "description": "The setting key.",
-            "type": "string"
-          },
-          "mode": {
-            "description": "`standard` or `advanced`, from the declaration. Absent only for a\nrequested key that has no declaration. Mode is a tag, never a filter:\nevery page carries every setting and a client groups them itself.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "outcome": {
-            "description": "`resolved`, `needs_review`, `not_found`, `retired`, `unavailable` or\n`error`.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "key",
-          "outcome"
-        ],
-        "type": "object"
-      },
       "SettlePaymentRequest": {
         "description": "The `POST /payments` request body: a settled payment to record (the\n**money-in** side). The target seller ledger is the body's own `tenant_id`\n(tenant in body, not path — the vhp-core REST convention); the `(payment,\nwrite)` PEP gate authorizes it. `scale` is the payment's currency scale as\nknown to the caller — advisory; the ledger resolves the authoritative\nper-line scale from the provisioned currency config. `effective_at` `None`\n⇒ the receipt is stamped at post time.",
         "properties": {
@@ -18925,18 +17554,6 @@
         },
         "type": "object"
       },
-      "StageSecretRequest": {
-        "description": "`POST /settings/{key}/secret-stage`: the plaintext to stage ahead of the\nstep-up redirect.",
-        "properties": {
-          "value": {
-            "description": "The secret value, validated against the declaration's type exactly as\na set validates it."
-          }
-        },
-        "required": [
-          "value"
-        ],
-        "type": "object"
-      },
       "StorageDto": {
         "description": "A configured storage backend (`GET /storages`).",
         "properties": {
@@ -18960,6 +17577,83 @@
         },
         "type": "array"
       },
+      "StreamEvent": {
+        "description": "Stream event envelope for the `messages:stream` pipeline.\n\nEach variant maps to a distinct SSE `event:` name and `data:` JSON payload.\nOrdering grammar: `stream_started ping* (delta | tool)* citations? (done | error)`.",
+        "oneOf": [
+          {
+            "properties": {
+              "StreamStarted": {
+                "$ref": "#/components/schemas/StreamStartedData"
+              }
+            },
+            "required": [
+              "StreamStarted"
+            ],
+            "type": "object"
+          },
+          {
+            "enum": [
+              "Ping"
+            ],
+            "type": "string"
+          },
+          {
+            "properties": {
+              "Delta": {
+                "$ref": "#/components/schemas/DeltaData"
+              }
+            },
+            "required": [
+              "Delta"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "Tool": {
+                "$ref": "#/components/schemas/ToolData"
+              }
+            },
+            "required": [
+              "Tool"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "Citations": {
+                "$ref": "#/components/schemas/CitationsData"
+              }
+            },
+            "required": [
+              "Citations"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "Done": {
+                "$ref": "#/components/schemas/DoneData"
+              }
+            },
+            "required": [
+              "Done"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "Error": {
+                "$ref": "#/components/schemas/ErrorData"
+              }
+            },
+            "required": [
+              "Error"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "StreamMessageRequest": {
         "description": "Request body for `POST /v1/chats/{id}/messages:stream`.",
         "properties": {
@@ -18976,7 +17670,7 @@
             "type": "string"
           },
           "request_id": {
-            "description": "Idempotency key: any UUID; generated by the server when omitted.",
+            "description": "Client-generated idempotency key (UUID v4). Optional in P1.",
             "format": "uuid",
             "type": [
               "string",
@@ -20252,9 +18946,7 @@
       "ToolData": {
         "description": "Tool lifecycle event.",
         "properties": {
-          "details": {
-            "type": "object"
-          },
+          "details": {},
           "name": {
             "type": "string"
           },
@@ -20276,54 +18968,6 @@
           "done"
         ],
         "type": "string"
-      },
-      "TrailEntryDto": {
-        "description": "One scope on the inheritance trail, with the setter identity and\ntimestamp the administrative read is allowed to show.",
-        "properties": {
-          "has_override": {
-            "description": "Whether an override row exists here.",
-            "type": "boolean"
-          },
-          "last_change_at": {
-            "description": "When the row here last changed.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "needs_review": {
-            "description": "Whether the row here is flagged for review and was skipped.",
-            "type": "boolean"
-          },
-          "provided_value": {
-            "description": "Whether this scope supplied the effective value.",
-            "type": "boolean"
-          },
-          "scope": {
-            "description": "`/` or `/tenants/{id}`.",
-            "type": "string"
-          },
-          "set_by": {
-            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tenant_id": {
-            "description": "The tenant inspected.",
-            "format": "uuid",
-            "type": "string"
-          }
-        },
-        "required": [
-          "scope",
-          "tenant_id",
-          "has_override",
-          "provided_value",
-          "needs_review"
-        ],
-        "type": "object"
       },
       "TransferOwnershipReq": {
         "description": "Request to transfer ownership of a file (`POST /files/{id}/transfer`).",
@@ -20439,51 +19083,6 @@
         ],
         "type": "object"
       },
-      "TurnStatusResponse": {
-        "description": "Response DTO for `GET /chats/{id}/turns/{request_id}`.",
-        "properties": {
-          "assistant_message_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "error_code": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "request_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/TurnStatusState"
-          },
-          "updated_at": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id",
-          "state",
-          "updated_at"
-        ],
-        "type": "object"
-      },
-      "TurnStatusState": {
-        "description": "Turn state as reported by the turn status endpoint.",
-        "enum": [
-          "running",
-          "done",
-          "error",
-          "cancelled"
-        ],
-        "type": "string"
-      },
       "TypeDto": {
         "description": "REST DTO for GTS type representation.",
         "properties": {
@@ -20543,56 +19142,6 @@
         ],
         "type": "object"
       },
-      "UpdateCategoryRequest": {
-        "additionalProperties": false,
-        "description": "What a caller supplies to update a category's mutable fields.\n\nA partial update: any of the updatable fields, the rest left as they are.\nFor an optional field, omitting it leaves it and an explicit `null` clears\nit — two different things on the wire, told apart here.\n\n`key` is accepted by the parser and then refused, rather than removed from\nthe shape. `deny_unknown_fields` would reject a supplied `key` as an\n*unknown* field, which is untrue -- the field exists, it is returned in\nevery response, and it simply may not be changed. A caller deserves to be\ntold that, not that we have never heard of it.",
-        "properties": {
-          "description": {
-            "description": "Optional long-form description; omitted, unchanged; `null` clears it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "domain_affinity": {
-            "description": "Optional domain affinity; omitted, unchanged; `null` clears it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "icon": {
-            "description": "Optional icon reference; omitted, unchanged; `null` clears it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "key": {
-            "description": "The stable slug. Accepted only to be refused: see the type docs.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "description": "Display name; omitted, unchanged.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sort_order": {
-            "description": "Ordering weight; omitted, unchanged.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "UpdateChatReq": {
         "description": "Request DTO for updating a chat title.",
         "properties": {
@@ -20617,61 +19166,6 @@
           "name": {
             "type": [
               "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "UpdateDeclarationRequest": {
-        "description": "What an administrator may supply to edit a declaration's metadata.\n\nThis shape exists for the schema the operation publishes; the handler reads\nthe raw object, because what matters is which fields are *present*: an\nomitted field is untouched, an explicit `null` clears a nullable one, and a\nfield this shape does not carry is refused by name rather than ignored.\nA typed struct cannot express the first distinction, so it documents the\nsurface while the handler enforces it.",
-        "properties": {
-          "anonymous_exposable": {
-            "description": "Setting it `false` is immediate; enabling it requires step-up and is\nrefused on a `pii` or `secret` setting.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "data_classification": {
-            "description": "`public` or `pii`. Tightening is immediate, loosening requires step-up,\nand `secret` is derived from the value type and refused here.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "description": {
-            "description": "Long-form description; `null` clears it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "domain_affinity": {
-            "description": "Administrative domain; `null` clears it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "licence_feature": {
-            "description": "Licence feature; `null` clears it.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "mode": {
-            "description": "`standard` or `advanced`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "requires_step_up": {
-            "description": "Setting it `true` is immediate; clearing it requires step-up.",
-            "type": [
-              "boolean",
               "null"
             ]
           }
@@ -21557,29 +20051,6 @@
           "$ref": "#/components/schemas/VersionDto"
         },
         "type": "array"
-      },
-      "ViolationDto": {
-        "description": "One field-level violation.",
-        "properties": {
-          "code": {
-            "description": "A stable code.",
-            "type": "string"
-          },
-          "field": {
-            "description": "The offending field, as a JSON pointer under `value`.",
-            "type": "string"
-          },
-          "message": {
-            "description": "In words.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "field",
-          "code",
-          "message"
-        ],
-        "type": "object"
       },
       "WebSearchConfig": {
         "description": "Web search toggle.",
@@ -26335,6 +24806,7 @@
     },
     "/api/file-storage/v1/files": {
       "get": {
+        "description": "Forward-only keyset pagination: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical order is `created_at desc, file_id desc` -- see docs/api.md.",
         "operationId": "file_storage.list_files",
         "parameters": [
           {
@@ -26356,7 +24828,7 @@
             }
           },
           {
-            "description": "Page size",
+            "description": "Page size (default 25, max 200)",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -26365,12 +24837,12 @@
             }
           },
           {
-            "description": "Offset",
+            "description": "Opaque continuation token from the previous page",
             "in": "query",
-            "name": "offset",
+            "name": "cursor",
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
             }
           }
         ],
@@ -26379,7 +24851,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/FileDtoList"
+                  "$ref": "#/components/schemas/Page_FileDto"
                 }
               }
             },
@@ -26431,7 +24903,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List files for an owner (owner_kind + owner_id required)",
+        "summary": "List files for an owner (owner_kind + owner_id required, cursor pagination)",
         "tags": [
           "File Storage"
         ]
@@ -27845,6 +26317,7 @@
     },
     "/api/file-storage/v1/files/{id}/versions": {
       "get": {
+        "description": "Forward-only keyset pagination: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical order is `created_at desc, version_id desc`; a page may return fewer than `limit` items (with `next_cursor` still set) when the ADR-0006 manifest-byte budget truncates it -- see docs/api.md.",
         "operationId": "file_storage.list_versions",
         "parameters": [
           {
@@ -27857,7 +26330,7 @@
             }
           },
           {
-            "description": "Page size",
+            "description": "Page size (default 25, max 200)",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -27866,12 +26339,12 @@
             }
           },
           {
-            "description": "Offset",
+            "description": "Opaque continuation token from the previous page",
             "in": "query",
-            "name": "offset",
+            "name": "cursor",
             "required": false,
             "schema": {
-              "type": "integer"
+              "type": "string"
             }
           }
         ],
@@ -27880,11 +26353,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/VersionDtoList"
+                  "$ref": "#/components/schemas/Page_VersionDto"
                 }
               }
             },
             "description": "Versions"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -27932,7 +26415,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List all versions of a file",
+        "summary": "List a file's versions, newest first (cursor pagination)",
         "tags": [
           "File Storage"
         ]
@@ -28359,17 +26842,48 @@
     },
     "/api/file-storage/v1/retention-rules": {
       "get": {
+        "description": "Forward-only keyset pagination: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical order is `created_at desc, rule_id desc`. An admin caller sees every rule in the tenant; a non-admin caller sees only tenant-scope rules, their own user-scope rules, and file-scope rules on files they own -- filtered in SQL, so every page but the last is full -- see docs/api.md.",
         "operationId": "file_storage.list_retention_rules",
+        "parameters": [
+          {
+            "description": "Page size (default 25, max 200)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque continuation token from the previous page",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RetentionRuleDtoList"
+                  "$ref": "#/components/schemas/Page_RetentionRuleDto"
                 }
               }
             },
             "description": "Retention rules"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -28407,7 +26921,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List all retention rules for the caller's tenant",
+        "summary": "List retention rules visible to the caller for their tenant",
         "tags": [
           "File Storage"
         ]
@@ -46729,15 +45243,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "description": "OData v4 orderby expression\n- updated_at asc\n- updated_at desc\n- id asc\n- id desc\n- title asc\n- title desc",
-            "in": "query",
-            "name": "$orderby",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -46790,24 +45295,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -46844,16 +45331,6 @@
               "in"
             ]
           }
-        },
-        "x-odata-orderby": {
-          "allowedFields": [
-            "updated_at asc",
-            "updated_at desc",
-            "id asc",
-            "id desc",
-            "title asc",
-            "title desc"
-          ]
         }
       },
       "post": {
@@ -46878,15 +45355,7 @@
                 }
               }
             },
-            "description": "Created chat",
-            "headers": {
-              "Location": {
-                "description": "Path of the created chat",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
+            "description": "Created chat"
           },
           "400": {
             "content": {
@@ -46918,16 +45387,6 @@
             },
             "description": "Forbidden"
           },
-          "422": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -46937,24 +45396,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -46989,6 +45430,13 @@
         ],
         "responses": {
           "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
             "description": "Chat deleted"
           },
           "400": {
@@ -47040,24 +45488,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -47143,24 +45573,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -47248,16 +45660,6 @@
             },
             "description": "Not Found"
           },
-          "422": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47267,24 +45669,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -47312,36 +45696,142 @@
             }
           }
         ],
-        "requestBody": {
-          "content": {
-            "multipart/form-data": {
-              "schema": {
-                "properties": {
-                  "file": {
-                    "format": "binary",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "file"
-                ],
-                "type": "object"
-              }
-            }
-          },
-          "description": "File to upload (expects field 'file' with file data)",
-          "required": true
-        },
         "responses": {
           "201": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AttachmentDetailDto"
+                  "type": "object"
                 }
               }
             },
-            "description": "Attachment uploaded and processed"
+            "description": "Attachment uploaded"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Upload an attachment to a chat",
+        "tags": [
+          "Mini Chat Attachments"
+        ]
+      }
+    },
+    "/mini-chat/v1/chats/{id}/attachments/{attachment_id}": {
+      "delete": {
+        "operationId": "mini_chat.delete_attachment",
+        "parameters": [
+          {
+            "description": "Chat UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Attachment UUID",
+            "in": "path",
+            "name": "attachment_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Attachment deleted"
           },
           "400": {
             "content": {
@@ -47412,24 +45902,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -47437,15 +45909,13 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Upload an attachment to a chat",
+        "summary": "Delete an attachment",
         "tags": [
           "Mini Chat Attachments"
         ]
-      }
-    },
-    "/mini-chat/v1/chats/{id}/attachments/{attachment_id}": {
-      "delete": {
-        "operationId": "mini_chat.delete_attachment",
+      },
+      "get": {
+        "operationId": "mini_chat.get_attachment",
         "parameters": [
           {
             "description": "Chat UUID",
@@ -47467,8 +45937,15 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": "Attachment deleted"
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Attachment metadata"
           },
           "400": {
             "content": {
@@ -47520,7 +45997,7 @@
             },
             "description": "Conflict"
           },
-          "500": {
+          "429": {
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -47528,109 +46005,7 @@
                 }
               }
             },
-            "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Delete an attachment",
-        "tags": [
-          "Mini Chat Attachments"
-        ]
-      },
-      "get": {
-        "operationId": "mini_chat.get_attachment",
-        "parameters": [
-          {
-            "description": "Chat UUID",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Attachment UUID",
-            "in": "path",
-            "name": "attachment_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AttachmentDetailDto"
-                }
-              }
-            },
-            "description": "Attachment metadata"
-          },
-          "400": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Not Found"
+            "description": "Too Many Requests"
           },
           "500": {
             "content": {
@@ -47641,24 +46016,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -47698,24 +46055,6 @@
             "description": "Cursor for pagination",
             "in": "query",
             "name": "cursor",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "OData v4 filter expression\n- created_at: eq|ne|gt|ge|lt|le|in\n- id: eq|ne|in\n- role: eq|ne|contains|startswith|endswith|in",
-            "in": "query",
-            "name": "$filter",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "OData v4 orderby expression\n- created_at asc\n- created_at desc\n- id asc\n- id desc\n- role asc\n- role desc",
-            "in": "query",
-            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -47773,6 +46112,26 @@
             },
             "description": "Not Found"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47782,24 +46141,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -47810,43 +46151,7 @@
         "summary": "List messages in a chat",
         "tags": [
           "Mini Chat Messages"
-        ],
-        "x-odata-filter": {
-          "allowedFields": {
-            "created_at": [
-              "eq",
-              "ne",
-              "gt",
-              "ge",
-              "lt",
-              "le",
-              "in"
-            ],
-            "id": [
-              "eq",
-              "ne",
-              "in"
-            ],
-            "role": [
-              "eq",
-              "ne",
-              "contains",
-              "startswith",
-              "endswith",
-              "in"
-            ]
-          }
-        },
-        "x-odata-orderby": {
-          "allowedFields": [
-            "created_at asc",
-            "created_at desc",
-            "id asc",
-            "id desc",
-            "role asc",
-            "role desc"
-          ]
-        }
+        ]
       }
     },
     "/mini-chat/v1/chats/{id}/messages/{msg_id}/reaction": {
@@ -47874,6 +46179,13 @@
         ],
         "responses": {
           "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
             "description": "Reaction removed"
           },
           "400": {
@@ -47916,6 +46228,26 @@
             },
             "description": "Not Found"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -47925,24 +46257,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48039,7 +46353,7 @@
             },
             "description": "Not Found"
           },
-          "422": {
+          "409": {
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -48047,7 +46361,17 @@
                 }
               }
             },
-            "description": "Unprocessable Entity"
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
           },
           "500": {
             "content": {
@@ -48058,24 +46382,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48119,7 +46425,7 @@
             "content": {
               "text/event-stream": {
                 "schema": {
-                  "$ref": "#/components/schemas/MiniChatSseEvent"
+                  "$ref": "#/components/schemas/StreamEvent"
                 }
               }
             },
@@ -48175,16 +46481,6 @@
             },
             "description": "Conflict"
           },
-          "422": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
           "429": {
             "content": {
               "application/problem+json": {
@@ -48204,24 +46500,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48260,6 +46538,13 @@
         ],
         "responses": {
           "204": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
             "description": "Turn deleted"
           },
           "400": {
@@ -48312,6 +46597,16 @@
             },
             "description": "Conflict"
           },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -48321,24 +46616,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48378,7 +46655,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TurnStatusResponse"
+                  "type": "object"
                 }
               }
             },
@@ -48424,6 +46701,26 @@
             },
             "description": "Not Found"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -48433,24 +46730,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48485,27 +46764,16 @@
             }
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/EditTurnRequest"
-              }
-            }
-          },
-          "description": "Replacement user message",
-          "required": true
-        },
         "responses": {
           "200": {
             "content": {
-              "text/event-stream": {
+              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MiniChatSseEvent"
+                  "type": "object"
                 }
               }
             },
-            "description": "SSE stream of the regenerated response"
+            "description": "Turn edited"
           },
           "400": {
             "content": {
@@ -48557,16 +46825,6 @@
             },
             "description": "Conflict"
           },
-          "422": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unprocessable Entity"
-          },
           "429": {
             "content": {
               "application/problem+json": {
@@ -48586,24 +46844,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48611,7 +46851,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Edit the latest turn's user message and stream the new response via SSE",
+        "summary": "Edit a turn (user message)",
         "tags": [
           "Mini Chat Turns"
         ]
@@ -48643,13 +46883,13 @@
         "responses": {
           "200": {
             "content": {
-              "text/event-stream": {
+              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MiniChatSseEvent"
+                  "type": "object"
                 }
               }
             },
-            "description": "SSE stream of the regenerated response"
+            "description": "Turn retry initiated"
           },
           "400": {
             "content": {
@@ -48720,24 +46960,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48745,7 +46967,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Retry the latest terminal turn and stream the new response via SSE",
+        "summary": "Retry a failed turn",
         "tags": [
           "Mini Chat Turns"
         ]
@@ -48764,6 +46986,16 @@
               }
             },
             "description": "List of models"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -48785,6 +47017,36 @@
             },
             "description": "Forbidden"
           },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -48794,24 +47056,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48850,6 +47094,16 @@
             },
             "description": "Model details"
           },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
           "401": {
             "content": {
               "application/problem+json": {
@@ -48880,6 +47134,26 @@
             },
             "description": "Not Found"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -48889,24 +47163,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -48934,6 +47190,16 @@
             },
             "description": "Quota status with remaining percentages and warning flags"
           },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
           "401": {
             "content": {
               "application/problem+json": {
@@ -48954,6 +47220,36 @@
             },
             "description": "Forbidden"
           },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -48963,24 +47259,6 @@
               }
             },
             "description": "Internal Server Error"
-          },
-          "503": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Service Unavailable",
-            "headers": {
-              "Retry-After": {
-                "description": "Seconds to wait before retrying",
-                "schema": {
-                  "type": "integer"
-                }
-              }
-            }
           }
         },
         "security": [
