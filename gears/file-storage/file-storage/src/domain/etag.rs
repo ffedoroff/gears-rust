@@ -38,15 +38,75 @@ pub fn etag_for(file: &File) -> Option<String> {
 /// and a `304`/[`file_storage_sdk::FileFetch::NotModified`] should be
 /// returned instead of the file. Shared by the REST handler (`GET
 /// /files/{id}`) and the SDK local client's `get_file`, so both apply the
-/// exact same match rule (`"*"`, or an exact ETag match; no match, or no
-/// current ETag to compare against, is never "unchanged").
+/// exact same match rule per RFC 9110 §13.1.2: `"*"`, or a comma-separated
+/// list of entity-tags (each optionally weak, `W/"..."`, and a tag's own
+/// quoted content may itself contain commas) any of which matches
+/// `current_etag` under *weak comparison* — the `W/` prefix, if any, is
+/// stripped from both sides before comparing the opaque quoted token. No
+/// match, or no current ETag to compare against, is never "unchanged".
 #[must_use]
 pub fn if_none_match_satisfied(if_none_match: Option<&str>, current_etag: Option<&str>) -> bool {
     let (Some(inm), Some(tag)) = (if_none_match, current_etag) else {
         return false;
     };
     let inm = inm.trim();
-    inm == "*" || inm == tag
+    if inm == "*" {
+        return true;
+    }
+    split_etag_list(inm).any(|candidate| weak_tag(candidate) == weak_tag(tag))
+}
+
+/// Strip an entity-tag's weak-validator prefix (`W/`), if present, leaving
+/// the opaque quoted token used for *weak comparison* (RFC 9110 §8.8.3.2).
+#[must_use]
+fn weak_tag(raw: &str) -> &str {
+    raw.strip_prefix("W/").unwrap_or(raw)
+}
+
+/// Split an `If-None-Match` field value into trimmed, non-empty entity-tag
+/// candidates, separated by commas — except a comma inside a quoted tag
+/// (e.g. `"a,b"`), which is part of the tag and must not be split on.
+/// Byte-wise, allocation-free: tracks an "inside quotes" flag while
+/// scanning for the next unquoted comma.
+#[must_use]
+fn split_etag_list(list: &str) -> EtagListSplit<'_> {
+    EtagListSplit { rest: list }
+}
+
+/// Iterator returned by [`split_etag_list`].
+struct EtagListSplit<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Iterator for EtagListSplit<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        while !self.rest.is_empty() {
+            let mut in_quotes = false;
+            let mut comma_at = None;
+            for (i, c) in self.rest.char_indices() {
+                match c {
+                    '"' => in_quotes = !in_quotes,
+                    ',' if !in_quotes => {
+                        comma_at = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let (item, rest) = match comma_at {
+                Some(i) => (&self.rest[..i], &self.rest[i + 1..]),
+                None => (self.rest, ""),
+            };
+            self.rest = rest;
+            let item = item.trim();
+            if !item.is_empty() {
+                return Some(item);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +143,38 @@ mod etag_tests {
         assert!(if_none_match_satisfied(
             Some("  \"abc\"  "),
             Some("\"abc\"")
+        ));
+    }
+
+    #[test]
+    fn list_matches_when_any_tag_matches() {
+        assert!(if_none_match_satisfied(Some("\"a\", \"b\""), Some("\"b\"")));
+    }
+
+    #[test]
+    fn list_is_not_satisfied_when_no_tag_matches() {
+        assert!(!if_none_match_satisfied(
+            Some("\"a\", \"b\""),
+            Some("\"c\"")
+        ));
+    }
+
+    #[test]
+    fn comma_inside_quotes_is_not_a_list_separator() {
+        assert!(if_none_match_satisfied(Some("\"a,b\""), Some("\"a,b\"")));
+        assert!(!if_none_match_satisfied(Some("\"a,b\""), Some("\"a\"")));
+    }
+
+    #[test]
+    fn weak_validator_matches_strong_current_etag() {
+        assert!(if_none_match_satisfied(Some("W/\"b\""), Some("\"b\"")));
+    }
+
+    #[test]
+    fn list_with_blank_elements_and_whitespace_is_handled() {
+        assert!(if_none_match_satisfied(
+            Some("\"a\", , \"b\""),
+            Some("\"b\"")
         ));
     }
 }

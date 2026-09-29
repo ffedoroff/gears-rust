@@ -2576,130 +2576,246 @@ async fn orphan_reclaim_vs_concurrent_insert_version_has_no_silent_loss() {
 // redesign)
 // =========================================================================
 //
-// Two real, concurrently-spawned `migrate_backend` calls for the SAME
-// version, targeting two DIFFERENT backends. `acquire_migration_lease` is a
-// single conditional `UPDATE`, so PostgreSQL's own row lock decides which
-// commits first; the loser's `UPDATE` re-evaluates its `WHERE` against the
-// now-committed row once the winner's transaction releases the lock, and
-// affects zero rows. Exactly one attempt must therefore win the lease and go
-// on to migrate; the other must be rejected with `Conflict` before it ever
-// touches a backend, so its target backend must never see a destination
-// object at all. Real `tokio::spawn` + `join`, per this file's own
-// `RACE_ITERATIONS` precedent above -- there is no fixed winner to pin (both
-// orderings are legitimate), only the two-clean-outcomes invariant to check
-// regardless of which side the real PostgreSQL lock queue favors.
-const MIGRATE_RACE_ITERATIONS: usize = 8;
+// Two real `migrate_backend` calls for the SAME version, targeting two
+// DIFFERENT backends, must never both succeed: `acquire_migration_lease` is a
+// single conditional `UPDATE`, so whichever call's `UPDATE` reaches
+// PostgreSQL first wins the row lock, and the other's `WHERE` re-evaluates
+// against the now-committed row and affects zero rows -- rejected with
+// `Conflict`, before it ever touches its target backend.
+//
+// This used to be tested with a `sleep(150µs)` stagger between two
+// `tokio::spawn`ed attempts, hoping the two `acquire_migration_lease` calls
+// would overlap. That is flaky in the OTHER direction from the usual
+// "assert too strict" story: `migrate_backend` releases its lease as soon as
+// its own attempt finishes -- success, error, OR timeout (see
+// `FileService::migrate_backend`'s own doc, point 5) -- so a fast attempt A
+// can acquire the lease, migrate, and release it again *before* a merely
+// `sleep`-staggered B ever reaches its own `acquire_migration_lease` call. At
+// that point B observes NO lease held at all and legitimately migrates the
+// (already-moved) version a second time, to its own target -- BOTH calls
+// report `Ok(())`. That is not a service bug (nothing forbids two SEQUENTIAL
+// migrations of the same version from each succeeding); it just means a
+// `sleep`-based stagger cannot reliably force the CONCURRENT interleaving
+// this test exists to pin down -- overlap was only ever probable, not
+// guaranteed.
+//
+// Fixed the same way this file's `f2_*` scenario forces its own
+// interleaving: a deterministic hook, not a timer. A's target backend
+// (`alt1`) is wrapped in `GatedPublishBackend`, whose `publish_exclusive` --
+// the exact call `migrate_backend` uses to write its destination object, see
+// `FileService::migrate_backend_transfer_and_commit` and
+// `StorageBackend::publish_exclusive`'s own doc -- signals "A is now inside
+// its destination write" and then blocks until the test says to continue.
+// Since `migrate_backend` acquires the migration lease BEFORE any
+// destination write (confirmed by reading `FileService::migrate_backend`
+// and `VersionRepo::acquire_migration_lease`, which runs as its own
+// auto-committing statement, not inside a transaction held open for the
+// whole call), by the time that signal fires A is GUARANTEED to already
+// hold the lease, committed and visible. The test spawns A, waits for that
+// signal, then calls B (`-> alt2`) directly (not spawned -- no real
+// concurrency is needed for B once A is reliably gated open) and asserts it
+// is rejected with `Conflict` -- deterministically, not "usually, if the
+// scheduler cooperates" -- before releasing A to finish. A single pass is
+// enough (the interleaving is now forced, not probabilistic), so the old
+// `MIGRATE_RACE_ITERATIONS` retry loop is gone along with the `sleep`.
+struct GatedPublishBackend {
+    inner: Arc<dyn StorageBackend>,
+    /// Notified once, right before delegating -- signals "the migration
+    /// lease is held and this call is now inside its destination write."
+    entered: Arc<Notify>,
+    /// Waited on before delegating -- lets the test hold this call open for
+    /// as long as it needs to before the real (inner) write proceeds.
+    resume: Arc<Notify>,
+}
+
+#[async_trait]
+impl StorageBackend for GatedPublishBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.entered.notify_one();
+        self.resume.notified().await;
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_stream(path, expected_len).await
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn migration_lease_two_concurrent_migrate_backend_calls_exactly_one_wins() {
     let (db, _pg_guard) = pg_db_or_skip!();
 
-    for iteration in 0..MIGRATE_RACE_ITERATIONS {
-        let store = Store::new(Arc::clone(&db));
-        let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-        let alt1: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt1"));
-        let alt2: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt2"));
-        let backends = BackendRegistry::new(
-            vec![Arc::clone(&mem), Arc::clone(&alt1), Arc::clone(&alt2)],
-            "mem",
-        )
-        .expect("registry");
-        let svc = make_file_service(store.clone(), backends.clone());
-        let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
+    let store = Store::new(Arc::clone(&db));
+    let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt1_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt1"));
+    let alt2: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt2"));
 
-        let tenant_id = Uuid::now_v7();
-        let ctx = make_ctx(tenant_id);
-        let content = Bytes::from_static(b"migration lease race content");
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let alt1: Arc<dyn StorageBackend> = Arc::new(GatedPublishBackend {
+        inner: Arc::clone(&alt1_inner),
+        entered: Arc::clone(&entered),
+        resume: Arc::clone(&resume),
+    });
 
-        let ticket = svc
-            .create_file(&ctx, new_file(), None, false)
-            .await
-            .expect("create_file");
-        dp.put_content(
-            &ctx,
-            ticket.file_id,
-            ticket.version_id,
-            "text/plain",
-            content.clone(),
-        )
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem), Arc::clone(&alt1), Arc::clone(&alt2)],
+        "mem",
+    )
+    .expect("registry");
+    let svc = make_file_service(store.clone(), backends.clone());
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
+
+    let tenant_id = Uuid::now_v7();
+    let ctx = make_ctx(tenant_id);
+    let content = Bytes::from_static(b"migration lease race content");
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
         .await
-        .expect("put_content");
-        svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
-            .await
-            .expect("bind");
+        .expect("create_file");
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .expect("put_content");
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .expect("bind");
 
-        let file_id = ticket.file_id;
-        let version_id = ticket.version_id;
+    let file_id = ticket.file_id;
+    let version_id = ticket.version_id;
 
-        let svc_a = Arc::clone(&svc);
-        let ctx_a = ctx.clone();
-        let a_task =
-            tokio::spawn(async move { svc_a.migrate_backend(&ctx_a, file_id, "alt1").await });
-        let svc_b = Arc::clone(&svc);
-        let ctx_b = ctx.clone();
-        let b_task = tokio::spawn(async move {
-            // Small real-clock stagger (same as `RACE_ITERATIONS`'s own
-            // precedent above): raises the odds of the two acquire
-            // `UPDATE`s actually overlapping under real Postgres network
-            // I/O, without pinning an exact winner.
-            tokio::time::sleep(std::time::Duration::from_micros(150)).await;
-            svc_b.migrate_backend(&ctx_b, file_id, "alt2").await
-        });
-        let a_res = a_task.await.expect("task A panicked");
-        let b_res = b_task.await.expect("task B panicked");
+    let svc_a = Arc::clone(&svc);
+    let ctx_a = ctx.clone();
+    let a_task = tokio::spawn(async move { svc_a.migrate_backend(&ctx_a, file_id, "alt1").await });
 
-        eprintln!(
-            "migration_lease_race[{iteration}]: a(alt1)={} b(alt2)={}",
-            describe_result(&a_res),
-            describe_result(&b_res)
-        );
+    // Wait for A to signal it is inside its (gated) destination write -- by
+    // construction (see the module doc above), A's migration lease is
+    // already acquired and committed at this point.
+    entered.notified().await;
 
-        let winner_target = match (&a_res, &b_res) {
-            (Ok(()), Err(e)) => {
-                assert!(
-                    matches!(e, DomainError::Conflict { .. }),
-                    "the losing attempt must be rejected by the migration lease with Conflict, \
-                     got {e}"
-                );
-                "alt1"
-            }
-            (Err(e), Ok(())) => {
-                assert!(
-                    matches!(e, DomainError::Conflict { .. }),
-                    "the losing attempt must be rejected by the migration lease with Conflict, \
-                     got {e}"
-                );
-                "alt2"
-            }
-            (a, b) => panic!(
-                "exactly one concurrent migrate_backend call must win the migration lease -- \
-                 got a={} b={}",
-                describe_result(a),
-                describe_result(b)
-            ),
-        };
+    // B must now be rejected: A's lease is live, and A cannot have released
+    // it yet -- it is blocked on `resume`, below, until this test lets it
+    // proceed.
+    let b_res = svc.migrate_backend(&ctx, file_id, "alt2").await;
+    eprintln!(
+        "migration_lease_race: b(alt2)={} (while a(alt1) is gated mid-transfer)",
+        describe_result(&b_res)
+    );
+    let b_err = b_res.expect_err(
+        "B must be rejected while A's migration lease is held -- no sleep-based stagger, this \
+         interleaving is now structurally guaranteed",
+    );
+    assert!(
+        matches!(b_err, DomainError::Conflict { .. }),
+        "the losing attempt must be rejected by the migration lease with Conflict, got {b_err}"
+    );
 
-        let after = store
-            .get_version(file_id, version_id)
-            .await
-            .expect("get_version")
-            .expect("version must still exist");
-        assert_eq!(
-            after.backend_id, winner_target,
-            "the version must end up on whichever target actually won the migration lease"
-        );
+    let dest_path = format!("/{file_id}/{version_id}");
+    assert!(
+        !alt2.exists(&dest_path).await.expect("exists"),
+        "B must never have touched its own target backend at all -- it must be rejected by the \
+         migration lease before any backend I/O"
+    );
 
-        let loser_target: Arc<dyn StorageBackend> = if winner_target == "alt1" {
-            Arc::clone(&alt2)
-        } else {
-            Arc::clone(&alt1)
-        };
-        let dest_path = format!("/{file_id}/{version_id}");
-        assert!(
-            !loser_target.exists(&dest_path).await.expect("exists"),
-            "the losing attempt must never have touched its own target backend at all -- it \
-             must be rejected by the migration lease before any backend I/O (iteration \
-             {iteration})"
-        );
-    }
+    // Let A finish.
+    resume.notify_one();
+    let a_res = a_task.await.expect("task A panicked");
+    eprintln!("migration_lease_race: a(alt1)={}", describe_result(&a_res));
+    a_res.expect("A must win the migration lease (nothing else holds it) and complete cleanly");
+
+    let after = store
+        .get_version(file_id, version_id)
+        .await
+        .expect("get_version")
+        .expect("version must still exist");
+    assert_eq!(
+        after.backend_id, "alt1",
+        "the version must end up on alt1 -- the only attempt that ever actually ran"
+    );
+    assert_eq!(after.backend_path, dest_path);
+
+    let stored = alt1_inner
+        .read_prefix(&dest_path, 1024)
+        .await
+        .expect("read_prefix alt1")
+        .expect("the migrated object must exist on alt1");
+    assert_eq!(
+        stored, content,
+        "the migrated object's content must match what was originally uploaded"
+    );
+
+    assert!(
+        !alt2.exists(&dest_path).await.expect("exists"),
+        "alt2 must still have no object after A's migration completes"
+    );
+
+    // The migration lease must have been released when A finished: a fresh
+    // migration attempt to alt2 must now succeed cleanly (rather than
+    // observing a still-live lease and failing with Conflict again).
+    let c_res = svc.migrate_backend(&ctx, file_id, "alt2").await;
+    eprintln!(
+        "migration_lease_race: post-release attempt c(alt2)={}",
+        describe_result(&c_res)
+    );
+    c_res.expect(
+        "the migration lease must have been released once A finished -- a subsequent attempt \
+         must succeed, not stay rejected",
+    );
+    let after_c = store
+        .get_version(file_id, version_id)
+        .await
+        .expect("get_version")
+        .expect("version must still exist");
+    assert_eq!(
+        after_c.backend_id, "alt2",
+        "the post-release attempt must have actually migrated the version onward to alt2"
+    );
 }
