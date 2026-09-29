@@ -5212,6 +5212,400 @@ async fn migrate_backend_rejects_corrupted_preexisting_destination_object() {
     );
 }
 
+/// A `StorageBackend` wrapper whose `get_stream` and/or `stat` each run a
+/// caller-supplied `FnOnce` hook exactly once -- immediately before
+/// delegating to the real backend -- then never fire again. Used to model a
+/// concurrent actor's effect landing in the two narrow windows
+/// `migrate_backend`'s confirmed-mismatch cleanup re-checks: `get_stream` is
+/// `verify_existing_dest_object`'s only backend call (the pre-existing
+/// object's read-back), and `stat` is
+/// `delete_confirmed_mismatch_if_uncontended`'s last read before deleting.
+/// Either hook can be left `None` when a test only needs the other.
+struct PreDeleteRaceBackend {
+    inner: Arc<dyn StorageBackend>,
+    #[allow(clippy::type_complexity)]
+    on_get_stream: std::sync::Mutex<
+        Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
+    >,
+    #[allow(clippy::type_complexity)]
+    on_stat: std::sync::Mutex<
+        Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
+    >,
+}
+
+#[async_trait]
+impl StorageBackend for PreDeleteRaceBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let hook = self
+            .on_get_stream
+            .lock()
+            .expect("on_get_stream mutex")
+            .take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+        self.inner.get_stream(path, expected_len).await
+    }
+
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        let hook = self.on_stat.lock().expect("on_stat mutex").take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+        self.inner.stat(path).await
+    }
+}
+
+/// (b') Same starting point as the corrupted-preexisting-object case above
+/// (mismatched bytes already sitting at the destination's canonical path),
+/// but a concurrent migration commits the version row's pointer to this
+/// exact `(backend_id, backend_path)` in the window between this call's own
+/// read-back confirming the mismatch and its pre-delete re-checks --
+/// modeled deterministically via `PreDeleteRaceBackend`'s `get_stream` hook,
+/// which runs the "racer's" direct CAS commit before this call's read-back
+/// of the pre-existing object even starts. However contradictory the result
+/// looks (the object this call just found mismatched is also the version's
+/// committed pointer), the object must be left untouched -- deleting it
+/// could destroy what the version row now calls its live content -- and the
+/// call must fail with `Conflict`, not the raw `HashMismatch`.
+#[tokio::test]
+async fn migrate_backend_preexisting_dest_mismatch_pointer_already_committed_not_deleted() {
+    let db = build_db().await;
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+
+    let store = Store::new(Arc::clone(&db));
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"the real, correct content on the source backend");
+
+    // Pre-seed "alt" (the real, unwrapped backend) at the canonical
+    // destination path with the SAME length but DIFFERENT bytes, exactly
+    // like the corrupted-preexisting-object case above.
+    let hook_store = store.clone();
+    let hook_alt_inner: Arc<dyn StorageBackend> = Arc::clone(&alt_inner);
+    let ids_cell: RaceIds = Arc::new(std::sync::Mutex::new(None));
+    let hook_ids_cell = Arc::clone(&ids_cell);
+    let hook: Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send> =
+        Box::new(move || {
+            Box::pin(async move {
+                let (file_id, version_id, orig_backend_id, orig_backend_path) = hook_ids_cell
+                    .lock()
+                    .expect("ids_cell mutex")
+                    .clone()
+                    .expect("ids must be set before the read-back runs");
+                let dest_path = format!("/{file_id}/{version_id}");
+                let audit = AuditEntry::success(
+                    tenant,
+                    "system",
+                    Uuid::nil(),
+                    Some(file_id),
+                    AuditOperation::BackendMigrate,
+                    serde_json::json!({ "racer": "pointer-already-committed" }),
+                );
+                let won = hook_store
+                    .rebind_version_backend(
+                        file_id,
+                        version_id,
+                        &orig_backend_id,
+                        &orig_backend_path,
+                        hook_alt_inner.id(),
+                        &dest_path,
+                        audit,
+                    )
+                    .await
+                    .expect("racer's CAS call");
+                assert!(
+                    won,
+                    "the injected racer's CAS must win: nothing else has touched the row yet"
+                );
+            })
+        });
+    let alt_backend: Arc<dyn StorageBackend> = Arc::new(PreDeleteRaceBackend {
+        inner: Arc::clone(&alt_inner),
+        on_get_stream: std::sync::Mutex::new(Some(hook)),
+        on_stat: std::sync::Mutex::new(None),
+    });
+
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let before = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must exist before migration");
+    assert_eq!(before.backend_id, "mem");
+    *ids_cell.lock().expect("ids_cell mutex") = Some((
+        ticket.file_id,
+        ticket.version_id,
+        before.backend_id.clone(),
+        before.backend_path.clone(),
+    ));
+
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    let mut corrupted_bytes = content.to_vec();
+    for b in &mut corrupted_bytes {
+        *b ^= 0xFF;
+    }
+    let corrupted = Bytes::from(corrupted_bytes);
+    write_all(&alt_inner, &dest_path, corrupted.clone()).await;
+
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Conflict { .. }),
+        "expected Conflict, not HashMismatch, when the version row already points at the \
+         object this call just found mismatched, got {err:?}"
+    );
+
+    // The object must be untouched -- deleting it could destroy what the
+    // version row now calls its live content.
+    let still_there = read_all(&alt_inner, &dest_path, corrupted.len() as u64).await;
+    assert_eq!(
+        still_there, corrupted,
+        "destination object must be left exactly as the racer's commit found it"
+    );
+
+    // The racer's committed pointer must still be the live one -- this call
+    // must not have touched the version row at all.
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(after.backend_id, "alt");
+    assert_eq!(after.backend_path, dest_path);
+}
+
+/// (c') Same starting point again, but this time nothing touches the version
+/// row -- it is still the injected racer that changes, but this time it
+/// changes the *object itself* (to a different length) in the window between
+/// this call's own read-back confirming the mismatch and its pre-delete
+/// re-`stat`, modeled via `PreDeleteRaceBackend`'s `stat` hook. The object
+/// must be left untouched (it may no longer be the same object that was
+/// found mismatched) and the call must fail with a retryable
+/// `BackendUnavailable`, not silently proceed to delete whatever is there
+/// now.
+#[tokio::test]
+async fn migrate_backend_preexisting_dest_mismatch_object_changes_before_delete_not_deleted() {
+    let db = build_db().await;
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+
+    let store = Store::new(Arc::clone(&db));
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"the real, correct content on the source backend");
+
+    let dest_path_cell: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let hook_alt_inner: Arc<dyn StorageBackend> = Arc::clone(&alt_inner);
+    let hook_dest_path_cell = Arc::clone(&dest_path_cell);
+    let hook: Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send> =
+        Box::new(move || {
+            Box::pin(async move {
+                let dest_path = hook_dest_path_cell
+                    .lock()
+                    .expect("dest_path_cell mutex")
+                    .clone()
+                    .expect("dest_path must be set before the pre-delete stat runs");
+                // A concurrent actor rewrites the object to a different
+                // length right before this call's pre-delete identity check.
+                write_all(
+                    &hook_alt_inner,
+                    &dest_path,
+                    Bytes::from_static(b"replaced by a racer"),
+                )
+                .await;
+            })
+        });
+    let alt_backend: Arc<dyn StorageBackend> = Arc::new(PreDeleteRaceBackend {
+        inner: Arc::clone(&alt_inner),
+        on_get_stream: std::sync::Mutex::new(None),
+        on_stat: std::sync::Mutex::new(Some(hook)),
+    });
+
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    *dest_path_cell.lock().expect("dest_path_cell mutex") = Some(dest_path.clone());
+
+    let mut corrupted_bytes = content.to_vec();
+    for b in &mut corrupted_bytes {
+        *b ^= 0xFF;
+    }
+    write_all(&alt_inner, &dest_path, Bytes::from(corrupted_bytes)).await;
+
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::BackendUnavailable { .. }),
+        "expected a retryable BackendUnavailable when the destination object changed between \
+         the confirmed-mismatch read-back and the pre-delete re-stat, got {err:?}"
+    );
+
+    // The object must be left untouched -- it may no longer be the same
+    // object that was found mismatched, so it must not be deleted.
+    let replacement = Bytes::from_static(b"replaced by a racer");
+    let replaced = read_all(&alt_inner, &dest_path, replacement.len() as u64).await;
+    assert_eq!(
+        replaced, replacement,
+        "destination object must be left exactly as the racer's rewrite left it"
+    );
+
+    // The version must stay on the source backend -- migration never
+    // committed.
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(after.backend_id, "mem");
+}
+
 /// (b) The CORRECT bytes already sit at the destination's canonical path
 /// before `migrate_backend` runs (e.g. an earlier attempt that fully
 /// completed its own write and would have verified fine, but the CAS/audit

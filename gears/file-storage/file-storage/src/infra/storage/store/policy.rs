@@ -131,7 +131,7 @@ impl Store {
             .transpose()?;
 
         let conn = self.db.conn().map_err(db_err)?;
-        let mut rows = self
+        let rows = self
             .repos
             .retention_rules
             .list_page(
@@ -148,32 +148,14 @@ impl Store {
             )
             .await?;
 
-        let has_more = rows.len() as u64 > limit;
-        if has_more {
-            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        }
-        let next_cursor = if has_more {
-            rows.last()
-                .map(|r| {
-                    pagination::encode(
-                        r.created_at,
-                        r.rule_id,
-                        pagination::RETENTION_RULES_ID_FIELD,
-                        None,
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        Ok(toolkit_odata::Page::new(
+        Ok(pagination::finish_page(
             rows,
-            toolkit_odata::PageInfo {
-                next_cursor,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+            limit,
+            after,
+            pagination::RETENTION_RULES_ID_FIELD,
+            None,
+            |r| (r.created_at, r.rule_id),
+        )?)
     }
 
     /// Fetch a single retention rule by `rule_id`.

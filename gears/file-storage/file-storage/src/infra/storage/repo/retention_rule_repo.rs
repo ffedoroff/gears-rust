@@ -42,23 +42,28 @@ impl RetentionRuleRepo {
         rows.into_iter().map(map_model).collect()
     }
 
-    /// List retention rules for a tenant, forward-only keyset-paginated
-    ///, with the non-admin visibility filter
-    /// applied in SQL -- see [`RetentionRuleListParams`]'s field docs and
+    /// List retention rules for a tenant, keyset-paginated in either
+    /// direction, with the non-admin visibility filter applied in SQL --
+    /// see [`RetentionRuleListParams`]'s field docs and
     /// `PolicyStore::list_retention_rules_page`'s doc comment for the exact
     /// semantics this reproduces (1:1) from the old filter-after-fetch
     /// application logic.
     ///
     /// Ordered `(created_at, rule_id)` descending -- same tie-breaker
     /// reasoning as `FileRepo::list_page`/`VersionRepo::list_by_file_page`.
-    /// `after`, when `Some`, restricts the result to rows strictly past that
-    /// position in this same descending order.
+    /// `params.after`, when `Some`, restricts the result to rows strictly
+    /// past that position and picks which way "past" means and which order
+    /// the query itself runs in -- see `FileRepo::list_page`'s doc comment
+    /// for the exact forward/backward predicate and order shapes, mirrored
+    /// here on `rule_id` instead of `file_id`.
     pub async fn list_page<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         params: RetentionRuleListParams<'_>,
     ) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        use crate::domain::pagination::Direction;
+
         let mut filter = Condition::all().add(Column::TenantId.eq(params.tenant_id));
         if !params.admin {
             // `EXISTS`-free `IN` subquery over the caller's own files --
@@ -86,19 +91,35 @@ impl RetentionRuleRepo {
                 );
             filter = filter.add(visible);
         }
+        let direction = params.after.map_or(Direction::Forward, |s| s.direction);
         if let Some(seek) = params.after {
-            filter = filter.add(super::tuple_lt(
-                (Entity, Column::CreatedAt),
-                (Entity, Column::RuleId),
-                seek.created_at,
-                seek.id,
-            ));
+            let pred = match direction {
+                Direction::Forward => super::tuple_lt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::RuleId),
+                    seek.created_at,
+                    seek.id,
+                ),
+                Direction::Backward => super::tuple_gt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::RuleId),
+                    seek.created_at,
+                    seek.id,
+                ),
+            };
+            filter = filter.add(pred);
         }
 
-        let rows = Entity::find()
-            .filter(filter)
-            .order_by_desc(Column::CreatedAt)
-            .order_by_desc(Column::RuleId)
+        let mut query = Entity::find().filter(filter);
+        query = match direction {
+            Direction::Forward => query
+                .order_by_desc(Column::CreatedAt)
+                .order_by_desc(Column::RuleId),
+            Direction::Backward => query
+                .order_by_asc(Column::CreatedAt)
+                .order_by_asc(Column::RuleId),
+        };
+        let rows = query
             .limit(params.limit)
             .secure()
             .scope_with(scope)

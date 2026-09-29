@@ -318,6 +318,64 @@ async fn composite_mode_tampered_part_fails_verification() {
     );
 }
 
+/// A manifest whose last part starts exactly at `expected_len` describes a
+/// zero-length final span: `process_chunk` would never finalize it at EOF
+/// (nothing ever crosses its `[start, start)` boundary), so a naive
+/// `zip(entries, part_digests)` in `compare` would just silently drop the
+/// unchecked last entry instead of ever comparing it -- a manifest for only
+/// the preceding entries would then verify successfully. Must be rejected up
+/// front, at `verify_stream` construction, before any streaming begins.
+#[tokio::test]
+async fn composite_mode_rejects_manifest_whose_last_offset_equals_expected_len() {
+    let part1 = vec![b'x'; 30];
+    let (manifest, root) = build_composite(&[&part1]);
+    let mut entries = manifest.entries().to_vec();
+    // A bogus trailing entry starting exactly where the object ends -- an
+    // empty final span.
+    entries.push(ManifestEntry {
+        offset: part1.len() as u64,
+        digest: [0u8; 32],
+    });
+    let manifest_with_empty_tail = Manifest::new(entries).expect("valid manifest shape");
+
+    let err = verify_stream(
+        ok_stream(vec![part1.clone()]),
+        part1.len() as u64,
+        HashMode::MultipartCompositeSha256,
+        root,
+        Some(manifest_with_empty_tail),
+    )
+    .map(|_| ())
+    .expect_err("a manifest with an empty final span must be rejected at construction");
+    assert!(
+        matches!(err, crate::domain::error::DomainError::HashMismatch { .. }),
+        "expected HashMismatch, got {err:?}"
+    );
+}
+
+/// `compare` exercised directly (bypassing `verify_stream`'s own
+/// construction, which -- since the previous test's fix -- never lets an
+/// empty span through) with a manifest/part-digest count mismatch a future
+/// change to `process_chunk`'s finalization logic could otherwise
+/// reintroduce silently: `zip` stops at the shorter side, so without an
+/// explicit length check a caller could get a passing verdict against only a
+/// prefix of the manifest's parts.
+#[test]
+fn compare_rejects_mismatched_composite_part_count() {
+    let (manifest, _root) = build_composite(&[&[b'x'; 10], &[b'y'; 10]]);
+    let entries = manifest.entries().to_vec();
+    let spec = super::Spec::Composite { entries };
+    // Only one finalized part digest for a two-part manifest.
+    let part_digests = vec![hash::digest_to_array(hash::sha256(b"xxxxxxxxxx"))];
+
+    let err = super::compare(&spec, &[0u8; 32], part_digests)
+        .expect_err("a part-count mismatch must fail verification, not silently zip-truncate");
+    assert!(
+        matches!(err, crate::domain::error::DomainError::HashMismatch { .. }),
+        "expected HashMismatch, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn composite_mode_requires_a_manifest() {
     let err = verify_stream(

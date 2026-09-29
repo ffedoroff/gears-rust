@@ -140,15 +140,19 @@ impl VersionRepo {
         rows.into_iter().map(file_version_from_model).collect()
     }
 
-    /// List a page of a file's versions, newest first, forward-only
-    /// keyset-paginated -- backs
-    /// `GET /files/{id}/versions`. Same `(created_at, version_id)`
-    /// descending order as [`Self::list_by_file`] (see its doc comment for
-    /// why the tie-breaker is needed); `after`, when `Some`, restricts the
-    /// result to rows strictly past that position in this same descending
-    /// order. Callers fetch `limit + 1` rows to learn whether a next page
-    /// exists (`domain::pagination`'s `Page` contract); this method itself
-    /// just runs whatever `limit` it is given.
+    /// List a page of a file's versions, newest first, keyset-paginated in
+    /// either direction -- backs `GET /files/{id}/versions`. Same
+    /// `(created_at, version_id)` descending canonical order as
+    /// [`Self::list_by_file`] (see its doc comment for why the tie-breaker
+    /// is needed); `after`, when `Some`, restricts the result to rows
+    /// strictly past that position and picks which way "past" means and
+    /// which order the query itself runs in -- see
+    /// [`crate::infra::storage::repo::FileRepo::list_page`]'s doc comment
+    /// for the exact forward/backward predicate and order shapes, mirrored
+    /// here on `version_id` instead of `file_id`. Callers fetch `limit + 1`
+    /// rows to learn whether a further page exists in the query's own
+    /// direction (`domain::pagination::finish_page`'s contract); this
+    /// method itself just runs whatever `limit` it is given.
     pub async fn list_by_file_page<C: DBRunner>(
         &self,
         conn: &C,
@@ -157,19 +161,37 @@ impl VersionRepo {
         limit: u64,
         after: Option<crate::domain::pagination::Seek>,
     ) -> Result<Vec<FileVersion>, DomainError> {
+        use crate::domain::pagination::Direction;
+
         let mut filter = Condition::all().add(Column::FileId.eq(file_id));
+        let direction = after.map_or(Direction::Forward, |s| s.direction);
         if let Some(seek) = after {
-            filter = filter.add(super::tuple_lt(
-                (Entity, Column::CreatedAt),
-                (Entity, Column::VersionId),
-                seek.created_at,
-                seek.id,
-            ));
+            let pred = match direction {
+                Direction::Forward => super::tuple_lt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::VersionId),
+                    seek.created_at,
+                    seek.id,
+                ),
+                Direction::Backward => super::tuple_gt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::VersionId),
+                    seek.created_at,
+                    seek.id,
+                ),
+            };
+            filter = filter.add(pred);
         }
-        let rows = Entity::find()
-            .filter(filter)
-            .order_by_desc(Column::CreatedAt)
-            .order_by_desc(Column::VersionId)
+        let mut query = Entity::find().filter(filter);
+        query = match direction {
+            Direction::Forward => query
+                .order_by_desc(Column::CreatedAt)
+                .order_by_desc(Column::VersionId),
+            Direction::Backward => query
+                .order_by_asc(Column::CreatedAt)
+                .order_by_asc(Column::VersionId),
+        };
+        let rows = query
             .limit(limit)
             .secure()
             .scope_with(scope)

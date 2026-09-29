@@ -111,9 +111,9 @@ pub enum DomainError {
     VersionedFileMigrationNotSupported { file_id: Uuid },
 
     /// A cursor-pagination failure from `domain::pagination` (unreadable
-    /// token, order/filter mismatch against the current request, or a
-    /// `"bwd"` direction — this platform's listings are forward-only).
-    /// Mapped straight through `toolkit_odata`'s own `Error -> CanonicalError`
+    /// token, order/filter mismatch against the current request, or a `d`
+    /// that is neither `"fwd"` nor `"bwd"`). Mapped straight through
+    /// `toolkit_odata`'s own `Error -> CanonicalError`
     /// (`libs/toolkit-odata/src/problem_mapping.rs`) at the REST boundary
     /// (`api/rest/error.rs`), so the `INVALID_CURSOR`/`ORDER_MISMATCH`/
     /// `FILTER_MISMATCH` reason codes stay identical to every other cursor

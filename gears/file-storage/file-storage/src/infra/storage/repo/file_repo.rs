@@ -158,9 +158,8 @@ impl FileRepo {
         Ok(files)
     }
 
-    /// List files for a mandatory owner filter, newest first, forward-only
-    /// keyset-paginated (replaces the
-    /// previous `OFFSET` pagination).
+    /// List files for a mandatory owner filter, newest first, keyset-paginated
+    /// in either direction (replaces the previous `OFFSET` pagination).
     ///
     /// Ordered `(created_at, file_id)` descending, not `created_at` alone:
     /// `created_at` is not unique (several files created in the same
@@ -169,13 +168,25 @@ impl FileRepo {
     /// relative order across two separate queries without a tie-breaker --
     /// a row can be skipped or repeated across pages. `file_id` is the
     /// primary key, so adding it as a tie-breaker makes the order -- and
-    /// therefore the page boundary -- fully deterministic. `after`, when
-    /// `Some`, restricts the result to rows strictly PAST that position in
-    /// this same descending order (`created_at < a.created_at OR
-    /// (created_at = a.created_at AND file_id < a.id)`) -- `None` starts
-    /// from the newest row. Callers fetch `limit + 1` rows to learn whether
-    /// a next page exists (`domain::pagination`'s `Page` contract); this
-    /// method itself just runs whatever `limit` it is given.
+    /// therefore the page boundary -- fully deterministic.
+    ///
+    /// `after`, when `Some`, restricts the result to rows strictly past that
+    /// position -- `None` starts from the newest row (always a forward
+    /// query). [`Seek::direction`] picks which way "past" means and which
+    /// order the query itself runs in:
+    /// - [`Direction::Forward`](crate::domain::pagination::Direction):
+    ///   `created_at < a.created_at OR (created_at = a.created_at AND
+    ///   file_id < a.id)`, ordered `(created_at, file_id)` descending -- the
+    ///   listing's canonical order, so rows come back ready to return as-is.
+    /// - [`Direction::Backward`](crate::domain::pagination::Direction): the
+    ///   mirrored predicate (`>`) and the *reverse* order (ascending), so
+    ///   the closest rows to `a` are the ones `LIMIT` keeps rather than the
+    ///   furthest -- `domain::pagination::finish_page` reverses these back
+    ///   to canonical order before they reach a caller.
+    ///
+    /// Callers fetch `limit + 1` rows to learn whether a further page exists
+    /// in the query's own direction (`domain::pagination::finish_page`'s
+    /// contract); this method itself just runs whatever `limit` it is given.
     pub async fn list_page<C: DBRunner>(
         &self,
         conn: &C,
@@ -184,21 +195,39 @@ impl FileRepo {
         limit: u64,
         after: Option<crate::domain::pagination::Seek>,
     ) -> Result<Vec<File>, DomainError> {
+        use crate::domain::pagination::Direction;
+
         let mut filter = Condition::all()
             .add(Column::OwnerKind.eq(owner.owner_kind.as_str()))
             .add(Column::OwnerId.eq(owner.owner_id));
+        let direction = after.map_or(Direction::Forward, |s| s.direction);
         if let Some(seek) = after {
-            filter = filter.add(super::tuple_lt(
-                (Entity, Column::CreatedAt),
-                (Entity, Column::FileId),
-                seek.created_at,
-                seek.id,
-            ));
+            let pred = match direction {
+                Direction::Forward => super::tuple_lt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::FileId),
+                    seek.created_at,
+                    seek.id,
+                ),
+                Direction::Backward => super::tuple_gt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::FileId),
+                    seek.created_at,
+                    seek.id,
+                ),
+            };
+            filter = filter.add(pred);
         }
-        let rows = Entity::find()
-            .filter(filter)
-            .order_by_desc(Column::CreatedAt)
-            .order_by_desc(Column::FileId)
+        let mut query = Entity::find().filter(filter);
+        query = match direction {
+            Direction::Forward => query
+                .order_by_desc(Column::CreatedAt)
+                .order_by_desc(Column::FileId),
+            Direction::Backward => query
+                .order_by_asc(Column::CreatedAt)
+                .order_by_asc(Column::FileId),
+        };
+        let rows = query
             .limit(limit)
             .secure()
             .scope_with(scope)

@@ -637,17 +637,18 @@ pub trait PolicyStore: Send + Sync {
         tenant_id: Uuid,
     ) -> Result<Vec<StoredRetentionRule>, DomainError>;
 
-    /// List retention rules for a tenant, forward-only cursor-paginated
-    ///, with the non-admin visibility filter
-    /// applied **in SQL** rather than in the application:
+    /// List retention rules for a tenant, cursor-paginated in either
+    /// direction, with the non-admin visibility filter applied **in SQL**
+    /// rather than in the application:
     /// `scope = 'tenant' OR (scope = 'user' AND scope_target_id = subject_id)
     /// OR (scope = 'file' AND scope_target_id IN (files this
     /// (subject_kind, subject_id) owns))`. `admin` (resolved by the caller
     /// probing `ADMIN_POLICY`) skips the visibility filter entirely -- an
     /// admin sees every rule in the tenant. Canonical order `created_at DESC,
-    /// rule_id DESC`; `cursor`, when `Some`, resumes after the position it
-    /// encodes (rejected as a `400` if it names a listing this call wasn't
-    /// made for -- see `domain::pagination`).
+    /// rule_id DESC`, always returned in that order regardless of navigation
+    /// direction; `cursor`, when `Some`, resumes from the position it
+    /// encodes, in the direction it carries (rejected as a `400` if it names
+    /// a listing this call wasn't made for -- see `domain::pagination`).
     ///
     /// # Errors
     /// A cursor error (`domain::pagination`) for an unreadable/mismatched

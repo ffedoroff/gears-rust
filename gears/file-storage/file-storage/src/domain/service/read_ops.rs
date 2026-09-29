@@ -65,8 +65,8 @@ impl FileService {
         self.store.list_metadata_for_files(file_ids).await
     }
 
-    /// List files for a mandatory owner filter, forward-only
-    /// cursor-paginated.
+    /// List files for a mandatory owner filter, cursor-paginated in either
+    /// direction.
     pub async fn list_files(
         &self,
         ctx: &SecurityContext,
@@ -212,9 +212,9 @@ impl FileService {
     }
 
     /// `GET /files/{id}/versions`: list a page of a file's versions, newest
-    /// first, forward-only cursor-paginated
-    /// and capped at `ServiceConfig::max_page_size` (P2 2.2 — closes the
-    /// unbounded-listing amplification surface).
+    /// first, cursor-paginated in either direction and capped at
+    /// `ServiceConfig::max_page_size` (P2 2.2 — closes the unbounded-listing
+    /// amplification surface).
     pub async fn list_versions(
         &self,
         ctx: &SecurityContext,
@@ -299,12 +299,19 @@ impl FileService {
                         v.version_id,
                         crate::domain::pagination::VERSIONS_ID_FIELD,
                         crate::domain::pagination::versions_binding(file_id),
+                        crate::domain::pagination::Direction::Forward,
                     )
                 })
                 .transpose()?
         } else {
             page.page_info.next_cursor.clone()
         };
+        // Budget truncation only ever drops items off the *tail* (see the
+        // doc comment above) -- it never changes what the page's first item
+        // is, so `prev_cursor` (built from that first item by
+        // `pagination::finish_page`) stays valid unchanged, in either
+        // navigation direction.
+        let prev_cursor = page.page_info.prev_cursor.clone();
         let items = page
             .items
             .into_iter()
@@ -317,7 +324,7 @@ impl FileService {
             items,
             toolkit_odata::PageInfo {
                 next_cursor,
-                prev_cursor: None,
+                prev_cursor,
                 limit: page.page_info.limit,
             },
         ))

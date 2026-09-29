@@ -2,10 +2,12 @@
 //! `GET /retention-rules`. Complements the endpoint-specific tests already
 //! updated elsewhere (`list_authz_test.rs`, `service_test.rs`,
 //! `policy_authz_test.rs`, `domain_coverage_test.rs`) with the pagination
-//! contract itself: full-walk coverage (including `created_at` ties at page
-//! boundaries), forward-only cursor errors, the manifest-byte-budget/cursor
-//! interaction on `/files/{id}/versions`, and non-admin visibility staying
-//! SQL-filtered (full pages) on `/retention-rules`.
+//! contract itself: full-walk coverage in both directions (including
+//! `created_at` ties at page boundaries), cursor errors (including a
+//! backward cursor bound to the wrong owner/file), the
+//! manifest-byte-budget/cursor interaction on `/files/{id}/versions`, and
+//! non-admin visibility staying SQL-filtered (full pages) on
+//! `/retention-rules`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -244,13 +246,18 @@ async fn files_cursor_walk_covers_all_items_exactly_once_including_created_at_ti
     };
 
     let mut seen = Vec::new();
+    let mut pages: Vec<Vec<Uuid>> = Vec::new();
+    let mut prev_cursors: Vec<Option<String>> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
         let page = svc
             .list_files(&ctx, owner_filter, Some(2), cursor.as_deref())
             .await
             .expect("list_files page");
-        seen.extend(page.items.iter().map(|f| f.file_id));
+        prev_cursors.push(page.page_info.prev_cursor.clone());
+        let page_ids: Vec<Uuid> = page.items.iter().map(|f| f.file_id).collect();
+        seen.extend(page_ids.iter().copied());
+        pages.push(page_ids);
         match page.page_info.next_cursor {
             Some(next) => cursor = Some(next),
             None => break,
@@ -261,6 +268,42 @@ async fn files_cursor_walk_covers_all_items_exactly_once_including_created_at_ti
     assert_eq!(
         seen, expected,
         "cursor walk must cover every file exactly once, in canonical order"
+    );
+    assert_eq!(
+        prev_cursors[0], None,
+        "the very first page (no cursor supplied) must have prev_cursor = null"
+    );
+    assert!(pages.len() > 1, "test must exercise more than one page");
+
+    // Walk backward from the last page's own prev_cursor and confirm the
+    // exact same pages come back, in the same canonical order, ending with
+    // prev_cursor = null on what is again the first page.
+    let mut back_pages: Vec<Vec<Uuid>> = Vec::new();
+    let mut back_cursor = prev_cursors
+        .last()
+        .cloned()
+        .flatten()
+        .expect("the last page must have a predecessor");
+    loop {
+        let page = svc
+            .list_files(&ctx, owner_filter, Some(2), Some(&back_cursor))
+            .await
+            .expect("list_files backward page");
+        back_pages.push(page.items.iter().map(|f| f.file_id).collect());
+        match page.page_info.prev_cursor {
+            Some(prev) => back_cursor = prev,
+            None => break,
+        }
+    }
+    back_pages.reverse();
+    // The backward walk starts from the last page's predecessor and ends at
+    // the first page, so it reproduces every page except the last one,
+    // still in forward order.
+    let expected_back = &pages[..pages.len() - 1];
+    assert_eq!(
+        back_pages, expected_back,
+        "walking prev_cursor backward from the last page must reproduce every \
+         earlier page, in the same canonical order"
     );
 }
 
@@ -309,6 +352,65 @@ async fn files_cursor_rejects_a_different_owner() {
         .list_files(&ctx_b, filter_for_b, Some(1), Some(&cursor))
         .await
         .expect_err("a cursor issued for a different owner must be rejected");
+    assert!(
+        matches!(err, DomainError::Cursor(_)),
+        "expected a cursor error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn files_backward_cursor_rejects_a_different_owner() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let svc = FileService::new(
+        store.clone(),
+        backends,
+        issuer,
+        authorizer,
+        base_config(),
+        None,
+        None,
+    );
+
+    let tenant = Uuid::now_v7();
+    let owner_a = Uuid::now_v7();
+    let owner_b = Uuid::now_v7();
+    let now = OffsetDateTime::now_utc();
+    seed_files(&db, tenant, owner_a, &[now, now]).await;
+    seed_files(&db, tenant, owner_b, &[now]).await;
+
+    let ctx_a = ctx(tenant, owner_a);
+    let filter_for_a = OwnerFilter {
+        owner_kind: OwnerKind::User,
+        owner_id: owner_a,
+    };
+    let page1 = svc
+        .list_files(&ctx_a, filter_for_a, Some(1), None)
+        .await
+        .expect("page 1");
+    let next = page1.page_info.next_cursor.expect("more pages remain");
+    let page2 = svc
+        .list_files(&ctx_a, filter_for_a, Some(1), Some(&next))
+        .await
+        .expect("page 2");
+    let prev = page2
+        .page_info
+        .prev_cursor
+        .expect("page 2 must have a predecessor");
+
+    let filter_for_b = OwnerFilter {
+        owner_kind: OwnerKind::User,
+        owner_id: owner_b,
+    };
+    let ctx_b = ctx(tenant, owner_b);
+    let err = svc
+        .list_files(&ctx_b, filter_for_b, Some(1), Some(&prev))
+        .await
+        .expect_err("a backward cursor issued for a different owner must be rejected");
     assert!(
         matches!(err, DomainError::Cursor(_)),
         "expected a cursor error, got {err:?}"
@@ -512,13 +614,18 @@ async fn versions_cursor_walk_covers_all_items_exactly_once_including_created_at
 
     let ctx = ctx(tenant, owner);
     let mut seen = Vec::new();
+    let mut pages: Vec<Vec<Uuid>> = Vec::new();
+    let mut prev_cursors: Vec<Option<String>> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
         let page = svc
             .list_versions(&ctx, file_id, Some(2), cursor.as_deref())
             .await
             .expect("list_versions page");
-        seen.extend(page.items.iter().map(|v| v.version_id));
+        prev_cursors.push(page.page_info.prev_cursor.clone());
+        let page_ids: Vec<Uuid> = page.items.iter().map(|v| v.version_id).collect();
+        seen.extend(page_ids.iter().copied());
+        pages.push(page_ids);
         match page.page_info.next_cursor {
             Some(next) => cursor = Some(next),
             None => break,
@@ -529,6 +636,36 @@ async fn versions_cursor_walk_covers_all_items_exactly_once_including_created_at
     assert_eq!(
         seen, expected,
         "cursor walk must cover every version exactly once, in canonical order"
+    );
+    assert_eq!(
+        prev_cursors[0], None,
+        "the very first page (no cursor supplied) must have prev_cursor = null"
+    );
+    assert!(pages.len() > 1, "test must exercise more than one page");
+
+    let mut back_pages: Vec<Vec<Uuid>> = Vec::new();
+    let mut back_cursor = prev_cursors
+        .last()
+        .cloned()
+        .flatten()
+        .expect("the last page must have a predecessor");
+    loop {
+        let page = svc
+            .list_versions(&ctx, file_id, Some(2), Some(&back_cursor))
+            .await
+            .expect("list_versions backward page");
+        back_pages.push(page.items.iter().map(|v| v.version_id).collect());
+        match page.page_info.prev_cursor {
+            Some(prev) => back_cursor = prev,
+            None => break,
+        }
+    }
+    back_pages.reverse();
+    let expected_back = &pages[..pages.len() - 1];
+    assert_eq!(
+        back_pages, expected_back,
+        "walking prev_cursor backward from the last page must reproduce every \
+         earlier page, in the same canonical order"
     );
 }
 
@@ -567,6 +704,55 @@ async fn versions_cursor_rejects_a_different_file() {
         .list_versions(&ctx, file_b, Some(1), Some(&cursor))
         .await
         .expect_err("a cursor issued for a different file must be rejected");
+    assert!(
+        matches!(err, DomainError::Cursor(_)),
+        "expected a cursor error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn versions_backward_cursor_rejects_a_different_file() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let svc = FileService::new(
+        store.clone(),
+        backends,
+        issuer,
+        authorizer,
+        base_config(),
+        None,
+        None,
+    );
+
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let now = OffsetDateTime::now_utc();
+    let (file_a, _) = seed_file_and_versions(&db, tenant, owner, &[now, now]).await;
+    let (file_b, _) = seed_file_and_versions(&db, tenant, owner, &[now]).await;
+
+    let ctx = ctx(tenant, owner);
+    let page1 = svc
+        .list_versions(&ctx, file_a, Some(1), None)
+        .await
+        .expect("page 1");
+    let next = page1.page_info.next_cursor.expect("more pages remain");
+    let page2 = svc
+        .list_versions(&ctx, file_a, Some(1), Some(&next))
+        .await
+        .expect("page 2");
+    let prev = page2
+        .page_info
+        .prev_cursor
+        .expect("page 2 must have a predecessor");
+
+    let err = svc
+        .list_versions(&ctx, file_b, Some(1), Some(&prev))
+        .await
+        .expect_err("a backward cursor issued for a different file must be rejected");
     assert!(
         matches!(err, DomainError::Cursor(_)),
         "expected a cursor error, got {err:?}"
@@ -951,13 +1137,18 @@ async fn retention_rules_admin_cursor_walk_covers_every_rule_in_tenant() {
     let _ = &svc;
 
     let mut seen = Vec::new();
+    let mut pages: Vec<Vec<Uuid>> = Vec::new();
+    let mut prev_cursors: Vec<Option<String>> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
         let page = policy_svc
             .list_retention_rules(&ctx_subject, Some(2), cursor.as_deref())
             .await
             .expect("list_retention_rules page");
-        seen.extend(page.items.iter().map(|r| r.rule_id));
+        prev_cursors.push(page.page_info.prev_cursor.clone());
+        let page_ids: Vec<Uuid> = page.items.iter().map(|r| r.rule_id).collect();
+        seen.extend(page_ids.iter().copied());
+        pages.push(page_ids);
         match page.page_info.next_cursor.clone() {
             Some(next) => cursor = Some(next),
             None => break,
@@ -965,11 +1156,41 @@ async fn retention_rules_admin_cursor_walk_covers_every_rule_in_tenant() {
         assert!(seen.len() <= created.len(), "walk must terminate");
     }
 
-    let seen_set: std::collections::HashSet<Uuid> = seen.into_iter().collect();
+    let seen_set: std::collections::HashSet<Uuid> = seen.iter().copied().collect();
     let expected_set: std::collections::HashSet<Uuid> = created.into_iter().collect();
     assert_eq!(
         seen_set, expected_set,
         "admin must see every rule in the tenant"
+    );
+    assert_eq!(
+        prev_cursors[0], None,
+        "the very first page (no cursor supplied) must have prev_cursor = null"
+    );
+    assert!(pages.len() > 1, "test must exercise more than one page");
+
+    let mut back_pages: Vec<Vec<Uuid>> = Vec::new();
+    let mut back_cursor = prev_cursors
+        .last()
+        .cloned()
+        .flatten()
+        .expect("the last page must have a predecessor");
+    loop {
+        let page = policy_svc
+            .list_retention_rules(&ctx_subject, Some(2), Some(&back_cursor))
+            .await
+            .expect("list_retention_rules backward page");
+        back_pages.push(page.items.iter().map(|r| r.rule_id).collect());
+        match page.page_info.prev_cursor {
+            Some(prev) => back_cursor = prev,
+            None => break,
+        }
+    }
+    back_pages.reverse();
+    let expected_back = &pages[..pages.len() - 1];
+    assert_eq!(
+        back_pages, expected_back,
+        "walking prev_cursor backward from the last page must reproduce every \
+         earlier page, in the same canonical order"
     );
 }
 
@@ -1033,11 +1254,36 @@ async fn retention_rules_cursor_with_wrong_order_field_is_rejected() {
         Uuid::now_v7(),
         pagination::FILES_ID_FIELD, // wrong id field for /retention-rules
         None,
+        pagination::Direction::Forward,
     )
     .expect("encode");
     let err = policy_svc
         .list_retention_rules(&ctx(tenant, subject), Some(2), Some(&bogus))
         .await
         .expect_err("a cursor built for a different listing's order must be rejected");
+    assert!(matches!(err, DomainError::Cursor(_)));
+}
+
+/// Same as [`retention_rules_cursor_with_wrong_order_field_is_rejected`], but
+/// for a backward-direction cursor -- `/retention-rules` carries no
+/// owner/file binding to test against (unlike `/files`/`/files/{id}/versions`),
+/// so the order check is this listing's equivalent bad-cursor case, and it
+/// must reject a foreign cursor the same way regardless of direction.
+#[tokio::test]
+async fn retention_rules_backward_cursor_with_wrong_order_field_is_rejected() {
+    let (_svc, policy_svc, authz, tenant, subject) = build_retention_harness().await;
+    authz.set_admin(true);
+    let bogus = pagination::encode(
+        OffsetDateTime::now_utc(),
+        Uuid::now_v7(),
+        pagination::FILES_ID_FIELD, // wrong id field for /retention-rules
+        None,
+        pagination::Direction::Backward,
+    )
+    .expect("encode");
+    let err = policy_svc
+        .list_retention_rules(&ctx(tenant, subject), Some(2), Some(&bogus))
+        .await
+        .expect_err("a backward cursor built for a different listing's order must be rejected");
     assert!(matches!(err, DomainError::Cursor(_)));
 }

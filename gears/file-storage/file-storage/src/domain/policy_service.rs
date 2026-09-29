@@ -198,8 +198,8 @@ impl PolicyService {
         ))
     }
 
-    /// List retention rules for the caller's tenant, forward-only
-    /// cursor-paginated.
+    /// List retention rules for the caller's tenant, cursor-paginated in
+    /// either direction.
     ///
     /// Plain `READ` only clears "may list retention rules at all" — a
     /// non-admin caller must not see every rule in the tenant (`User`-scope

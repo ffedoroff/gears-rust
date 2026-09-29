@@ -34,13 +34,20 @@ impl FileService {
     ///    same deterministic path) can be interrupted after writing but
     ///    before its own hash check and cleanup. So the pre-existing object
     ///    is read back and re-verified against the same hash spec before it
-    ///    is trusted. Only a **confirmed** mismatch (the object was read in
-    ///    full and its hash/length disagree) proves it is garbage and gets
-    ///    best-effort deleted; a re-verification that could not be completed
-    ///    at all (the read-back never opened, broke off mid-read, or left no
-    ///    verdict) proves nothing about the object's content, is left
-    ///    untouched, and surfaces as a retryable backend error instead — see
-    ///    `Self::verify_preexisting_dest_and_clean_on_confirmed_mismatch`'s
+    ///    is trusted. A **confirmed** mismatch (the object was read in full
+    ///    and its hash/length disagree) is a deletion *candidate*, not an
+    ///    automatic delete: immediately before deleting, this re-checks that
+    ///    no version row has since come to point at this exact object and
+    ///    that the object's size has not changed since the read-back, and
+    ///    only deletes when both hold — otherwise the object is left
+    ///    untouched and `Conflict` is returned instead, since a confirmed
+    ///    mismatch alone cannot tell "provably nobody's content" apart from
+    ///    "a concurrent migration's own write landed after this call's
+    ///    read-back completed". A re-verification that could not be
+    ///    completed at all (the read-back never opened, broke off mid-read,
+    ///    or left no verdict) proves nothing about the object's content, is
+    ///    left untouched, and surfaces as a retryable backend error instead
+    ///    — see `Self::verify_preexisting_dest_and_clean_on_confirmed_mismatch`'s
     ///    own doc comment.
     /// 4. Immediately before the CAS below, re-`stat` the destination object
     ///    to confirm it is still there at the expected size. This narrows
@@ -331,6 +338,10 @@ impl FileService {
                 hash_mode,
                 version.hash_value.clone(),
                 manifest,
+                version.file_id,
+                version.version_id,
+                &version.backend_id,
+                &version.backend_path,
             )
             .await?;
         }
@@ -360,10 +371,17 @@ impl FileService {
     ///   completion and its hash/length disagree with what this version
     ///   declares. `publish_exclusive` publishes atomically, so any writer
     ///   holding the correct bytes always passes this exact check — a
-    ///   passing competitor's blob can never end up here. This is therefore
-    ///   *confirmed* garbage (it carries no live database pointer either
-    ///   way), safe — and necessary, so it is not leaked forever — to
-    ///   best-effort delete unconditionally.
+    ///   passing competitor's blob can never end up here. This is
+    ///   *confirmed* garbage from this call's own point of view — but a
+    ///   confirmed mismatch by itself only proves the bytes are wrong, not
+    ///   that no concurrent migration has, in the meantime, already
+    ///   committed a live pointer to this exact path (a mismatch found here
+    ///   says nothing about a write that lands *after* the read-back
+    ///   completes). Deletion is therefore gated on
+    ///   [`Self::delete_confirmed_mismatch_if_uncontended`] re-confirming
+    ///   both that no version row already points at this object and that the
+    ///   object itself has not changed since the read-back — not performed
+    ///   unconditionally.
     /// - a [`PreexistingDestVerdict::Unconfirmed`] means the check itself
     ///   could not be completed: the read-back stream never opened, broke
     ///   off mid-read, or the verdict slot was left empty. This proves
@@ -377,6 +395,7 @@ impl FileService {
     ///   otherwise — either way a rejection of this call, never of the
     ///   migration itself, and `api/rest/error.rs` maps each to its own 5xx
     ///   at the REST boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn verify_preexisting_dest_and_clean_on_confirmed_mismatch(
         &self,
         dest: &dyn StorageBackend,
@@ -385,6 +404,10 @@ impl FileService {
         hash_mode: HashMode,
         hash_value: Vec<u8>,
         manifest: Option<Manifest>,
+        file_id: Uuid,
+        version_id: Uuid,
+        source_backend_id: &str,
+        source_backend_path: &str,
     ) -> Result<(), DomainError> {
         match verify_existing_dest_object(
             dest,
@@ -397,11 +420,117 @@ impl FileService {
         .await
         {
             Ok(()) => Ok(()),
-            Err(PreexistingDestVerdict::Mismatch(mismatch_err)) => {
-                self.best_effort_blob_delete(dest.id(), dest_path).await;
-                Err(mismatch_err)
-            }
+            Err(PreexistingDestVerdict::Mismatch(mismatch_err)) => Err(self
+                .delete_confirmed_mismatch_if_uncontended(
+                    dest,
+                    dest_path,
+                    expected_len,
+                    file_id,
+                    version_id,
+                    source_backend_id,
+                    source_backend_path,
+                    mismatch_err,
+                )
+                .await),
             Err(PreexistingDestVerdict::Unconfirmed(backend_err)) => Err(backend_err),
+        }
+    }
+
+    /// Decides whether the object just confirmed mismatched by
+    /// [`verify_existing_dest_object`] is actually safe to delete, and
+    /// returns the error `migrate_backend` should surface either way — a
+    /// confirmed mismatch never lets the migration succeed, but whether the
+    /// object gets deleted depends on two re-checks made as close to the
+    /// delete as this call can get them:
+    ///
+    /// 1. **Nobody has since claimed this object as their live content.** The
+    ///    version row is re-fetched by `(file_id, version_id)`: if it now
+    ///    points at `(dest.id(), dest_path)` — this exact object — a
+    ///    concurrent migration must have committed its own CAS to the same
+    ///    deterministic path between this call's read-back and this check,
+    ///    and this call's earlier mismatch verdict cannot be trusted to mean
+    ///    what it normally means (a passing competitor's blob can never fail
+    ///    this check, so either that migration's own verification was wrong
+    ///    or this one raced its own read against an in-flight write in a way
+    ///    the mismatch path does not otherwise expect). Either way, deleting
+    ///    now could destroy a concurrent winner's live blob, so this refuses
+    ///    to delete and returns a `Conflict` asking for operator
+    ///    investigation instead of the original `mismatch_err`. If the row
+    ///    points anywhere else — including simply having disappeared — other
+    ///    than the pre-migration source snapshot this call started from, the
+    ///    state changed underneath this call in some other way this check
+    ///    was never designed to reason about, so it is equally conservative:
+    ///    no delete, `Conflict`.
+    /// 2. **The object is still exactly what was just read back.** Only once
+    ///    the version row confirms nothing has claimed the object does this
+    ///    re-`stat` it and compare the returned size against `expected_len` —
+    ///    the same length the read-back already confirmed the object had.
+    ///    A re-`stat` is **not** atomic with the delete immediately below —
+    ///    an object can still disappear or be rewritten in the gap between
+    ///    the two calls, the same known limitation as the pre-CAS `stat` in
+    ///    `migrate_backend` itself (issue #5013) — but it narrows the window
+    ///    from "since the read-back completed" to "since this one round
+    ///    trip", instead of trusting a read-back that may by now be
+    ///    arbitrarily stale.
+    ///
+    /// Only when both checks hold does this actually delete the object; it
+    /// still always returns an error, since a confirmed mismatch never lets
+    /// the migration itself proceed to the CAS.
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_confirmed_mismatch_if_uncontended(
+        &self,
+        dest: &dyn StorageBackend,
+        dest_path: &str,
+        expected_len: u64,
+        file_id: Uuid,
+        version_id: Uuid,
+        source_backend_id: &str,
+        source_backend_path: &str,
+        mismatch_err: DomainError,
+    ) -> DomainError {
+        let current = match self.store.get_version(file_id, version_id).await {
+            Ok(current) => current,
+            Err(e) => return e,
+        };
+        match current {
+            Some(v) if v.backend_id == dest.id() && v.backend_path == dest_path => {
+                return DomainError::conflict(format!(
+                    "destination object at {dest_path} on backend {} was found mismatched \
+                     during re-verification, but the version row already points at this exact \
+                     object -- refusing to delete a possibly-live blob; this requires operator \
+                     investigation",
+                    dest.id()
+                ));
+            }
+            Some(v)
+                if v.backend_id == source_backend_id && v.backend_path == source_backend_path =>
+            {
+                // Still on the pre-migration snapshot -- nothing has claimed
+                // this object yet. Proceed to the identity re-check below.
+            }
+            Some(_) | None => {
+                return DomainError::conflict(format!(
+                    "version {version_id} no longer matches the pre-migration snapshot it \
+                     started from -- refusing to delete destination object at {dest_path} \
+                     pending operator investigation"
+                ));
+            }
+        }
+
+        match dest.stat(dest_path).await {
+            Ok(Some(actual_len)) if actual_len == expected_len => {
+                self.best_effort_blob_delete(dest.id(), dest_path).await;
+                mismatch_err
+            }
+            Ok(_) => DomainError::backend_unavailable(
+                dest.id(),
+                format!(
+                    "destination object at {dest_path} changed after its confirmed-mismatch \
+                     re-verification; leaving it untouched instead of deleting an object that \
+                     may no longer be the one that was checked"
+                ),
+            ),
+            Err(e) => e,
         }
     }
 

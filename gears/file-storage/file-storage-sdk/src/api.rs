@@ -73,9 +73,9 @@ pub trait FileStorageClientV1: Send + Sync {
     ) -> Result<FileFetch, FileStorageError>;
 
     /// List files (each with its custom metadata) for a mandatory owner
-    /// filter, forward-only cursor-paginated.
-    /// `cursor` resumes after the position encoded in a previous
-    /// `page.page_info.next_cursor` (`None` starts from the first page).
+    /// filter, cursor-paginated in either direction. `cursor` resumes from
+    /// the position encoded in a previous `page.page_info.next_cursor` or
+    /// `page.page_info.prev_cursor` (`None` starts from the first page).
     async fn list_files(
         &self,
         ctx: &SecurityContext,
@@ -115,9 +115,9 @@ pub trait FileStorageClientV1: Send + Sync {
 
     // ── versions ─────────────────────────────────────────────────────────────
 
-    /// List a file's content versions, newest first, forward-only
-    /// cursor-paginated. `cursor` resumes
-    /// after the position encoded in a previous `page.page_info.next_cursor`
+    /// List a file's content versions, newest first, cursor-paginated in
+    /// either direction. `cursor` resumes from the position encoded in a
+    /// previous `page.page_info.next_cursor` or `page.page_info.prev_cursor`
     /// (`None` starts from the first page). A page may carry fewer than
     /// `limit` items (with `next_cursor` still set) when the ADR-0006
     /// manifest-byte budget truncates it -- see `docs/api.md`.
@@ -258,7 +258,7 @@ pub trait FileStorageClientV1: Send + Sync {
     // ── retention rules ──────────────────────────────────────────────────────
 
     /// List retention rules visible to the caller for their tenant,
-    /// forward-only cursor-paginated. An
+    /// cursor-paginated in either direction. An
     /// admin caller sees every rule in the tenant; a non-admin caller sees
     /// only tenant-scope rules, their own user-scope rules, and file-scope
     /// rules on files they own.

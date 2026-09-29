@@ -86,18 +86,20 @@ impl Store {
             .ok_or_else(|| DomainError::file_not_found(file_id))
     }
 
-    /// List files for an owner filter, newest-first, forward-only
-    /// keyset-paginated. `limit` is the
-    /// caller's already-clamped page size (see `FileService::list_files`);
-    /// `cursor`, when `Some`, resumes after the position it encodes --
-    /// decoded and validated here against [`crate::domain::pagination::files_binding`]
+    /// List files for an owner filter, newest-first, keyset-paginated in
+    /// either direction. `limit` is the caller's already-clamped page size
+    /// (see `FileService::list_files`); `cursor`, when `Some`, resumes from
+    /// the position it encodes, in the direction it carries -- decoded and
+    /// validated here against [`crate::domain::pagination::files_binding`]
     /// so a cursor issued for a different owner pair is rejected as a `400`
     /// rather than silently reused.
     ///
-    /// Fetches `limit + 1` rows to learn whether a next page exists without
-    /// a separate `COUNT` query (the platform's cursor-pagination contract,
-    /// `guidelines/DNA/REST/QUERYING.md`), trims back to `limit`, and encodes
-    /// `next_cursor` from the last row actually returned.
+    /// Fetches `limit + 1` rows to learn whether a further page exists in
+    /// the query's own direction, without a separate `COUNT` query (the
+    /// platform's cursor-pagination contract,
+    /// `guidelines/DNA/REST/QUERYING.md`); [`pagination::finish_page`] trims
+    /// back to `limit`, restores canonical order for a backward query, and
+    /// builds both `next_cursor`/`prev_cursor`.
     pub async fn list_files(
         &self,
         scope: &AccessScope,
@@ -113,38 +115,20 @@ impl Store {
             .transpose()?;
 
         let conn = self.db.conn().map_err(db_err)?;
-        let mut rows = self
+        let rows = self
             .repos
             .files
             .list_page(&conn, scope, owner, limit.saturating_add(1), after)
             .await?;
 
-        let has_more = rows.len() as u64 > limit;
-        if has_more {
-            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        }
-        let next_cursor = if has_more {
-            rows.last()
-                .map(|f| {
-                    pagination::encode(
-                        f.created_at,
-                        f.file_id,
-                        pagination::FILES_ID_FIELD,
-                        binding.clone(),
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        Ok(toolkit_odata::Page::new(
+        Ok(pagination::finish_page(
             rows,
-            toolkit_odata::PageInfo {
-                next_cursor,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+            limit,
+            after,
+            pagination::FILES_ID_FIELD,
+            binding.as_deref(),
+            |f| (f.created_at, f.file_id),
+        )?)
     }
 
     // ── create ───────────────────────────────────────────────────────────────

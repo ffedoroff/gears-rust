@@ -414,6 +414,7 @@ async fn list_by_file_page_keyset_orders_by_created_at_then_version_id_with_no_s
     let after_pos = file_storage::domain::pagination::Seek {
         created_at: last.created_at,
         id: last.version_id,
+        direction: file_storage::domain::pagination::Direction::Forward,
     };
     let page2 = versions
         .list_by_file_page(&conn, &scope, file_id, 2, Some(after_pos))
@@ -425,6 +426,7 @@ async fn list_by_file_page_keyset_orders_by_created_at_then_version_id_with_no_s
             Some(file_storage::domain::pagination::Seek {
                 created_at: last.created_at,
                 id: last.version_id,
+                direction: file_storage::domain::pagination::Direction::Forward,
             })
         })
         .await

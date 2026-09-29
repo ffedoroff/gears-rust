@@ -671,6 +671,7 @@ async fn list_page_orders_by_created_at_then_file_id_so_keyset_pages_do_not_skip
     let after_pos = pagination::Seek {
         created_at: page1.last().expect("page 1 non-empty").created_at,
         id: page1.last().expect("page 1 non-empty").file_id,
+        direction: pagination::Direction::Forward,
     };
     let page2 = files
         .list_page(&conn, &scope, owner, 2, Some(after_pos))

@@ -131,7 +131,7 @@ impl Store {
             .transpose()?;
 
         let conn = self.db.conn().map_err(db_err)?;
-        let mut rows = self
+        let rows = self
             .repos
             .versions
             .list_by_file_page(
@@ -143,32 +143,14 @@ impl Store {
             )
             .await?;
 
-        let has_more = rows.len() as u64 > limit;
-        if has_more {
-            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        }
-        let next_cursor = if has_more {
-            rows.last()
-                .map(|v| {
-                    pagination::encode(
-                        v.created_at,
-                        v.version_id,
-                        pagination::VERSIONS_ID_FIELD,
-                        binding.clone(),
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        Ok(toolkit_odata::Page::new(
+        Ok(pagination::finish_page(
             rows,
-            toolkit_odata::PageInfo {
-                next_cursor,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+            limit,
+            after,
+            pagination::VERSIONS_ID_FIELD,
+            binding.as_deref(),
+            |v| (v.created_at, v.version_id),
+        )?)
     }
 
     /// Return the MIME type of the file's current (bound) version, if any.
