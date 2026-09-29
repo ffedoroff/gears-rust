@@ -41,7 +41,7 @@ use file_storage::infra::backend::{
     BackendCapabilities, BackendRegistry, InMemoryBackend, MultipartCompletionPart, StorageBackend,
 };
 use file_storage::infra::content::hash;
-use file_storage::infra::content::hash_mode::{HashMode, Manifest};
+use file_storage::infra::content::hash_mode::{HashMode, Manifest, ManifestEntry};
 use file_storage::infra::content::stream_verify::verify_stream;
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
@@ -480,6 +480,32 @@ async fn client_reverification_succeeds_and_detects_tampering() {
         version.hash_value.as_slice()
     );
     assert_eq!(hash::sha256(manifest.as_bytes()), version.hash_value);
+}
+
+/// A zero-byte object stored as a `multipart-composite-sha256` version: a
+/// single manifest entry at offset 0 covering zero bytes, the shape the
+/// multipart planner produces for a declared size of 0. Per S3
+/// composite-checksum semantics this is a legitimate manifest — its part
+/// digest (`sha256("")`) still participates in the root — so re-verification
+/// through `verify_content_hash` (the same `verify_stream` `migrate_backend`
+/// uses) must succeed rather than reject the manifest as malformed. Built
+/// directly rather than via `drive_multipart` (no real zero-byte upload
+/// helper exists, and none of the DB/backend machinery is needed to exercise
+/// `verify_stream` itself).
+#[tokio::test]
+async fn client_reverification_succeeds_for_zero_byte_composite_object() {
+    let digest = hash::digest_to_array(hash::sha256(b""));
+    let manifest = Manifest::new(vec![ManifestEntry { offset: 0, digest }]).unwrap();
+    let root = manifest.root().to_vec();
+
+    verify_content_hash(
+        &[],
+        HashMode::MultipartCompositeSha256,
+        &root,
+        Some(&manifest),
+    )
+    .await
+    .expect("a zero-byte composite object must re-verify against sha256(\"\")");
 }
 
 // ── AC4: migrate_backend verifies from manifest row alone ─────────────────

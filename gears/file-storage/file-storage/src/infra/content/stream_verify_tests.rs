@@ -318,35 +318,131 @@ async fn composite_mode_tampered_part_fails_verification() {
     );
 }
 
-/// A manifest whose last part starts exactly at `expected_len` describes a
-/// zero-length final span: `process_chunk` would never finalize it at EOF
-/// (nothing ever crosses its `[start, start)` boundary), so a naive
-/// `zip(entries, part_digests)` in `compare` would just silently drop the
-/// unchecked last entry instead of ever comparing it -- a manifest for only
-/// the preceding entries would then verify successfully. Must be rejected up
-/// front, at `verify_stream` construction, before any streaming begins.
+/// A zero-byte object stored as a one-part composite manifest (the shape a
+/// multipart plan/`complete_multipart` produces when the declared size is 0):
+/// a single entry at offset 0, `expected_len == 0`. Per S3 composite-checksum
+/// semantics a zero-byte object is a legitimate single zero-length part, and
+/// its digest (`sha256("")`) still participates in the manifest root.
+/// `process_chunk` is never called (the source yields no chunks at all), so
+/// this exercises `verify_stream`'s EOF-time finalization of a span that
+/// never received a single byte. Fails on the pre-fix code, which rejected
+/// any `start == end` span in `build_spec`.
 #[tokio::test]
-async fn composite_mode_rejects_manifest_whose_last_offset_equals_expected_len() {
+async fn composite_mode_zero_byte_object_with_one_empty_part_verifies_ok() {
+    let (manifest, root) = build_composite(&[&[]]);
+    let inner = ok_stream(vec![]);
+    let (wrapped, slot) = verify_stream(
+        inner,
+        0,
+        HashMode::MultipartCompositeSha256,
+        root,
+        Some(manifest),
+    )
+    .expect("a single zero-length part covering a zero-byte object is a valid manifest");
+    let (collected, err) = drain(wrapped).await;
+    assert!(collected.is_empty());
+    assert_eq!(err, None);
+    assert!(
+        slot.lock()
+            .unwrap()
+            .take()
+            .expect("verdict published")
+            .is_ok(),
+        "a zero-byte composite object must verify against sha256(\"\") for its sole part"
+    );
+}
+
+/// A multi-part object whose *last* manifest entry is a zero-length trailing
+/// part (`offset == expected_len`) -- also legitimate per S3 composite-
+/// checksum semantics, since manifest offsets are strictly ascending so only
+/// the last entry can ever be empty. `process_chunk` finalizes the
+/// non-empty part(s) as usual but never touches the trailing empty one (no
+/// bytes ever arrive for it), so this exercises the same EOF finalization
+/// path for a span that isn't the whole object. Fails on the pre-fix code.
+#[tokio::test]
+async fn composite_mode_trailing_empty_part_verifies_ok() {
+    let part1 = vec![b'x'; 30];
+    let (manifest, root) = build_composite(&[&part1, &[]]);
+
+    let inner = ok_stream(vec![part1.clone()]);
+    let (wrapped, slot) = verify_stream(
+        inner,
+        part1.len() as u64,
+        HashMode::MultipartCompositeSha256,
+        root,
+        Some(manifest),
+    )
+    .expect("a trailing zero-length part is a valid manifest shape");
+    let (collected, err) = drain(wrapped).await;
+    assert_eq!(collected, part1);
+    assert_eq!(err, None);
+    assert!(
+        slot.lock()
+            .unwrap()
+            .take()
+            .expect("verdict published")
+            .is_ok(),
+        "a matching manifest with a trailing empty part must verify"
+    );
+}
+
+/// Same shape as [`composite_mode_trailing_empty_part_verifies_ok`], but the
+/// root handed to `verify_stream` doesn't match the recomputed one (as if an
+/// attacker supplied a root for a truncated manifest) -- must still be
+/// caught as a hash mismatch, not silently accepted just because the
+/// trailing part is empty.
+#[tokio::test]
+async fn composite_mode_trailing_empty_part_with_wrong_root_fails_verification() {
+    let part1 = vec![b'x'; 30];
+    let (manifest, _real_root) = build_composite(&[&part1, &[]]);
+    let bogus_root = vec![0xAB; 32];
+
+    let inner = ok_stream(vec![part1.clone()]);
+    let (wrapped, slot) = verify_stream(
+        inner,
+        part1.len() as u64,
+        HashMode::MultipartCompositeSha256,
+        bogus_root,
+        Some(manifest),
+    )
+    .expect("a trailing zero-length part is a valid manifest shape");
+    let (_collected, err) = drain(wrapped).await;
+    assert_eq!(err, None);
+    let verdict = slot.lock().unwrap().take().expect("verdict published");
+    assert!(
+        matches!(
+            verdict,
+            Err(crate::domain::error::DomainError::HashMismatch { .. })
+        ),
+        "a mismatched root must fail verification even with a trailing empty part: {verdict:?}"
+    );
+}
+
+/// A manifest offset that falls strictly beyond `expected_len` (not just
+/// touching it, as the legitimate trailing-empty-part case does) must still
+/// be rejected up front, at `verify_stream` construction, before any
+/// streaming begins.
+#[tokio::test]
+async fn composite_mode_rejects_manifest_offset_beyond_expected_len() {
     let part1 = vec![b'x'; 30];
     let (manifest, root) = build_composite(&[&part1]);
     let mut entries = manifest.entries().to_vec();
-    // A bogus trailing entry starting exactly where the object ends -- an
-    // empty final span.
+    // A bogus trailing entry starting *past* where the object ends.
     entries.push(ManifestEntry {
-        offset: part1.len() as u64,
+        offset: part1.len() as u64 + 5,
         digest: [0u8; 32],
     });
-    let manifest_with_empty_tail = Manifest::new(entries).expect("valid manifest shape");
+    let manifest_out_of_range = Manifest::new(entries).expect("valid manifest shape");
 
     let err = verify_stream(
         ok_stream(vec![part1.clone()]),
         part1.len() as u64,
         HashMode::MultipartCompositeSha256,
         root,
-        Some(manifest_with_empty_tail),
+        Some(manifest_out_of_range),
     )
     .map(|_| ())
-    .expect_err("a manifest with an empty final span must be rejected at construction");
+    .expect_err("a manifest entry starting past expected_len must be rejected at construction");
     assert!(
         matches!(err, crate::domain::error::DomainError::HashMismatch { .. }),
         "expected HashMismatch, got {err:?}"
