@@ -137,6 +137,8 @@ mod tests {
             backend_path: "/f/v".to_owned(),
             created_at: now,
             bound_on_finalize: false,
+            migration_lease_owner: None,
+            migration_lease_until: None,
         };
         let err = file_version_from_model(model)
             .expect_err("an unparseable status must surface as an error, not a default");

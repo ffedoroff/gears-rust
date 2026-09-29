@@ -134,6 +134,22 @@ pub struct FileService {
     /// `signing_key_seed` rotation doesn't reject an in-flight upload's
     /// callback the moment the control plane restarts on the new seed.
     pub(super) callback_verifier: crate::infra::signed_url::Verifier,
+    /// Time budget (seconds) `migrate_backend` allows itself for one
+    /// migration attempt -- see `FileStorageConfig::migrate_timeout_secs`'s
+    /// doc comment. Defaults in [`Self::new`] to that config field's own
+    /// default (3600s / 1 hour) so every existing `FileService::new(...)`
+    /// call site across the test suite keeps compiling and behaving
+    /// sensibly unchanged; `gear.rs` overrides it via
+    /// [`Self::with_migrate_lease_config`] with the actually-configured
+    /// value, the same builder-step pattern
+    /// `MultipartService::with_complete_lease_secs` uses.
+    pub(super) migrate_timeout_secs: u64,
+    /// Extra margin (seconds) added to [`Self::migrate_timeout_secs`] when
+    /// sizing the migration lease -- see
+    /// `FileStorageConfig::migrate_lease_margin_secs`'s doc comment.
+    /// Defaults in [`Self::new`] to that config field's own default (300s /
+    /// 5 minutes); see [`Self::migrate_timeout_secs`]'s doc for why.
+    pub(super) migrate_lease_margin_secs: u64,
 }
 
 impl FileService {
@@ -157,7 +173,23 @@ impl FileService {
             usage_reporter,
             metrics: Arc::new(NoopMetrics),
             callback_verifier,
+            // Same defaults as `FileStorageConfig::{migrate_timeout_secs,
+            // migrate_lease_margin_secs}` -- see `Self::migrate_timeout_secs`'s
+            // doc for why this mirrors, rather than reads, that config type.
+            migrate_timeout_secs: 3600,
+            migrate_lease_margin_secs: 300,
         }
+    }
+
+    /// Install the migration lease's timeout and margin (upload-flow
+    /// redesign, `migrate_backend`). Same builder shape as
+    /// [`Self::with_metrics`] -- see its doc for why this is a builder step
+    /// rather than a `new()` parameter.
+    #[must_use]
+    pub fn with_migrate_lease_config(mut self, timeout_secs: u64, margin_secs: u64) -> Self {
+        self.migrate_timeout_secs = timeout_secs;
+        self.migrate_lease_margin_secs = margin_secs;
+        self
     }
 
     /// Install a real metrics port (P2 1.8 remediation). Kept as a builder

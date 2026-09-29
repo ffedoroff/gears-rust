@@ -1,6 +1,9 @@
 //! Backend migration and backend discovery.
 
-use futures::StreamExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -9,54 +12,55 @@ use crate::domain::authz::actions;
 use crate::domain::error::DomainError;
 use crate::domain::service::FileService;
 use crate::domain::storage_layout;
-use crate::infra::backend::{BackendCapabilities, StorageBackend, classify_stream_io_error};
+use crate::infra::backend::{BackendCapabilities, StorageBackend};
 use crate::infra::content::hash_mode::{HashMode, Manifest};
 use crate::infra::content::stream_verify;
 
-// ── backend migration (P2-M4) ──────────────────────────────────────────────────
+// ── backend migration (P2-M4, upload-flow redesign lease) ──────────────────────
 
 impl FileService {
     /// Relocate a non-versioned file's content from one backend to another
     /// without changing its identity (`file_id`, ownership, metadata, content
     /// hash).
     ///
-    /// Steps:
-    /// 1. Verify the file has exactly 1 version (non-versioned files only).
-    /// 2. Stream the blob from the source backend into the destination
-    ///    backend at the canonical path, verifying its content hash (SHA-256,
-    ///    mode-aware per ADR-0006) incrementally on the same pass.
-    /// 3. If verification of the source stream fails (or it breaks
-    ///    mid-read), fail without committing the CAS below, and best-effort
-    ///    delete the destination object if this call is the one that created
-    ///    it. If the destination object already existed (`created: false`),
-    ///    that alone is not proof it was ever verified — an earlier attempt
-    ///    (this exact call retried, or a distinct migration racing on the
-    ///    same deterministic path) can be interrupted after writing but
-    ///    before its own hash check and cleanup. So the pre-existing object
-    ///    is read back and re-verified against the same hash spec before it
-    ///    is trusted. A **confirmed** mismatch (the object was read in full
-    ///    and its hash/length disagree) is a deletion *candidate*, not an
-    ///    automatic delete: immediately before deleting, this re-checks that
-    ///    no version row has since come to point at this exact object and
-    ///    that the object's size has not changed since the read-back, and
-    ///    only deletes when both hold — otherwise the object is left
-    ///    untouched and `Conflict` is returned instead, since a confirmed
-    ///    mismatch alone cannot tell "provably nobody's content" apart from
-    ///    "a concurrent migration's own write landed after this call's
-    ///    read-back completed". A re-verification that could not be
-    ///    completed at all (the read-back never opened, broke off mid-read,
-    ///    or left no verdict) proves nothing about the object's content, is
-    ///    left untouched, and surfaces as a retryable backend error instead
-    ///    — see `Self::verify_preexisting_dest_and_clean_on_confirmed_mismatch`'s
-    ///    own doc comment.
-    /// 4. Immediately before the CAS below, re-`stat` the destination object
-    ///    to confirm it is still there at the expected size. This narrows
-    ///    (it cannot fully close) the window between step 3's verification
-    ///    and the CAS: see the call site's own comment for why that is
-    ///    enough given step 3's stricter deletion rule.
-    /// 5. Transactionally update `backend_id` + `backend_path` and emit a
-    ///    `BackendMigrate` audit row.
-    /// 6. Best-effort delete the source blob (orphan cleanup if this fails).
+    /// Because the destination path is deterministic
+    /// (`storage_layout::backend_path`, `/{file_id}/{version_id}`), two
+    /// migration attempts of the SAME version would otherwise race on the
+    /// identical destination object. This is prevented by a per-version
+    /// migration lease (`file_versions.migration_lease_owner`/
+    /// `migration_lease_until`), acquired up front and held for the whole
+    /// attempt:
+    ///
+    /// 1. Verify the file has exactly 1 version (non-versioned files only)
+    ///    and that version is `available`.
+    /// 2. Acquire the migration lease (`Store::acquire_migration_lease`,
+    ///    sized `migrate_timeout_secs + migrate_lease_margin_secs`, timed by
+    ///    the database's own clock). `false` -- a live lease already held by
+    ///    another attempt -- surfaces as `Conflict` (409).
+    /// 3. Under a `tokio::time::timeout(migrate_timeout_secs, ..)`: stream
+    ///    the blob from the source backend into the destination, verifying
+    ///    its content hash incrementally on the same pass
+    ///    (`Self::stream_verify_and_publish_to_dest`, which also resolves a
+    ///    destination tail from an interrupted earlier attempt -- see that
+    ///    method's own doc); re-`stat` the destination immediately before
+    ///    committing (cheap defense-in-depth against the object vanishing in
+    ///    the narrow, structurally-unclosable window before the CAS -- see
+    ///    issue #5013); then transactionally rebind `backend_id`/
+    ///    `backend_path`, gated on both the pre-migration pointer snapshot
+    ///    AND this call's own lease ownership, clearing the lease in the
+    ///    same statement on a win.
+    /// 4. A timeout best-effort deletes the destination object -- but ONLY
+    ///    if this call is known to have created it AND its own CAS attempt
+    ///    had not yet started (see `Self::migrate_backend_transfer_and_commit`'s
+    ///    doc for why the second condition matters) -- and returns a
+    ///    retryable `BackendUnavailable` (503 + `Retry-After`); the pointer
+    ///    is never observed to change on a timeout.
+    /// 5. The lease is released best-effort on every exit path (success,
+    ///    error, or timeout) -- a successful CAS already cleared it in the
+    ///    same statement, so this is a no-op there; on any other exit, a
+    ///    lease this call still held is freed immediately instead of making
+    ///    the next attempt wait out the full lease duration. A release that
+    ///    itself fails is not fatal: the lease simply expires on its own.
     ///
     /// Returns `Ok(())` when the file already lives on the target backend
     /// (no-op), or after the migration completes successfully.
@@ -111,22 +115,142 @@ impl FileService {
                 .await?;
         }
 
-        // Stream the blob from the source backend straight into the
-        // destination, verifying its content hash incrementally on the same
-        // pass (mode-aware, ADR-0006) instead of materializing the whole
-        // object in memory, and only return once that verification (source
-        // stream, plus a pre-existing destination object's own read-back
-        // where relevant) has passed — see
-        // `Self::stream_verify_and_publish_to_dest`'s own doc comment for the
-        // full contract, including its cleanup behavior on failure.
+        // Acquire the migration lease before ANY write to the destination
+        // backend -- see this method's own doc for why, and
+        // `VersionRepo::acquire_migration_lease` for why its expiry is
+        // computed by the database itself rather than this instance's clock.
+        let owner = Uuid::now_v7();
+        let lease_secs = self
+            .migrate_timeout_secs
+            .saturating_add(self.migrate_lease_margin_secs);
+        let acquired = self
+            .store
+            .acquire_migration_lease(
+                file_id,
+                version.version_id,
+                owner,
+                Duration::from_secs(lease_secs),
+            )
+            .await?;
+        if !acquired {
+            return Err(DomainError::conflict(
+                "a migration of this version is already in progress",
+            ));
+        }
+
         let expected_len = u64::try_from(version.size).unwrap_or(0);
         let dest_path = storage_layout::backend_path(file_id, version.version_id);
+
+        // Shared with the timed-out branch below: whether this call's own
+        // publish actually landed fresh bytes at `dest_path`, and whether
+        // its own CAS attempt had already started -- see
+        // `Self::migrate_backend_transfer_and_commit`'s doc for why both
+        // matter to the timeout's best-effort cleanup decision. Plain
+        // `AtomicBool`s (not a mutex): each is only ever written once, by
+        // the single task driving the timed future, and read only after
+        // that future has stopped running (either it finished, in which
+        // case its result is used directly instead, or `timeout` gave up on
+        // it) -- ordering the reads with `Relaxed` is fine, there is no
+        // concurrent writer to synchronize against.
+        let created_by_us = Arc::new(AtomicBool::new(false));
+        let cas_started = Arc::new(AtomicBool::new(false));
+
+        let timeout_secs = self.migrate_timeout_secs.max(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            self.migrate_backend_transfer_and_commit(
+                ctx,
+                file_id,
+                version,
+                source.as_ref(),
+                dest.as_ref(),
+                target_backend_id,
+                &dest_path,
+                expected_len,
+                owner,
+                &created_by_us,
+                &cas_started,
+            ),
+        )
+        .await;
+
+        // Best-effort release on every exit path -- see this method's own
+        // doc, point 5. Errors are deliberately logged, not surfaced: a
+        // lease this call no longer legitimately holds (already lost to a
+        // takeover) is correctly left alone by `release_migration_lease`'s
+        // own owner fencing (that isn't a real failure, just `Ok(false)`),
+        // and any actual error here just means the lease expires on its own
+        // instead of being freed early.
+        if let Err(err) = self
+            .store
+            .release_migration_lease(file_id, version.version_id, owner)
+            .await
+        {
+            tracing::warn!(?err, "best-effort migration-lease release failed");
+        }
+
+        match result {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                // Only delete an object this call is known to have created,
+                // and only if its own CAS attempt never started -- once the
+                // CAS is in flight, this call can no longer tell whether it
+                // silently committed before the timeout raced it (see the
+                // module doc's "Known gap" section), and deleting the
+                // object in that case could destroy a pointer this same
+                // call just made live.
+                if created_by_us.load(Ordering::Relaxed) && !cas_started.load(Ordering::Relaxed) {
+                    self.best_effort_blob_delete(dest.id(), &dest_path).await;
+                }
+                Err(DomainError::backend_unavailable(
+                    dest.id(),
+                    format!("backend migration timed out after {timeout_secs}s"),
+                ))
+            }
+        }
+    }
+
+    /// The timed body of `migrate_backend`: transfer + verify, the pre-CAS
+    /// `stat`, and the CAS itself (plus its lost-CAS recovery). Split out
+    /// purely so `migrate_backend` can wrap it in one
+    /// `tokio::time::timeout` call without the whole function living inside
+    /// an inline `async move` block.
+    ///
+    /// `cas_started` is stamped `true` immediately before the CAS call --
+    /// after that point, a cancellation from the enclosing timeout can no
+    /// longer distinguish "the CAS never ran" from "the CAS's own `await`
+    /// was cancelled after the database had already applied it" (an
+    /// inherent limitation of racing a future against a timer, not
+    /// something this gear's cancellation handling can close). Not
+    /// attempting a cleanup in that ambiguous case is the safe choice: at
+    /// worst a destination object this call created is left behind after a
+    /// timeout despite the CAS never actually landing, which is exactly the
+    /// tail scenario `Self::stream_verify_and_publish_to_dest` already
+    /// reclaims on this version's next migration attempt -- as opposed to
+    /// the alternative of deleting an object a just-committed CAS made
+    /// live.
+    #[allow(clippy::too_many_arguments)]
+    async fn migrate_backend_transfer_and_commit(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version: &file_storage_sdk::FileVersion,
+        source: &dyn StorageBackend,
+        dest: &dyn StorageBackend,
+        target_backend_id: &str,
+        dest_path: &str,
+        expected_len: u64,
+        owner: Uuid,
+        created_by_us: &AtomicBool,
+        cas_started: &AtomicBool,
+    ) -> Result<(), DomainError> {
         self.stream_verify_and_publish_to_dest(
-            source.as_ref(),
-            dest.as_ref(),
+            source,
+            dest,
             version,
-            &dest_path,
+            dest_path,
             expected_len,
+            created_by_us,
         )
         .await?;
 
@@ -135,27 +259,12 @@ impl FileService {
         // the size this version declares. This narrows -- it cannot fully
         // close -- the window between "verified" and "CAS": nothing
         // coordinates a delete that lands in between this `stat` and the CAS
-        // call right below it either. What it closes is the specific
-        // data-loss scenario this function exists to prevent: the only path
-        // inside this function that ever deletes a destination object now
-        // requires a *confirmed* hash/length mismatch
-        // (`Self::verify_preexisting_dest_and_clean_on_confirmed_mismatch`
-        // above) -- content a writer with the correct bytes could never have
-        // produced -- so a delayed writer's own correctly-verified object can
-        // no longer be destroyed by a concurrent migration's cleanup path. An
-        // object that still vanishes here can only be the result of
-        // something outside that coordination entirely (an external actor,
-        // an operator action, direct backend surgery), which is exactly the
-        // class of failure a retryable backend error is the right response
-        // to -- not silently proceeding to bind a pointer at nothing.
-        match dest.stat(&dest_path).await? {
+        // call right below it either (issue #5013, an external actor or
+        // direct backend surgery, not another migration attempt of this
+        // version -- the lease already rules those out).
+        match dest.stat(dest_path).await? {
             Some(actual_len) if actual_len == expected_len => {}
             Some(actual_len) => {
-                // A concurrent actor changed the object in the narrow window
-                // between this call's own verification and this re-stat — see
-                // the doc comment above. Retrying the migration re-verifies
-                // and re-CASes from scratch, so this is transient, not a
-                // permanent fault.
                 return Err(DomainError::backend_unavailable(
                     dest.id(),
                     format!(
@@ -174,9 +283,9 @@ impl FileService {
 
         // Transactionally update the version row and emit the audit row. The
         // CAS predicate is the pre-migration snapshot captured above (before
-        // the source read / destination write), so a concurrent migration
-        // that already moved the pointer is detected rather than silently
-        // overwritten.
+        // the source read / destination write) AND this call's own lease
+        // ownership -- see `VersionRepo::rebind_backend`'s own doc for the
+        // three distinct ways this can now lose.
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -187,6 +296,7 @@ impl FileService {
                 "version_id": version.version_id,
             }),
         );
+        cas_started.store(true, Ordering::Relaxed);
         let updated = self
             .store
             .rebind_version_backend(
@@ -195,21 +305,25 @@ impl FileService {
                 &version.backend_id,
                 &version.backend_path,
                 target_backend_id,
-                &dest_path,
+                dest_path,
+                owner,
                 audit,
             )
             .await?;
         if !updated {
-            // The CAS lost: either the version is gone, or a concurrent
-            // migration already moved the pointer away from the snapshot we
-            // started from. Re-fetch to tell these apart — the destination
-            // blob we just wrote may or may not be safe to clean up depending
-            // on which case this is.
+            // The CAS lost: the version is gone, a concurrent migration
+            // already moved the pointer away from the snapshot we started
+            // from, or (structurally no longer reachable via a genuine
+            // second `migrate_backend` call, since the lease excludes that)
+            // this call's own lease was somehow taken over before the CAS
+            // ran. Re-fetch to tell these apart — the destination blob we
+            // just wrote may or may not be safe to clean up depending on
+            // which case this is.
             let current = self.store.get_version(file_id, version.version_id).await?;
             return match current {
                 None => {
                     // Version gone: the blob we wrote is genuinely orphaned.
-                    self.best_effort_blob_delete(dest.id(), &dest_path).await;
+                    self.best_effort_blob_delete(dest.id(), dest_path).await;
                     Err(DomainError::version_not_found(file_id, version.version_id))
                 }
                 Some(now)
@@ -230,7 +344,7 @@ impl FileService {
                     // case the live pointer ever coincides with it for some
                     // other reason.
                     if !(now.backend_id == dest.id() && now.backend_path == dest_path) {
-                        self.best_effort_blob_delete(dest.id(), &dest_path).await;
+                        self.best_effort_blob_delete(dest.id(), dest_path).await;
                     }
                     Err(DomainError::conflict(
                         "concurrent backend migration in progress",
@@ -250,23 +364,32 @@ impl FileService {
     /// resolves `version`'s mode-aware hash spec (`hash_mode` and, for
     /// `multipart-composite-sha256`, its stored manifest), streams its bytes
     /// from `source` straight into `dest` at `dest_path` (create-exclusive —
-    /// see [Concurrent-Migration CAS
+    /// see [Concurrent-Migration Lease
     /// Resolution](../../../docs/features/backend-migration.md) for why),
     /// verifying incrementally on the same pass, and returns `Ok(())` only
-    /// once that content is confirmed correct at `dest_path`:
-    /// - if this call's own write's source-stream verification fails (or the
+    /// once fresh bytes are confirmed correct and in place at `dest_path`.
+    ///
+    /// - If this call's own write's source-stream verification fails (or the
     ///   source stream breaks mid-read), the destination object is
     ///   best-effort deleted only if this call actually created it
     ///   (`created: false` means something else already had bytes there
-    ///   before this call, which this verification says nothing about);
-    /// - if this call's own `publish_exclusive` reported `created: false`
-    ///   (the destination already held bytes), that pre-existing object is
-    ///   independently read back and re-verified — see
-    ///   `Self::verify_preexisting_dest_and_clean_on_confirmed_mismatch`'s own
-    ///   doc comment for why `created: false` alone is not proof of anything,
-    ///   and for that path's own cleanup rule, which only deletes on a
-    ///   *confirmed* mismatch and otherwise surfaces a retryable backend
-    ///   error without touching the object.
+    ///   before this call, which this verification says nothing about).
+    /// - If `publish_exclusive` reported `created: false` (the destination
+    ///   already held bytes), this call already holds the migration lease on
+    ///   this exact version, so nothing else can be a *legitimate* concurrent
+    ///   writer to this exact deterministic path right now. That collapses
+    ///   the question to one the version's own pointer already answers:
+    ///   - the pointer is STILL on the pre-migration source snapshot this
+    ///     call started from → the object cannot be anyone's live content;
+    ///     it is a tail an earlier attempt at this same path left behind
+    ///     (wrote successfully, then crashed, was cancelled, or timed out
+    ///     before it ever reached its own CAS). Delete it and retry the
+    ///     publish exactly once.
+    ///   - the pointer has moved elsewhere → a concurrent migration (to this
+    ///     same target or a different one) already claimed this path as live
+    ///     content. Leave it untouched and fail with `Conflict` — never read
+    ///     or hash-check it; the lease is what makes that check unnecessary,
+    ///     not something this call still has to independently re-derive.
     async fn stream_verify_and_publish_to_dest(
         &self,
         source: &dyn StorageBackend,
@@ -274,6 +397,7 @@ impl FileService {
         version: &file_storage_sdk::FileVersion,
         dest_path: &str,
         expected_len: u64,
+        created_by_us: &AtomicBool,
     ) -> Result<(), DomainError> {
         let hash_mode = HashMode::parse(&version.hash_mode).ok_or_else(|| {
             DomainError::database(format!(
@@ -298,239 +422,80 @@ impl FileService {
             }
         };
 
-        let source_stream = source
-            .get_stream(&version.backend_path, expected_len)
-            .await?;
-        let (verified_stream, verify_slot) = stream_verify::verify_stream(
-            source_stream,
-            expected_len,
-            hash_mode,
-            version.hash_value.clone(),
-            manifest.clone(),
-        )?;
-
-        let outcome = dest
-            .publish_exclusive(dest_path, verified_stream, Some(expected_len))
-            .await?;
-
-        let verify_result = verify_slot
-            .lock()
-            .map_err(|_| DomainError::backend(dest.id(), "poisoned content-verification lock"))?
-            .take()
-            .unwrap_or_else(|| {
-                Err(DomainError::backend(
-                    dest.id(),
-                    "destination write completed without fully draining the verified source stream",
-                ))
-            });
-        if let Err(verify_err) = verify_result {
-            if outcome.created {
-                self.best_effort_blob_delete(dest.id(), dest_path).await;
-            }
-            return Err(verify_err);
-        }
-
-        if !outcome.created {
-            self.verify_preexisting_dest_and_clean_on_confirmed_mismatch(
-                dest,
-                dest_path,
+        // At most two attempts: the fresh write, and -- iff the first
+        // attempt's `created: false` turns out to be a tail from an earlier
+        // interrupted attempt at this same path -- one retry after clearing
+        // it.
+        let mut cleared_tail = false;
+        loop {
+            let source_stream = source
+                .get_stream(&version.backend_path, expected_len)
+                .await?;
+            let (verified_stream, verify_slot) = stream_verify::verify_stream(
+                source_stream,
                 expected_len,
                 hash_mode,
                 version.hash_value.clone(),
-                manifest,
-                version.file_id,
-                version.version_id,
-                &version.backend_id,
-                &version.backend_path,
-            )
-            .await?;
-        }
+                manifest.clone(),
+            )?;
 
-        Ok(())
-    }
+            let outcome = dest
+                .publish_exclusive(dest_path, verified_stream, Some(expected_len))
+                .await?;
 
-    /// Called from `migrate_backend` only when this call's own
-    /// `publish_exclusive` reported `created: false`, i.e. `dest_path`
-    /// already held bytes before this call ever tried to write there.
-    ///
-    /// `created: false` alone is not proof those bytes were ever
-    /// hash-checked: an earlier attempt (this exact call retried, or a
-    /// distinct migration racing on the same deterministic path) can write
-    /// here via its own `publish_exclusive` and then be interrupted —
-    /// process crash, cancellation — before it reads its own `verify_slot`
-    /// and cleans up on mismatch, leaving unverified bytes sitting at this
-    /// path with no live database pointer. That is exactly the object
-    /// `migrate_backend`'s CAS is about to make live, so this reads it back
-    /// and runs it through the same mode-aware verification the source
-    /// stream already went through, rather than trusting `created: false`
-    /// as proof someone else already did.
-    ///
-    /// [`verify_existing_dest_object`] reports one of two outcomes, and they
-    /// are handled very differently:
-    /// - a [`PreexistingDestVerdict::Mismatch`] means the object was read to
-    ///   completion and its hash/length disagree with what this version
-    ///   declares. `publish_exclusive` publishes atomically, so any writer
-    ///   holding the correct bytes always passes this exact check — a
-    ///   passing competitor's blob can never end up here. This is
-    ///   *confirmed* garbage from this call's own point of view — but a
-    ///   confirmed mismatch by itself only proves the bytes are wrong, not
-    ///   that no concurrent migration has, in the meantime, already
-    ///   committed a live pointer to this exact path (a mismatch found here
-    ///   says nothing about a write that lands *after* the read-back
-    ///   completes). Deletion is therefore gated on
-    ///   [`Self::delete_confirmed_mismatch_if_uncontended`] re-confirming
-    ///   both that no version row already points at this object and that the
-    ///   object itself has not changed since the read-back — not performed
-    ///   unconditionally.
-    /// - a [`PreexistingDestVerdict::Unconfirmed`] means the check itself
-    ///   could not be completed: the read-back stream never opened, broke
-    ///   off mid-read, or the verdict slot was left empty. This proves
-    ///   NOTHING about the object's actual content — it may be perfectly
-    ///   valid data written by a concurrent migration that is merely
-    ///   momentarily unreachable (a dropped connection, a transient backend
-    ///   fault) — so deleting it here would recreate exactly the data-loss
-    ///   bug this function exists to prevent. It is left untouched and this
-    ///   returns the underlying error unchanged: `DomainError::BackendUnavailable`
-    ///   when the cause was classified transient, `DomainError::Backend`
-    ///   otherwise — either way a rejection of this call, never of the
-    ///   migration itself, and `api/rest/error.rs` maps each to its own 5xx
-    ///   at the REST boundary.
-    #[allow(clippy::too_many_arguments)]
-    async fn verify_preexisting_dest_and_clean_on_confirmed_mismatch(
-        &self,
-        dest: &dyn StorageBackend,
-        dest_path: &str,
-        expected_len: u64,
-        hash_mode: HashMode,
-        hash_value: Vec<u8>,
-        manifest: Option<Manifest>,
-        file_id: Uuid,
-        version_id: Uuid,
-        source_backend_id: &str,
-        source_backend_path: &str,
-    ) -> Result<(), DomainError> {
-        match verify_existing_dest_object(
-            dest,
-            dest_path,
-            expected_len,
-            hash_mode,
-            hash_value,
-            manifest,
-        )
-        .await
-        {
-            Ok(()) => Ok(()),
-            Err(PreexistingDestVerdict::Mismatch(mismatch_err)) => Err(self
-                .delete_confirmed_mismatch_if_uncontended(
-                    dest,
-                    dest_path,
-                    expected_len,
-                    file_id,
-                    version_id,
-                    source_backend_id,
-                    source_backend_path,
-                    mismatch_err,
-                )
-                .await),
-            Err(PreexistingDestVerdict::Unconfirmed(backend_err)) => Err(backend_err),
-        }
-    }
+            let verify_result = verify_slot
+                .lock()
+                .map_err(|_| {
+                    DomainError::backend(dest.id(), "poisoned content-verification lock")
+                })?
+                .take()
+                .unwrap_or_else(|| {
+                    Err(DomainError::backend(
+                        dest.id(),
+                        "destination write completed without fully draining the verified source stream",
+                    ))
+                });
+            if let Err(verify_err) = verify_result {
+                if outcome.created {
+                    self.best_effort_blob_delete(dest.id(), dest_path).await;
+                }
+                return Err(verify_err);
+            }
 
-    /// Decides whether the object just confirmed mismatched by
-    /// [`verify_existing_dest_object`] is actually safe to delete, and
-    /// returns the error `migrate_backend` should surface either way — a
-    /// confirmed mismatch never lets the migration succeed, but whether the
-    /// object gets deleted depends on two re-checks made as close to the
-    /// delete as this call can get them:
-    ///
-    /// 1. **Nobody has since claimed this object as their live content.** The
-    ///    version row is re-fetched by `(file_id, version_id)`: if it now
-    ///    points at `(dest.id(), dest_path)` — this exact object — a
-    ///    concurrent migration must have committed its own CAS to the same
-    ///    deterministic path between this call's read-back and this check,
-    ///    and this call's earlier mismatch verdict cannot be trusted to mean
-    ///    what it normally means (a passing competitor's blob can never fail
-    ///    this check, so either that migration's own verification was wrong
-    ///    or this one raced its own read against an in-flight write in a way
-    ///    the mismatch path does not otherwise expect). Either way, deleting
-    ///    now could destroy a concurrent winner's live blob, so this refuses
-    ///    to delete and returns a `Conflict` asking for operator
-    ///    investigation instead of the original `mismatch_err`. If the row
-    ///    points anywhere else — including simply having disappeared — other
-    ///    than the pre-migration source snapshot this call started from, the
-    ///    state changed underneath this call in some other way this check
-    ///    was never designed to reason about, so it is equally conservative:
-    ///    no delete, `Conflict`.
-    /// 2. **The object is still exactly what was just read back.** Only once
-    ///    the version row confirms nothing has claimed the object does this
-    ///    re-`stat` it and compare the returned size against `expected_len` —
-    ///    the same length the read-back already confirmed the object had.
-    ///    A re-`stat` is **not** atomic with the delete immediately below —
-    ///    an object can still disappear or be rewritten in the gap between
-    ///    the two calls, the same known limitation as the pre-CAS `stat` in
-    ///    `migrate_backend` itself (issue #5013) — but it narrows the window
-    ///    from "since the read-back completed" to "since this one round
-    ///    trip", instead of trusting a read-back that may by now be
-    ///    arbitrarily stale.
-    ///
-    /// Only when both checks hold does this actually delete the object; it
-    /// still always returns an error, since a confirmed mismatch never lets
-    /// the migration itself proceed to the CAS.
-    #[allow(clippy::too_many_arguments)]
-    async fn delete_confirmed_mismatch_if_uncontended(
-        &self,
-        dest: &dyn StorageBackend,
-        dest_path: &str,
-        expected_len: u64,
-        file_id: Uuid,
-        version_id: Uuid,
-        source_backend_id: &str,
-        source_backend_path: &str,
-        mismatch_err: DomainError,
-    ) -> DomainError {
-        let current = match self.store.get_version(file_id, version_id).await {
-            Ok(current) => current,
-            Err(e) => return e,
-        };
-        match current {
-            Some(v) if v.backend_id == dest.id() && v.backend_path == dest_path => {
-                return DomainError::conflict(format!(
-                    "destination object at {dest_path} on backend {} was found mismatched \
-                     during re-verification, but the version row already points at this exact \
-                     object -- refusing to delete a possibly-live blob; this requires operator \
-                     investigation",
-                    dest.id()
+            if outcome.created {
+                created_by_us.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+
+            if cleared_tail {
+                // Already retried once after clearing a confirmed tail; a
+                // second `created: false` means something keeps winning this
+                // exact path even under our own held lease -- stay
+                // conservative (`Conflict`, no further retry) rather than
+                // looping.
+                return Err(DomainError::conflict(
+                    "destination path is contended by another writer",
                 ));
             }
-            Some(v)
-                if v.backend_id == source_backend_id && v.backend_path == source_backend_path =>
-            {
-                // Still on the pre-migration snapshot -- nothing has claimed
-                // this object yet. Proceed to the identity re-check below.
-            }
-            Some(_) | None => {
-                return DomainError::conflict(format!(
-                    "version {version_id} no longer matches the pre-migration snapshot it \
-                     started from -- refusing to delete destination object at {dest_path} \
-                     pending operator investigation"
+
+            let current = self
+                .store
+                .get_version(version.file_id, version.version_id)
+                .await?;
+            let still_on_source = matches!(
+                &current,
+                Some(v) if v.backend_id == version.backend_id && v.backend_path == version.backend_path
+            );
+            if !still_on_source {
+                return Err(DomainError::conflict(
+                    "destination path already holds a concurrently-committed migration's content",
                 ));
             }
-        }
-
-        match dest.stat(dest_path).await {
-            Ok(Some(actual_len)) if actual_len == expected_len => {
-                self.best_effort_blob_delete(dest.id(), dest_path).await;
-                mismatch_err
-            }
-            Ok(_) => DomainError::backend_unavailable(
-                dest.id(),
-                format!(
-                    "destination object at {dest_path} changed after its confirmed-mismatch \
-                     re-verification; leaving it untouched instead of deleting an object that \
-                     may no longer be the one that was checked"
-                ),
-            ),
-            Err(e) => e,
+            // Tail from an earlier interrupted attempt at this exact
+            // deterministic path -- safe to delete under this call's own
+            // held lease.
+            self.best_effort_blob_delete(dest.id(), dest_path).await;
+            cleared_tail = true;
         }
     }
 
@@ -546,91 +511,5 @@ impl FileService {
     pub fn get_backend(&self, id: &str) -> Result<(String, BackendCapabilities), DomainError> {
         let b = self.backends.get(id)?;
         Ok((b.id().to_owned(), b.capabilities()))
-    }
-}
-
-/// Outcome of [`verify_existing_dest_object`]'s attempt to establish whether
-/// a pre-existing destination object is valid: either the check ran to
-/// completion and definitively found the object wrong, or the check itself
-/// could not be completed at all. See
-/// [`FileService::verify_preexisting_dest_and_clean_on_confirmed_mismatch`]'s
-/// doc comment for how each variant is handled.
-enum PreexistingDestVerdict {
-    /// The object was read in full and its hash/length disagree with what
-    /// this version declares. `publish_exclusive` publishes atomically, so
-    /// this can only be genuinely bad content, never a passing competitor's
-    /// blob caught mid-write.
-    Mismatch(DomainError),
-    /// The check could not be completed either way: the read-back stream
-    /// never opened, broke off mid-read, or the verdict slot was left empty.
-    /// This is not evidence the object is bad — it says nothing about its
-    /// content at all.
-    Unconfirmed(DomainError),
-}
-
-/// Read back the object already sitting at `dest_path` on `dest` — reached
-/// only when a `publish_exclusive` call reported `created: false`, i.e. this
-/// call did not write it — and verify it against the same mode-aware hash
-/// spec (`hash_mode`/`hash_value`/`manifest`) the source stream was already
-/// checked against in [`FileService::migrate_backend`]. `created: false`
-/// means only that *something* wrote here first; it is not evidence that
-/// whatever it wrote was ever hash-checked, since a prior writer can crash or
-/// be cancelled after its own `publish_exclusive` call returns but before it
-/// reads its own `verify_slot` and cleans up on mismatch.
-///
-/// Every failure short of a fully-drained, definitively-mismatched read is
-/// reported as [`PreexistingDestVerdict::Unconfirmed`] rather than assumed to
-/// mean the object is bad — opening the stream, a mode/manifest mismatch
-/// (`stream_verify::verify_stream`'s own upfront validation), a mid-read
-/// error, and an empty verdict slot all land here.
-async fn verify_existing_dest_object(
-    dest: &dyn StorageBackend,
-    dest_path: &str,
-    expected_len: u64,
-    hash_mode: HashMode,
-    hash_value: Vec<u8>,
-    manifest: Option<Manifest>,
-) -> Result<(), PreexistingDestVerdict> {
-    let stream = dest
-        .get_stream(dest_path, expected_len)
-        .await
-        .map_err(PreexistingDestVerdict::Unconfirmed)?;
-    let (mut verified, verify_slot) =
-        stream_verify::verify_stream(stream, expected_len, hash_mode, hash_value, manifest)
-            .map_err(PreexistingDestVerdict::Unconfirmed)?;
-    // Drain to the wrapped stream's terminal `None` -- the verdict is only
-    // populated once that happens (see `stream_verify`'s module doc comment).
-    // The bytes themselves are irrelevant here, only the verdict is, so they
-    // are read and dropped. A read error here means the object opened fine
-    // and then broke off mid-read -- the verdict slot is never populated in
-    // that case, so this reports `Unconfirmed` directly rather than falling
-    // through to the (also-empty) slot check below.
-    while let Some(chunk) = verified.next().await {
-        if let Err(e) = chunk {
-            return Err(PreexistingDestVerdict::Unconfirmed(
-                classify_stream_io_error(
-                    dest.id(),
-                    "failed reading back destination object for verification",
-                    &e,
-                ),
-            ));
-        }
-    }
-    let verdict = verify_slot
-        .lock()
-        .map_err(|_| {
-            PreexistingDestVerdict::Unconfirmed(DomainError::backend(
-                dest.id(),
-                "poisoned content-verification lock",
-            ))
-        })?
-        .take();
-    match verdict {
-        Some(Ok(())) => Ok(()),
-        Some(Err(mismatch_err)) => Err(PreexistingDestVerdict::Mismatch(mismatch_err)),
-        None => Err(PreexistingDestVerdict::Unconfirmed(DomainError::backend(
-            dest.id(),
-            "destination read-back ended without fully draining the verified stream",
-        ))),
     }
 }

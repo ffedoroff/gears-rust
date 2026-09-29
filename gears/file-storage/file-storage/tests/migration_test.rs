@@ -169,6 +169,17 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
         bound_on_finalize_before.is_ok(),
         "bound_on_finalize must exist after the full up(): {bound_on_finalize_before:?}"
     );
+    let migration_lease_cols_before = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT migration_lease_owner, migration_lease_until FROM file_versions LIMIT 0",
+        ))
+        .await;
+    assert!(
+        migration_lease_cols_before.is_ok(),
+        "migration_lease_owner/migration_lease_until must exist after the full up(): \
+         {migration_lease_cols_before:?}"
+    );
     assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
     assert!(!index_exists(&db, "files_owner_listing_idx").await);
     assert!(index_exists(&db, "retention_rules_tenant_listing_idx").await);
@@ -209,6 +220,17 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
         bound_on_finalize_after_down.is_err(),
         "bound_on_finalize must be gone after a real (non-no-op) down(): \
          {bound_on_finalize_after_down:?}"
+    );
+    let migration_lease_cols_after_down = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT migration_lease_owner, migration_lease_until FROM file_versions LIMIT 0",
+        ))
+        .await;
+    assert!(
+        migration_lease_cols_after_down.is_err(),
+        "migration_lease_owner/migration_lease_until must be gone after a real (non-no-op) \
+         down(): {migration_lease_cols_after_down:?}"
     );
     assert!(
         !index_exists(&db, "files_owner_listing_v2_idx").await,
@@ -260,6 +282,17 @@ async fn upload_flow_redesign_down_actually_drops_the_new_columns_and_indexes() 
     assert!(
         bound_on_finalize_after_up.is_ok(),
         "bound_on_finalize must exist again after re-up(): {bound_on_finalize_after_up:?}"
+    );
+    let migration_lease_cols_after_up = db
+        .execute_raw(stmt(
+            &db,
+            "SELECT migration_lease_owner, migration_lease_until FROM file_versions LIMIT 0",
+        ))
+        .await;
+    assert!(
+        migration_lease_cols_after_up.is_ok(),
+        "migration_lease_owner/migration_lease_until must exist again after re-up(): \
+         {migration_lease_cols_after_up:?}"
     );
     assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
     assert!(!index_exists(&db, "files_owner_listing_idx").await);

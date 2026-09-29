@@ -72,6 +72,36 @@ pub const MAX_MULTIPART_SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
 /// assembly while the shipped default (120s) sits far below it.
 pub const MAX_MULTIPART_COMPLETE_LEASE_SECS: u64 = 24 * 3600;
 
+/// Upper bound (seconds) accepted for `migrate_timeout_secs`: 1 day.
+///
+/// `migrate_timeout_secs` bounds how long one `migrate_backend` call may hold
+/// the migration lease it acquires on the version being moved (see
+/// `migrate_lease_margin_secs` for the extra margin added on top). Like
+/// `multipart_complete_lease_secs`, this isn't an `i64`-conversion overflow
+/// hazard -- `FileService` converts it via a safe finite fallback, never
+/// `unwrap_or(i64::MAX)` -- but an oversized value would let a stuck or
+/// crashed migration hold the lease (and block every other migration attempt
+/// of the same version) far longer than any real backend transfer could take.
+/// 1 day is generous for even a very large object over a slow backend, while
+/// the shipped default (3600s / 1 hour) sits far below it.
+pub const MAX_MIGRATE_TIMEOUT_SECS: u64 = 24 * 3600;
+
+/// Upper bound (seconds) accepted for `migrate_lease_margin_secs`: 1 hour.
+///
+/// The margin is added on top of `migrate_timeout_secs` when computing the
+/// migration lease's duration, to absorb clock skew between the instance
+/// that acquired the lease and whichever DB replica's clock the lease
+/// expiry is ultimately measured against, plus the tail of a backend
+/// request that was already in flight when `migrate_backend`'s own
+/// `tokio::time::timeout` fires (the backend call itself does not observe
+/// the timeout and may keep running briefly after this call has already
+/// given up on it). It otherwise has no ceiling of its own; an oversized
+/// margin would extend the lease -- and therefore how long a stuck migration
+/// blocks every other attempt at the same version -- far past what either
+/// of those two effects could plausibly need. 1 hour is generous for both
+/// while the shipped default (300s / 5 minutes) sits far below it.
+pub const MAX_MIGRATE_LEASE_MARGIN_SECS: u64 = 3600;
+
 /// Upper bound (seconds) accepted for `orphan_grace_secs`: 30 days.
 ///
 /// `domain::cleanup::CleanupEngine::run_sweep` subtracts it from `now` (via
@@ -174,6 +204,52 @@ pub struct FileStorageConfig {
     /// is held WITHOUT any open DB transaction. Default: 120.
     #[serde(default = "default_multipart_complete_lease_secs")]
     pub multipart_complete_lease_secs: u64,
+
+    /// Time budget (seconds) `migrate_backend` allows itself for one
+    /// migration attempt: streaming the blob from the source backend into
+    /// the destination, verifying its content hash, and committing the
+    /// `backend_id`/`backend_path` CAS. Enforced via
+    /// `tokio::time::timeout` around that whole sequence
+    /// (`domain::service::backend::FileService::migrate_backend`); a call
+    /// that exceeds it best-effort deletes the destination object it
+    /// itself created (never one it did not write) and returns a
+    /// retryable 503. Also the base duration (before
+    /// `migrate_lease_margin_secs` is added) of the migration lease that
+    /// call acquires up front, so a second concurrent migration attempt of
+    /// the same version is rejected with 409 for as long as this one is
+    /// still within its own budget. Choose this relative to the slowest
+    /// realistic object size divided by the slowest backend's sustained
+    /// throughput this deployment expects to migrate, with headroom --
+    /// too short aborts legitimate large-object transfers before they can
+    /// finish; too long lets a genuinely stuck attempt block every other
+    /// migration of the same version for that entire window. Default:
+    /// 3600 (1 hour). Capped at `MAX_MIGRATE_TIMEOUT_SECS` (1 day) by
+    /// `validate()`.
+    #[serde(default = "default_migrate_timeout_secs")]
+    pub migrate_timeout_secs: u64,
+
+    /// Extra margin (seconds) added on top of `migrate_timeout_secs` when
+    /// computing the migration lease's actual duration
+    /// (`lease = migrate_timeout_secs + migrate_lease_margin_secs`). Covers
+    /// two effects `migrate_timeout_secs` alone does not budget for: clock
+    /// skew between the instance that acquired the lease and whichever
+    /// clock its expiry is ultimately measured against (the lease itself is
+    /// timed by the database's own clock, `now()`/`CURRENT_TIMESTAMP` --
+    /// see `VersionRepo::acquire_migration_lease` -- but the instance's own
+    /// `tokio::time::timeout` still fires on its local clock, so the two
+    /// can disagree by however far the instances' clocks have drifted
+    /// apart); and the tail of a backend request that was already in
+    /// flight when that local timeout fires -- the backend call itself
+    /// does not observe the timeout and may keep running (and could still
+    /// write to the destination object) for a short while after this call
+    /// has already given up on it and released the lease it would
+    /// otherwise still be entitled to hold. Without this margin, the lease
+    /// could lapse and be taken over by a second migration attempt while
+    /// the first one's now-abandoned backend call is still writing.
+    /// Default: 300 (5 minutes). Capped at `MAX_MIGRATE_LEASE_MARGIN_SECS`
+    /// (1 hour) by `validate()`.
+    #[serde(default = "default_migrate_lease_margin_secs")]
+    pub migrate_lease_margin_secs: u64,
 
     /// Public base URL of the data-plane sidecar that signed URLs point at.
     #[serde(default = "default_sidecar_base_url")]
@@ -637,6 +713,7 @@ impl FileStorageConfig {
                 MAX_MULTIPART_COMPLETE_LEASE_SECS
             );
         }
+        self.validate_migrate_lease()?;
         // `sweep_time_budget_secs` otherwise has no ceiling of its own --
         // reject it up front, the same way MAX_ORPHAN_GRACE_SECS bounds
         // orphan_grace_secs above.
@@ -721,6 +798,65 @@ impl FileStorageConfig {
         }
         Ok(())
     }
+
+    /// Cross-field/ceiling checks for `migrate_timeout_secs` and
+    /// `migrate_lease_margin_secs` -- split out of `validate()` purely to
+    /// keep that function under the workspace's line-count lint, same
+    /// reasoning as any other extracted helper in this module.
+    fn validate_migrate_lease(&self) -> anyhow::Result<()> {
+        // `FileService::migrate_backend` applies `migrate_timeout_secs.max(1)`
+        // as defense-in-depth against a zero duration reaching
+        // `tokio::time::timeout`/`checked_add`; `0` has no documented
+        // "disabled" meaning here -- it would just abort every migration
+        // attempt before it could plausibly transfer any bytes. Reject it up
+        // front, the same way the other `*_lease_secs`/`*_ttl_secs` knobs
+        // above are.
+        if self.migrate_timeout_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: migrate_timeout_secs must be > 0 (a zero-second \
+                 migration timeout would abort every migration attempt before it could transfer \
+                 any bytes)"
+            );
+        }
+        // `migrate_timeout_secs` otherwise has no ceiling of its own -- it
+        // also sizes the migration lease's base duration
+        // (`migrate_timeout_secs + migrate_lease_margin_secs`), so an
+        // oversized value would let a stuck migration block every other
+        // attempt at the same version for that entire window.
+        if self.migrate_timeout_secs > MAX_MIGRATE_TIMEOUT_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: migrate_timeout_secs ({}) must not exceed \
+                 MAX_MIGRATE_TIMEOUT_SECS ({})",
+                self.migrate_timeout_secs,
+                MAX_MIGRATE_TIMEOUT_SECS
+            );
+        }
+        // A zero margin defeats the clock-skew/in-flight-request slack
+        // `migrate_lease_margin_secs` exists to provide (see its own doc
+        // comment) -- reject it up front rather than silently accepting a
+        // lease sized at exactly `migrate_timeout_secs` with no slack at all.
+        if self.migrate_lease_margin_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: migrate_lease_margin_secs must be > 0 (a zero \
+                 margin leaves no slack for clock skew or an in-flight backend request that \
+                 outlives migrate_backend's own timeout)"
+            );
+        }
+        // `migrate_lease_margin_secs` otherwise has no ceiling of its own --
+        // an oversized value would extend the migration lease (and therefore
+        // how long a stuck migration blocks every other attempt at the same
+        // version) far past what clock skew or an in-flight request tail
+        // could plausibly need.
+        if self.migrate_lease_margin_secs > MAX_MIGRATE_LEASE_MARGIN_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: migrate_lease_margin_secs ({}) must not exceed \
+                 MAX_MIGRATE_LEASE_MARGIN_SECS ({})",
+                self.migrate_lease_margin_secs,
+                MAX_MIGRATE_LEASE_MARGIN_SECS
+            );
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for FileStorageConfig {
@@ -737,6 +873,8 @@ impl fmt::Debug for FileStorageConfig {
                 "multipart_complete_lease_secs",
                 &self.multipart_complete_lease_secs,
             )
+            .field("migrate_timeout_secs", &self.migrate_timeout_secs)
+            .field("migrate_lease_margin_secs", &self.migrate_lease_margin_secs)
             .field("sidecar_base_url", &self.sidecar_base_url)
             .field("default_page_size", &self.default_page_size)
             .field("max_page_size", &self.max_page_size)
@@ -787,6 +925,8 @@ impl Default for FileStorageConfig {
             finalize_token_grace_secs: default_finalize_token_grace_secs(),
             multipart_session_ttl_secs: default_multipart_session_ttl_secs(),
             multipart_complete_lease_secs: default_multipart_complete_lease_secs(),
+            migrate_timeout_secs: default_migrate_timeout_secs(),
+            migrate_lease_margin_secs: default_migrate_lease_margin_secs(),
             sidecar_base_url: default_sidecar_base_url(),
             default_page_size: default_page_size(),
             max_page_size: default_max_page_size(),
@@ -825,6 +965,14 @@ fn default_finalize_token_grace_secs() -> u64 {
 
 fn default_multipart_complete_lease_secs() -> u64 {
     120 // backend-assembly budget; see FileStorageConfig::multipart_complete_lease_secs
+}
+
+fn default_migrate_timeout_secs() -> u64 {
+    3600 // 1 hour: see FileStorageConfig::migrate_timeout_secs
+}
+
+fn default_migrate_lease_margin_secs() -> u64 {
+    300 // 5 minutes: see FileStorageConfig::migrate_lease_margin_secs
 }
 
 fn default_multipart_session_ttl_secs() -> u64 {

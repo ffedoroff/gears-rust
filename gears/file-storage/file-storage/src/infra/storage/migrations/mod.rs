@@ -45,9 +45,13 @@ mod m20260924_000001_upload_flow_redesign;
 /// `file_versions_file_created_idx` (covers `VersionRepo::list_by_file`), and
 /// `files_owner_listing_v2_idx` (supersedes `files_owner_listing_idx` with a
 /// `file_id` tie-breaker). It also adds `file_versions.bound_on_finalize`
-/// (persists a version's own bind-on-finalize CAS outcome) and runs a
-/// one-time cleanup of `retention_rules` rows left dangling by a `files` row
-/// deleted before this migration ran.
+/// (persists a version's own bind-on-finalize CAS outcome),
+/// `file_versions.migration_lease_owner`/`migration_lease_until` (the
+/// migration lease `migrate_backend` acquires on a version before writing to
+/// its destination backend, so two concurrent migration attempts of the same
+/// version cannot race on its deterministic destination path -- timed by the
+/// database's own clock), and runs a one-time cleanup of `retention_rules`
+/// rows left dangling by a `files` row deleted before this migration ran.
 pub struct Migrator;
 
 #[async_trait::async_trait]

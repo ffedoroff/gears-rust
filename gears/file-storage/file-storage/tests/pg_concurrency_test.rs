@@ -2570,3 +2570,136 @@ async fn orphan_reclaim_vs_concurrent_insert_version_has_no_silent_loss() {
             .ok();
     }
 }
+
+// =========================================================================
+// Migration lease -- real concurrent `migrate_backend` calls (upload-flow
+// redesign)
+// =========================================================================
+//
+// Two real, concurrently-spawned `migrate_backend` calls for the SAME
+// version, targeting two DIFFERENT backends. `acquire_migration_lease` is a
+// single conditional `UPDATE`, so PostgreSQL's own row lock decides which
+// commits first; the loser's `UPDATE` re-evaluates its `WHERE` against the
+// now-committed row once the winner's transaction releases the lock, and
+// affects zero rows. Exactly one attempt must therefore win the lease and go
+// on to migrate; the other must be rejected with `Conflict` before it ever
+// touches a backend, so its target backend must never see a destination
+// object at all. Real `tokio::spawn` + `join`, per this file's own
+// `RACE_ITERATIONS` precedent above -- there is no fixed winner to pin (both
+// orderings are legitimate), only the two-clean-outcomes invariant to check
+// regardless of which side the real PostgreSQL lock queue favors.
+const MIGRATE_RACE_ITERATIONS: usize = 8;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migration_lease_two_concurrent_migrate_backend_calls_exactly_one_wins() {
+    let (db, _pg_guard) = pg_db_or_skip!();
+
+    for iteration in 0..MIGRATE_RACE_ITERATIONS {
+        let store = Store::new(Arc::clone(&db));
+        let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+        let alt1: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt1"));
+        let alt2: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt2"));
+        let backends = BackendRegistry::new(
+            vec![Arc::clone(&mem), Arc::clone(&alt1), Arc::clone(&alt2)],
+            "mem",
+        )
+        .expect("registry");
+        let svc = make_file_service(store.clone(), backends.clone());
+        let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
+
+        let tenant_id = Uuid::now_v7();
+        let ctx = make_ctx(tenant_id);
+        let content = Bytes::from_static(b"migration lease race content");
+
+        let ticket = svc
+            .create_file(&ctx, new_file(), None, false)
+            .await
+            .expect("create_file");
+        dp.put_content(
+            &ctx,
+            ticket.file_id,
+            ticket.version_id,
+            "text/plain",
+            content.clone(),
+        )
+        .await
+        .expect("put_content");
+        svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+            .await
+            .expect("bind");
+
+        let file_id = ticket.file_id;
+        let version_id = ticket.version_id;
+
+        let svc_a = Arc::clone(&svc);
+        let ctx_a = ctx.clone();
+        let a_task =
+            tokio::spawn(async move { svc_a.migrate_backend(&ctx_a, file_id, "alt1").await });
+        let svc_b = Arc::clone(&svc);
+        let ctx_b = ctx.clone();
+        let b_task = tokio::spawn(async move {
+            // Small real-clock stagger (same as `RACE_ITERATIONS`'s own
+            // precedent above): raises the odds of the two acquire
+            // `UPDATE`s actually overlapping under real Postgres network
+            // I/O, without pinning an exact winner.
+            tokio::time::sleep(std::time::Duration::from_micros(150)).await;
+            svc_b.migrate_backend(&ctx_b, file_id, "alt2").await
+        });
+        let a_res = a_task.await.expect("task A panicked");
+        let b_res = b_task.await.expect("task B panicked");
+
+        eprintln!(
+            "migration_lease_race[{iteration}]: a(alt1)={} b(alt2)={}",
+            describe_result(&a_res),
+            describe_result(&b_res)
+        );
+
+        let winner_target = match (&a_res, &b_res) {
+            (Ok(()), Err(e)) => {
+                assert!(
+                    matches!(e, DomainError::Conflict { .. }),
+                    "the losing attempt must be rejected by the migration lease with Conflict, \
+                     got {e}"
+                );
+                "alt1"
+            }
+            (Err(e), Ok(())) => {
+                assert!(
+                    matches!(e, DomainError::Conflict { .. }),
+                    "the losing attempt must be rejected by the migration lease with Conflict, \
+                     got {e}"
+                );
+                "alt2"
+            }
+            (a, b) => panic!(
+                "exactly one concurrent migrate_backend call must win the migration lease -- \
+                 got a={} b={}",
+                describe_result(a),
+                describe_result(b)
+            ),
+        };
+
+        let after = store
+            .get_version(file_id, version_id)
+            .await
+            .expect("get_version")
+            .expect("version must still exist");
+        assert_eq!(
+            after.backend_id, winner_target,
+            "the version must end up on whichever target actually won the migration lease"
+        );
+
+        let loser_target: Arc<dyn StorageBackend> = if winner_target == "alt1" {
+            Arc::clone(&alt2)
+        } else {
+            Arc::clone(&alt1)
+        };
+        let dest_path = format!("/{file_id}/{version_id}");
+        assert!(
+            !loser_target.exists(&dest_path).await.expect("exists"),
+            "the losing attempt must never have touched its own target backend at all -- it \
+             must be rejected by the migration lease before any backend I/O (iteration \
+             {iteration})"
+        );
+    }
+}

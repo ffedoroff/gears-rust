@@ -1000,13 +1000,17 @@ impl Store {
     }
 
     /// Transactionally update `backend_id` and `backend_path` for a version row,
-    /// CAS-gated on `expected_backend_id`/`expected_backend_path`, and write a
+    /// CAS-gated on `expected_backend_id`/`expected_backend_path` **and** on
+    /// `owner` still holding the migration lease (`VersionRepo::rebind_backend`),
+    /// clearing that lease in the same `UPDATE` on a win, and write a
     /// `BackendMigrate` audit row in the same transaction.
     ///
-    /// Returns `true` if the version row matched the expected pointer and was
-    /// updated. `false` means either the version is gone or a concurrent
-    /// migration already moved the pointer away from the expected value —
-    /// the caller must re-fetch to tell these apart.
+    /// Returns `true` if the version row matched the expected pointer and the
+    /// lease, and was updated. `false` means the version is gone, a
+    /// concurrent migration already moved the pointer away from the expected
+    /// value, or the lease moved on from `owner` — the caller must re-fetch
+    /// to tell these apart (see `VersionRepo::rebind_backend`'s own doc for
+    /// why the lease case still reads correctly through that recovery path).
     #[allow(clippy::too_many_arguments)]
     pub async fn rebind_version_backend(
         &self,
@@ -1016,6 +1020,7 @@ impl Store {
         expected_backend_path: &str,
         new_backend_id: &str,
         new_backend_path: &str,
+        owner: Uuid,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
         let versions = self.repos.versions.clone();
@@ -1038,6 +1043,7 @@ impl Store {
                             &expected_backend_path,
                             &new_backend_id,
                             &new_backend_path,
+                            owner,
                         )
                         .await?;
                     if updated {
@@ -1046,6 +1052,74 @@ impl Store {
                     Ok::<bool, DomainError>(updated)
                 })
             })
+            .await
+    }
+
+    /// Acquire (or take over, if database-side expired) the migration lease
+    /// on a version (`VersionRepo::acquire_migration_lease`). `false` means a
+    /// live lease is held by another in-flight `migrate_backend` attempt --
+    /// the caller surfaces this as `Conflict` (409).
+    pub async fn acquire_migration_lease(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        owner: Uuid,
+        lease: std::time::Duration,
+    ) -> Result<bool, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        let backend = self.db.db().backend();
+        // `FileStorageConfig::validate()` caps `migrate_timeout_secs` (1 day)
+        // + `migrate_lease_margin_secs` (1 hour) well within `i64`, so this
+        // never actually saturates; kept as a defensive fallback, the same
+        // `u64` -> `i64` conversion idiom `gear.rs` uses for every other
+        // duration-shaped config knob.
+        let lease_secs = i64::try_from(lease.as_secs()).unwrap_or(i64::MAX);
+        self.repos
+            .versions
+            .acquire_migration_lease(
+                &conn,
+                &AccessScope::allow_all(),
+                backend,
+                file_id,
+                version_id,
+                owner,
+                lease_secs,
+            )
+            .await
+    }
+
+    /// Release a held migration lease (`VersionRepo::release_migration_lease`),
+    /// scoped to `owner`. `migrate_backend` always calls this best-effort, on
+    /// every exit path; a lease this call no longer holds is left alone and
+    /// simply expires on its own.
+    pub async fn release_migration_lease(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        owner: Uuid,
+    ) -> Result<bool, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .versions
+            .release_migration_lease(&conn, &AccessScope::allow_all(), file_id, version_id, owner)
+            .await
+    }
+
+    /// Force-set a version's migration lease fields directly. **Test-support
+    /// only; do not call in production** -- see
+    /// `VersionRepo::set_migration_lease_for_test`.
+    #[doc(hidden)]
+    pub async fn set_migration_lease_for_test(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        owner: Option<Uuid>,
+        until: Option<OffsetDateTime>,
+    ) -> Result<(), DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .versions
+            .set_migration_lease_for_test(&conn, file_id, version_id, owner, until)
             .await
     }
 

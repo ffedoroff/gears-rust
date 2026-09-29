@@ -507,6 +507,14 @@ fn default_config_passes_validation() {
          ceiling"
     );
     assert!(
+        cfg.migrate_timeout_secs <= MAX_MIGRATE_TIMEOUT_SECS,
+        "sanity: the shipped default_migrate_timeout_secs must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.migrate_lease_margin_secs <= MAX_MIGRATE_LEASE_MARGIN_SECS,
+        "sanity: the shipped default_migrate_lease_margin_secs must not itself exceed the ceiling"
+    );
+    assert!(
         cfg.orphan_grace_secs <= MAX_ORPHAN_GRACE_SECS,
         "sanity: the shipped default_orphan_grace_secs must not itself exceed the ceiling"
     );
@@ -884,6 +892,136 @@ fn validate_accepts_multipart_complete_lease_of_one() {
     assert!(
         cfg.validate().is_ok(),
         "multipart_complete_lease_secs == 1 must be accepted"
+    );
+}
+
+// ── migrate_timeout_secs absolute ceiling ───────────────────────────────────
+//
+// `migrate_timeout_secs` also sizes the migration lease's base duration
+// (`migrate_timeout_secs + migrate_lease_margin_secs`), so an oversized value
+// would let a stuck migration block every other attempt at the same version
+// for that entire window.
+
+#[test]
+fn validate_accepts_migrate_timeout_at_ceiling() {
+    let cfg = FileStorageConfig {
+        migrate_timeout_secs: MAX_MIGRATE_TIMEOUT_SECS,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "migrate_timeout_secs == MAX_MIGRATE_TIMEOUT_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_migrate_timeout_above_ceiling() {
+    let cfg = FileStorageConfig {
+        migrate_timeout_secs: MAX_MIGRATE_TIMEOUT_SECS + 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "migrate_timeout_secs exceeding MAX_MIGRATE_TIMEOUT_SECS must be rejected"
+    );
+}
+
+// ── migrate_timeout_secs lower bound ────────────────────────────────────────
+//
+// A zero timeout would abort every migration attempt before it could
+// plausibly transfer any bytes -- `0` has no documented "disabled" meaning
+// here, so `validate()` must reject it outright.
+
+#[test]
+fn validate_rejects_zero_migrate_timeout() {
+    let cfg = FileStorageConfig {
+        migrate_timeout_secs: 0,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "migrate_timeout_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_migrate_timeout_of_one() {
+    let cfg = FileStorageConfig {
+        migrate_timeout_secs: 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "migrate_timeout_secs == 1 must be accepted"
+    );
+}
+
+// ── migrate_lease_margin_secs absolute ceiling ──────────────────────────────
+//
+// An oversized margin would extend the migration lease -- and therefore how
+// long a stuck migration blocks every other attempt at the same version --
+// far past what clock skew or an in-flight backend request's tail could
+// plausibly need.
+
+#[test]
+fn validate_accepts_migrate_lease_margin_at_ceiling() {
+    let cfg = FileStorageConfig {
+        migrate_lease_margin_secs: MAX_MIGRATE_LEASE_MARGIN_SECS,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "migrate_lease_margin_secs == MAX_MIGRATE_LEASE_MARGIN_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_migrate_lease_margin_above_ceiling() {
+    let cfg = FileStorageConfig {
+        migrate_lease_margin_secs: MAX_MIGRATE_LEASE_MARGIN_SECS + 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "migrate_lease_margin_secs exceeding MAX_MIGRATE_LEASE_MARGIN_SECS must be rejected"
+    );
+}
+
+// ── migrate_lease_margin_secs lower bound ───────────────────────────────────
+//
+// A zero margin leaves no slack for clock skew or an in-flight backend
+// request that outlives `migrate_backend`'s own timeout -- `0` has no
+// documented "disabled" meaning here either.
+
+#[test]
+fn validate_rejects_zero_migrate_lease_margin() {
+    let cfg = FileStorageConfig {
+        migrate_lease_margin_secs: 0,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "migrate_lease_margin_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_migrate_lease_margin_of_one() {
+    let cfg = FileStorageConfig {
+        migrate_lease_margin_secs: 1,
+        require_signing_key_seed: false,
+        ..FileStorageConfig::default()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "migrate_lease_margin_secs == 1 must be accepted"
     );
 }
 

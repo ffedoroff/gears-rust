@@ -1,7 +1,10 @@
 //! Repository for the `file_versions` table (immutable content versions).
 
-use sea_orm::sea_query::{Expr, Query};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
+use sea_orm::sea_query::{Expr, Query, SimpleExpr};
+use sea_orm::{
+    ColumnTrait, Condition, DbBackend, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
+};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
     DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, max_bind_params_for, secure_insert,
@@ -64,6 +67,12 @@ impl VersionRepo {
             backend_path: Set(v.backend_path.clone()),
             created_at: Set(v.created_at),
             bound_on_finalize: Set(v.bound_on_finalize),
+            // A freshly-inserted version has never been migrated -- no
+            // lease held. Not part of the `FileVersion` domain model (see
+            // `entity::file_version::Model`'s doc comment), so there is no
+            // caller-supplied value to carry through here.
+            migration_lease_owner: Set(None),
+            migration_lease_until: Set(None),
         };
         secure_insert::<Entity>(am, scope, conn)
             .await
@@ -624,15 +633,30 @@ impl VersionRepo {
     }
 
     /// Transactionally update `backend_id` and `backend_path` for a version row,
-    /// CAS-gated on the version's *current* `backend_id`/`backend_path`.
-    /// Used by backend migration.
+    /// CAS-gated on the version's *current* `backend_id`/`backend_path` **and**
+    /// on `owner` still holding the migration lease. Used by backend
+    /// migration. Clears the lease (`migration_lease_owner`/
+    /// `migration_lease_until` -> `NULL`) in the same `UPDATE` on a won CAS,
+    /// so a successful migration always leaves the version lease-free without
+    /// a separate `release_migration_lease` round trip.
     ///
-    /// `0` rows affected now means either "version gone" (the row's
-    /// `(file_id, version_id)` no longer exists — today's meaning) **or**
-    /// "the backend pointer changed concurrently" (a different migration won
-    /// the race and already moved the row past `expected_backend_id`/
-    /// `expected_backend_path`) — the caller must re-fetch to distinguish
-    /// these.
+    /// The `migration_lease_owner = owner` predicate means this can now lose
+    /// the CAS for a THIRD reason beyond the two `rebind_backend` already
+    /// documented (version gone / pointer moved): `owner`'s lease was taken
+    /// over by another attempt (this call's own `migrate_backend` timed out
+    /// and released it, or it simply expired) between that attempt acquiring
+    /// the lease and this CAS running. The caller's existing re-fetch-and-
+    /// compare recovery already handles this correctly: the pointer is still
+    /// on the pre-migration snapshot in that case (the new lease holder
+    /// hasn't committed yet), which reads as "a concurrent backend migration
+    /// in progress" — the right outcome, since one now is.
+    ///
+    /// `0` rows affected now means "version gone" (the row's `(file_id,
+    /// version_id)` no longer exists — today's meaning), "the backend
+    /// pointer changed concurrently" (a different migration won the race and
+    /// already moved the row past `expected_backend_id`/`expected_backend_path`),
+    /// or "the lease moved on from `owner`" (see above) — the caller must
+    /// re-fetch to distinguish these.
     #[allow(clippy::too_many_arguments)]
     pub async fn rebind_backend<C: DBRunner>(
         &self,
@@ -644,16 +668,26 @@ impl VersionRepo {
         expected_backend_path: &str,
         new_backend_id: &str,
         new_backend_path: &str,
+        owner: Uuid,
     ) -> Result<bool, DomainError> {
         let res = Entity::update_many()
             .col_expr(Column::BackendId, Expr::value(new_backend_id))
             .col_expr(Column::BackendPath, Expr::value(new_backend_path))
+            .col_expr(
+                Column::MigrationLeaseOwner,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                Column::MigrationLeaseUntil,
+                Expr::value(Option::<OffsetDateTime>::None),
+            )
             .filter(
                 Condition::all()
                     .add(Column::FileId.eq(file_id))
                     .add(Column::VersionId.eq(version_id))
                     .add(Column::BackendId.eq(expected_backend_id))
-                    .add(Column::BackendPath.eq(expected_backend_path)),
+                    .add(Column::BackendPath.eq(expected_backend_path))
+                    .add(Column::MigrationLeaseOwner.eq(owner)),
             )
             .secure()
             .scope_with(scope)
@@ -662,4 +696,176 @@ impl VersionRepo {
             .map_err(db_err)?;
         Ok(res.rows_affected > 0)
     }
+
+    /// Acquire (or take over, if expired) the migration lease on a version:
+    /// one conditional `UPDATE` that only matches when no lease is currently
+    /// held (`migration_lease_until IS NULL`) or the held lease has already
+    /// expired (`migration_lease_until` is in the past). `false` means a
+    /// live lease is held by someone else -- `FileService::migrate_backend`
+    /// surfaces that as `Conflict` (409).
+    ///
+    /// Both the expiry check and the new `migration_lease_until` value are
+    /// computed **by the database itself** (`now()` on Postgres,
+    /// `datetime('now', ...)` on `SQLite`), never by this process's own clock:
+    /// two instances racing to acquire the same lease read the exact same
+    /// notion of "now" no matter how far their wall clocks have drifted
+    /// apart. This differs from `MultipartRepo::acquire_complete_lease`
+    /// (`multipart_uploads.lease_until`), whose caller supplies `now` as an
+    /// application-clock `OffsetDateTime` parameter -- that lease's own CAS
+    /// is still correct (the *acquiring* instance's clock stamps its own
+    /// lease, and every comparison reduces to comparing two values stored
+    /// the same way), but a sufficiently skewed instance could stamp a lease
+    /// that looks expired to its peers sooner or later than intended. This
+    /// lease is built DB-side instead, specifically to remove clock skew
+    /// from the equation entirely.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_migration_lease<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        backend: DbBackend,
+        file_id: Uuid,
+        version_id: Uuid,
+        owner: Uuid,
+        lease_secs: i64,
+    ) -> Result<bool, DomainError> {
+        let res = Entity::update_many()
+            .col_expr(Column::MigrationLeaseOwner, Expr::value(owner))
+            .col_expr(
+                Column::MigrationLeaseUntil,
+                migration_lease_until_expr(backend, lease_secs)?,
+            )
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::VersionId.eq(version_id))
+                    .add(
+                        Condition::any()
+                            .add(Column::MigrationLeaseUntil.is_null())
+                            .add(migration_lease_expired_filter(backend)?),
+                    ),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Release a held migration lease, scoped to `owner` so a lease this
+    /// caller no longer holds (already taken over by another attempt after
+    /// this one's own `migrate_backend` gave up on it) is never clobbered.
+    /// `false` means either the version is gone or the lease had already
+    /// moved on from `owner` -- both are fine to ignore: `migrate_backend`
+    /// always calls this best-effort, on every exit path, and a lease that
+    /// outlives this call simply expires on its own.
+    pub async fn release_migration_lease<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+        version_id: Uuid,
+        owner: Uuid,
+    ) -> Result<bool, DomainError> {
+        let res = Entity::update_many()
+            .col_expr(
+                Column::MigrationLeaseOwner,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                Column::MigrationLeaseUntil,
+                Expr::value(Option::<OffsetDateTime>::None),
+            )
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::VersionId.eq(version_id))
+                    .add(Column::MigrationLeaseOwner.eq(owner)),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected > 0)
+    }
+
+    /// Force-set a version's migration lease fields directly, bypassing the
+    /// normal acquire/release CAS semantics entirely. **Test-support only;
+    /// do not call in production** -- mirrors `MultipartRepo::set_expires_at`
+    /// (see that method's own doc comment for why this is `#[doc(hidden)]`
+    /// rather than gated behind a Cargo feature: it is called from the
+    /// external integration-test crate `tests/cleanup_test.rs`, which
+    /// `#[cfg(test)]` alone would not reach). Used to deterministically
+    /// simulate "a lease is already held" -- an expired one, to exercise
+    /// takeover; a live one under a chosen owner, to exercise a racer hook
+    /// -- without a real second concurrent `migrate_backend` call.
+    #[doc(hidden)]
+    pub async fn set_migration_lease_for_test<C: DBRunner>(
+        &self,
+        conn: &C,
+        file_id: Uuid,
+        version_id: Uuid,
+        owner: Option<Uuid>,
+        until: Option<OffsetDateTime>,
+    ) -> Result<(), DomainError> {
+        Entity::update_many()
+            .col_expr(Column::MigrationLeaseOwner, Expr::value(owner))
+            .col_expr(Column::MigrationLeaseUntil, Expr::value(until))
+            .filter(
+                Condition::all()
+                    .add(Column::FileId.eq(file_id))
+                    .add(Column::VersionId.eq(version_id)),
+            )
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+}
+
+/// SQL expression for "database-side `now() + secs` seconds", used to stamp
+/// [`VersionRepo::acquire_migration_lease`]'s `migration_lease_until`. See
+/// that method's doc comment for why this is computed by the database
+/// itself rather than passed in as an application-clock value.
+///
+/// # Errors
+/// A backend other than Postgres/SQLite -- the only two dialects this gear
+/// ever connects to (`toolkit_db::connect_db`/`run_migrations_for_testing`
+/// already refuse anything else at startup, the same way every migration in
+/// `infra::storage::migrations` does), so this is unreachable in practice;
+/// kept fallible rather than a panic, matching this gear's no-panics-in-
+/// request-path convention.
+fn migration_lease_until_expr(backend: DbBackend, secs: i64) -> Result<SimpleExpr, DomainError> {
+    match backend {
+        DbBackend::Postgres => Ok(Expr::cust(format!("now() + INTERVAL '{secs} seconds'"))),
+        DbBackend::Sqlite => Ok(Expr::cust(format!("datetime('now', '+{secs} seconds')"))),
+        other => Err(unsupported_migration_lease_backend(other)),
+    }
+}
+
+/// SQL predicate for "`migration_lease_until` is database-side expired"
+/// (`migration_lease_until < now()`). On `SQLite` both sides are normalized
+/// through `datetime(...)` so a value written via
+/// [`migration_lease_until_expr`] (DB-native, space-separated) and one a
+/// test sets directly via a differently-formatted literal both parse to one
+/// canonical form before the compare -- mirrors `gears/bss/libs/coord`'s
+/// `Dialect::expired_filter`.
+fn migration_lease_expired_filter(backend: DbBackend) -> Result<SimpleExpr, DomainError> {
+    match backend {
+        DbBackend::Postgres => Ok(Expr::col(Column::MigrationLeaseUntil).lt(Expr::cust("now()"))),
+        DbBackend::Sqlite => Ok(Expr::cust(
+            "datetime(migration_lease_until) < datetime('now')",
+        )),
+        other => Err(unsupported_migration_lease_backend(other)),
+    }
+}
+
+fn unsupported_migration_lease_backend(backend: DbBackend) -> DomainError {
+    DomainError::database(format!(
+        "file-storage supports Postgres and SQLite only, got {backend:?}"
+    ))
 }

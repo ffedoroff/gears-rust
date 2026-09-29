@@ -113,7 +113,21 @@
 //! `files.content_id`, which can have moved on to a different version by the
 //! time of the retry.
 //!
-//! # 4. Dangling `File`-scope retention-rule cleanup
+//! # 4. `file_versions.migration_lease_owner` / `migration_lease_until`
+//!
+//! `file_versions.migration_lease_owner uuid NULL` and
+//! `migration_lease_until timestamptz NULL` (both nullable, both text on
+//! `SQLite`, matching every other nullable timestamp column in this
+//! migration): a lease `migrate_backend` acquires on the version being
+//! migrated before it ever writes to the destination backend, so two
+//! concurrent migration attempts of the same version -- which always target
+//! the same deterministic `/{file_id}/{version_id}` destination path -- can
+//! no longer race each other there. The lease's expiry is timed by the
+//! **database's own clock** (`now()`/`CURRENT_TIMESTAMP`), never the
+//! acquiring instance's, so instance clock skew cannot make a live lease
+//! look expired (or vice versa) to a second attempt reading the same row.
+//!
+//! # 5. Dangling `File`-scope retention-rule cleanup
 //!
 //! `retention_rules` has no FK from `scope_target_id` to `files.file_id`
 //! (`scope = 'file'` rows are matched by id alone, see
@@ -137,13 +151,14 @@
 //! outcome an expired lease would eventually produce on its own —
 //! `backend_id`/`backend_path` are dropped without an inverse backfill (the
 //! round trip is schema-equivalence only for those two columns, not data
-//! preservation). `file_versions.bound_on_finalize` (part 3) is also dropped
-//! -- unlike part 2's indexes/part 1's columns, nothing else in this branch
-//! depends on it existing, so the rollback is a plain, symmetric drop. The
-//! part 4 retention-rule cleanup is data cleanup, not a schema change -- it
-//! has no inverse and is not undone on rollback (rows it deleted are gone;
-//! rolling back a schema migration was never expected to resurrect deleted
-//! rows).
+//! preservation). `file_versions.bound_on_finalize` (part 3) and
+//! `file_versions.migration_lease_owner`/`migration_lease_until` (part 4) are
+//! also dropped -- unlike part 2's indexes/part 1's columns, nothing else in
+//! this branch depends on them existing, so the rollback is a plain,
+//! symmetric drop. The part 5 retention-rule cleanup is data cleanup, not a
+//! schema change -- it has no inverse and is not undone on rollback (rows it
+//! deleted are gone; rolling back a schema migration was never expected to
+//! resurrect deleted rows).
 //!
 //! This migration merges two migrations from this branch into one, since
 //! neither had shipped in a release.
@@ -218,7 +233,15 @@ DROP INDEX IF EXISTS file_versions_backend_idx;
 ALTER TABLE file_versions
     ADD COLUMN IF NOT EXISTS bound_on_finalize boolean NOT NULL DEFAULT false;
 
--- Part 4: one-time cleanup of `File`-scope retention rules already left
+-- Part 4: migration lease (see the module doc) -- both nullable, so every
+-- existing row simply gets an unheld lease (NULL/NULL), same as a version
+-- that has never been migrated.
+ALTER TABLE file_versions
+    ADD COLUMN IF NOT EXISTS migration_lease_owner uuid NULL;
+ALTER TABLE file_versions
+    ADD COLUMN IF NOT EXISTS migration_lease_until timestamptz NULL;
+
+-- Part 5: one-time cleanup of `File`-scope retention rules already left
 -- dangling by a `files` row deleted before this migration ran (see the
 -- module doc) -- 'file' is `RetentionScope::File`'s wire/DB spelling, same
 -- value `m20260701_000001_p2_initial`'s CHECK and `RetentionRuleRepo::
@@ -332,7 +355,12 @@ DROP INDEX IF EXISTS file_versions_backend_idx;
 -- SQLite's `ADD COLUMN` has no `IF NOT EXISTS` clause, unlike Postgres above.
 ALTER TABLE file_versions ADD COLUMN bound_on_finalize BOOLEAN NOT NULL DEFAULT FALSE;
 
--- Part 4: one-time cleanup of `File`-scope retention rules already left
+-- Part 4: migration lease (see the module doc) -- TEXT, matching every other
+-- nullable timestamp column on SQLite in this migration.
+ALTER TABLE file_versions ADD COLUMN migration_lease_owner TEXT NULL;
+ALTER TABLE file_versions ADD COLUMN migration_lease_until TEXT NULL;
+
+-- Part 5: one-time cleanup of `File`-scope retention rules already left
 -- dangling by a `files` row deleted before this migration ran -- see
 -- POSTGRES_UP's matching statement for the full comment.
 DELETE FROM retention_rules
@@ -368,6 +396,10 @@ CREATE INDEX IF NOT EXISTS file_versions_backend_idx
 -- Part 3 (see the module doc): plain, symmetric drop -- nothing else in
 -- this migration depends on the column existing.
 ALTER TABLE file_versions DROP COLUMN IF EXISTS bound_on_finalize;
+
+-- Part 4 (see the module doc): plain, symmetric drop.
+ALTER TABLE file_versions DROP COLUMN IF EXISTS migration_lease_owner;
+ALTER TABLE file_versions DROP COLUMN IF EXISTS migration_lease_until;
 
 UPDATE multipart_uploads SET state = 'aborted' WHERE state = 'completing';
 ALTER TABLE multipart_uploads DROP CONSTRAINT IF EXISTS multipart_uploads_state_check;
@@ -405,6 +437,10 @@ CREATE INDEX IF NOT EXISTS file_versions_backend_idx
 -- Part 3 (see the module doc): plain, symmetric drop. SQLite's `DROP COLUMN`
 -- has no `IF EXISTS` clause, unlike Postgres's equivalent statement.
 ALTER TABLE file_versions DROP COLUMN bound_on_finalize;
+
+-- Part 4 (see the module doc): plain, symmetric drop.
+ALTER TABLE file_versions DROP COLUMN migration_lease_owner;
+ALTER TABLE file_versions DROP COLUMN migration_lease_until;
 
 CREATE TABLE multipart_upload_parts_backup AS SELECT * FROM multipart_upload_parts;
 

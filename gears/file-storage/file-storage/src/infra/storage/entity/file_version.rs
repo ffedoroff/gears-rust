@@ -36,6 +36,25 @@ pub struct Model {
     pub created_at: OffsetDateTime,
     /// See [`file_storage_sdk::FileVersion::bound_on_finalize`]'s doc comment.
     pub bound_on_finalize: bool,
+    /// Migration lease owner (upload-flow redesign): a random `Uuid` a
+    /// `migrate_backend` call stamps here (alongside
+    /// [`Self::migration_lease_until`]) before it ever writes to the
+    /// destination backend, so a concurrent migration attempt of this same
+    /// version -- which would always target the same deterministic
+    /// destination path -- is rejected instead of racing this one there.
+    /// `None` means no migration currently holds the lease. Internal state
+    /// only: deliberately **not** part of the public
+    /// [`file_storage_sdk::FileVersion`] domain model (see that struct's own
+    /// doc comment).
+    pub migration_lease_owner: Option<Uuid>,
+    /// Migration lease expiry (upload-flow redesign), timed by the
+    /// **database's own clock** (`VersionRepo::acquire_migration_lease`
+    /// writes it via `now()`/`CURRENT_TIMESTAMP`, never the acquiring
+    /// instance's clock) so instance clock skew cannot make a live lease
+    /// look expired -- or an expired one look live -- to a second attempt
+    /// reading this row. `None` iff [`Self::migration_lease_owner`] is
+    /// `None`. Internal state only -- see that field's doc comment.
+    pub migration_lease_until: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

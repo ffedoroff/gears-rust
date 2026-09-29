@@ -254,6 +254,8 @@ async fn get_manifests_returns_all_results_across_multiple_chunks() {
             backend_path: Set(format!("/{file_id}/{version_id}")),
             created_at: Set(now),
             bound_on_finalize: Set(false),
+            migration_lease_owner: Set(None),
+            migration_lease_until: Set(None),
         })
         .collect();
     secure_insert_many::<FileVersionEntity>(version_models, &scope, &conn)

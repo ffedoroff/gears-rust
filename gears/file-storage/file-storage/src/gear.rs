@@ -260,7 +260,8 @@ impl Gear for FileStorageGear {
             )
             .with_metrics(Arc::clone(&metrics))
             .with_previous_signing_public_keys(previous_signing_public_keys)
-            .map_err(|e| anyhow::anyhow!("file-storage previous_signing_public_keys: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("file-storage previous_signing_public_keys: {e}"))?
+            .with_migrate_lease_config(cfg.migrate_timeout_secs, cfg.migrate_lease_margin_secs),
         );
         self.service
             .set(Arc::clone(&service))
