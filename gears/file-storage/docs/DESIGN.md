@@ -256,7 +256,9 @@ Content access is authorized by a short-lived, opaque **Ed25519-signed compact t
 codec, ADR-0004) that the **control plane alone mints** (holds the private key); the **sidecar only verifies** (holds
 the public key) and can never forge one. The token carries AND-combined claims (`op`, `file_id`, `version_id`,
 `backend_id`, `backend_path`, `exp`, and, for uploads, `max_size`/`exact_size`/`expected_hash`; download tokens also
-carry `content_type`/`etag`) under one signature; it is carried in the URL query (`?fs-token=`) or a header. An
+carry `content_type`/`etag`, plus `content_sha256` for `whole-sha256`-mode versions only — verified end-to-end
+against the full (non-`Range`) response stream, see api.md's "Signed URLs" §claims table) under one signature; it is
+carried in the URL query (`?fs-token=`) or a header. An
 `ip`/CIDR constraint and a token-claim predicate are a documented, not-yet-implemented extension point — `Claims`
 carries no such fields today. Its **format is private to control + sidecar** — everyone else treats it as opaque
 bytes and must not parse it (ADR-0004 "Token Opacity Contract"). Stateless: no DB lookup to verify, no per-token
@@ -1263,6 +1265,13 @@ find it by). `DELETE /files/{id}/versions/{vid}` (§3.3) applies the same lock-t
 `vid` the file's only version?" decision when that delete is equivalent to deleting the whole file, and the
 orphan-reclaim sweep (`cleanup-engine`, above) applies it to its own zero-version check before reclaiming a
 versionless `files` row.
+
+The same transaction also re-verifies a concrete `If-Match` against the locked row, immediately after that lock
+and before any version is listed or deleted — this diagram's earlier "ETag mismatch" branch is only the cheap,
+pre-transaction fast reject; the in-transaction re-check is the actual guarantee, since a `bind`/version-restore
+that commits strictly between the fast reject and the lock would otherwise go undetected and let the delete
+remove content the caller's `If-Match` never approved (`*` skips the check at both points). See
+[concurrency-and-failure-model.md](./concurrency-and-failure-model.md) race #12.
 
 #### List files (P1)
 

@@ -708,6 +708,7 @@ avoid leaving this unswept sibling behind.
   | `max_conns` | no | **not implemented (planned)** | up/down | — |
   | `content_type` | no | yes | download (`op = get`) | n/a — echoed as `Content-Type`³ |
   | `etag` | no | yes | download (`op = get`) | n/a — echoed as `ETag`³ |
+  | `content_sha256` | no | yes, **full download only** | download (`op = get`) | aborts the response mid-stream⁴ |
 
   `Claims` has no `ip`, `tok.<claim>`, `max_rate`, or `max_conns` field (`infra/signed_url/mod.rs`). The sidecar
   validates only: the token's signature and expiry (`exp`); `op` against the HTTP method; the `file_id`/`version_id`
@@ -725,7 +726,15 @@ avoid leaving this unswept sibling behind.
   stamps both into the claims, so the sidecar (no DB access) can emit the real `Content-Type`/`ETag` response
   headers instead of a generic `application/octet-stream` fallback with no `ETag` at all. `#[serde(default)]` keeps
   verification tolerant of a token minted before these fields existed — such a token still falls back exactly as
-  before. Never populated on upload (`op = put`) or multipart-part (`op = multipart_part`) tokens.
+  before. Never populated on upload (`op = put`) or multipart-part (`op = multipart_part`) tokens.<br>
+  ⁴ `content_sha256` is populated at `download-url` issuance time with the version's hex SHA-256 **only** when its
+  `hash_mode` is `whole-sha256` — a `multipart-composite-sha256` version's stored hash is a Merkle-style root over
+  per-part digests (ADR-0006), not a digest of the assembled object, so it is left empty (no check) for those. It is
+  also empty for a token minted before this claim existed. The sidecar's **full** (non-`Range`) `GET` handler hashes
+  the response body as it streams and compares it to this claim once the stream ends; a mismatch ends the stream in
+  an `Err` instead of a clean completion, so the HTTP connection aborts rather than delivering a seemingly-successful
+  body with the wrong bytes under the token's `ETag`. The sidecar's `Range` handler (S2 above) never performs this
+  check — a partial range's bytes cannot be compared against a digest of the whole object.
 - **`exp` is mandatory, short by default, and hard-capped.** Every issued URL gets a **short default TTL**
   (`default_url_ttl_secs`, minutes — 15 min default) to bound the stale-permission window, and `Issuer::issue`
   **silently clamps** `exp` down to a **hard ceiling** `max_url_ttl_secs` (≤ **7 days** default) rather than refusing
@@ -762,7 +771,12 @@ avoid leaving this unswept sibling behind.
 - `If-Match`: required on **bind** (`POST /files/{id}/bind`) and on `DELETE`. Mismatch → `400 Bad Request` on the
   control plane (`FailedPrecondition` collapses to `400` on this platform — see "Status code summary" below). The
   sidecar's data-plane `PUT` does not check `If-Match` at all — it only streams bytes and calls finalize; conditional
-  concurrency on content is enforced solely by the control-plane `bind` handler.
+  concurrency on content is enforced solely by the control-plane `bind` handler. On `DELETE`, a concrete `If-Match`
+  value is re-verified a second time, *inside* the delete transaction against the row it locks there — not only
+  against a `file` read taken before the transaction opened — so a `bind`/version-restore that lands in the narrow
+  gap between that earlier read and the transaction's own lock cannot slip an unapproved delete through; `*` skips
+  the check entirely, at both points (see race #12 in
+  [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)).
 - `If-Match-Metadata: <u64>`: **optional** on metadata-only `PATCH`; matched against the current `meta_version`.
   Mismatch → `400` (same `FailedPrecondition` → `400` mapping). `meta_version` is returned in the JSON body
   (`FileDto.meta_version`) on every file read/mutation response; there is **no** `X-FS-Metadata-Revision` response

@@ -155,8 +155,14 @@ migration attempt of the same version while the lease is live is rejected with `
 backend I/O.
 
 `migrate_timeout_secs` (seconds, default `3600` = 1h) is the time budget for one migration attempt's transfer +
-verification + commit, enforced via `tokio::time::timeout`; exceeding it best-effort deletes only the destination
-object this call itself created and fails with a retryable `503 service_unavailable` + `Retry-After`. **Production
+verification + commit **and** the best-effort deletion of the now-superseded source object that follows a won CAS,
+all enforced via a single `tokio::time::timeout` around the whole attempt; exceeding it best-effort deletes only the
+destination object this call itself created and fails with a retryable `503 service_unavailable` + `Retry-After`. The
+lease is deliberately held through that source-object cleanup — the CAS step itself no longer clears it — precisely
+so that a second migration of the same version cannot re-acquire the lease and move the version back onto the
+backend this call is still in the middle of deleting from; see `docs/features/backend-migration.md` for why that
+matters (the destination path is deterministic, so a second migration would land on the exact path this call is
+about to delete). **Production
 recommendation**: size it to your largest realistic object divided by the slowest backend's sustained throughput this
 deployment expects to migrate, with headroom — e.g. a 50 GiB object over a backend sustaining 100 MiB/s needs at
 least ~500s; leave a comfortable multiple on top for backend hiccups rather than sizing to the exact expected
@@ -171,8 +177,9 @@ effects the timeout alone doesn't budget for: clock skew between the instance ho
 ultimately evaluates its expiry (the lease itself is timed by the **database's own clock**, `now()` /
 `CURRENT_TIMESTAMP` — see `VersionRepo::acquire_migration_lease` — but the instance's own `tokio::time::timeout`
 still fires on its local clock, so the two can disagree by however far the instances have drifted); and the tail of a
-backend request already in flight when that local timeout fires, which does not itself observe the timeout and may
-keep running briefly afterward. **Production recommendation**: a few minutes is enough for typical clock-sync (NTP)
+backend request already in flight when that local timeout fires — including the source-object cleanup above — which
+does not itself observe the timeout and may keep running briefly afterward. **Production recommendation**: a few
+minutes is enough for typical clock-sync (NTP)
 drift and backend request tails; raise it if this deployment's instances are known to drift further than that.
 **Misconfiguration risk**: too small risks a second attempt taking over the lease while the first one's now-abandoned
 backend call is still writing; too large extends how long a stuck migration blocks every other attempt at the same
@@ -390,9 +397,13 @@ open once that many days have passed is by construction already abandoned. FileS
 handles on a best-effort basis only, and two windows are not covered by any sweep: a control-plane crash between
 `initiate_multipart` and the session-row insert leaves a handle with no persisted correlation at all, and a backend
 abort that fails after the session has already flipped to `aborted` is never retried (later passes list only
-`in_progress` and lease-expired `completing` sessions). No object bytes are at stake in either case, but S3 bills for
-incomplete multipart uploads. The sweep remains the primary reclamation path; the lifecycle rule is only the
-backstop for these two uncorrelated windows — see `concurrency-and-failure-model.md` §5.
+`in_progress` and lease-expired `completing` sessions). No object bytes are at stake in either of those two cases,
+but S3 bills for incomplete multipart uploads. A **third**, related case does have real bytes at stake: if a
+completer had already fully assembled the object on the backend before the session was reclaimed out from under it,
+the sweep (or the completer itself, on its own next step) best-effort deletes that assembled object too — a failure
+of *that* delete leaves a real, billed object with no DB row left to ever correlate it back to a `file_id`/
+`version_id`, likewise never retried. The sweep remains the primary reclamation path; the lifecycle rule is only the
+backstop for all three uncorrelated windows — see `concurrency-and-failure-model.md` §5.
 
 **The endpoint must honour conditional writes (`If-None-Match: *`)** — this is a **requirement** for any S3-compatible
 backend used here, not an optimisation. Publishing a version is create-exclusive: the single-part `PutObject` and
@@ -522,6 +533,18 @@ a genuine **concurrent** double-finalize — two callbacks racing before either 
 already-`available` status — not for an ordinary sequential retry, which converges as above. For the finalize case
 specifically, the version may already be correctly finalized server-side even though the client saw a transient
 `502` on a preceding attempt (re-verify via `GET /files/{id}/versions` before assuming failure).
+
+A full (non-`Range`) download whose token carries `content_sha256` (`whole-sha256`-mode versions only, see
+[api.md](./api.md) §"Signed URLs") is hashed as it streams and compared to that claim once the body ends; a
+mismatch logs `"whole-object download content hash mismatch; aborting response"` at `error` level (with the
+expected/actual hex digests, never the object's bytes) and aborts the HTTP response mid-stream instead of
+completing it. **This log line is an operator signal, not routine noise** — on a correctly-operating deployment it
+should never fire. Seeing it means a download's bytes no longer match the version they were issued for, almost
+always because the deterministic backend path (`/{file_id}/{version_id}`) was reoccupied by a fresh write after the
+version it belonged to was deleted and before the stale download token's `exp` passed; investigate the backend's
+object history at that path and the timing of the version's deletion. `Range` downloads and
+`multipart-composite-sha256` versions never emit this check (see `Claims::content_sha256`'s own doc comment), so
+its absence on those paths is expected, not a gap.
 
 ## The background cleanup sweep
 

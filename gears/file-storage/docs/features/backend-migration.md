@@ -208,10 +208,10 @@ apply to it)
 10. [x] - `p1` - **IF** verification of the streamed source content failed (hash mismatch, wrong length, or the source stream broke before finishing): do **not** proceed to the CAS step; best-effort delete the destination object, but only if this call is the one that created it (see below) - `inst-migrate-verify-failed-no-commit`
 11. [x] - `p1` - **IF** source verification passed but the destination object already existed before this call wrote anything (`created: false`): re-fetch the version row and compare its `(backend_id, backend_path)` against the pre-migration snapshot this call started from, rather than reading the object back at all — the lease already held since step 6 rules out any other *legitimate* concurrent writer to this exact path. **IF** the pointer is still on that snapshot: the object is a tail an earlier, interrupted attempt at this same path left behind — best-effort delete it and retry the publish exactly once (a second `created: false` after that retry is `Conflict`, no further retry). **IF** the pointer has already moved: RETURN `409` (`Conflict`) without deleting the object at all - `inst-migrate-tail-resolve`
 12. [x] - `p1` - Immediately before the CAS step, re-`stat` the destination object and confirm it still exists at the expected size. **IF** it does not: do **not** proceed to the CAS step; RETURN a retryable error (`503 service_unavailable` with `Retry-After`; retrying the migration is safe) - `inst-migrate-precommit-stat`
-13. [x] - `p1` - DB: `rebind_version_backend` — CAS the version row's `(backend_id, backend_path)` from the pre-migration snapshot to the destination AND `migration_lease_owner` from this call's own owner, clearing the lease in the same statement on a win, in the same transaction as a `BackendMigrate` audit row - `inst-migrate-cas-rebind`
+13. [x] - `p1` - DB: `rebind_version_backend` — CAS the version row's `(backend_id, backend_path)` from the pre-migration snapshot to the destination AND `migration_lease_owner` from this call's own owner, in the same transaction as a `BackendMigrate` audit row; the lease itself is left held on a win (see step 16) - `inst-migrate-cas-rebind`
 14. [x] - `p1` - **IF** the CAS lost: resolve using `cpt-cf-file-storage-algo-backend-migration-race-resolve` (below) — RETURN `404`/`409`/success-as-no-op depending on what actually happened - `inst-migrate-cas-race`
 15. [x] - `p1` - **IF** the CAS won: best-effort delete the source blob (failures logged, not surfaced to the caller — an orphan-cleanup concern, not a migration-correctness one) - `inst-migrate-cleanup-source`
-16. [x] - `p1` - Best-effort release the migration lease regardless of how the attempt above ended (already a no-op on a won CAS, which clears it in the same statement); a release that itself fails is not fatal, the lease simply expires on its own - `inst-migrate-lease-release`
+16. [x] - `p1` - Best-effort release the migration lease regardless of how the attempt above ended, only after step 15's source-delete attempt has already run on a won CAS — releasing any earlier would let a second migration of the same version re-acquire the lease and move it back onto the backend step 15 is still about to delete from (the destination path is deterministic, so both migrations target the same path), turning step 15's delayed delete into one that destroys live content instead of the stale object it was meant to remove; a release that itself fails is not fatal, the lease simply expires on its own - `inst-migrate-lease-release`
 17. [x] - `p1` - RETURN `204 No Content` - `inst-migrate-return`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -415,9 +415,17 @@ concurrent winner's blob, best-effort cleaning up a destination object only
 when doing so cannot destroy a concurrent winner's already-live content
 (this call created it and its own verification failed, or the destination
 tail rule above found it safe to reclaim), and best-effort clean up the
-source blob only after the CAS has won. The system **MUST** best-effort
-release the migration lease on every exit path, whether or not the release
-itself succeeds.
+source blob only after the CAS has won. The CAS itself **MUST NOT** release
+the migration lease on a win -- the lease **MUST** stay held by this call's
+own owner through that best-effort source cleanup, so that a second
+migration of the same version can never re-acquire it and move the version
+back onto the backend this call is still in the middle of deleting from (the
+destination path is deterministic, so both migrations would target the
+identical path, and the delayed delete would otherwise risk destroying the
+second migration's live object instead of the stale one it was meant to
+remove). The system **MUST** best-effort release the migration lease on
+every exit path, whether or not the release itself succeeds, and only after
+that exit path's own source-cleanup attempt (if any) has already run.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-backend-migration`

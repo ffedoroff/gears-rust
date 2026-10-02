@@ -15,6 +15,7 @@ date: 2026-06-20
   - [Confirmation](#confirmation)
   - [Implementation note (P2, 2026-07)](#implementation-note-p2-2026-07)
   - [Claim-set evolution (P2 1.11, 2026-07)](#claim-set-evolution-p2-111-2026-07)
+  - [Claim-set evolution (download integrity, 2026-09)](#claim-set-evolution-download-integrity-2026-09)
 - [Token Opacity Contract](#token-opacity-contract)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Encoding: opaque token (chosen) vs discrete fields (rejected)](#encoding-opaque-token-chosen-vs-discrete-fields-rejected)
@@ -202,6 +203,26 @@ version-skew-tolerant in both directions by construction — `#[serde(default)]`
 verifies a token minted before this change (falls back exactly as it did before), and a sidecar running the prior
 code simply ignores the two new fields on a token minted after this change (same as the pre-existing `request_id`
 (P2 1.8) and `backend_handle` (P2 1.7) fields, which established this pattern first).
+
+### Claim-set evolution (download integrity, 2026-09)
+
+The download token gained a third download-only claim, `content_sha256` (optional, like `content_type`/`etag`
+above: absent or empty means "no check", and tokens without it stay valid). It is populated at `download-url`
+issuance time with the version's stored hex SHA-256, but **only** when the version's `hash_mode` is
+`whole-sha256` — a `multipart-composite-sha256` version's stored hash is a manifest root over per-part digests
+(ADR-0006), not a digest of the assembled object, so recomputing it by hashing the whole stream would never match
+and the claim is left empty (meaning "no check") for those versions. It is likewise empty on a token minted before
+this claim existed, and on upload (`op = put`) / multipart-part (`op = multipart_part`) tokens, which never carry
+it.
+
+The sidecar's **full** (non-`Range`) `GET` handler is the only consumer: when the claim is non-empty it hashes the
+response body as it streams and compares the running digest to the claim once the stream ends, ending the response
+in an error on a mismatch rather than completing it cleanly — this closes a gap where the bytes sitting at the
+token's deterministic `backend_path` could have changed since the token was issued (its version deleted and the
+identical path reoccupied by a later upload) with nothing short of a full content comparison able to tell. The
+`Range` handler never performs this check: a partial range's bytes cannot be compared against a digest of the
+whole object. Like the two claims above, this is a minter/verifier-only change under the same skew tolerance (an
+absent claim is accepted) — no intermediary, and no other claim, is affected.
 
 ## Token Opacity Contract
 

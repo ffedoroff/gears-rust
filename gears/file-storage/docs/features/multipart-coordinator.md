@@ -228,6 +228,13 @@ returned.
 - Policy size limit exceeded by the assembled total -- policy-size-exceeded error
 - Session `aborted` or expired, or `upload_id` foreign to this `file_id` -- `404`-shaped "not found"
 - `If-Match` supplied and it does not match the file's current content ETag -- `400` (`FailedPrecondition`)
+- The abandoned-session/expiry sweep aborts the session **after** this call already passed the step-4 non-terminal
+  check and won the lease, but **before** its finalize transaction (step 14) runs -- a race window the sweep's own
+  TTL reclaim can land in while this call's backend assembly (step 12) is still in flight. The finalize transaction's
+  first statement re-checks session state and rejects with `409 Conflict` instead of finalizing a version for a
+  session no longer there to own it. Because the backend assembly already succeeded by this point, this call
+  best-effort deletes the object it just assembled (it's an orphan no DB row will ever point at again -- the sweep
+  that aborted the session already removed its part rows) before returning the `409`
 
 **Steps**:
 1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete (no request body; optional `If-Match` header). Control plane: authorize `write` - `inst-complete-request`
@@ -404,9 +411,10 @@ regardless of lease state.
 2. [x] - `p1` - **FROM** completing **TO** completing **WHEN** a `complete` call takes over a `completing` session whose `lease_until` has already passed (dead lease owner) - `inst-st-completing-takeover`
 3. [x] - `p1` - **FROM** completing **TO** in_progress **WHEN** the lease holder's assembly/finalize attempt fails (missing parts, size mismatch, policy violation, MIME mismatch, backend error) -- releases the lease so the next `complete` retries immediately - `inst-st-completing-release`
 4. [x] - `p1` - **FROM** completing **TO** completed **WHEN** the lease holder's finalize transaction commits (version `available` [+ bind], `complete_result` persisted, plus the audit row on the fast (first-attempt) path -- a takeover or converge path writes the audit row via a separate step instead) - `inst-st-to-completed`
-5. [x] - `p1` - **FROM** in_progress **TO** aborted **WHEN** abort flow is called explicitly by the client - `inst-st-to-aborted`
-6. [x] - `p1` - **FROM** in_progress **TO** aborted **WHEN** TTL/orphan-reconciliation sweep expires an unfinished session (`cpt-cf-file-storage-fr-orphan-reconciliation`) - `inst-st-ttl-abort`
-7. [x] - `p1` - **FROM** completing **TO** aborted **WHEN** the orphan-reconciliation sweep finds the session's `expires_at` **and** its `lease_until` both already past (a live lease is never reaped mid-assembly) - `inst-st-completing-ttl-abort`
+5. [x] - `p1` - **FROM** in_progress **TO** completed **WHEN** the same finalize transaction as #4 commits, but by the time its own embedded, owner-blind session-close CAS runs the session is observed `in_progress` rather than `completing` -- a *different* completer had taken over the lease in between and then lost its own race, releasing it back to `in_progress` (transition #3) before this call's much earlier finalize attempt finally landed. The version-finalize half of this same transaction is fenced only by the version row's own `status`, never by session state or lease ownership, so this call is already the sole legitimate author of the completion by the time it reaches its own session-close step; closing the session out from `in_progress` here, rather than leaving it stranded there with an already-`available` version underneath it, is this same transition, not a new one -`inst-st-in-progress-to-completed`
+6. [x] - `p1` - **FROM** in_progress **TO** aborted **WHEN** abort flow is called explicitly by the client - `inst-st-to-aborted`
+7. [x] - `p1` - **FROM** in_progress **TO** aborted **WHEN** TTL/orphan-reconciliation sweep expires an unfinished session (`cpt-cf-file-storage-fr-orphan-reconciliation`) - `inst-st-ttl-abort`
+8. [x] - `p1` - **FROM** completing **TO** aborted **WHEN** the orphan-reconciliation sweep finds the session's `expires_at` **and** its `lease_until` both already past (a live lease is never reaped mid-assembly) - `inst-st-completing-ttl-abort`
 
 ## 5. Definitions of Done
 
@@ -467,7 +475,12 @@ session `completing -> completed`, and persists the `complete_result` JSON -- pl
 path, the audit row too (a takeover or converge path instead writes the audit row via a separate step). A crash
 between winning the lease and this transaction committing leaves the session at `completing` for the next `complete`
 call to take over (§4's state machine), never a half-finalized version. A failed assembly/verification instead
-releases the lease (`completing -> in_progress`) so the next `complete` retries immediately. Returns **`200`** with
+releases the lease (`completing -> in_progress`) so the next `complete` retries immediately. If instead the
+abandoned-session/expiry sweep aborts the session out from under this call between its lease win and this
+transaction (a race the sweep's own TTL reclaim can land in while assembly is still running), the transaction's own
+first statement detects the session is no longer there to own and rejects with `409` instead of finalizing a version
+for it -- this call then best-effort deletes the object it already assembled on the backend, since the aborted
+session leaves no DB row left to ever reference it. Returns **`200`** with
 `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?,
 current_etag?}`. A retry against an already-`completed` session **converges**: it replays the persisted
 `complete_result` verbatim -- or, only for a session that predates the `complete_result`/`auto_bind` migration
