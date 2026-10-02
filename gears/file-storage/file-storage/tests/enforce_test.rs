@@ -367,6 +367,7 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let err = svc
         .finalize_upload_by_token(&claims, -1, vec![0u8; 32])

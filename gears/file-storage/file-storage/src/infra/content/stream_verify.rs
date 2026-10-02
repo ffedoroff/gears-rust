@@ -366,6 +366,91 @@ pub fn verify_stream(
     Ok((Box::pin(stream), out_slot))
 }
 
+/// Wrap a **whole-object** download stream (the sidecar's full, non-`Range`
+/// `GET` response body) so it is forwarded unchanged while its SHA-256
+/// digest is accumulated incrementally, and -- if the finished digest does
+/// not match `expected_sha256_hex` -- the stream's own last item is an `Err`
+/// instead of a clean end.
+///
+/// This differs from [`verify_stream`] in how a mismatch is surfaced, not
+/// just in being whole-object-only. `verify_stream` backs a "write first,
+/// check second" caller (`migrate_backend`'s destination write): the
+/// verdict is read from its [`VerifySlot`] only *after* that caller's own
+/// consumer has finished with the stream, while the response it was writing
+/// has not been sent to anyone yet, so an `Err` there can still cleanly fail
+/// the whole operation before any client sees a byte. A download response
+/// body has no such later moment -- by the time the last chunk has been
+/// read, the `200`/headers/every prior chunk have already reached the
+/// client, so the only way left to signal "these bytes were wrong" is to
+/// make the stream itself end in error, aborting the HTTP connection
+/// instead of completing it (`axum::body::Body::from_stream` surfaces a
+/// stream `Err` exactly that way).
+///
+/// Logs the mismatch at `error!` (digests only, never the object's bytes).
+#[must_use]
+pub fn verify_whole_object_download_stream(
+    inner: BoxStream<'static, io::Result<Bytes>>,
+    expected_sha256_hex: String,
+) -> BoxStream<'static, io::Result<Bytes>> {
+    enum State {
+        Reading {
+            inner: BoxStream<'static, io::Result<Bytes>>,
+            hasher: Hasher,
+            expected_hex: String,
+        },
+        Done,
+    }
+
+    let stream = futures::stream::unfold(
+        State::Reading {
+            inner,
+            hasher: Hasher::new(),
+            expected_hex: expected_sha256_hex,
+        },
+        move |state| async move {
+            match state {
+                State::Done => None,
+                State::Reading {
+                    mut inner,
+                    mut hasher,
+                    expected_hex,
+                } => match inner.next().await {
+                    None => {
+                        let digest_hex = hex::encode(hasher.finalize());
+                        if digest_hex == expected_hex {
+                            None
+                        } else {
+                            tracing::error!(
+                                expected = %expected_hex,
+                                actual = %digest_hex,
+                                "whole-object download content hash mismatch; aborting response"
+                            );
+                            let e = io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "downloaded object's content does not match its recorded hash",
+                            );
+                            Some((Err(e), State::Done))
+                        }
+                    }
+                    Some(Err(e)) => Some((Err(e), State::Done)),
+                    Some(Ok(chunk)) => {
+                        hasher.update(&chunk);
+                        Some((
+                            Ok(chunk),
+                            State::Reading {
+                                inner,
+                                hasher,
+                                expected_hex,
+                            },
+                        ))
+                    }
+                },
+            }
+        },
+    );
+    Box::pin(stream)
+}
+
 #[cfg(test)]
 #[path = "stream_verify_tests.rs"]
 mod stream_verify_tests;

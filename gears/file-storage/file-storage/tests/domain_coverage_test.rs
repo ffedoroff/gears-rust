@@ -646,11 +646,12 @@ impl CleanupStore for FaultyCleanupStore {
         &self,
         scope: &AccessScope,
         file_id: Uuid,
+        expected_etag: Option<String>,
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
         self.inner
-            .delete_file_with_event_collecting_versions(scope, file_id, audit, event)
+            .delete_file_with_event_collecting_versions(scope, file_id, expected_etag, audit, event)
             .await
     }
 

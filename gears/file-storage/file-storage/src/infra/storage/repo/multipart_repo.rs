@@ -336,6 +336,20 @@ impl MultipartRepo {
     /// `MultipartService::finish_session`'s takeover-fastpath and
     /// converge-after-lost-CAS paths -- decisions made independently of any
     /// finalize this same transaction just won) always passes `Some`.
+    ///
+    /// `expected_owner == None` also accepts `state = 'in_progress'`, not
+    /// just `'completing'`: by the time this embedded call runs, the
+    /// finalize CAS above it has already won on `status = 'pending'` alone,
+    /// so the version is becoming `available` regardless of what this
+    /// session's own `state` says -- but between this same owner's earlier
+    /// `acquire_complete_lease` and this call, another completer can have
+    /// taken over the lease and then lost its own race (`release_complete_lease`
+    /// putting the session back to `in_progress` so the next `complete` call
+    /// can retry). Without also matching `in_progress` here, that leaves the
+    /// session stuck there forever even though its version is already
+    /// `available`: this CAS is the only transition this gear ever runs
+    /// toward `completed`, and every other state (`aborted`, `completed`
+    /// itself) is deliberately left alone by not being named in either arm.
     pub async fn finish_complete<C: DBRunner>(
         &self,
         conn: &C,
@@ -344,12 +358,17 @@ impl MultipartRepo {
         result_json: &str,
     ) -> Result<bool, DomainError> {
         use sea_orm::sea_query::Expr;
-        let mut condition = sea_orm::Condition::all()
-            .add(UploadColumn::UploadId.eq(upload_id))
-            .add(UploadColumn::State.eq("completing"));
-        if let Some(owner) = expected_owner {
-            condition = condition.add(UploadColumn::LeaseOwner.eq(owner));
-        }
+        let mut condition = sea_orm::Condition::all().add(UploadColumn::UploadId.eq(upload_id));
+        condition = match expected_owner {
+            Some(owner) => condition
+                .add(UploadColumn::State.eq("completing"))
+                .add(UploadColumn::LeaseOwner.eq(owner)),
+            None => condition.add(
+                sea_orm::Condition::any()
+                    .add(UploadColumn::State.eq("completing"))
+                    .add(UploadColumn::State.eq("in_progress")),
+            ),
+        };
         let res = UploadEntity::update_many()
             .col_expr(UploadColumn::State, Expr::value("completed"))
             .col_expr(UploadColumn::MimeValidated, Expr::value(true))

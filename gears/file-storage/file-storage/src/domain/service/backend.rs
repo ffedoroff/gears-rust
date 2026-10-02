@@ -47,8 +47,11 @@ impl FileService {
     ///    the narrow, structurally-unclosable window before the CAS -- see
     ///    issue #5013); then transactionally rebind `backend_id`/
     ///    `backend_path`, gated on both the pre-migration pointer snapshot
-    ///    AND this call's own lease ownership, clearing the lease in the
-    ///    same statement on a win.
+    ///    AND this call's own lease ownership. The lease is deliberately left
+    ///    held on a won CAS -- see point 5 below and
+    ///    `VersionRepo::rebind_backend`'s own doc for why -- and the
+    ///    now-superseded source object is best-effort deleted immediately
+    ///    after, still under that same lease.
     /// 4. A timeout best-effort deletes the destination object -- but ONLY
     ///    if this call is known to have created it AND its own CAS attempt
     ///    had not yet started (see `Self::migrate_backend_transfer_and_commit`'s
@@ -56,11 +59,18 @@ impl FileService {
     ///    retryable `BackendUnavailable` (503 + `Retry-After`); the pointer
     ///    is never observed to change on a timeout.
     /// 5. The lease is released best-effort on every exit path (success,
-    ///    error, or timeout) -- a successful CAS already cleared it in the
-    ///    same statement, so this is a no-op there; on any other exit, a
-    ///    lease this call still held is freed immediately instead of making
-    ///    the next attempt wait out the full lease duration. A release that
-    ///    itself fails is not fatal: the lease simply expires on its own.
+    ///    error, or timeout), and only after that exit path's own attempt at
+    ///    deleting the superseded source object has already run (on a won
+    ///    CAS, that delete happens before `Self::migrate_backend_transfer_and_commit`
+    ///    returns -- see point 3). Releasing any earlier would reopen exactly
+    ///    the race this ordering exists to close: a second migration of the
+    ///    SAME version could acquire the freed lease and move it back onto
+    ///    the backend this call is still about to delete from (the
+    ///    destination path is deterministic, so both migrations target the
+    ///    identical path), and this call's delayed delete would then destroy
+    ///    the second migration's live object instead of the stale one it was
+    ///    meant to remove. A release that itself fails is not fatal: the
+    ///    lease simply expires on its own.
     ///
     /// Returns `Ok(())` when the file already lives on the target backend
     /// (no-op), or after the migration completes successfully.

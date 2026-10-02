@@ -365,11 +365,16 @@ impl Store {
     ///   here is safe: the version CAS a few lines down will correctly find
     ///   `status` already `available` and report `updated: false`, which is
     ///   the caller's existing, correct signal to converge.
-    /// - `in_progress` is reachable in principle too (an even-later takeover
-    ///   whose own assembly failed released its lease,
+    /// - `in_progress` is reachable too (an even-later takeover whose own
+    ///   assembly failed released its lease,
     ///   `MultipartRepo::release_complete_lease`, before this call's much
-    ///   older attempt finally lands) and is left to the same fallthrough --
-    ///   out of scope for this fix, which is about `aborted` specifically.
+    ///   older attempt finally lands) and is left to the same fallthrough:
+    ///   the version CAS below still wins on `status = 'pending'` alone, and
+    ///   `MultipartRepo::finish_complete`'s own `expected_owner == None` arm
+    ///   now matches `in_progress` too (not just `completing`), so the
+    ///   session's terminal CAS a few lines down still closes it out to
+    ///   `completed` instead of leaving it stranded `in_progress` forever
+    ///   with an already-`available` version underneath it.
     pub async fn finalize_multipart_version(
         &self,
         file_id: Uuid,
@@ -424,7 +429,7 @@ impl Store {
                 };
                 if reclaimed_by_cleanup {
                     return Err(DomainError::conflict(
-                        "multipart session is no longer completing (aborted by cleanup)",
+                        crate::domain::error::MULTIPART_SESSION_RECLAIMED_BY_CLEANUP_MESSAGE,
                     ));
                 }
                 let updated = versions
@@ -545,7 +550,12 @@ impl Store {
                 // already proves unique, legitimate authorship) and unsafe
                 // (it would re-strand the exact race
                 // `f2_stale_completer_converges_instead_of_stranding_after_
-                // owner_fencing_fix` exists to prevent).
+                // owner_fencing_fix` exists to prevent), and for why this
+                // `None` arm also accepts `state = 'in_progress'` (not just
+                // `'completing'`): a lease taken over and then released by a
+                // completer that lost its own race must not leave this
+                // session stranded there once ITS version is already
+                // `available`.
                 let session_completed = multipart
                     .finish_complete(tx, finish.upload_id, None, &result_json)
                     .await?;
@@ -1002,8 +1012,13 @@ impl Store {
     /// Transactionally update `backend_id` and `backend_path` for a version row,
     /// CAS-gated on `expected_backend_id`/`expected_backend_path` **and** on
     /// `owner` still holding the migration lease (`VersionRepo::rebind_backend`),
-    /// clearing that lease in the same `UPDATE` on a win, and write a
-    /// `BackendMigrate` audit row in the same transaction.
+    /// and write a `BackendMigrate` audit row in the same transaction.
+    /// Deliberately does NOT release the migration lease on a win -- it stays
+    /// held by `owner` until the caller's separate `release_migration_lease`
+    /// call, which `FileService::migrate_backend` only makes after it has
+    /// finished best-effort deleting the source object this migration just
+    /// superseded (see `VersionRepo::rebind_backend`'s own doc for why that
+    /// ordering matters).
     ///
     /// Returns `true` if the version row matched the expected pointer and the
     /// lease, and was updated. `false` means the version is gone, a
@@ -1090,8 +1105,9 @@ impl Store {
 
     /// Release a held migration lease (`VersionRepo::release_migration_lease`),
     /// scoped to `owner`. `migrate_backend` always calls this best-effort, on
-    /// every exit path; a lease this call no longer holds is left alone and
-    /// simply expires on its own.
+    /// every exit path -- after, on a successful migration, it has already
+    /// finished deleting the superseded source object -- and a lease this
+    /// call no longer holds is left alone and simply expires on its own.
     pub async fn release_migration_lease(
         &self,
         file_id: Uuid,

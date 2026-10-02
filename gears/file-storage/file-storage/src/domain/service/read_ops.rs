@@ -12,6 +12,7 @@ use crate::domain::error::DomainError;
 use crate::domain::etag;
 use crate::domain::ports::DeleteVersionOutcome;
 use crate::domain::service::{DownloadTicket, FileService};
+use crate::infra::content::hash_mode::HashMode;
 use crate::infra::external_clients::UsageDelta;
 
 impl FileService {
@@ -196,12 +197,23 @@ impl FileService {
         // `ETag` header with no DB lookup) and into the ticket returned here
         // — one source of truth (`etag::content_etag`).
         let content_etag = etag::content_etag(file_id, target);
+        // Whole-object download-hash verification: only `whole-sha256`
+        // versions carry a hash the sidecar can check against the full
+        // (non-Range) stream end-to-end -- a `multipart-composite-sha256`
+        // version's stored `hash_value` is a Merkle-style root over
+        // per-part digests (ADR-0006), not a digest of the assembled bytes,
+        // so it is meaningless to recompute by hashing the object straight
+        // through. Empty means "no check" (`Claims::content_sha256`'s own
+        // doc comment).
+        let content_sha256 = (HashMode::parse(&version.hash_mode) == Some(HashMode::WholeSha256))
+            .then(|| hex::encode(&version.hash_value))
+            .unwrap_or_default();
         let download_url = self.build_download_url(
             file_id,
             target,
             version.backend_id,
             version.backend_path,
-            Some((version.mime_type, content_etag.clone())),
+            Some((version.mime_type, content_etag.clone(), content_sha256)),
         )?;
         self.metrics.record_operation("download_url", "ok");
         Ok(DownloadTicket {
@@ -410,6 +422,12 @@ impl FileService {
     /// an `If-Match` content-ETag precondition, then best-effort delete the
     /// backend blobs. `If-Match` is **required** (see api.md §DELETE); pass `"*"`
     /// to delete unconditionally when the ETag is unknown.
+    ///
+    /// The precondition is checked twice: once here, against the pre-fetched
+    /// `file` (a fast reject for the common case, before any transaction is
+    /// opened), and once more inside `delete_file_inner`'s own transaction,
+    /// against the row it locks there -- see that method's doc comment for
+    /// why the early check alone is not enough.
     #[tracing::instrument(skip_all)]
     pub async fn delete_file(
         &self,
@@ -426,7 +444,7 @@ impl FileService {
 
         // Validate the If-Match precondition against the current content ETag.
         let current_etag = etag::etag_for(&file);
-        match if_match {
+        let expected_etag = match if_match {
             None => {
                 return Err(DomainError::precondition_failed(
                     "If-Match is required to delete a file",
@@ -439,17 +457,35 @@ impl FileService {
                         "If-Match does not match the current content ETag",
                     ));
                 }
+                // `"*"` means "no check" (see this method's own doc comment);
+                // anything else is re-verified against the row this call's
+                // own transaction locks, below.
+                (m != "*").then(|| m.to_owned())
             }
-        }
+        };
 
-        self.delete_file_inner(ctx, file_id).await?;
+        self.delete_file_inner(ctx, file_id, expected_etag).await?;
         self.metrics.record_operation("delete_file", "ok");
         Ok(())
     }
 
-    /// Inner (unconditional) file deletion: authorization and If-Match must have
-    /// already been checked by the caller. Removes the DB row (and FK children
-    /// via cascade), then best-effort-deletes all backend blobs.
+    /// Inner file deletion: authorization must have already been checked by
+    /// the caller. Removes the DB row (and FK children via cascade), then
+    /// best-effort-deletes all backend blobs.
+    ///
+    /// `expected_etag` re-verifies the `If-Match` precondition **inside** the
+    /// delete transaction, against the row it locks there -- `None` here
+    /// always means `delete_file`'s own `If-Match: *` (this method's only
+    /// caller), skipping the check entirely; see
+    /// [`crate::infra::storage::Store::delete_file_collecting_versions`]'s
+    /// doc comment for the other `None` callers that bypass `delete_file`
+    /// altogether (e.g. the retention-expiry sweep). The check `delete_file`
+    /// runs beforehand, against a `file` read before any transaction opened,
+    /// is only a fast reject for the common case: nothing stops the content
+    /// from being rebound between that read and this transaction's own lock,
+    /// and without a second check here the delete would go on to remove a
+    /// file whose content no longer matches the caller's `If-Match` at all --
+    /// precisely the precondition the client asked this call to enforce.
     ///
     /// The version list used for the audit/event `version_count` and for
     /// backend-blob cleanup is collected by
@@ -466,6 +502,7 @@ impl FileService {
         &self,
         ctx: &SecurityContext,
         file_id: Uuid,
+        expected_etag: Option<String>,
     ) -> Result<(), DomainError> {
         // Authorization has already been verified by callers; use allow_all() for
         // the DB scope — the tenant boundary was enforced by require_file() above.
@@ -498,7 +535,7 @@ impl FileService {
 
         let deleted = self
             .store
-            .delete_file_collecting_versions(&scope, file_id, audit, event)
+            .delete_file_collecting_versions(&scope, file_id, expected_etag, audit, event)
             .await?;
         if !deleted.removed {
             return Err(DomainError::file_not_found(file_id));

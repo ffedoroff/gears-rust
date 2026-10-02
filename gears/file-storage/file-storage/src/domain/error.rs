@@ -12,6 +12,16 @@ use uuid::Uuid;
 /// recovery path.
 pub const BACKEND_RETRY_AFTER_SECS: u64 = 5;
 
+/// `DomainError::Conflict`'s message when `Store::finalize_multipart_version`
+/// rejects an embedded finalize because the abandoned-session sweep already
+/// reclaimed (aborted) the session -- shared between the raise site
+/// (`infra/storage/store/versions.rs`) and `MultipartService`'s own match on
+/// it, so the two can never drift apart. `DomainError::Conflict` carries only
+/// a free-text message (no sub-kind of its own), so this constant is the
+/// single source of truth for recognizing this one specific conflict.
+pub const MULTIPART_SESSION_RECLAIMED_BY_CLEANUP_MESSAGE: &str =
+    "multipart session is no longer completing (aborted by cleanup)";
+
 /// Domain-specific errors. Mapped to RFC-9457 Problem at the REST boundary
 /// (`api/rest/error.rs`).
 #[domain_model]

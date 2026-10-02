@@ -423,6 +423,7 @@ async fn finalize_version_bind_claim_won_sets_bound_header_and_etag() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: true,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -531,6 +532,7 @@ async fn finalize_version_bind_claim_lost_cas_reports_conflict_header() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: true,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())

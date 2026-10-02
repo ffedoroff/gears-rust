@@ -123,10 +123,12 @@ impl CleanupStore for Store {
         &self,
         scope: &toolkit_security::AccessScope,
         file_id: Uuid,
+        expected_etag: Option<String>,
         audit: crate::domain::audit::AuditEntry,
         event: Option<crate::domain::audit::FileEvent>,
     ) -> Result<crate::domain::ports::DeletedFile, DomainError> {
-        Store::delete_file_collecting_versions(self, scope, file_id, audit, event).await
+        Store::delete_file_collecting_versions(self, scope, file_id, expected_etag, audit, event)
+            .await
     }
 
     async fn delete_orphan_file_with_event(

@@ -1244,16 +1244,37 @@ impl CleanupEngine {
                 "version_id": session.version_id,
             }),
         );
-        if let Err(e) = self
+        match self
             .store
             .delete_pending_version(session.file_id, session.version_id, del_audit)
             .await
         {
-            tracing::warn!(
-                error = ?e,
-                version_id = %session.version_id,
-                "cleanup: failed to delete pending version for expired multipart"
-            );
+            Ok(true) => {
+                // Best-effort delete the object at this version's
+                // (backend_id, backend_path), beyond the `abort_multipart`
+                // call above: a completer can have successfully assembled the
+                // object on the backend (its own `complete_multipart`
+                // succeeded) and then crashed or failed before finalizing the
+                // DB row, leaving the deterministic path occupied by a real,
+                // fully-assembled object -- `abort_multipart` alone only
+                // discards the backend's own in-progress-upload handle, which
+                // is already gone once assembly succeeded, so it can never
+                // reclaim this. Only reached when the pending row was
+                // actually just removed here (not when it had already been
+                // flipped to `available` by a racing
+                // `complete_multipart_upload`, in which case this version --
+                // and its backend object -- is live content, never to be
+                // touched).
+                self.best_effort_delete(&backend_id, &backend_path).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    version_id = %session.version_id,
+                    "cleanup: failed to delete pending version for expired multipart"
+                );
+            }
         }
 
         // The session is now `aborted` (the caller only reaches this method
@@ -1529,7 +1550,7 @@ impl CleanupEngine {
         let scope = toolkit_security::AccessScope::allow_all();
         match self
             .store
-            .delete_file_with_event_collecting_versions(&scope, file.file_id, audit, event)
+            .delete_file_with_event_collecting_versions(&scope, file.file_id, None, audit, event)
             .await
         {
             Ok(DeletedFile {

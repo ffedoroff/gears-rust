@@ -121,6 +121,7 @@ use uuid::Uuid;
 use file_storage::domain::error::{BACKEND_RETRY_AFTER_SECS, DomainError};
 use file_storage::domain::ports::FileStorageMetricsPort;
 use file_storage::infra::backend::{BackendRegistry, LocalFsBackend, S3Backend, StorageBackend};
+use file_storage::infra::content::stream_verify::verify_whole_object_download_stream;
 use file_storage::infra::content::{hash, range};
 use file_storage::infra::metrics::FileStorageMetricsMeter;
 use file_storage::infra::signed_url::{
@@ -2114,6 +2115,20 @@ async fn download_range(
 /// buffer first — the sidecar's own `FS_SIDECAR_MAX_BODY_BYTES` default alone
 /// permits objects up to 5 GiB, and a whole in-memory copy per concurrent
 /// whole-object download at that size is not acceptable.
+///
+/// When `claims.content_sha256` is non-empty, the stream is also verified
+/// against it end-to-end (`verify_whole_object_download_stream`): without
+/// this, the bytes actually sitting at `claims.backend_path` are served as-is
+/// on the strength of the token alone, with nothing re-confirming they are
+/// still the version this token was issued for -- a deleted version's path
+/// can be reoccupied by a fresh upload (a still-live upload token reusing the
+/// same deterministic path) before an old, still-valid download token for the
+/// original content gets used, which would otherwise serve the new bytes
+/// under the old `ETag` with no way for the client to detect it. A mismatch
+/// aborts the response mid-stream instead of completing it. `download_range`
+/// never performs this check: a partial range's bytes cannot be compared
+/// against a digest of the whole object (see `Claims::content_sha256`'s own
+/// doc comment).
 async fn download_whole(
     state: &SidecarState,
     backend: &Arc<dyn StorageBackend>,
@@ -2126,6 +2141,17 @@ async fn download_whole(
     // can refuse a body that would disagree with it.
     match backend.get_stream(path, total).await {
         Ok(stream) => {
+            // Whole-object download-hash verification (empty
+            // `content_sha256` -- old tokens, `Range`/multipart-composite
+            // versions -- means no check; see `Claims::content_sha256`'s own
+            // doc comment). Applied before the observability wrapper below so
+            // a hash-mismatch `Err` is still counted/logged by it exactly
+            // like any other mid-stream backend failure.
+            let stream = if claims.content_sha256.is_empty() {
+                stream
+            } else {
+                verify_whole_object_download_stream(stream, claims.content_sha256.clone())
+            };
             // Counted per chunk as it is handed to the client — see
             // `download_range`'s identical comment for why.
             let body_stream = download_stream_with_observability(

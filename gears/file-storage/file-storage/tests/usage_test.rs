@@ -421,6 +421,7 @@ async fn finalize_by_token_reports_positive_byte_delta() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     svc.finalize_upload_by_token(&claims, size, digest)
         .await

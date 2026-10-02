@@ -333,11 +333,14 @@ pub trait CleanupStore: Send + Sync {
     /// enqueue a file-event, and audit — all atomically. See
     /// `Store::delete_file_collecting_versions`'s doc comment for why the
     /// version list must be read inside this transaction, not by the caller
-    /// beforehand.
+    /// beforehand, and for what `expected_etag` re-checks there (`None` here:
+    /// every `CleanupStore` caller -- e.g. retention expiry -- has already
+    /// decided the file must go regardless of its current content).
     async fn delete_file_with_event_collecting_versions(
         &self,
         scope: &AccessScope,
         file_id: Uuid,
+        expected_etag: Option<String>,
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<DeletedFile, DomainError>;

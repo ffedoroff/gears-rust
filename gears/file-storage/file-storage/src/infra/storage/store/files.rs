@@ -11,6 +11,7 @@ use file_storage_sdk::{File, NewFile, OwnerFilter};
 
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
+use crate::domain::etag;
 use crate::domain::ports::DeletedFile;
 use crate::infra::storage::db::{db_err, transaction_with_bounded_retry};
 use crate::infra::storage::store::versions::UNBOUNDED_VERSIONS;
@@ -240,6 +241,24 @@ impl Store {
     /// transaction runs, so it must not bake a stale one into the JSON it
     /// hands in.
     ///
+    /// # `expected_etag` re-checks `If-Match` against the locked row
+    ///
+    /// `expected_etag` is `FileService::delete_file`'s already-validated
+    /// `If-Match` value, carried all the way into this transaction instead of
+    /// being trusted from the pre-transaction read that produced it. `None`
+    /// means no check (`If-Match: *`, or an internal caller -- retention
+    /// expiry, orphan reclaim -- that has already decided unconditionally).
+    /// `Some(expected)` is compared, immediately after the row lock below,
+    /// against the ETag derived from the locked row's own `content_id`
+    /// (`etag::content_etag`); a mismatch rolls back the whole transaction
+    /// with `DomainError::precondition_failed` before any version is listed
+    /// or any row deleted. Without this, a `bind`/`restore_version` landing
+    /// between `delete_file`'s pre-transaction read and this transaction's
+    /// own lock would delete content the caller's `If-Match` never actually
+    /// approved -- the precondition would be enforced against an
+    /// already-stale snapshot instead of the row this transaction is about
+    /// to remove.
+    ///
     /// # Row lock closes the delete-vs-insert race
     ///
     /// The transaction's first statement locks the `files` row
@@ -262,6 +281,7 @@ impl Store {
         &self,
         scope: &AccessScope,
         file_id: Uuid,
+        expected_etag: Option<String>,
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<DeletedFile, DomainError> {
@@ -282,6 +302,7 @@ impl Store {
             let audit_repo = audit_repo.clone();
             let events_repo = events_repo.clone();
             let del_scope = del_scope.clone();
+            let expected_etag = expected_etag.clone();
             let mut audit = audit.clone();
             let mut event = event.clone();
             Box::pin(async move {
@@ -290,15 +311,25 @@ impl Store {
                 // doc comment. `None` means the file is already gone (a
                 // concurrent delete/expiry won outright); nothing left to
                 // collect or remove.
-                if files
-                    .lock_for_update(tx, &del_scope, file_id)
-                    .await?
-                    .is_none()
-                {
+                let Some(locked) = files.lock_for_update(tx, &del_scope, file_id).await? else {
                     return Ok::<DeletedFile, DomainError>(DeletedFile {
                         removed: false,
                         versions: Vec::new(),
                     });
+                };
+
+                // Re-check `If-Match` against the row this transaction just
+                // locked -- see this method's doc comment for why the
+                // pre-transaction check alone is not enough.
+                if let Some(expected) = expected_etag {
+                    let current = locked
+                        .content_id
+                        .map(|cid| etag::content_etag(file_id, cid));
+                    if current.as_deref() != Some(expected.as_str()) {
+                        return Err(DomainError::precondition_failed(
+                            "If-Match does not match the current content ETag",
+                        ));
+                    }
                 }
 
                 // Fresh, in-transaction snapshot -- see this method's doc

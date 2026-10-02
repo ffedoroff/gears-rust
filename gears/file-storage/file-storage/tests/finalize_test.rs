@@ -387,6 +387,7 @@ async fn finalize_by_token_without_prior_put_is_rejected() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
 
     let err = svc
@@ -970,6 +971,7 @@ async fn finalize_with_internal_secret_required_rejects_missing_header() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1040,6 +1042,7 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1130,6 +1133,7 @@ async fn finalize_with_expired_token_accepted_within_grace() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1197,6 +1201,7 @@ async fn finalize_with_expired_token_rejected_beyond_grace() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1281,6 +1286,7 @@ async fn finalize_accepts_token_signed_by_previous_key_after_rotation() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     // Minted under the OLD seed -- exactly what a real client's in-flight
     // upload would carry into the callback below.
@@ -1389,6 +1395,7 @@ async fn finalize_rejects_token_signed_by_previous_key_without_rotation_config()
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = old_issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1473,6 +1480,7 @@ async fn finalize_accepts_expired_previous_key_token_within_grace_after_rotation
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = old_issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1623,6 +1631,7 @@ async fn report_part_with_expired_token_passes_verification_within_grace() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1695,6 +1704,7 @@ async fn report_part_with_expired_token_rejected_beyond_grace() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1761,6 +1771,7 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, time::OffsetDateTime::now_utc())
@@ -1833,6 +1844,7 @@ async fn finalize_with_bind_claim_binds_first_content() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: true,
+        content_sha256: String::new(),
     };
     let outcome = svc
         .finalize_upload_by_token(
@@ -1905,6 +1917,7 @@ async fn finalize_by_token_retry_replays_bound_decision_despite_later_rebind() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: true,
+        content_sha256: String::new(),
     };
     let original = svc
         .finalize_upload_by_token(
@@ -2023,6 +2036,7 @@ async fn finalize_bind_claim_lost_cas_reports_conflict() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: true,
+        content_sha256: String::new(),
     };
     let outcome = svc
         .finalize_upload_by_token(
@@ -2106,6 +2120,7 @@ async fn finalize_by_token_retry_after_lost_cas_still_reports_conflict() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: true,
+        content_sha256: String::new(),
     };
     let original = svc
         .finalize_upload_by_token(
@@ -2180,6 +2195,7 @@ async fn finalize_manual_token_converges_on_retry() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
 
     let outcome = svc
@@ -2253,6 +2269,7 @@ async fn finalize_manual_token_converges_to_bound_after_manual_bind() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
 
     svc.finalize_upload_by_token(
@@ -2313,6 +2330,7 @@ async fn finalize_manual_token_retry_with_mismatched_hash_is_rejected() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
 
     svc.finalize_upload_by_token(

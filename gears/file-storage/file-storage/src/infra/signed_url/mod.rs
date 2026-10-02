@@ -147,6 +147,19 @@ pub struct Claims {
     /// verification tolerant of tokens minted before this field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bind_on_finalize: bool,
+    /// Whole-object content hash, hex-encoded SHA-256 (`op = get` tokens
+    /// only; `GET`/full download, never a `Range` request -- a partial
+    /// range's bytes cannot be checked against a whole-object digest).
+    /// Populated only when the version's own `hash_mode` is
+    /// `whole-sha256` -- never for `multipart-composite-sha256`, whose
+    /// stored `hash_value` is a Merkle-style root over per-part digests, not
+    /// a digest of the assembled bytes themselves (ADR-0006), so it cannot
+    /// be recomputed by hashing the object end-to-end. Empty means "no
+    /// check": the sidecar skips verification entirely, which is also what
+    /// happens for every token minted before this field existed
+    /// (`#[serde(default)]` keeps verification tolerant of those).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_sha256: String,
 }
 
 fn is_default_constraints(c: &UploadConstraints) -> bool {

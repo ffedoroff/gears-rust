@@ -193,6 +193,7 @@ async fn download_rejects_conflicting_query_and_header_tokens() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let query_token = issuer
         .issue(base_claims.clone(), OffsetDateTime::now_utc())
@@ -553,6 +554,7 @@ fn download_token_with_meta(
         content_type: content_type.to_owned(),
         etag: etag.to_owned(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -2111,6 +2113,7 @@ fn upload_token(
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -2150,6 +2153,7 @@ fn multipart_part_token(
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -2359,6 +2363,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
 
     let err =
@@ -2397,6 +2402,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
 
     let err = write_multipart_part_offset_object(
@@ -2971,6 +2977,7 @@ fn build_config_rotation_accepts_old_key_while_listed_then_rejects_once_removed(
                 content_type: String::new(),
                 etag: String::new(),
                 bind_on_finalize: false,
+                content_sha256: String::new(),
             },
             OffsetDateTime::now_utc(),
         )
@@ -3226,6 +3233,7 @@ async fn upload_exact_size_mismatch_returns_400_and_deletes_created_object() {
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -3383,6 +3391,7 @@ async fn upload_succeeds_when_token_expires_after_verification_while_body_still_
         content_type: String::new(),
         etag: String::new(),
         bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     let token = issuer
         .issue(claims, OffsetDateTime::now_utc())

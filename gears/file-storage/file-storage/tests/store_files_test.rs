@@ -487,6 +487,7 @@ async fn files_delete_with_event_cascades_versions_and_metadata() {
         .delete_file_collecting_versions(
             &scope,
             file_id,
+            None,
             audit_entry(tenant_id, file_id, AuditOperation::DeleteFile),
             Some(file_event(tenant_id, owner_id, file_id, "file.deleted")),
         )
@@ -589,6 +590,7 @@ async fn files_delete_with_event_cascades_file_scope_retention_rule() {
         .delete_file_collecting_versions(
             &scope,
             file_id,
+            None,
             audit_entry(tenant_id, file_id, AuditOperation::DeleteFile),
             Some(file_event(tenant_id, owner_id, file_id, "file.deleted")),
         )

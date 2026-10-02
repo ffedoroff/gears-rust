@@ -884,6 +884,7 @@ async fn delete_file_collecting_versions_returns_false_for_missing_file() {
         .delete_file_collecting_versions(
             &scope,
             file_id,
+            None,
             audit_entry(tenant_id, file_id, AuditOperation::DeleteFile),
             None,
         )

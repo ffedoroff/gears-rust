@@ -1475,6 +1475,7 @@ async fn f11_finalize_multipart_version_rejects_after_cleanup_aborts_completing_
         .delete_file_collecting_versions(
             &AccessScope::allow_all(),
             file_id,
+            None,
             AuditEntry::success(
                 tenant_id,
                 "system",
@@ -2127,6 +2128,7 @@ async fn delete_file_vs_concurrent_insert_version_has_no_silent_loss() {
                 .delete_file_collecting_versions(
                     &AccessScope::allow_all(),
                     file_id,
+                    None,
                     race_audit(
                         tenant_id,
                         file_id,
@@ -2406,6 +2408,7 @@ async fn delete_last_version_vs_concurrent_insert_second_version_has_no_silent_l
             .delete_file_collecting_versions(
                 &AccessScope::allow_all(),
                 file_id,
+                None,
                 race_audit(
                     tenant_id,
                     file_id,
@@ -2558,6 +2561,7 @@ async fn orphan_reclaim_vs_concurrent_insert_version_has_no_silent_loss() {
             .delete_file_collecting_versions(
                 &AccessScope::allow_all(),
                 file_id,
+                None,
                 race_audit(
                     tenant_id,
                     file_id,

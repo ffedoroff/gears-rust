@@ -199,6 +199,7 @@ async fn delete_file_collecting_versions_does_not_leak_a_concurrently_added_vers
         .delete_file_collecting_versions(
             &toolkit_security::AccessScope::allow_all(),
             file_id,
+            None,
             audit(
                 tenant_id,
                 file_id,

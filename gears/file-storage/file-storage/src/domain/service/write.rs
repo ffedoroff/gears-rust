@@ -389,15 +389,17 @@ impl FileService {
     /// Issue a signed download URL for a version (shared helper used by
     /// `read_ops.rs`). Visibility is `pub(super)` so only sibling modules use it.
     ///
-    /// `download_meta` is `Some((content_type, etag))` (P2 1.11) — threaded
-    /// straight through to `sign_url`'s `Op::Get`-only claims population.
+    /// `download_meta` is `Some((content_type, etag, content_sha256))` (P2
+    /// 1.11; `content_sha256` empty unless the version is whole-object-hash
+    /// mode) — threaded straight through to `sign_url`'s `Op::Get`-only
+    /// claims population.
     pub(super) fn build_download_url(
         &self,
         file_id: Uuid,
         version_id: Uuid,
         backend_id: String,
         backend_path: String,
-        download_meta: Option<(String, String)>,
+        download_meta: Option<(String, String, String)>,
     ) -> Result<String, DomainError> {
         self.sign_url(
             Op::Get,

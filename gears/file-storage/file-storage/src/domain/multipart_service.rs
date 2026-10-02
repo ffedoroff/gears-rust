@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::domain::audit::{AuditEntry, AuditOperation, FileEvent};
 use crate::domain::authz::{Authorizer, actions};
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, MULTIPART_SESSION_RECLAIMED_BY_CLEANUP_MESSAGE};
 use crate::domain::etag;
 use crate::domain::multipart::{
     BindState, CompletedMultipartUpload, DEFAULT_MIN_PART_SIZE, MAX_PART_SIZE, MissingPart,
@@ -405,6 +405,9 @@ impl MultipartService {
             // Multipart binds via `complete` (session auto_bind), never via
             // the per-part token.
             bind_on_finalize: false,
+            // GET-only claim; a multipart-part token is always `op =
+            // multipart_part`, never `op = get`.
+            content_sha256: String::new(),
         };
         let token = self.issuer.issue(claims, now)?;
         Ok(format!(
@@ -1446,7 +1449,7 @@ impl MultipartService {
         // transactions; now there is no gap for it to land in. See
         // `ports::MultipartStore::finalize_multipart_version`'s doc.
         let session_audit = Self::multipart_complete_audit(ctx, session);
-        let finalize_outcome = self
+        let finalize_outcome = match self
             .store
             .finalize_multipart_version(
                 file_id,
@@ -1468,7 +1471,34 @@ impl MultipartService {
                     session_audit,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The object at `backend_path` was already assembled for
+                // real above (`backend.complete_multipart` succeeded, or the
+                // takeover branch confirmed it exists) by the time this call
+                // could even run -- so when the embedded finalize rejects
+                // because the abandoned-session sweep reclaimed (aborted)
+                // this session out from under it, that assembled object is
+                // now an orphan no DB row will ever reference again (the
+                // sweep that aborted the session also deletes its part rows
+                // and, once the pending version ages out, the version row
+                // itself). Best-effort delete it here rather than leaving it
+                // for the orphan-reconciliation sweep to never find (it only
+                // ever looks at rows still in the database, and this object
+                // was never committed to one).
+                if matches!(
+                    &e,
+                    DomainError::Conflict { message }
+                        if *message == MULTIPART_SESSION_RECLAIMED_BY_CLEANUP_MESSAGE
+                ) {
+                    self.best_effort_blob_delete(&backend_id, &backend_path)
+                        .await;
+                }
+                return Err(e);
+            }
+        };
         let finalized = finalize_outcome.updated;
         let bound = finalize_outcome.bound;
         if !finalized {
@@ -1959,5 +1989,20 @@ impl MultipartService {
             .await?;
 
         Ok(())
+    }
+
+    /// Delete a backend blob, logging (not failing) on error -- mirrors
+    /// `FileService::best_effort_blob_delete` exactly (not shared directly:
+    /// that one is `pub(super)` to `domain::service`, and this struct lives
+    /// in a sibling module). A failed delete degrades to an orphan reconciled
+    /// by the P2 cleanup engine.
+    async fn best_effort_blob_delete(&self, backend_id: &str, path: &str) {
+        let Ok(backend) = self.backends.get(backend_id) else {
+            return;
+        };
+        if let Err(err) = backend.delete(path).await {
+            self.metrics.record_backend_error(backend_id, "delete");
+            tracing::warn!(?err, path, "best-effort backend delete failed");
+        }
     }
 }

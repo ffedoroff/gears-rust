@@ -635,10 +635,21 @@ impl VersionRepo {
     /// Transactionally update `backend_id` and `backend_path` for a version row,
     /// CAS-gated on the version's *current* `backend_id`/`backend_path` **and**
     /// on `owner` still holding the migration lease. Used by backend
-    /// migration. Clears the lease (`migration_lease_owner`/
-    /// `migration_lease_until` -> `NULL`) in the same `UPDATE` on a won CAS,
-    /// so a successful migration always leaves the version lease-free without
-    /// a separate `release_migration_lease` round trip.
+    /// migration. Deliberately does NOT touch `migration_lease_owner`/
+    /// `migration_lease_until` on a won CAS -- the lease stays held by
+    /// `owner` until the caller's own, separate `release_migration_lease`
+    /// call, which `migrate_backend` only makes after it has finished
+    /// best-effort deleting the (now-superseded) source object. If this CAS
+    /// freed the lease itself, there would be a window, between this `UPDATE`
+    /// committing and that source delete actually running, where the lease is
+    /// free: a second migration of the SAME version could acquire it, migrate
+    /// the version back onto the very backend this call is about to delete
+    /// from (the destination path is deterministic -- `storage_layout::
+    /// backend_path` -- so both migrations land on the identical path), and
+    /// have that move committed before this call's delayed delete runs. The
+    /// delete would then remove the second migration's live object instead of
+    /// the stale one it was meant to clean up. Holding the lease across the
+    /// whole cleanup, not just the pointer swap, closes that window.
     ///
     /// The `migration_lease_owner = owner` predicate means this can now lose
     /// the CAS for a THIRD reason beyond the two `rebind_backend` already
@@ -657,6 +668,12 @@ impl VersionRepo {
     /// already moved the row past `expected_backend_id`/`expected_backend_path`),
     /// or "the lease moved on from `owner`" (see above) — the caller must
     /// re-fetch to distinguish these.
+    ///
+    /// Repeating this call for the same version after it already migrated
+    /// successfully still reads as a safe no-op end-to-end: a retried
+    /// `migrate_backend` sees the version already sitting on the requested
+    /// target backend and returns early, before ever reaching this CAS (see
+    /// `FileService::migrate_backend`'s own no-op check).
     #[allow(clippy::too_many_arguments)]
     pub async fn rebind_backend<C: DBRunner>(
         &self,
@@ -673,14 +690,6 @@ impl VersionRepo {
         let res = Entity::update_many()
             .col_expr(Column::BackendId, Expr::value(new_backend_id))
             .col_expr(Column::BackendPath, Expr::value(new_backend_path))
-            .col_expr(
-                Column::MigrationLeaseOwner,
-                Expr::value(Option::<Uuid>::None),
-            )
-            .col_expr(
-                Column::MigrationLeaseUntil,
-                Expr::value(Option::<OffsetDateTime>::None),
-            )
             .filter(
                 Condition::all()
                     .add(Column::FileId.eq(file_id))
@@ -703,6 +712,13 @@ impl VersionRepo {
     /// expired (`migration_lease_until` is in the past). `false` means a
     /// live lease is held by someone else -- `FileService::migrate_backend`
     /// surfaces that as `Conflict` (409).
+    ///
+    /// The lease acquired here is held not just for the pointer swap
+    /// (`rebind_backend`'s CAS) but for the best-effort deletion of the
+    /// source object that follows it -- `rebind_backend` no longer clears the
+    /// lease itself; only `release_migration_lease` does, and
+    /// `FileService::migrate_backend` only calls that after the source
+    /// delete. See `rebind_backend`'s own doc comment for why.
     ///
     /// Both the expiry check and the new `migration_lease_until` value are
     /// computed **by the database itself** (`now()` on Postgres,
@@ -760,6 +776,13 @@ impl VersionRepo {
     /// moved on from `owner` -- both are fine to ignore: `migrate_backend`
     /// always calls this best-effort, on every exit path, and a lease that
     /// outlives this call simply expires on its own.
+    ///
+    /// This is now the ONLY place that clears `migration_lease_owner`/
+    /// `migration_lease_until` on a successful migration (`rebind_backend`'s
+    /// CAS deliberately leaves them alone -- see its doc comment); a won
+    /// migration therefore stays leased from the CAS commit through the
+    /// best-effort source-object delete that `migrate_backend` performs
+    /// before calling this method.
     pub async fn release_migration_lease<C: DBRunner>(
         &self,
         conn: &C,

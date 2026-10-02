@@ -709,6 +709,7 @@ impl CleanupStore for FaultyListVersionsStore {
         &self,
         scope: &toolkit_security::AccessScope,
         file_id: Uuid,
+        expected_etag: Option<String>,
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
@@ -716,7 +717,13 @@ impl CleanupStore for FaultyListVersionsStore {
             Err(DomainError::InternalError)
         } else {
             self.inner
-                .delete_file_with_event_collecting_versions(scope, file_id, audit, event)
+                .delete_file_with_event_collecting_versions(
+                    scope,
+                    file_id,
+                    expected_etag,
+                    audit,
+                    event,
+                )
                 .await
         }
     }
@@ -883,11 +890,12 @@ impl CleanupStore for FaultyListFilesByIdsStore {
         &self,
         scope: &toolkit_security::AccessScope,
         file_id: Uuid,
+        expected_etag: Option<String>,
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
         self.inner
-            .delete_file_with_event_collecting_versions(scope, file_id, audit, event)
+            .delete_file_with_event_collecting_versions(scope, file_id, expected_etag, audit, event)
             .await
     }
 
@@ -1052,11 +1060,12 @@ impl CleanupStore for CountingCleanupStoreWrapper {
         &self,
         scope: &toolkit_security::AccessScope,
         file_id: Uuid,
+        expected_etag: Option<String>,
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
         self.inner
-            .delete_file_with_event_collecting_versions(scope, file_id, audit, event)
+            .delete_file_with_event_collecting_versions(scope, file_id, expected_etag, audit, event)
             .await
     }
 
