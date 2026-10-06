@@ -35,6 +35,7 @@ pub(crate) mod reasons {
     pub const INVALID_FILTER: &str = "INVALID_FILTER";
     pub const INVALID_ORDERBY_FIELD: &str = "INVALID_ORDERBY_FIELD";
     pub const INVALID_SELECT: &str = "INVALID_SELECT";
+    pub const SECRET_SELECT_FIELDS: &str = "SECRET_SELECT_FIELDS";
 }
 
 fn invalid_filter(detail: impl Into<String>) -> DomainError {
@@ -113,9 +114,9 @@ const SELECT_ALLOWLIST: &[&str] = &[
 ];
 
 /// The administrative record fields (ADR-0004 Amendment A): naming any of
-/// these in `$select` requires `read`/`list` — in addition to, or instead
-/// of, `read_secret` — because disclosing them is that action's privilege,
-/// not `read_secret`'s. Distinct from the envelope fields (`reference`,
+/// these in the point read's `$select` requires `read` — in addition to, or
+/// instead of, `read_secret` — because disclosing them is that action's
+/// privilege, not `read_secret`'s. Distinct from the envelope fields (`reference`,
 /// `type`, `expires_at`), which carry no action requirement of their own and
 /// ride along under whichever action the rest of the projection already
 /// needs.
@@ -144,15 +145,37 @@ pub(crate) fn validate_select(fields: &[String]) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// The collection read's `$select` rule: `secret` may be combined only with
+/// the envelope fields (`reference`, `type`, `expires_at`), so the collection
+/// with `secret` selected is authorized by `read_secret` alone; any
+/// administrative field beside it is `SECRET_SELECT_FIELDS`. The point read
+/// has no such rule (`read` + `read_secret`).
+pub(crate) fn validate_collection_select(fields: &[String]) -> Result<(), DomainError> {
+    if secret_selected(Some(fields))
+        && fields
+            .iter()
+            .any(|f| !matches!(f.as_str(), "secret" | "reference" | "type" | "expires_at"))
+    {
+        return Err(DomainError::InvalidRequest {
+            field: "$select",
+            reason: reasons::SECRET_SELECT_FIELDS,
+            detail: "on the collection, $select with secret may name only reference, type, \
+                     expires_at"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// `true` iff `fields` names `secret` — the switch that makes the collection
 /// read carry each item's value (ADR-0004).
 pub(crate) fn secret_selected(fields: Option<&[String]>) -> bool {
     fields.is_some_and(|fields| fields.iter().any(|f| f == "secret"))
 }
 
-/// `true` iff `fields` names one of [`ADMIN_FIELDS`] — the point read's and
-/// the collection read's secret selection's shared trigger for requiring `read`/`list` on
-/// top of (or instead of) `read_secret` (ADR-0004 Amendment A).
+/// `true` iff `fields` names one of [`ADMIN_FIELDS`] — the point read's
+/// trigger for requiring `read` on top of (or instead of) `read_secret`
+/// (ADR-0004 Amendment A).
 pub(crate) fn admin_field_selected(fields: Option<&[String]>) -> bool {
     fields.is_some_and(|fields| fields.iter().any(|f| ADMIN_FIELDS.contains(&f.as_str())))
 }
