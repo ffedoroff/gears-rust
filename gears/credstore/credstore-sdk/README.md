@@ -19,7 +19,7 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
   `supports_destroy`. It holds no sharing/hierarchy/policy — that lives in the
   gear (ADR-0006)
 - **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`Credential`** / **`Secret`** — Domain models
-- **`CredStoreError`** — Error types for all operations; `SecretExpired` means the decisive record's secret has expired (its metadata stays readable with status `expired`; never served, never replaced by an ancestor's value); a stored version the backend can never return (lost or rotated decryption key, corrupt entry, or a version gone although the pointer did not move) surfaces as `Internal` — permanent, retrying does not help, the record must be rewritten or deleted (REST: `500`; in secret-mode `list` such an item fails the request)
+- **`CredStoreError`** — Error types for all operations; `SecretExpired` means the decisive record's secret has expired (its metadata stays readable with status `expired`; never served, never replaced by an ancestor's value); a stored version the backend can never return (lost or rotated decryption key, corrupt entry, or a version gone although the pointer did not move) surfaces as `Internal` — permanent, retrying does not help, the record must be rewritten or deleted (REST: `500`; in a `list` with `secret` selected such an item fails the request)
 - **`CredStorePluginSpecV1`** — GTS schema for plugin registration
 
 ## `CredStoreClientV1`
@@ -46,14 +46,15 @@ and its optional secret (ADR-0004, ADR-0007):
   never creates
 - `list` — takes an `OData` query (`filter`, `select`, `orderby`, `limit`,
   `cursor`) over credential records; an item's `secret` is present only when
-  `select` names it. Selecting `secret` switches the call into **secret mode**
-  (ADR-0005): `limit` and `cursor` are rejected, results are capped and not
-  paginated, and only `reference in (...)` or `type eq`/`in` may filter.
-  Without `secret` selected, `list` is paginated and never carries secrets
+  `select` names it. Selecting `secret` keeps the call paginated
+  (ADR-0005): `limit`, `cursor`, `orderby` and `filter` behave as without it,
+  and it requires `read_secret`; records of a type the caller may not
+  `read_secret` are omitted. Without `secret` selected, `list` never carries
+  secrets
 - `delete` — precondition-guarded delete of the record and its secret
 
 There is no `create` (`put` under the create-only precondition is create) and
-no separate bulk-read method (`list` in secret mode is the bulk read).
+no separate bulk-read method (`list` with `secret` selected returns the secrets of its page).
 
 Rotating only the secret is a `patch` with only `secret`. `put` is a whole
 replace: an omitted expiry is cleared and `fallback` resets to `inherit` (the

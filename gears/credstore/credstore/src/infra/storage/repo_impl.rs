@@ -39,6 +39,15 @@ impl SecretRepo for SecretRepoImpl {
         reads::resolve_for_get(self, req_tenant, subject, key, chain).await
     }
 
+    async fn resolve_non_private(
+        &self,
+        req_tenant: TenantId,
+        key: &SecretRef,
+        chain: &[Uuid],
+    ) -> Result<Option<SecretRow>, DomainError> {
+        reads::resolve_non_private(self, req_tenant, key, chain).await
+    }
+
     async fn resolve_candidates(
         &self,
         req_tenant: TenantId,

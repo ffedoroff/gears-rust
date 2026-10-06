@@ -152,13 +152,11 @@ pub fn map_plugin_err(e: CredStoreError) -> DomainError {
 }
 
 /// Collection-read settings (`Service::list`, ADR-0005/ADR-0004), from
-/// `ListCfg`: the metadata-mode page-size cap (`limit`/`$top`) and the
-/// secret-mode (`$select` containing `secret`) match-set cap.
+/// `ListCfg`: the page-size cap (`limit`/`$top`).
 #[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct ListSettings {
     pub max_limit: u64,
-    pub secret_mode_cap: u64,
 }
 
 /// Secret-write settings (`WriteCfg`): how long a write intent is protected
@@ -474,7 +472,7 @@ impl Service {
         // field alongside it) — the shape `get_secret` uses; `read_secret`
         // is required whenever `secret` is named. At least one is always
         // `true`.
-        let need_value = list_filter::is_secret_mode(fields);
+        let need_value = list_filter::secret_selected(fields);
         let need_admin = list_filter::admin_field_selected(fields);
         let need_read = !need_value || need_admin;
         let need_read_secret = need_value;
@@ -794,8 +792,8 @@ impl Service {
     /// found (a concurrent write switched the pointer and destroyed the old
     /// version) -> re-read the row once and, if `value_version` changed, `get`
     /// again; a second miss is 503. The shared tail of [`Self::get_secret`]
-    /// and, per reduced winner, the collection read's secret mode (ADR-0005
-    /// "Bulk secret read").
+    /// and, per reduced winner, the collection read's `secret` selection
+    /// (ADR-0004).
     ///
     /// Callers MUST have already checked `row.value_version.is_some()` (a
     /// `declared`/suppressed row has nothing to read, and never causes a store
@@ -1055,11 +1053,11 @@ impl Service {
     /// missing type on create (`TYPE_REQUIRED`), or a create over a reference
     /// that currently resolves, for the creating caller (its tenant, owner
     /// and ancestor chain), to a record of a different type
-    /// (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's `shared` record or,
-    /// when creating a private record, the tenant's own non-private one — or
+    /// (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's `shared` record — or
     /// over a reference a descendant tenant of the creator already holds, in
-    /// any status and sharing mode, with a different type
-    /// (`TYPE_MISMATCH_WITH_DESCENDANT`).
+    /// any status, as a non-private record with a different type
+    /// (`TYPE_MISMATCH_WITH_DESCENDANT`). Both checks are skipped when
+    /// creating a `private` record, and private records are never compared.
     pub async fn put(
         &self,
         ctx: &SecurityContext,
@@ -1378,33 +1376,36 @@ impl Service {
             });
         }
 
-        // If the reference currently resolves (for this caller: its tenant,
-        // owner and ancestor chain) to a record of a different type, creating
-        // here would silently diverge from what a value read already serves
-        // (`fr-override-type-consistency`).
-        let chain = self.dir.ancestor_chain(ctx, tenant).await?;
-        if let Some(inherited) = self
-            .repo
-            .resolve_for_get(tenant, owner, key, &chain)
-            .await?
-            && inherited.secret_type_uuid != type_uuid
-        {
-            let inherited_resolved = self.resolve_stored(inherited.secret_type_uuid).await?;
-            return Err(DomainError::TypeViolation {
-                field: "type",
-                reason: typing::reasons::TYPE_MISMATCH_WITH_INHERITED,
-                detail: format!(
-                    "reference currently resolves to an inherited credential of type '{}'; \
-                     '{}' would diverge from it",
-                    inherited_resolved.gts_id, resolved.gts_id
-                ),
-            });
-        }
+        // Type consistency (`fr-override-type-consistency`) binds non-private
+        // records only: a private record is read by its owner alone, who
+        // chose its type, so it is neither checked nor counted.
+        if sharing != SharingMode::Private {
+            // Upward: if the reference currently resolves, among non-private
+            // records (the nearest ancestor's `shared` one), to a record of a
+            // different type, creating here would silently diverge from what a
+            // value read already serves.
+            let chain = self.dir.ancestor_chain(ctx, tenant).await?;
+            if let Some(inherited) = self.repo.resolve_non_private(tenant, key, &chain).await?
+                && inherited.secret_type_uuid != type_uuid
+            {
+                let inherited_resolved = self.resolve_stored(inherited.secret_type_uuid).await?;
+                return Err(DomainError::TypeViolation {
+                    field: "type",
+                    reason: typing::reasons::TYPE_MISMATCH_WITH_INHERITED,
+                    detail: format!(
+                        "reference currently resolves to an inherited credential of type '{}'; \
+                         '{}' would diverge from it",
+                        inherited_resolved.gts_id, resolved.gts_id
+                    ),
+                });
+            }
 
-        // Downward: a descendant of the creator already holding the reference
-        // with another type would diverge from the new record the same way.
-        self.ensure_no_descendant_type_mismatch(ctx, tenant, key, type_uuid)
-            .await?;
+            // Downward: a descendant of the creator already holding the
+            // reference (non-private) with another type would diverge from the
+            // new record the same way.
+            self.ensure_no_descendant_type_mismatch(ctx, tenant, key, type_uuid)
+                .await?;
+        }
 
         let validator = if let Some(v) = value {
             let plugin = self.plugins.resolve().await?;
@@ -1450,7 +1451,7 @@ impl Service {
     /// Downward half of the create-time type-consistency check
     /// (`fr-override-type-consistency`): walks, page by page, the distinct
     /// tenants holding `key` with another type outside the creator's tenant
-    /// (any status, sharing and owner) and stops at the first one the creator
+    /// (any status and owner, non-private rows only) and stops at the first one the creator
     /// is an ancestor of, barriers ignored. Cost follows the number of rows of
     /// that reference with another type, usually none, never the subtree size.
     /// The wire detail names neither the tenant nor the type.

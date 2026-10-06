@@ -225,6 +225,48 @@ pub(super) async fn resolve_for_get(
     best.map(RowWithFlags::into_row).transpose()
 }
 
+/// Create-time upward type check: the record `req_tenant`'s reference
+/// resolves to among **non-private** rows only — a `shared` row anywhere in
+/// `chain` or a `tenant` row of `req_tenant` itself, under the same
+/// resolution predicate as [`resolve_for_get`]. Private rows (the caller's
+/// own included) never take part: they are exempt from type consistency.
+/// Closest tenant in `chain` wins. Unscoped internal lookup, like
+/// [`resolve_for_get`].
+pub(super) async fn resolve_non_private(
+    repo: &SecretRepoImpl,
+    req_tenant: TenantId,
+    key: &SecretRef,
+    chain: &[Uuid],
+) -> Result<Option<SecretRow>, DomainError> {
+    let conn = repo.db.conn()?;
+    let req = req_tenant.0;
+    let select = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(Condition::all().add(entity::secrets::Column::Reference.eq(key.as_ref())))
+        .filter(resolution_eligible_condition())
+        .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
+        .filter(
+            Condition::any()
+                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Shared)))
+                .add(
+                    Condition::all()
+                        .add(
+                            entity::secrets::Column::Sharing
+                                .eq(sharing_to_i16(SharingMode::Tenant)),
+                        )
+                        .add(entity::secrets::Column::TenantId.eq(req)),
+                ),
+        );
+    let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
+
+    let pos = |t: Uuid| chain.iter().position(|c| *c == t).unwrap_or(usize::MAX);
+    rows.into_iter()
+        .min_by_key(|r| pos(r.tenant_id))
+        .map(RowWithFlags::into_row)
+        .transpose()
+}
+
 /// Visibility predicate shared by [`resolve_candidates`] and the collection
 /// read's candidate queries (ADR-0005): in the caller's own tenant, every
 /// sharing-visible row of any status (so the record view can report a
@@ -288,7 +330,8 @@ struct TenantRow {
 
 /// Create-time downward type check: the distinct tenants other than
 /// `exclude_tenant` holding `reference` with a type other than
-/// `requested_type`, any status, sharing and owner. Unscoped (internal
+/// `requested_type`, any status and owner, non-private rows only (private
+/// records are exempt from type consistency). Unscoped (internal
 /// lookup, like the create's own-row lookup), served by
 /// `idx_credstore_lookup`; keyset-paged by `tenant_id`, never a `COUNT`.
 pub(super) async fn list_tenants_with_other_type(
@@ -303,6 +346,7 @@ pub(super) async fn list_tenants_with_other_type(
     let mut filter = Condition::all()
         .add(entity::secrets::Column::Reference.eq(reference.as_ref()))
         .add(entity::secrets::Column::SecretTypeUuid.ne(requested_type))
+        .add(entity::secrets::Column::Sharing.ne(sharing_to_i16(SharingMode::Private)))
         .add(entity::secrets::Column::TenantId.ne(exclude_tenant.0));
     if let Some(after) = after {
         filter = filter.add(entity::secrets::Column::TenantId.gt(after));
@@ -337,9 +381,8 @@ pub(super) async fn list_tenants_with_other_type(
 /// by `reference` (`desc` when `desc`), keyset-paginated by `cursor`
 /// (exclusive: `reference > cursor` ascending, `reference < cursor`
 /// descending). Fetches at most `limit` references — the caller passes
-/// `page_limit + 1` in metadata mode to detect a next page, or
-/// `secret_mode_cap + 1` in secret mode (no cursor, always ascending); both
-/// counts reflect only references admitted by the permitted-type clamp.
+/// `page_limit + 1` to detect a next page; the count reflects only
+/// references admitted by the permitted-type clamp.
 #[allow(
     clippy::too_many_arguments,
     reason = "every clamp the collection read's step 1 query supports, named rather than \

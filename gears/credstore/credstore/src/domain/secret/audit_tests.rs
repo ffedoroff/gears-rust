@@ -100,10 +100,7 @@ fn service_with_sink(
         Arc::new(FakePluginSelector::new(FakePlugin::new())) as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         metrics,
-        ListSettings {
-            max_limit: 200,
-            secret_mode_cap: 25,
-        },
+        ListSettings { max_limit: 200 },
     )
     .with_audit(sink)
 }
@@ -228,9 +225,9 @@ async fn point_read_with_secret_and_record_fields_publishes_one_read_event() {
 }
 
 #[tokio::test]
-async fn secret_mode_publishes_one_event_per_secret_returned() {
+async fn secret_selected_page_publishes_one_event_per_secret_returned() {
     let f = fixture();
-    for name in ["a", "b", "c"] {
+    for name in ["a", "b", "c", "d"] {
         f.svc
             .put(
                 &f.ctx,
@@ -243,14 +240,11 @@ async fn secret_mode_publishes_one_event_per_secret_returned() {
     }
     let before = f.audit.events().len();
 
+    // A page of three out of four: only the secrets of the page are audited.
     let query = ODataQuery::new()
         .with_select(vec!["reference".to_owned(), "secret".to_owned()])
-        .with_filter(
-            toolkit_odata::parse_filter_string("reference in ('a', 'b', 'c')")
-                .expect("filter")
-                .into_expr(),
-        );
-    let page = f.svc.list(&f.ctx, &query).await.expect("secret mode");
+        .with_limit(3);
+    let page = f.svc.list(&f.ctx, &query).await.expect("secret page");
     assert_eq!(page.items.len(), 3);
 
     let events = f.audit.events();
@@ -470,10 +464,7 @@ async fn a_denied_write_discloses_and_changes_nothing_and_is_not_audited() {
         Arc::new(FakePluginSelector::new(FakePlugin::new())) as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        ListSettings {
-            max_limit: 200,
-            secret_mode_cap: 25,
-        },
+        ListSettings { max_limit: 200 },
     )
     .with_audit(audit.clone());
     let ctx = make_ctx(Uuid::new_v4(), tenant);
@@ -623,10 +614,7 @@ fn racing_fixture() -> (Fixture, Arc<FakeSecretRepo>, Arc<FakePlugin>) {
         Arc::new(FakePluginSelector::new(plugin.clone())) as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        ListSettings {
-            max_limit: 200,
-            secret_mode_cap: 25,
-        },
+        ListSettings { max_limit: 200 },
     )
     .with_audit(audit.clone());
     (

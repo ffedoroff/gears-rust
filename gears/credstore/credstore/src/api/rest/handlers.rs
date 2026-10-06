@@ -164,20 +164,17 @@ fn parse_gts_type(field: &'static str, raw: &str) -> Result<GtsId, DomainError> 
 
 /// `GET /credstore/v1/credentials` (ADR-0005/ADR-0004): the collection read.
 ///
-/// Metadata-mode responses carry every reduced item as the same shape
-/// `GET .../{ref}` returns (`value` absent); selecting `value` in
-/// `$select` switches to secret mode (ADR-0004, "Bulk secret read"), whose
-/// items additionally carry the decrypted value — audited per item exactly
-/// like the point read's `$select=…,value`, since both paths share
-/// `Service::read_value_for_row`'s re-read/metrics.
+/// Responses carry every reduced item as the same shape `GET .../{ref}`
+/// returns (`secret` absent); selecting `secret` in `$select` additionally
+/// carries each item's decrypted value on the same paginated read — audited
+/// per item exactly like the point read's `$select=…,secret`, since both
+/// paths share `Service::read_value_for_row`'s re-read/metrics.
 ///
 /// # Errors
 ///
 /// Returns a canonical `Problem` envelope on an unsupported `$filter`/
 /// `$orderby`/`$select` field or shape (400), an out-of-range `limit` or a
-/// malformed/inconsistent cursor (400), or — in secret mode — pagination
-/// present, an invalid selector, or a match-set over the configured cap
-/// (400).
+/// malformed/inconsistent cursor (400).
 pub async fn list_credentials(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,

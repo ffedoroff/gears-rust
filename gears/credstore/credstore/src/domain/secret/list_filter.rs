@@ -30,18 +30,11 @@ use crate::domain::secret::model::Fallback;
 /// Stable machine-readable reason codes this module's validation failures
 /// carry. `INVALID_FILTER`/`INVALID_ORDERBY_FIELD`/`INVALID_SELECT` mirror
 /// the platform's standard `OData` reason codes (`guidelines/DNA/REST/
-/// PAGINATION.md`, DESIGN §10); `SECRET_MODE_NO_PAGINATION`/
-/// `SECRET_MODE_NO_ORDER`/`SECRET_MODE_SELECTOR`/`TOO_MANY_MATCHES` are the
-/// secret-mode-specific codes ADR-0004/0005 describe only in prose ("rejected
-/// (400)") without naming — named here for Phase 3.
+/// PAGINATION.md`, DESIGN §10).
 pub(crate) mod reasons {
     pub const INVALID_FILTER: &str = "INVALID_FILTER";
     pub const INVALID_ORDERBY_FIELD: &str = "INVALID_ORDERBY_FIELD";
     pub const INVALID_SELECT: &str = "INVALID_SELECT";
-    pub const SECRET_MODE_NO_PAGINATION: &str = "SECRET_MODE_NO_PAGINATION";
-    pub const SECRET_MODE_NO_ORDER: &str = "SECRET_MODE_NO_ORDER";
-    pub const SECRET_MODE_SELECTOR: &str = "SECRET_MODE_SELECTOR";
-    pub const TOO_MANY_MATCHES: &str = "TOO_MANY_MATCHES";
 }
 
 fn invalid_filter(detail: impl Into<String>) -> DomainError {
@@ -104,7 +97,7 @@ impl FilterField for CredentialFilterField {
 }
 
 /// `$select` allowlist (ADR-0004): the `Credential` field names plus
-/// `secret`. Selecting `secret` switches the request to secret mode.
+/// `secret`.
 const SELECT_ALLOWLIST: &[&str] = &[
     "reference",
     "type",
@@ -151,13 +144,14 @@ pub(crate) fn validate_select(fields: &[String]) -> Result<(), DomainError> {
     Ok(())
 }
 
-/// `true` iff `fields` names `secret` — the secret-mode switch (ADR-0004).
-pub(crate) fn is_secret_mode(fields: Option<&[String]>) -> bool {
+/// `true` iff `fields` names `secret` — the switch that makes the collection
+/// read carry each item's value (ADR-0004).
+pub(crate) fn secret_selected(fields: Option<&[String]>) -> bool {
     fields.is_some_and(|fields| fields.iter().any(|f| f == "secret"))
 }
 
 /// `true` iff `fields` names one of [`ADMIN_FIELDS`] — the point read's and
-/// the collection secret mode's shared trigger for requiring `read`/`list` on
+/// the collection read's secret selection's shared trigger for requiring `read`/`list` on
 /// top of (or instead of) `read_secret` (ADR-0004 Amendment A).
 pub(crate) fn admin_field_selected(fields: Option<&[String]>) -> bool {
     fields.is_some_and(|fields| fields.iter().any(|f| ADMIN_FIELDS.contains(&f.as_str())))
@@ -180,15 +174,13 @@ impl ListDirection {
     }
 }
 
-/// Validate metadata-mode `$orderby`: absent (default ascending) or exactly
+/// Validate `$orderby`: absent (default ascending) or exactly
 /// `reference` (`asc`/`desc`); anything else is `INVALID_ORDERBY_FIELD`.
 /// Never called for a cursor-driven page (the `OData` extractor forces
 /// `query.order` empty whenever a cursor is present; the cursor's own minted
 /// order is validated separately by [`crate::domain::secret::list_filter`]'s
 /// caller via `toolkit_odata::validate_cursor_against`).
-pub(crate) fn validate_metadata_orderby(
-    order: &ODataOrderBy,
-) -> Result<ListDirection, DomainError> {
+pub(crate) fn validate_orderby(order: &ODataOrderBy) -> Result<ListDirection, DomainError> {
     if order.is_empty() {
         return Ok(ListDirection::Asc);
     }
@@ -266,30 +258,6 @@ impl ParsedFilter {
             }
         }
         true
-    }
-
-    /// Secret mode's selector shape (ADR-0005 "Secret mode has no cursor at
-    /// all"; ADR-0004 "Bulk secret read"): the filter must be **exactly**
-    /// one of `reference` (`eq`/`in`) or `type` (`eq`/`in`) — nothing else,
-    /// and not both together.
-    pub(crate) fn require_secret_mode_selector(&self) -> Result<(), DomainError> {
-        let selector_error = || DomainError::InvalidRequest {
-            field: "$filter",
-            reason: reasons::SECRET_MODE_SELECTOR,
-            detail: "secret mode requires $filter to be exactly `reference eq/in (...)` or \
-                     `type eq/in (...)`"
-                .to_owned(),
-        };
-        let extra_predicate =
-            self.sharing_eq.is_some() || self.fallback_eq.is_some() || self.expires_at.is_some();
-        match (
-            self.reference_in.as_ref(),
-            self.type_uuid_in.as_ref(),
-            extra_predicate,
-        ) {
-            (Some(_), None, false) | (None, Some(_), false) => Ok(()),
-            _ => Err(selector_error()),
-        }
     }
 }
 

@@ -239,14 +239,14 @@ impl CredStoreClientV1 for MockCredStoreClient {
     /// (unfiltered, unpaginated — this test double is read-oriented and does
     /// not model the `OData` allowlist, reduction, or cursor semantics a real
     /// server enforces). `secret` is populated only when `query`'s `$select`
-    /// names it, mirroring the real secret-mode switch.
+    /// names it, mirroring the real selection switch.
     async fn list(
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
     ) -> Result<Page<CredentialListItem>, CredStoreError> {
         let limit = query.limit.unwrap_or(50);
-        let secret_mode = query
+        let with_secrets = query
             .selected_fields()
             .is_some_and(|fields| fields.iter().any(|f| f.eq_ignore_ascii_case("secret")));
         match &self.behavior {
@@ -261,7 +261,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
                         let key = SecretRef::new(k.clone()).ok()?;
                         Some(CredentialListItem {
                             credential: Self::credential(&key),
-                            secret: secret_mode.then(|| SecretValue::new(v.clone())),
+                            secret: with_secrets.then(|| SecretValue::new(v.clone())),
                         })
                     })
                     .collect();

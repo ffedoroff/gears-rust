@@ -3,7 +3,7 @@
 //! Unit tests for [`MockCredStoreClient`], the public double other gears use
 //! in their own tests. Only the behaviour the mock documents is asserted: the
 //! write half is a no-op that reports a placeholder validator, and `list`
-//! returns the seeded references sorted, with values only in secret mode.
+//! returns the seeded references sorted, with values only when `secret` is selected.
 
 use toolkit_odata::ODataQuery;
 use toolkit_security::SecurityContext;
@@ -129,7 +129,7 @@ async fn mock_patch_returns_a_validator() {
     }
 }
 
-/// In the expired-secret mode only the secret read fails; the record stays
+/// In the expired-secret behavior only the secret read fails; the record stays
 /// readable and writes (a renewal is a `put` or a `patch`) are accepted.
 #[tokio::test]
 async fn mock_write_result_secret_expired_is_ok_for_writes() {
@@ -227,12 +227,12 @@ async fn mock_list_plain_mode_omits_secrets_and_sorts_by_reference() {
     );
     assert!(
         page.items.iter().all(|item| item.secret.is_none()),
-        "plain mode must never carry a value"
+        "a list without `secret` selected must never carry a value"
     );
 }
 
 #[tokio::test]
-async fn mock_list_select_without_secret_stays_in_plain_mode() {
+async fn mock_list_select_without_secret_stays_without_secrets() {
     let client = seeded(&[("alpha", "v-alpha"), ("beta", "v-beta")]);
     let cases: Vec<(&str, Vec<&str>)> = vec![
         ("reference only", vec!["reference"]),
@@ -251,13 +251,13 @@ async fn mock_list_select_without_secret_stays_in_plain_mode() {
         assert_eq!(page.items.len(), 2, "{what}");
         assert!(
             page.items.iter().all(|item| item.secret.is_none()),
-            "{what}: a $select that does not name `secret` must not switch to secret mode"
+            "{what}: a $select that does not name `secret` must not carry secrets"
         );
     }
 }
 
 #[tokio::test]
-async fn mock_list_secret_mode_includes_secrets() {
+async fn mock_list_with_secret_selected_includes_secrets() {
     let client = seeded(&[("beta", "v-beta"), ("alpha", "v-alpha")]);
     let cases: Vec<(&str, Vec<&str>)> = vec![
         ("lowercase", vec!["reference", "secret"]),
@@ -291,7 +291,7 @@ async fn mock_list_secret_mode_includes_secrets() {
         );
         assert!(
             page.page_info.next_cursor.is_none(),
-            "{what}: secret mode never paginates"
+            "{what}: the mock never paginates"
         );
     }
 }
