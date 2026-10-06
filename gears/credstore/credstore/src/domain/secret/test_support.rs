@@ -604,7 +604,7 @@ fn plugin_key(key: &StoreKey) -> PluginKey {
 }
 
 /// Injected `get` fault for one key - see [`FakePlugin::deny_get_for`] /
-/// [`FakePlugin::fail_get_for`]. Used by the secret-mode-list concurrency
+/// [`FakePlugin::fail_get_for`]. Used by the secret-selecting list concurrency
 /// tests, which need a *specific* winner's read (not just "the next `get`
 /// call", nondeterministic once reads run concurrently) to fail.
 #[derive(Clone, Copy)]
@@ -656,9 +656,9 @@ pub struct FakePlugin {
     /// modelling a backend whose own ACLs reject a read the gear's PDP has
     /// already allowed.
     get_denied: bool,
-    /// Per-key injected `get` faults (secret-mode-list concurrency tests).
+    /// Per-key injected `get` faults (secret-selecting list concurrency tests).
     get_faults: Mutex<HashMap<PluginKey, FakeGetFault>>,
-    /// Per-key injected read latency in milliseconds (secret-mode-list
+    /// Per-key injected read latency in milliseconds (secret-selecting list
     /// concurrency tests): `get` sleeps this long for a key present here,
     /// tracked by `in_flight`/`max_in_flight` so a test can observe how many
     /// reads were in flight at once.
@@ -880,7 +880,7 @@ impl FakePlugin {
     /// Always fail `get` for `key` with `CredStoreError::AccessDenied` - a
     /// backend ACL refusing a read the gear's PDP already allowed, which
     /// `fetch_with_retry` treats as a legitimate per-item miss (`Ok(None)`),
-    /// not a request failure. For the secret-mode-list "refused item omitted"
+    /// not a request failure. For the secret-selecting list "refused item omitted"
     /// test: unlike [`Self::fail_next_gets_with_not_found`] (a global counter
     /// over the *next* call, nondeterministic once reads run concurrently),
     /// this targets one specific winner.
@@ -926,7 +926,7 @@ impl FakePlugin {
 
     /// Make every future `get` for `key` sleep `ms` milliseconds, with the
     /// sleep tracked by [`Self::max_in_flight`] - for asserting the
-    /// secret-mode list's bounded-concurrency fan-out.
+    /// secret-selecting list's bounded-concurrency fan-out.
     ///
     /// # Panics
     ///
@@ -2036,6 +2036,30 @@ impl SecretRepo for FakeSecretRepo {
         Ok(result)
     }
 
+    async fn resolve_non_private(
+        &self,
+        req_tenant: TenantId,
+        key: &SecretRef,
+        chain: &[Uuid],
+    ) -> Result<Option<SecretRow>, DomainError> {
+        let rows = self.rows.lock().expect("lock");
+        let pos = |t: Uuid| chain.iter().position(|c| *c == t).unwrap_or(usize::MAX);
+        let best = rows
+            .iter()
+            .filter(|r| {
+                Self::resolution_eligible(r)
+                    && r.reference == key.as_ref()
+                    && chain.contains(&r.tenant_id.0)
+                    && match r.sharing {
+                        SharingMode::Private => false,
+                        SharingMode::Tenant => r.tenant_id == req_tenant,
+                        SharingMode::Shared => true,
+                    }
+            })
+            .min_by_key(|r| pos(r.tenant_id.0));
+        Ok(best.cloned().map(|r| self.with_flags(r)))
+    }
+
     async fn resolve_candidates(
         &self,
         req_tenant: TenantId,
@@ -2135,6 +2159,7 @@ impl SecretRepo for FakeSecretRepo {
             .iter()
             .filter(|r| r.reference == reference.as_ref())
             .filter(|r| r.secret_type_uuid != requested_type)
+            .filter(|r| r.sharing != SharingMode::Private)
             .filter(|r| r.tenant_id != exclude_tenant)
             .map(|r| r.tenant_id.0)
             .filter(|t| after.is_none_or(|a| *t > a))

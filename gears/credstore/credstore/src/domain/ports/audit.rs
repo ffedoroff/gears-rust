@@ -16,7 +16,7 @@ use uuid::Uuid;
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditOperation {
-    /// A secret was read (point read, `get_secret`, or one item of secret mode).
+    /// A secret was read (point read, `get_secret`, or one item of a collection read selecting `secret`).
     Read,
     /// A record was created carrying a secret.
     Create,

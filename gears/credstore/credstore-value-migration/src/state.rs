@@ -603,62 +603,6 @@ pub async fn fetch_states(
         .collect()
 }
 
-/// A private row whose type differs from the non-private row of the same
-/// `(tenant_id, reference)`. Both keep working; a NEW private override with a
-/// differing type is rejected after the cutover (`TYPE_MISMATCH_WITH_INHERITED`).
-/// Divergence across tenants cannot be computed here: it needs the tenant
-/// hierarchy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeDivergence {
-    /// Tenant of both rows.
-    pub tenant_id: Uuid,
-    /// Their reference.
-    pub reference: String,
-    /// The private row.
-    pub private_row: Uuid,
-    /// Its secret type (UUID of the GTS type id).
-    pub private_type: Uuid,
-    /// The non-private row.
-    pub nonprivate_row: Uuid,
-    /// Its secret type.
-    pub nonprivate_type: Uuid,
-}
-
-/// Private rows whose secret type differs from the non-private row of the same
-/// tenant and reference (only rows that were `active`: the ones the gear keeps).
-///
-/// # Errors
-///
-/// A failing statement.
-pub async fn type_divergence(
-    db: &DatabaseConnection,
-    backend: DatabaseBackend,
-) -> Result<Vec<TypeDivergence>, MigrationError> {
-    let sql = format!(
-        "SELECT p.tenant_id AS tenant_id, p.reference AS reference, p.id AS private_id, \
-         p.secret_type_uuid AS private_type, n.id AS nonprivate_id, \
-         n.secret_type_uuid AS nonprivate_type \
-         FROM {ROWS_TABLE} p JOIN {ROWS_TABLE} n \
-         ON n.tenant_id = p.tenant_id AND n.reference = p.reference \
-         WHERE p.sharing = 1 AND n.sharing <> 1 AND p.status_before = {STATUS_ACTIVE} \
-         AND n.status_before = {STATUS_ACTIVE} AND p.secret_type_uuid <> n.secret_type_uuid \
-         ORDER BY p.id"
-    );
-    let rows = db.query_all_raw(stmt(backend, &sql, vec![])).await?;
-    rows.iter()
-        .map(|r| {
-            Ok(TypeDivergence {
-                tenant_id: r.try_get("", "tenant_id")?,
-                reference: r.try_get("", "reference")?,
-                private_row: r.try_get("", "private_id")?,
-                private_type: r.try_get("", "private_type")?,
-                nonprivate_row: r.try_get("", "nonprivate_id")?,
-                nonprivate_type: r.try_get("", "nonprivate_type")?,
-            })
-        })
-        .collect()
-}
-
 /// How many rows are in each state, tallied by scanning the table in id order
 /// (the tool never `COUNT`s).
 ///

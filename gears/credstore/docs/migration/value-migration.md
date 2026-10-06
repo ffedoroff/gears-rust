@@ -262,19 +262,6 @@ right, so check that list in the report.
 Rows in the retired statuses `1` and `3` are recorded as `unfinished` and not
 copied; `m0002` deletes them.
 
-## Type-divergent pairs
-
-`migrate` also reports, read-only, every **same-tenant** pair of a private and a
-non-private row with one reference whose secret types differ. Both rows keep
-working after the cutover. What changes is that a **new** private override whose
-type differs from the type it overrides is rejected with
-`TYPE_MISMATCH_WITH_INHERITED`, and a **new** record whose descendant tenants
-already hold the reference with another type is rejected with
-`TYPE_MISMATCH_WITH_DESCENDANT`; records that already exist are not touched. The
-report is information for the owners of those references (they may want to align
-the types before writing new overrides). A divergence between a tenant and an
-**ancestor** needs the tenant hierarchy and is not computed by the tool.
-
 ## Rollback
 
 - **Before `cleanup` has deleted anything:** restore the database snapshot and

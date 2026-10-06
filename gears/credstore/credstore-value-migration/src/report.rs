@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use uuid::Uuid;
 
-use crate::state::{RowState, TypeDivergence};
+use crate::state::RowState;
 
 /// The stream reports are written to.
 pub type Out<'a> = &'a mut (dyn Write + Send);
@@ -96,36 +96,6 @@ pub fn print_tally(out: &mut dyn Write, tally: &BTreeMap<RowState, usize>) {
         if let Some(n) = tally.get(&state) {
             emit(out, format_args!("  {state}: {n}"));
         }
-    }
-}
-
-/// Prints the type-divergent pairs.
-pub fn print_type_divergence(out: &mut dyn Write, pairs: &[TypeDivergence]) {
-    if pairs.is_empty() {
-        return;
-    }
-    emit(
-        out,
-        format_args!(
-            "type-divergent pairs: {} (they keep working; a NEW private override with a differing \
-             type is rejected after the cutover; divergence across tenants cannot be computed \
-             without the tenant hierarchy)",
-            pairs.len()
-        ),
-    );
-    for d in pairs {
-        emit(
-            out,
-            format_args!(
-                "  tenant={} reference={} private={} ({}) non-private={} ({})",
-                d.tenant_id,
-                d.reference,
-                d.private_row,
-                d.private_type,
-                d.nonprivate_row,
-                d.nonprivate_type
-            ),
-        );
     }
 }
 

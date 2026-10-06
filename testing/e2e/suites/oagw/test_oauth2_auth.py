@@ -20,6 +20,9 @@ from .helpers import (
 )
 
 
+_CREDSTORE_GENERIC_TYPE = "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"
+
+
 def _oauth2_auth(plugin_id: str, mock_upstream_url: str, **refs) -> dict:
     return {
         "type": plugin_id,
@@ -121,13 +124,18 @@ async def test_oauth2_client_cred_secret_deleted_returns_401(
     """Scenario 9.7-B at proxy time: the secret existed at write time, then was deleted."""
     alias = unique_alias("oauth2-gone")
     ref = f"e2e-oauth2-gone-{uuid.uuid4().hex[:8]}"
-    secrets_url = f"{oagw_base_url}/credstore/v1/secrets"
+    cred_url = f"{oagw_base_url}/credstore/v1/credentials/{ref}"
     async with httpx.AsyncClient(timeout=10.0) as client:
-        created = await client.post(
-            secrets_url, headers=oagw_headers,
-            json={"reference": ref, "value": "test-client-secret", "sharing": "tenant"},
+        # Create-only PUT carrying the record and the value (ADR-0004).
+        created = await client.put(
+            cred_url, headers={**oagw_headers, "If-None-Match": "*"},
+            json={
+                "type": _CREDSTORE_GENERIC_TYPE,
+                "sharing": "tenant",
+                "secret": "test-client-secret",
+            },
         )
-        if created.status_code not in (200, 201):
+        if created.status_code not in (200, 201, 204):
             pytest.fail(f"could not create secret {ref!r}: HTTP {created.status_code}")
         try:
             upstream = cleanup.upstream(oagw_headers, await create_upstream(
@@ -142,7 +150,7 @@ async def test_oauth2_client_cred_secret_deleted_returns_401(
             )
         finally:
             deleted = await client.delete(
-                f"{secrets_url}/{ref}", headers={**oagw_headers, "If-Match": "*"},
+                cred_url, headers={**oagw_headers, "If-Match": "*"},
             )
         if deleted.status_code != 204:
             pytest.fail(f"could not delete secret {ref!r}: HTTP {deleted.status_code}")

@@ -151,9 +151,6 @@ that list. If the fence key is absent while a row carries a fingerprint, the run
 aborts. The old address of a row is `(tenant_id, reference, owner)` with
 `owner = Some(owner_id)` for a private row (`sharing = 1`) and `None` otherwise.
 Statuses `1` and `3` are not copied (`unfinished`; `m0002` deletes those rows).
-Verification also reports private rows whose type differs from the tenant's
-non-private row of the same reference (they keep working; a *new* private override
-of a differing type is rejected after the cutover).
 
 Before the schema change the tool refuses (exit `1`) when `credstore_secrets`
 holds a row that was not there when the snapshot was taken: the old credstore must
