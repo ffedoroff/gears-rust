@@ -69,9 +69,9 @@ returns the provider's `ValueVersion`; `get` reads exactly that version
 `delete_key` removes the key with all versions (idempotent); `destroy` is
 optional and declared through `supports_destroy`. The gear calls both from the
 request that recorded the cleanup, right after the commit, or when it heals a
-record on a later access (after a record delete, a rotation, a secret removal,
-or a write that lost its compare-and-set); the same version or key may be
-passed again, so both calls must be idempotent.
+live record on a later access (after a rotation, a secret removal, or a write
+that lost its compare-and-set); the same version or key may be passed again,
+so both calls must be idempotent.
 
 ### Plugin conformance suite
 
