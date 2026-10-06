@@ -37,10 +37,9 @@ use super::Service;
 /// smaller default of its own).
 const DEFAULT_LIMIT: u64 = 50;
 
-/// Bounded parallelism for secret-mode value reads (ADR-0005 "Bulk secret
-/// read"): a handful of in-flight reads amortises a remote vault's RTT
-/// without stampeding it, and the cap of 25 (`list.secret_mode_cap`) bounds
-/// the total there is ever to read.
+/// Bounded parallelism for a page's secret value reads (ADR-0004): a handful
+/// of in-flight reads amortises a remote vault's RTT without stampeding it,
+/// and the page size (`limit`) bounds the total there is ever to read.
 const SECRET_READ_CONCURRENCY: usize = 8;
 
 /// Map a [`toolkit_odata::Error`] (cursor/order/filter-consistency failures
@@ -115,7 +114,7 @@ fn build_credential(key: &SecretRef, secret_type: String, reduced: &Reduced<'_>)
     }
 }
 
-/// One winner whose backend value phase 2 of secret mode still has to read
+/// One winner whose backend value phase 2 of a `secret` selection still has to read
 /// (`Service::reduce_and_authorize`): the `Credential` phase 1 already
 /// built, the reference key, a clone of the winning row, and its resolved
 /// GTS id — every argument [`Service::read_value_for_row`] needs, captured
@@ -129,11 +128,11 @@ struct SecretReadJob {
     gts_id: String,
 }
 
-/// One finished secret-mode read: the credential, its reference and GTS type
+/// One finished secret read: the credential, its reference and GTS type
 /// (for the audit record), and the secret if the read found one.
 type ReadResult = (Credential, SecretRef, String, Option<Secret>);
 
-/// One secret-mode result slot, in reference order: an item already complete
+/// One result slot of a `secret` selection, in reference order: an item already complete
 /// (an expired record: metadata only, no secret) or the index of a value read
 /// still to land.
 enum Slot {
@@ -145,16 +144,15 @@ impl Service {
     /// The collection read (ADR-0005): one reduced item per reference,
     /// rooted at the caller's tenant and walking upward through its
     /// ancestor chain only. Selecting `secret` in `query`'s `$select`
-    /// switches to secret mode (ADR-0004, "Bulk secret read").
+    /// additionally reads each returned item's secret on the same paginated
+    /// read (ADR-0004).
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::InvalidRequest`] for every validation failure
     /// this endpoint defines (see [`crate::domain::secret::list_filter`]):
     /// an unsupported `$filter`/`$orderby`/`$select` field or shape, an
-    /// out-of-range `limit`, a malformed or inconsistent cursor, or (secret
-    /// mode) pagination present, a missing/invalid selector, or a
-    /// match-set over the configured cap.
+    /// out-of-range `limit`, or a malformed or inconsistent cursor.
     pub async fn list(
         &self,
         ctx: &SecurityContext,
@@ -163,24 +161,12 @@ impl Service {
         if let Some(fields) = query.selected_fields() {
             list_filter::validate_select(fields)?;
         }
-        let parsed_filter = match query.filter() {
+        let parsed_filter = &match query.filter() {
             Some(expr) => list_filter::parse_filter(expr)?,
             None => ParsedFilter::default(),
         };
+        let with_secrets = list_filter::secret_selected(query.selected_fields());
 
-        if list_filter::is_secret_mode(query.selected_fields()) {
-            self.list_secret_mode(ctx, query, &parsed_filter).await
-        } else {
-            self.list_metadata_mode(ctx, query, &parsed_filter).await
-        }
-    }
-
-    async fn list_metadata_mode(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-        parsed_filter: &ParsedFilter,
-    ) -> Result<Page<CredentialListItem>, DomainError> {
         let limit = match query.limit {
             Some(l) if l > self.list.max_limit => {
                 return Err(DomainError::InvalidRequest {
@@ -217,23 +203,39 @@ impl Service {
             };
             (direction, Some(only_key.clone()))
         } else {
-            (list_filter::validate_metadata_orderby(&query.order)?, None)
+            (list_filter::validate_orderby(&query.order)?, None)
         };
 
         let req = TenantId(ctx.subject_tenant_id());
         let subject = OwnerId(ctx.subject_id());
         let chain = self.dir.ancestor_chain(ctx, req).await?;
 
-        // Before step 1: ONE PDP evaluation of `list` on the base credential
-        // type; its type constraint becomes step 1's SQL clamp (ADR-0005,
-        // ADR-0010) — never a scan of every visible row followed by an
-        // in-memory authorization pass, and never one evaluation per type.
+        // Selecting `secret` requires `read_secret`; a record-only field named
+        // alongside it additionally requires `list` (ADR-0004 Amendment A) —
+        // disclosing `sharing`/`inheritance`/... is `list`'s privilege, not
+        // `read_secret`'s, exactly as the point read's `get_item` splits the
+        // two.
+        let required_actions = if with_secrets {
+            let mut required = vec![actions::READ_SECRET];
+            if list_filter::admin_field_selected(query.selected_fields()) {
+                required.push(actions::LIST);
+            }
+            required
+        } else {
+            vec![actions::LIST]
+        };
+
+        // Before step 1: one PDP evaluation per required action on the base
+        // credential type; the resulting type constraint becomes step 1's SQL
+        // clamp (ADR-0005, ADR-0010) — never a scan of every visible row
+        // followed by an in-memory authorization pass, and never one
+        // evaluation per type.
         let allowed = self
             .permitted_rows(
                 ctx,
                 req,
                 parsed_filter.type_uuid_in.as_deref(),
-                &[actions::LIST],
+                &required_actions,
             )
             .await?;
         // A caller the gate refuses gets an empty page, never a refusal
@@ -287,7 +289,7 @@ impl Service {
                 &refs,
                 parsed_filter,
                 &allowed,
-                false,
+                with_secrets,
             )
             .await?;
 
@@ -333,142 +335,12 @@ impl Service {
         })
     }
 
-    async fn list_secret_mode(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-        parsed_filter: &ParsedFilter,
-    ) -> Result<Page<CredentialListItem>, DomainError> {
-        if query.limit.is_some() || query.cursor.is_some() {
-            return Err(DomainError::InvalidRequest {
-                field: if query.limit.is_some() {
-                    "limit"
-                } else {
-                    "cursor"
-                },
-                reason: list_filter::reasons::SECRET_MODE_NO_PAGINATION,
-                detail: "secret mode does not paginate; remove limit/cursor".to_owned(),
-            });
-        }
-        if !query.order.is_empty() {
-            return Err(DomainError::InvalidRequest {
-                field: "$orderby",
-                reason: list_filter::reasons::SECRET_MODE_NO_ORDER,
-                detail: "secret mode has no $orderby".to_owned(),
-            });
-        }
-        parsed_filter.require_secret_mode_selector()?;
-
-        let req = TenantId(ctx.subject_tenant_id());
-        let subject = OwnerId(ctx.subject_id());
-        let chain = self.dir.ancestor_chain(ctx, req).await?;
-
-        // Secret mode always requires `read_secret`; a record-only field
-        // named alongside `secret` additionally requires `list` (ADR-0004
-        // Amendment A) — disclosing `sharing`/`inheritance`/... is `list`'s
-        // privilege, not `read_secret`'s, exactly as the point read's
-        // `get_item` splits the two.
-        let mut required_actions = vec![actions::READ_SECRET];
-        if list_filter::admin_field_selected(query.selected_fields()) {
-            required_actions.push(actions::LIST);
-        }
-
-        // Before step 1: one PDP evaluation per required action on the base
-        // credential type; the resulting type constraint becomes step 1's SQL
-        // clamp (ADR-0005, ADR-0010).
-        let allowed = self
-            .permitted_rows(
-                ctx,
-                req,
-                parsed_filter.type_uuid_in.as_deref(),
-                &required_actions,
-            )
-            .await?;
-        let cap = self.list.secret_mode_cap;
-        if allowed.is_empty() {
-            return Ok(Page {
-                items: Vec::new(),
-                page_info: PageInfo {
-                    next_cursor: None,
-                    prev_cursor: None,
-                    limit: cap,
-                },
-            });
-        }
-        let type_scope = allowed.to_scope();
-
-        // The caller's own `reference in (…)` list is checked against the cap
-        // before it builds the candidate query (ADR-0005): a list longer than
-        // the cap can only match more than `cap` references.
-        if parsed_filter
-            .reference_in
-            .as_deref()
-            .is_some_and(|list| list.len() as u64 > cap)
-        {
-            return Err(DomainError::InvalidRequest {
-                field: "$filter",
-                reason: list_filter::reasons::TOO_MANY_MATCHES,
-                detail: format!("selector matches more than {cap} references; narrow it"),
-            });
-        }
-
-        let cap_plus_one = cap
-            .checked_add(1)
-            .ok_or_else(|| DomainError::internal("secret_mode_cap + 1 overflowed u64"))?;
-        // The type clamp here is the PDP-permitted set computed above (the
-        // caller's own `$filter type in (…)` is already folded into it), so
-        // the cap below counts only references the caller may see.
-        let refs = self
-            .repo
-            .list_candidate_references(
-                req,
-                subject,
-                &chain,
-                parsed_filter.reference_in.as_deref(),
-                &type_scope,
-                None,
-                false,
-                cap_plus_one,
-            )
-            .await?;
-
-        if refs.len() as u64 > cap {
-            return Err(DomainError::InvalidRequest {
-                field: "$filter",
-                reason: list_filter::reasons::TOO_MANY_MATCHES,
-                detail: format!("selector matches more than {cap} references; narrow it"),
-            });
-        }
-
-        let items = self
-            .reduce_and_authorize(
-                ctx,
-                req,
-                subject,
-                &chain,
-                &refs,
-                parsed_filter,
-                &allowed,
-                true,
-            )
-            .await?;
-
-        Ok(Page {
-            items,
-            page_info: PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit: cap,
-            },
-        })
-    }
-
     /// The PDP-permitted type clamp (ADR-0005, ADR-0010) — computed **before**
     /// step 1 so it becomes step 1's own SQL type predicate, rather than an
     /// in-memory filter applied after unpermitted rows have already reached
     /// the process. ONE PDP evaluation per action in `required_actions` on the
     /// base credential type (all must permit and include the caller's tenant)
-    /// — metadata mode names `[list]`; secret mode names `[read_secret]`,
+    /// — a plain read names `[list]`; selecting `secret` names `[read_secret]`,
     /// plus `list` too when a record-only field is selected alongside
     /// `secret` (ADR-0004 Amendment A) — each answering with a constraint on
     /// the credential type and/or reference; the scopes are intersected and
@@ -491,11 +363,11 @@ impl Service {
         Ok(authz::row_clamp(&scope, req.0).restrict_to(caller_type_in))
     }
 
-    /// Shared tail of both modes (ADR-0005 steps 6-9): fetch `references`'
+    /// Shared tail (ADR-0005 steps 6-9): fetch `references`'
     /// rows whole (unclamped by type — see the comment at the call site
     /// below), reduce each to one item, drop what `allowed` (computed
     /// by [`Self::permitted_rows`] before step 1) does not cover, apply the
-    /// in-memory filters, and — in secret mode — read each winner's value.
+    /// in-memory filters, and — when `with_secrets` — read each winner's value.
     #[allow(
         clippy::too_many_arguments,
         reason = "every input the shared reduction+authorization tail needs; splitting it into \
@@ -510,7 +382,7 @@ impl Service {
         references: &[String],
         parsed_filter: &ParsedFilter,
         allowed: &RowClamp,
-        secret_mode: bool,
+        with_secrets: bool,
     ) -> Result<Vec<CredentialListItem>, DomainError> {
         if references.is_empty() {
             return Ok(Vec::new());
@@ -536,15 +408,15 @@ impl Service {
                 .push(row);
         }
 
-        let plugin: Option<Arc<dyn CredStorePluginClientV2>> = if secret_mode {
+        let plugin: Option<Arc<dyn CredStorePluginClientV2>> = if with_secrets {
             Some(self.plugins.resolve().await?)
         } else {
             None
         };
 
         // Phase (a): the synchronous pass. Builds, per reference in order,
-        // the `Credential` metadata mode already needs plus — in secret
-        // mode — the `SecretReadJob` phase (b) reads from; skips exactly the
+        // the `Credential` every item needs plus — when
+        // reading secrets — the `SecretReadJob` phase (b) reads from; skips exactly the
         // cases it skips today (structurally-unreachable step-1/step-2
         // mismatch, the override-type-consistency invariant, a
         // post-reduction filter miss, a `declared`/value-less winner).
@@ -588,7 +460,7 @@ impl Service {
             })?;
             let credential = build_credential(&key, resolved.gts_id.clone(), &reduced);
 
-            if !secret_mode {
+            if !with_secrets {
                 items.push(CredentialListItem {
                     credential,
                     secret: None,
@@ -623,7 +495,7 @@ impl Service {
             });
         }
 
-        if !secret_mode {
+        if !with_secrets {
             return Ok(items);
         }
         if jobs.is_empty() {
@@ -642,11 +514,11 @@ impl Service {
         // `buffer_unordered` inside this async fn — never `tokio::spawn` —
         // is enough; the futures never need to outlive this call.
         //
-        // Set whenever `secret_mode` is true, which the `!secret_mode`
+        // Set whenever `with_secrets` is true, which the `!with_secrets`
         // early return above already ruled out.
         let Some(plugin) = plugin.as_ref() else {
             return Err(DomainError::internal(
-                "secret mode reached the read step without a resolved plugin",
+                "a secret read reached the read step without a resolved plugin",
             ));
         };
 
@@ -724,8 +596,7 @@ impl Service {
             };
             let Some(secret) = secret else {
                 // A refused or missing value is omitted,
-                // not reported (ADR-0004 "Bulk secret read: the collection in
-                // secret mode") — `read_value_for_row` already recorded the
+                // not reported (ADR-0004) — `read_value_for_row` already recorded the
                 // relevant metric.
                 continue;
             };

@@ -113,23 +113,6 @@ fn matches_post_reduction_applies_sharing_fallback_expires_at() {
 }
 
 #[test]
-fn secret_mode_selector_accepts_exactly_reference_or_type() {
-    let f = parse("reference eq 'r'").expect("valid");
-    assert!(f.require_secret_mode_selector().is_ok());
-
-    let f = parse("type eq 'gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~'")
-        .expect("valid");
-    assert!(f.require_secret_mode_selector().is_ok());
-
-    let f = parse("sharing eq 'shared'").expect("valid");
-    let err = f.require_secret_mode_selector().expect_err("must reject");
-    assert_eq!(reason_of(&err), reasons::SECRET_MODE_SELECTOR);
-
-    let neither = ParsedFilter::default();
-    assert!(neither.require_secret_mode_selector().is_err());
-}
-
-#[test]
 fn select_allowlist_accepts_credential_fields_and_secret() {
     for field in [
         "reference",
@@ -151,13 +134,13 @@ fn select_allowlist_accepts_credential_fields_and_secret() {
 }
 
 #[test]
-fn is_secret_mode_detects_secret_in_select() {
-    assert!(is_secret_mode(Some(&[
+fn secret_selected_detects_secret_in_select() {
+    assert!(secret_selected(Some(&[
         "reference".to_owned(),
         "secret".to_owned()
     ])));
-    assert!(!is_secret_mode(Some(&["reference".to_owned()])));
-    assert!(!is_secret_mode(None));
+    assert!(!secret_selected(Some(&["reference".to_owned()])));
+    assert!(!secret_selected(None));
 }
 
 #[test]
@@ -187,7 +170,7 @@ fn admin_field_selected_detects_each_administrative_field_but_not_envelope_field
 
 #[test]
 fn orderby_defaults_to_ascending_when_absent() {
-    let dir = validate_metadata_orderby(&ODataOrderBy::empty()).expect("valid");
+    let dir = validate_orderby(&ODataOrderBy::empty()).expect("valid");
     assert_eq!(dir, ListDirection::Asc);
 }
 
@@ -197,19 +180,13 @@ fn orderby_accepts_reference_asc_and_desc() {
         field: "reference".to_owned(),
         dir: SortDir::Asc,
     }]);
-    assert_eq!(
-        validate_metadata_orderby(&asc).expect("valid"),
-        ListDirection::Asc
-    );
+    assert_eq!(validate_orderby(&asc).expect("valid"), ListDirection::Asc);
 
     let desc = ODataOrderBy(vec![OrderKey {
         field: "reference".to_owned(),
         dir: SortDir::Desc,
     }]);
-    assert_eq!(
-        validate_metadata_orderby(&desc).expect("valid"),
-        ListDirection::Desc
-    );
+    assert_eq!(validate_orderby(&desc).expect("valid"), ListDirection::Desc);
 }
 
 #[test]
@@ -218,7 +195,7 @@ fn orderby_rejects_any_other_field_or_multiple_keys() {
         field: "updated_at".to_owned(),
         dir: SortDir::Asc,
     }]);
-    let err = validate_metadata_orderby(&other).expect_err("must reject");
+    let err = validate_orderby(&other).expect_err("must reject");
     assert_eq!(reason_of(&err), reasons::INVALID_ORDERBY_FIELD);
 
     let multiple = ODataOrderBy(vec![
@@ -231,7 +208,7 @@ fn orderby_rejects_any_other_field_or_multiple_keys() {
             dir: SortDir::Desc,
         },
     ]);
-    assert!(validate_metadata_orderby(&multiple).is_err());
+    assert!(validate_orderby(&multiple).is_err());
 }
 
 #[test]

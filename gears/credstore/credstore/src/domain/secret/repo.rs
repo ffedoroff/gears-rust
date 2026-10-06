@@ -41,6 +41,19 @@ pub trait SecretRepo: Send + Sync {
         chain: &[Uuid],
     ) -> Result<Option<SecretRow>, DomainError>;
 
+    /// Create-time upward type check
+    /// (`cpt-cf-credstore-fr-override-type-consistency`): the winning row for
+    /// `req_tenant` among **non-private** rows only (a `shared` row in `chain`
+    /// or a `tenant` row of `req_tenant`), same resolution predicate and
+    /// nearest-tenant order as [`Self::resolve_for_get`]. Private rows, the
+    /// caller's own included, never take part.
+    async fn resolve_non_private(
+        &self,
+        req_tenant: TenantId,
+        key: &SecretRef,
+        chain: &[Uuid],
+    ) -> Result<Option<SecretRow>, DomainError>;
+
     /// Every row of the reference visible to the caller across `chain`
     /// (`req_tenant` first, root last), for the credential-**record** read
     /// (ADR-0004 `get`): the caller's own-tenant rows of **any** status
@@ -102,7 +115,8 @@ pub trait SecretRepo: Send + Sync {
     /// Create-time downward type check
     /// (`cpt-cf-credstore-fr-override-type-consistency`): the distinct
     /// tenants, other than `exclude_tenant`, holding a row under `reference`
-    /// of a type other than `requested_type` — any status, sharing and owner.
+    /// of a type other than `requested_type` — any status and owner,
+    /// non-private rows only (private records are exempt).
     /// An unscoped internal lookup (no PDP clamp), keyset-paged by tenant id:
     /// tenants after `after` in ascending order, at most `limit`. Never a
     /// `COUNT`.

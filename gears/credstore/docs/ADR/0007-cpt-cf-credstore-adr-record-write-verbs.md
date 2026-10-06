@@ -86,10 +86,10 @@ A body with no secret change whose metadata equals the current record is a no-op
 
 ## More Information
 
-Precondition table (create / replace / rotate / suppress shapes) and status codes: DESIGN §4.3.2.
+Precondition table (create / replace / rotate / suppress shapes) and status codes: DESIGN §4.3.1.
 
 ## Traceability
 
-- **PRD**: [PRD.md](../PRD.md) · **DESIGN**: [DESIGN.md](../DESIGN.md) §4.3.2
+- **PRD**: [PRD.md](../PRD.md) · **DESIGN**: [DESIGN.md](../DESIGN.md) §4.3.1
 - `cpt-cf-credstore-fr-write-credential-record`, `cpt-cf-credstore-fr-write-secret`, `cpt-cf-credstore-fr-authz-action-split`.
 - Builds on [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md) and [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md); built on by [ADR-0008](0008-cpt-cf-credstore-adr-suppression-fallback.md).

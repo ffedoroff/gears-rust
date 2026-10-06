@@ -8,8 +8,8 @@ use credstore_sdk::SecretValue;
 
 use crate::env::{Env, load_fence_key};
 use crate::error::MigrationError;
-use crate::report::{Out, RowRef, print_rows, print_type_divergence, say};
-use crate::state::{self, ProgressRow, RowState, TypeDivergence};
+use crate::report::{Out, RowRef, print_rows, say};
+use crate::state::{self, ProgressRow, RowState};
 use crate::stores::OldAddress;
 use crate::verdict::{Verdict, judge};
 
@@ -26,8 +26,6 @@ pub struct VerifyReport {
     pub losses: Vec<(RowRef, RowState)>,
     /// Rows in status `1`/`3`, listed for cleanup only.
     pub unfinished: usize,
-    /// Private rows whose type differs from the tenant's non-private row.
-    pub type_divergent: Vec<TypeDivergence>,
 }
 
 impl VerifyReport {
@@ -92,7 +90,6 @@ impl VerifyReport {
             "unfinished rows (status 1/3, nothing to copy, listed for cleanup): {}",
             self.unfinished
         );
-        print_type_divergence(out, &self.type_divergent);
     }
 }
 
@@ -146,7 +143,6 @@ pub async fn run(env: &Env<'_>, out: Out<'_>) -> Result<VerifyReport, MigrationE
     }
     let tally = state::tally(env.db, env.backend, env.tuning.batch_size).await?;
     report.unfinished = tally.get(&RowState::Unfinished).copied().unwrap_or(0);
-    report.type_divergent = state::type_divergence(env.db, env.backend).await?;
     Ok(report)
 }
 

@@ -56,18 +56,18 @@ async def test_route_smoke_list_credentials(base_url, l1a_headers):
     assert "page_info" in body
 
 
-# ── S2: Create -> read -> read secret -> rotate -> list (metadata + secret
-#       mode) -> suppress -> delete: one credential's full lifecycle ────────
+# ── S2: Create -> read -> read secret -> rotate -> list (without and with
+#       `secret` selected) -> suppress -> delete: one credential's full lifecycle ────────
 
 
 async def test_credential_lifecycle_and_listing_seam(
     base_url, l1a_headers, unique_ref, create_credential,
 ):
     """Seam: PUT create-only -> GET record -> GET secret -> PATCH rotate ->
-    collection read (metadata and secret mode) -> PATCH suppress -> DELETE.
+    collection read (without and with `secret` selected) -> PATCH suppress -> DELETE.
 
     One reference walks every write/read address the credential surface
-    has, plus both collection-read modes, so each is exercised exactly once
+    has, plus the collection read with and without `secret` selected, so each is exercised exactly once
     in a single coherent story.
     """
     ref = unique_ref("lifecycle")
@@ -147,9 +147,9 @@ async def test_credential_lifecycle_and_listing_seam(
     assert items[0]["reference"] == ref
     assert "secret" not in items[0]
 
-    # --- Collection read, secret mode: item carries the rotated value ---
+    # --- Collection read with `secret` selected: item carries the rotated value ---
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
-        secret_mode_resp = await c.get(
+        secret_select_resp = await c.get(
             f"{base_url}/credstore/v1/credentials",
             headers=l1a_headers,
             params={
@@ -157,8 +157,8 @@ async def test_credential_lifecycle_and_listing_seam(
                 "$filter": f"reference eq '{ref}'",
             },
         )
-    assert secret_mode_resp.status_code == 200
-    secret_items = secret_mode_resp.json()["items"]
+    assert secret_select_resp.status_code == 200
+    secret_items = secret_select_resp.json()["items"]
     assert len(secret_items) == 1, secret_items
     assert secret_items[0]["reference"] == ref
     assert secret_items[0]["secret"] == "rotated-value"

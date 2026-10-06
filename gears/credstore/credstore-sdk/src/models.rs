@@ -549,18 +549,17 @@ impl CredentialPatch {
 
 /// One item of the collection read (`CredStoreClientV1::list`, ADR-0005): the
 /// reduced [`Credential`] a reference resolves to, plus its decrypted value
-/// (`secret`) when the request ran in **secret mode**
-/// (`$select` containing `secret`, ADR-0004 "Bulk secret read: the collection
-/// in secret mode"). `secret` is `None` in ordinary (metadata-mode) listing —
-/// the collection never carries a value unless the caller opted into secret
-/// mode, and even then only for the items whose value the caller may read.
+/// (`secret`) when the request selected it (`$select` containing `secret`,
+/// ADR-0004). `secret` is `None` otherwise — the collection never carries a
+/// value unless the caller opted in, and even then only for the items whose
+/// value the caller may read.
 #[derive(Debug)]
 pub struct CredentialListItem {
     /// The reduced credential record (ADR-0005, "Reducing a reference to one
     /// item"): one item per reference, matching what a point read
     /// (`CredStoreClientV1::get`) of that reference would resolve to.
     pub credential: Credential,
-    /// The decrypted value, present only in secret mode and only for an item
+    /// The decrypted value, present only when `secret` is selected and only for an item
     /// the caller may read (`read_secret`); an item the caller may not read
     /// is omitted from the page entirely, and an expired item is returned
     /// with `None` here.

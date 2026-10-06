@@ -22,8 +22,8 @@ in `$select` — there is no separate address for the secret alone.
   implies secret access
 - Suppression: `fallback: none` lets a tenant block an inherited secret
   locally without touching the ancestor's credential
-- List credential records (`$filter`/`$orderby`/`limit`/`cursor`), or bulk-read
-  several secrets at once by selecting `secret`
+- List credential records (`$filter`/`$orderby`/`limit`/`cursor`), and read the secrets of a page by
+  selecting `secret`
 - Immutable value versions: every write announces itself in PostgreSQL (a
   write intent), stores a new version in the backend and switches the record's
   pointer to it; no in-place overwrite. The cleanup of superseded and removed
@@ -64,8 +64,7 @@ gears:
       write:
         intent_lease_secs: 300      # lease of a write intent, database clock (default: 300; minimum: 60; time after which the intent of a crashed writer may be healed; must be far above the longest store request)
       list:
-        max_limit: 200              # cap for a metadata-mode page's `limit` (default: 200)
-        secret_mode_cap: 25         # cap on how many references a secret-mode ($select=…,secret) request may match (default: 25)
+        max_limit: 200              # cap for a page's `limit` (default: 200)
 ```
 
 There is no `reaper:` or `gc:` block and no `reclaim_batch` key: the gear runs
@@ -207,8 +206,8 @@ canonical **404** — indistinguishable from "does not exist". Requires
 returns it, with `status: "expired"` and its normal `ETag`; a read that
 selects `secret` fails **409** with reason `SECRET_EXPIRED` (only for a
 caller allowed to read the secret — anyone else gets the usual **404**), and
-the answer never falls through to an ancestor's value. In the collection's
-secret mode an expired item is returned with `status: "expired"` and no
+the answer never falls through to an ancestor's value. In a collection read
+with `secret` selected an expired item is returned with `status: "expired"` and no
 `secret`. Renew it in place with
 `PATCH` `{"expires_at": "<future RFC 3339 instant>"}` (or a replace); a
 create-only `PUT` over it is **409** `ALREADY_EXISTS`.
@@ -344,18 +343,20 @@ as `cursor` to continue. `$filter` accepts `reference`/`type` (`eq`/`in`)
 and `sharing`/`fallback`/`expires_at`; `$orderby` accepts only `reference`.
 Requires `list`.
 
-### Bulk-read secrets (secret mode)
+### Read secrets through the collection
 
-Selecting `secret` in `$select` switches the collection into secret mode:
-bounded, unpaginated, one request for several secrets at once.
+Selecting `secret` in `$select` on the collection is the same paginated read
+as the listing above: `limit`, `cursor`, `$orderby` and `$filter` work exactly
+as without it. Each item additionally carries its secret.
 
 ```bash
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=reference+in+('smtp-default','stripe-key')&\$select=reference,type,secret" \
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?limit=25&\$filter=reference+in+('smtp-default','stripe-key')&\$select=reference,type,secret" \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
-Response: **200 OK** — the same page envelope, `page_info.next_cursor`
-always `null`; each item additionally carries the decrypted `secret`:
+Response: **200 OK** with `Cache-Control: no-store` — the same page envelope
+(continue with `page_info.next_cursor` as usual); each item additionally
+carries the decrypted `secret`:
 ```json
 {
   "items": [
@@ -365,15 +366,12 @@ always `null`; each item additionally carries the decrypted `secret`:
 }
 ```
 
-`limit`/`cursor` are rejected (**400** `SECRET_MODE_NO_PAGINATION`),
-`$orderby` is rejected (**400** `SECRET_MODE_NO_ORDER`), and `$filter` must
-be exactly `reference eq/in (...)` or `type eq/in (...)` (**400**
-`SECRET_MODE_SELECTOR`). A match set over `list.secret_mode_cap` (default 25)
-fails the whole request with **400** `TOO_MANY_MATCHES` rather than
-truncating it. A refused or missing item is
-omitted, never reported; an expired item comes back with its metadata and
-without a secret, while one whose stored version the backend cannot return
-fails the whole request (**500**, as on a point read). Requires `read_secret`, evaluated per item.
+Requires `read_secret` (plus `list` when record fields are selected
+alongside), evaluated per item: a record of a type or reference the caller may
+not `read_secret` is omitted, never reported. An expired item comes back with
+its metadata and without a secret, while one whose stored version the backend
+cannot return fails the whole request (**500**, as on a point read). Every
+returned secret is audited.
 
 ### Delete a credential
 

@@ -19,8 +19,8 @@ use crate::models::{
 /// Consumer-facing API trait for credential storage operations. Six
 /// methods, none named `create` or `read_secrets`: `put` under
 /// [`PutPrecondition::CreateOnly`] **is** create, and [`Self::list`] is the
-/// collection read (metadata by default; `$select` containing `secret`
-/// switches it to bulk secret mode, ADR-0005/ADR-0004).
+/// collection read (`$select` containing `secret` additionally carries each
+/// item's value on the same paginated read, ADR-0005/ADR-0004).
 #[async_trait]
 pub trait CredStoreClientV1: Send + Sync {
     /// Retrieves the credential **record** by reference, applying
@@ -93,8 +93,8 @@ pub trait CredStoreClientV1: Send + Sync {
     /// including creating over a reference that currently resolves, for the
     /// creating caller (its tenant, owner and ancestor chain), to a record of
     /// a different type (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's
-    /// `shared` record or, when creating a private record, the tenant's own
-    /// non-private one.
+    /// `shared` record. Creating a `private` record is exempt from the
+    /// type-consistency checks.
     async fn put(
         &self,
         ctx: &SecurityContext,
@@ -169,17 +169,13 @@ pub trait CredStoreClientV1: Send + Sync {
     /// (ascending by default). `query.selected_fields()` accepts the
     /// `Credential` field names plus `secret`.
     ///
-    /// Selecting `secret` switches the request to **secret mode**: `limit`
-    /// and `query.cursor` are rejected, `query.order` must be empty, the
-    /// selector in `query.filter()` must be exactly `reference` or `type`
-    /// (`eq`/`in`), the match set is capped, and each returned item's
-    /// [`CredentialListItem::secret`] carries the decrypted value for the
-    /// items the caller may read — an item the caller may not read is
-    /// omitted rather than reported; an expired item is returned with its
-    /// metadata and without a secret; an item whose stored version the
-    /// backend cannot return fails the whole request.
-    /// `Page::page_info.next_cursor` is always `None` in this mode; there is
-    /// no pagination over a secret-mode match set.
+    /// Selecting `secret` is the same paginated read — `limit`, `query.cursor`,
+    /// `query.order` and `query.filter()` behave exactly as without it — and
+    /// each returned item's [`CredentialListItem::secret`] carries the
+    /// decrypted value for the items the caller may read: an item the caller
+    /// may not read is omitted rather than reported; an expired item is
+    /// returned with its metadata and without a secret; an item whose stored
+    /// version the backend cannot return fails the whole request.
     ///
     /// A caller whose scope does not admit its own tenant gets an empty page,
     /// never [`CredStoreError::AccessDenied`] (ADR-0005: the PDP resource is
@@ -187,17 +183,14 @@ pub trait CredStoreClientV1: Send + Sync {
     /// therefore nothing to deny — until rows exist).
     ///
     /// Requires the `list` action per distinct type present among candidates
-    /// (metadata mode) or `read_secret` (secret mode); a type the caller may
+    /// (or `read_secret` when `secret` is selected); a type the caller may
     /// not read is dropped from the page rather than failing the request.
     ///
     /// # Errors
     ///
     /// Returns [`CredStoreError::InvalidRequest`] if `query` names an
     /// unsupported filter/order field, an out-of-range `limit`, a malformed
-    /// cursor, a cursor minted under a different filter/order, or a
-    /// secret-mode request that also carries pagination — or, in secret mode,
-    /// if the selector is not `reference`/`type` `eq`/`in`, or the selector
-    /// matches more than the configured cap.
+    /// cursor, or a cursor minted under a different filter/order.
     async fn list(
         &self,
         ctx: &SecurityContext,

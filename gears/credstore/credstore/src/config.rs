@@ -26,29 +26,20 @@ impl Default for CredStoreConfig {
 }
 
 /// Settings for the collection read (`GET /credstore/v1/credentials`,
-/// ADR-0005/ADR-0004): the metadata-mode page-size cap and the secret-mode
-/// (`$select` containing `secret`) match-set cap. Both keys, `list.max_limit`
-/// and `list.secret_mode_cap`, are documented in DESIGN §4.3.2.
+/// ADR-0005/ADR-0004): the page-size cap, `list.max_limit`, documented in
+/// DESIGN §4.3.1.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ListCfg {
-    /// Maximum `limit`/`$top` for a metadata-mode page; a caller-supplied
+    /// Maximum `limit`/`$top` for a page; a caller-supplied
     /// value above this is rejected (400 `INVALID_LIMIT`) rather than
     /// silently clamped.
     pub max_limit: u64,
-    /// Cap on how many references a secret-mode (`$select=…,secret`) request
-    /// may match. Enforced by fetching `cap + 1` candidate references and
-    /// failing closed with `400 TOO_MANY_MATCHES` if the `(cap + 1)`th
-    /// appears — never by a `COUNT` query.
-    pub secret_mode_cap: u64,
 }
 
 impl Default for ListCfg {
     fn default() -> Self {
-        Self {
-            max_limit: 200,
-            secret_mode_cap: 25,
-        }
+        Self { max_limit: 200 }
     }
 }
 
@@ -91,9 +82,6 @@ impl CredStoreConfig {
         if self.list.max_limit == 0 {
             return Err("list.max_limit must be > 0".to_owned());
         }
-        if self.list.secret_mode_cap == 0 {
-            return Err("list.secret_mode_cap must be > 0".to_owned());
-        }
         if self.write.intent_lease_secs < MIN_INTENT_LEASE_SECS {
             return Err(format!(
                 "write.intent_lease_secs must be >= {MIN_INTENT_LEASE_SECS}: the lease is the time \
@@ -117,7 +105,6 @@ mod tests {
         // resolves no backend plugin and 503s on every secret op.
         assert_eq!(cfg.vendor, "constructorfabric");
         assert_eq!(cfg.list.max_limit, 200);
-        assert_eq!(cfg.list.secret_mode_cap, 25);
         assert_eq!(cfg.write.intent_lease_secs, 300);
         assert!(cfg.validate().is_ok());
     }
@@ -129,17 +116,6 @@ mod tests {
                 .expect("deserialize");
         assert_eq!(cfg.vendor, "acme");
         assert_eq!(cfg.list.max_limit, 5);
-        // Unspecified fields fall back to defaults.
-        assert_eq!(cfg.list.secret_mode_cap, 25);
-    }
-
-    #[test]
-    fn deserializes_partial_list_config_with_defaults() {
-        let cfg: CredStoreConfig =
-            serde_json::from_str(r#"{"list":{"max_limit":50}}"#).expect("deserialize");
-        assert_eq!(cfg.list.max_limit, 50);
-        // Unspecified fields fall back to defaults.
-        assert_eq!(cfg.list.secret_mode_cap, 25);
     }
 
     #[test]
@@ -170,6 +146,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_the_removed_secret_mode_cap_key() {
+        let err = serde_json::from_str::<CredStoreConfig>(r#"{"list":{"secret_mode_cap":25}}"#)
+            .expect_err("a removed list key must be rejected");
+        assert!(err.to_string().contains("secret_mode_cap"));
+    }
+
+    #[test]
     fn rejects_an_unknown_write_key() {
         let err = serde_json::from_str::<CredStoreConfig>(r#"{"write":{"lease":60}}"#)
             .expect_err("unknown write key must be rejected");
@@ -187,22 +170,10 @@ mod tests {
         assert!(empty_vendor.validate().is_err());
 
         let zero_max_limit = CredStoreConfig {
-            list: ListCfg {
-                max_limit: 0,
-                ..Default::default()
-            },
+            list: ListCfg { max_limit: 0 },
             ..Default::default()
         };
         assert!(zero_max_limit.validate().is_err());
-
-        let zero_secret_mode_cap = CredStoreConfig {
-            list: ListCfg {
-                secret_mode_cap: 0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(zero_secret_mode_cap.validate().is_err());
 
         let zero_intent_lease = CredStoreConfig {
             write: WriteCfg {

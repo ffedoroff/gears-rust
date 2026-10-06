@@ -16,7 +16,7 @@ mod common;
 
 use std::sync::atomic::Ordering;
 
-use common::{Fixture, Row, STANDARD_ACTIVE, Standard, TYPE_B, expect_exit, rid, tenant};
+use common::{Fixture, Row, STANDARD_ACTIVE, Standard, expect_exit, rid, tenant};
 use credstore::CredStoreGear;
 use credstore::infra::storage::migrations::Migrator;
 use credstore_sdk::{StoreKey, TenantId};
@@ -342,29 +342,6 @@ async fn a_reference_the_old_store_could_not_have_held_aborts() {
     let run = f.run(&["migrate"]).await;
     expect_exit(&run, Exit::Failure);
     assert!(run.err.contains(&row.id.to_string()), "{}", run.err);
-}
-
-#[tokio::test]
-async fn verification_reports_type_divergent_pairs() {
-    let f = Fixture::sqlite().await;
-    let shared = Row::valued(1, tenant(1), "k");
-    let mut private = Row::valued(2, tenant(1), "k").private(Uuid::from_u128(0x77));
-    private.ty = TYPE_B;
-    let same = Row::valued(3, tenant(2), "same");
-    let same_private = Row::valued(4, tenant(2), "same").private(Uuid::from_u128(0x78));
-    for row in [&shared, &private, &same, &same_private] {
-        f.seed(row, &row.value()).await;
-    }
-
-    let run = f.run(&["migrate"]).await;
-    expect_exit(&run, Exit::Success);
-    assert!(run.out.contains("type-divergent pairs: 1"), "{}", run.out);
-    assert!(
-        run.out.contains(&format!("private={}", private.id))
-            && run.out.contains(&format!("non-private={}", shared.id)),
-        "{}",
-        run.out
-    );
 }
 
 // -- failures of the stores ------------------------------------------------------------

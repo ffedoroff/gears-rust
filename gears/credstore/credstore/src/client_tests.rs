@@ -49,10 +49,7 @@ fn build_client(repo: Arc<FakeSecretRepo>, dir: Arc<FakeDir>) -> CredStoreLocalC
         selector,
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        ListSettings {
-            max_limit: 200,
-            secret_mode_cap: 25,
-        },
+        ListSettings { max_limit: 200 },
     ));
     CredStoreLocalClient::new(svc)
 }

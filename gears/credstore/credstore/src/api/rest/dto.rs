@@ -245,7 +245,7 @@ impl std::fmt::Debug for CredentialPatchDto {
 /// of `GET /credstore/v1/credentials` (ADR-0004 Amendment A, "Why one item
 /// shape, and why writes do not follow `$select`"): one shape for both
 /// addresses. `secret` is populated only when `$select` names it (point
-/// read) or in secret mode (collection) and only for an item the caller may
+/// read or collection read), and only for an item the caller may
 /// read; absent from the wire entirely otherwise — including when the item's
 /// value could not be served (refused or missing — omitted by the
 /// domain layer already — or the record has expired, in which case the item
@@ -284,8 +284,8 @@ pub struct CredentialDto {
     #[schema(format = DateTime)]
     pub expires_at: Option<String>,
     /// The decrypted secret — present only when `$select` names it (point
-    /// read) or in secret mode (collection), and only for an item the caller
-    /// may read.
+    /// read or collection read), and only for an item the caller may
+    /// read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 }
@@ -310,7 +310,7 @@ impl std::fmt::Debug for CredentialDto {
 
 impl CredentialDto {
     /// Convert the domain [`Credential`] into the REST DTO shape, with no
-    /// secret (the unselected point read, or a metadata-mode collection
+    /// secret (the unselected point read, or a collection
     /// item).
     ///
     /// # Errors
@@ -322,7 +322,7 @@ impl CredentialDto {
     }
 
     /// Convert one domain [`CredentialListItem`] into the REST DTO shape,
-    /// carrying its secret when the collection read ran in secret mode and
+    /// carrying its secret when the collection read selected `secret` and
     /// the item's value was served.
     ///
     /// # Errors

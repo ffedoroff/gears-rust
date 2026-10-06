@@ -49,15 +49,14 @@ pub fn register_routes(
              the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ \
              `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after \
              reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` \
-             switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` \
-             (`eq`/`in`) or `type` (`eq`/`in`) selector only, capped and unpaginated; an expired \
-             item is returned without its secret; an item whose stored version the backend \
-             cannot return fails the whole request.",
+             adds each item's secret to the same paginated read (ADR-0004); an expired item is \
+             returned without its secret; an item whose stored version the backend cannot \
+             return fails the whole request.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param_typed("limit", false, "Page size (metadata mode only)", "integer")
+        .query_param_typed("limit", false, "Page size", "integer")
         .query_param(
             "cursor",
             false,
@@ -70,7 +69,7 @@ pub fn register_routes(
         .json_response_with_schema::<toolkit_odata::Page<CredentialDto>>(
             openapi,
             StatusCode::OK,
-            "A page of reduced credential items (secret-mode items additionally carry `secret`)",
+            "A page of reduced credential items (items additionally carry `secret` when selected)",
         )
         .standard_errors(openapi)
         .error_503(openapi)

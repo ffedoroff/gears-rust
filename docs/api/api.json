@@ -3392,7 +3392,7 @@
         "description": "The response to a create: the declaration, and whether a retired one was\nrevived or the active one evolved rather than a new setting declared."
       },
       "CredentialDto": {
-        "description": "Response body for both `GET /credstore/v1/credentials/{ref}` and each item\nof `GET /credstore/v1/credentials` (ADR-0004 Amendment A, \"Why one item\nshape, and why writes do not follow `$select`\"): one shape for both\naddresses. `secret` is populated only when `$select` names it (point\nread) or in secret mode (collection) and only for an item the caller may\nread; absent from the wire entirely otherwise — including when the item's\nvalue could not be served (refused or missing — omitted by the\ndomain layer already — or the record has expired, in which case the item\nstays with its metadata).\n\n`Debug` is hand-written to redact `secret`.",
+        "description": "Response body for both `GET /credstore/v1/credentials/{ref}` and each item\nof `GET /credstore/v1/credentials` (ADR-0004 Amendment A, \"Why one item\nshape, and why writes do not follow `$select`\"): one shape for both\naddresses. `secret` is populated only when `$select` names it (point\nread or collection read), and only for an item the caller may\nread; absent from the wire entirely otherwise — including when the item's\nvalue could not be served (refused or missing — omitted by the\ndomain layer already — or the record has expired, in which case the item\nstays with its metadata).\n\n`Debug` is hand-written to redact `secret`.",
         "properties": {
           "expires_at": {
             "format": "date-time",
@@ -3426,7 +3426,7 @@
             "type": "string"
           },
           "secret": {
-            "description": "The decrypted secret — present only when `$select` names it (point\nread) or in secret mode (collection), and only for an item the caller\nmay read.",
+            "description": "The decrypted secret — present only when `$select` names it (point\nread or collection read), and only for an item the caller may\nread.",
             "type": [
               "string",
               "null"
@@ -51005,11 +51005,11 @@
     },
     "/credstore/v1/credentials": {
       "get": {
-        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` (`eq`/`in`) or `type` (`eq`/`in`) selector only, capped and unpaginated; an expired item is returned without its secret; an item whose stored version the backend cannot return fails the whole request.",
+        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` adds each item's secret to the same paginated read (ADR-0004); an expired item is returned without its secret; an item whose stored version the backend cannot return fails the whole request.",
         "operationId": "credstore.list_credentials",
         "parameters": [
           {
-            "description": "Page size (metadata mode only)",
+            "description": "Page size",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -51063,7 +51063,7 @@
                 }
               }
             },
-            "description": "A page of reduced credential items (secret-mode items additionally carry `secret`)"
+            "description": "A page of reduced credential items (items additionally carry `secret` when selected)"
           },
           "400": {
             "content": {

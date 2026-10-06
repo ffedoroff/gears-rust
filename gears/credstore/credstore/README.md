@@ -117,7 +117,7 @@ A version the backend holds but can never return (lost or rotated decryption
 key, corrupt entry) — or one that is gone although the row's pointer did not
 move — is permanent: the read fails `500` (SDK `CredStoreError::Internal`, logged),
 unlike the transient `503` for a version that vanished while the pointer moved.
-The record must be rewritten or deleted; in secret-mode collection reads such
+The record must be rewritten or deleted; in a collection read with `secret` selected such
 an item fails the whole request. Rotating
 only the secret is a `PATCH` with only `secret`; `PUT` is a whole replace, so an
 omitted expiry is cleared and `fallback` resets to `inherit` (the pre-0.3 `PUT`
@@ -160,8 +160,7 @@ credstore:
   config:
     vendor: "constructorfabric" # GTS vendor used to discover the value-store plugin
     list:
-      max_limit: 200             # metadata-mode page-size cap
-      secret_mode_cap: 25        # secret-mode ($select=…,secret) match-set cap
+      max_limit: 200             # page-size cap
     write:
       intent_lease_secs: 300     # after this, the intent of a crashed writer may be healed (>= 60);
                                  # must well exceed the longest store request (Vault: 90 s by default)

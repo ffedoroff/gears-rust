@@ -3136,6 +3136,91 @@ async fn uuid_shaped_reference_in_a_scope_finds_the_row() {
 }
 
 #[tokio::test]
+async fn tenants_with_other_type_ignore_private_rows() {
+    let repo = setup().await;
+    let type_a = SecretType::generic().uuid();
+    let type_b = SecretType::from_name("personal-token")
+        .expect("known")
+        .uuid();
+    let name = Uuid::new_v4().to_string();
+    let creator = Uuid::new_v4();
+    let private_only = Uuid::new_v4();
+    let non_private = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    seed_active_typed(
+        &repo,
+        private_only,
+        owner,
+        &name,
+        SharingMode::Private,
+        type_b,
+    )
+    .await;
+    seed_active_typed(
+        &repo,
+        non_private,
+        owner,
+        &name,
+        SharingMode::Shared,
+        type_b,
+    )
+    .await;
+
+    let got = repo
+        .list_tenants_with_other_type(&sref(&name), type_a, TenantId(creator), None, 100)
+        .await
+        .expect("query");
+    assert_eq!(got, vec![non_private], "a private-only tenant is ignored");
+}
+
+#[tokio::test]
+async fn resolve_non_private_ignores_private_rows() {
+    let repo = setup().await;
+    let type_b = SecretType::from_name("personal-token")
+        .expect("known")
+        .uuid();
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let chain = [child, parent];
+
+    // The caller's own private row (another type) is invisible to it...
+    seed_active_typed(&repo, child, owner, "k", SharingMode::Private, type_b).await;
+    assert!(
+        repo.resolve_non_private(TenantId(child), &sref("k"), &chain)
+            .await
+            .expect("resolve")
+            .is_none()
+    );
+    // ...and an ancestor's private row never resolves.
+    seed_active_typed(&repo, parent, owner, "k", SharingMode::Private, type_b).await;
+    assert!(
+        repo.resolve_non_private(TenantId(child), &sref("k"), &chain)
+            .await
+            .expect("resolve")
+            .is_none()
+    );
+    // The nearest ancestor's shared row is what it resolves to.
+    seed_active_typed(
+        &repo,
+        parent,
+        Uuid::new_v4(),
+        "k",
+        SharingMode::Shared,
+        SecretType::generic().uuid(),
+    )
+    .await;
+    let row = repo
+        .resolve_non_private(TenantId(child), &sref("k"), &chain)
+        .await
+        .expect("resolve")
+        .expect("shared row");
+    assert_eq!(row.tenant_id, TenantId(parent));
+    assert_eq!(row.sharing, SharingMode::Shared);
+    assert_eq!(row.secret_type_uuid, SecretType::generic().uuid());
+}
+
+#[tokio::test]
 async fn tenants_with_other_type_exclude_creator_and_same_type_and_page_by_tenant() {
     let repo = setup().await;
     let type_a = SecretType::generic().uuid();

@@ -36,10 +36,7 @@ fn key(s: &str) -> SecretRef {
 }
 
 fn test_list_settings() -> ListSettings {
-    ListSettings {
-        max_limit: 200,
-        secret_mode_cap: 25,
-    }
+    ListSettings { max_limit: 200 }
 }
 
 fn make_service(
@@ -3227,6 +3224,158 @@ async fn put_create_type_mismatch_with_inherited() {
     ));
 }
 
+#[tokio::test]
+async fn put_create_private_ignores_inherited_type_and_skips_descendant_check() {
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let svc_parent = make_service_noop(
+        repo.clone(),
+        plugin.clone(),
+        Arc::new(FakeDir::single(parent)),
+    );
+    svc_parent
+        .put(
+            &make_ctx(Uuid::new_v4(), parent),
+            &key("k"),
+            write_create_typed(
+                SharingMode::Shared,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect("parent creates basic-auth");
+
+    // A failing `is_ancestor` would turn a descendant check into a 503.
+    let svc_child = make_service_noop(
+        repo.clone(),
+        plugin.clone(),
+        Arc::new(FakeDir::new(vec![child, parent]).with_failing_is_ancestor()),
+    );
+    let out = svc_child
+        .put(
+            &make_ctx(Uuid::new_v4(), child),
+            &key("k"),
+            write_create(SharingMode::Private, "v"),
+            create_only(),
+        )
+        .await
+        .expect("private is exempt from type consistency");
+    assert!(out.created);
+}
+
+#[tokio::test]
+async fn put_create_private_skips_descendant_check_when_a_descendant_holds_another_type() {
+    let f = DescendantFixture::new(write_create(SharingMode::Tenant, "v")).await;
+    let svc = f.ancestor_service(FakeDir::single(f.ancestor).with_failing_is_ancestor());
+    let out = svc
+        .put(
+            &f.ancestor_ctx(),
+            &key("k"),
+            write_create_typed(
+                SharingMode::Private,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect("private skips the downward check");
+    assert!(out.created);
+}
+
+#[tokio::test]
+async fn put_create_private_with_other_type_than_same_tenant_non_private() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let svc = make_service_noop(
+        repo.clone(),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_create(SharingMode::Tenant, "v"),
+        create_only(),
+    )
+    .await
+    .expect("tenant record");
+    let out = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create_typed(
+                SharingMode::Private,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect("private record may differ in type");
+    assert!(out.created);
+    assert_eq!(repo.rows().len(), 2);
+}
+
+#[tokio::test]
+async fn put_create_non_private_compares_with_non_private_only() {
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let svc_parent = make_service_noop(
+        repo.clone(),
+        plugin.clone(),
+        Arc::new(FakeDir::single(parent)),
+    );
+    svc_parent
+        .put(
+            &make_ctx(Uuid::new_v4(), parent),
+            &key("k"),
+            write_create(SharingMode::Shared, "v"),
+            create_only(),
+        )
+        .await
+        .expect("parent shares generic");
+    let svc_child = make_service_noop(
+        repo.clone(),
+        plugin.clone(),
+        Arc::new(FakeDir::new(vec![child, parent])),
+    );
+    let ctx = make_ctx(owner, child);
+    // The caller's own private record has another type than the shared one.
+    svc_child
+        .put(
+            &ctx,
+            &key("k"),
+            write_create_typed(
+                SharingMode::Private,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect("private differs");
+    // A non-private create matches the ancestor's shared type: allowed.
+    let out = svc_child
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "w"),
+            create_only(),
+        )
+        .await
+        .expect("compared with the shared record, not the private one");
+    assert!(out.created);
+}
+
 // ── Downward type consistency on create (`TYPE_MISMATCH_WITH_DESCENDANT`) ───
 
 /// A repo where `holder` already holds `k` through its own service
@@ -3304,7 +3453,7 @@ async fn put_create_type_mismatch_with_descendant() {
             &f.ancestor_ctx(),
             &key("k"),
             write_create_typed(
-                SharingMode::Private,
+                SharingMode::Tenant,
                 r#"{"username":"u","password":"p"}"#,
                 "basic-auth",
             ),
@@ -3315,6 +3464,26 @@ async fn put_create_type_mismatch_with_descendant() {
     assert_descendant_mismatch(&err, f.holder, f.ancestor);
     assert_eq!(f.repo.rows().len(), 1, "nothing written");
     assert_eq!(f.repo.begun_attempts().len(), begun, "no intent announced");
+}
+
+#[tokio::test]
+async fn put_create_succeeds_when_descendant_holds_only_a_private_record() {
+    let f = DescendantFixture::new(write_create(SharingMode::Private, "v")).await;
+    let svc = f.ancestor_service(FakeDir::single(f.ancestor).with_descendants(vec![f.holder]));
+    let out = svc
+        .put(
+            &f.ancestor_ctx(),
+            &key("k"),
+            write_create_typed(
+                SharingMode::Tenant,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect("a descendant's private record is exempt");
+    assert!(out.created);
 }
 
 #[tokio::test]
