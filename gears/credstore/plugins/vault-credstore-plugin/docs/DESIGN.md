@@ -226,7 +226,7 @@ All calls carry `X-Vault-Token` (and `X-Vault-Namespace` when configured). "Tran
 | Operation | HTTP call | Success | `404` | Other errors |
 |---|---|---|---|---|
 | `put(key, value)` | `POST data/...` with `{"data":{"value":"<base64>"}}` (no `cas`) | `200` with `data.version` -> that version | Explained `404` (missing mount) -> `Internal`; a plain `404` on a write does not occur | Not retried. Transient -> `ServiceUnavailable`; `403` -> `ServiceUnavailable`; `400` -> `Internal` with Vault's text; anything else -> `Internal` |
-| `get(key, version)` | `GET data/...?version=N` (never sent for `N = 0`) | `200` with a value -> bytes | Plain `404` (absent, soft-deleted, destroyed, evicted, key missing) -> `None`; explained `404` -> `Internal` | Retried on transient. `403` -> `ServiceUnavailable`; an entry with no string `value` or invalid base64 -> `SecretUnreadable`; unexpected shape -> `Internal` |
+| `get(key, version)` | `GET data/...?version=N` (never sent for `N = 0`) | `200` with a value -> bytes | Plain `404` (absent, soft-deleted, destroyed, evicted, key missing) -> `None`; explained `404` -> `Internal` | Retried on transient. `403` -> `ServiceUnavailable`; an entry with no string `value` or invalid base64 -> `Internal` (permanent); unexpected shape -> `Internal` |
 | `delete_key(key)` | `DELETE metadata/...` | `204` / `2xx` -> `Ok` | Plain `404` -> `Ok`; explained `404` -> `Internal` | Retried on transient; `403` -> `ServiceUnavailable`; others -> `Internal` |
 | `destroy(key, Exactly(v))` | `POST destroy/...` with `{"versions":[v]}` (no call for `v = 0`) | `204` -> `Ok` | Plain `404` -> `Ok`; explained `404` -> `Internal` | As `delete_key` |
 | `destroy(key, Below(v))` | `GET metadata/...`, then `POST destroy/...` with every version `< v` that has `destroyed = false` | `Ok` | Plain `404` on the metadata read (no such key) -> `Ok`, no destroy call; empty selection -> `Ok`, no destroy call; `v <= 1` -> `Ok` without any call | Each of the two calls retried on transient; `403` -> `ServiceUnavailable`; others -> `Internal` |
@@ -246,7 +246,7 @@ A soft-deleted version has `destroyed = false` and a `deletion_time`: it is incl
 | Any other `4xx` / `3xx` | `Internal` | no | Status and text |
 | Explained `404` (`no handler for route`) | `Internal` | no | A missing mount is a configuration error |
 | Response that is not the expected JSON shape | `Internal` | no | The body is never echoed |
-| Entry present but not a value this plugin wrote | `SecretUnreadable` | no | Permanent: retrying does not help; the record must be rewritten |
+| Entry present but not a value this plugin wrote | `Internal` | no | Permanent: retrying does not help; the record must be rewritten; the gear answers 500 |
 | `version` that is not a number | `Internal` | no | The gear passes back only what `put` returned |
 
 #### Vault answers the plugin relies on
@@ -505,7 +505,7 @@ The plugin needs a **KV v2** mount (`vault secrets enable -path=secret -version=
 
 | Setting | Required value | If violated |
 |---|---|---|
-| `delete_version_after` | `0s` (disabled) | Versions are soft-deleted after the interval; `get` then answers "no value" for a version a record still points at, and the record answers `SECRET_UNREADABLE` until rewritten |
+| `delete_version_after` | `0s` (disabled) | Versions are soft-deleted after the interval; `get` then answers "no value" for a version a record still points at, and the record answers an internal error (500) until rewritten |
 | `cas_required` | `false` | Every `put` is refused by Vault with `400 check-and-set parameter required for this call`; the plugin surfaces it as an internal error |
 | `max_versions` | Larger than the number of versions one key can hold at once (see below) | Vault drops the oldest versions of a key beyond the limit |
 
@@ -515,7 +515,7 @@ vault write secret/config max_versions=20 delete_version_after=0s cas_required=f
 
 **Retention.** Vault keeps **10 versions per key by default**; `max_versions = 0` or unset also means 10, not unlimited. The effective limit of a key is the larger of the mount's `max_versions` and the key's own (`vault kv metadata put -max-versions=N`); a key's own value can raise the limit above the mount's but not lower it. Set a larger `max_versions` on the mount (or per key) if you need more.
 
-What exceeding it means for CredStore: a key normally holds one or two versions, because the gear destroys superseded versions right after each commit. If more versions than the limit pile up above the version a record points at (orphans of failed or ambiguous writes, or destroy debts not yet executed), Vault removes the oldest ones, which may include the referenced version. The plugin then answers "no value" for it, the gear finds that the pointer did not move, and the record answers `SECRET_UNREADABLE` until it is rewritten (CredStore DESIGN §4.6). The plugin does not check these settings, at startup or later.
+What exceeding it means for CredStore: a key normally holds one or two versions, because the gear destroys superseded versions right after each commit. If more versions than the limit pile up above the version a record points at (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not, since destroyed versions still count; versions below the pointer are evicted first and are harmless), Vault removes the oldest ones, which may include the referenced version. The plugin then answers "no value" for it, the gear finds that the pointer did not move, and the record answers an internal error (500) until it is rewritten (CredStore DESIGN §4.6). The plugin does not check these settings, at startup or later.
 
 #### Token delivery: the Vault Agent sidecar pattern (Kubernetes)
 
@@ -566,11 +566,11 @@ Other deployments follow the same shape: any process that keeps a valid token in
 | `token_file` missing, empty or malformed | `ServiceUnavailable` for the calls that need a token; startup is not affected | Provide the file |
 | `token_env` unset or empty, inline token empty or malformed | Startup fails with the key named | Fix the configuration |
 | Mount does not exist or is misspelled | `Internal` for every operation (`no handler for route` text); `delete_key` does not report success | Fix `mount`, or enable the mount |
-| Mount is not KV v2 | Reads and writes hit different paths than expected and fail or return unexpected shapes (`Internal` or `SecretUnreadable`) | Use a KV v2 mount |
+| Mount is not KV v2 | Reads and writes hit different paths than expected and fail or return unexpected shapes (`Internal`) | Use a KV v2 mount |
 | `cas_required = true` | Every `put` fails with `Internal` carrying Vault's `check-and-set` text | Set `cas_required = false` |
-| `delete_version_after` not `0s` | Versions disappear by age; affected records answer `SECRET_UNREADABLE` | Set `0s`; rewrite affected records |
-| More versions than the retention limit | The oldest are evicted; the referenced one may be among them (`SECRET_UNREADABLE`) | Raise `max_versions`; rewrite affected records |
-| Entry written by something else | `SecretUnreadable` for that version | Keep the prefix exclusive to CredStore |
+| `delete_version_after` not `0s` | Versions disappear by age; affected records answer an internal error (500) | Set `0s`; rewrite affected records |
+| More versions than the retention limit | The oldest are evicted; the referenced one may be among them (500) | Raise `max_versions`; rewrite affected records |
+| Entry written by something else | `Internal` for that version (the gear answers 500) | Keep the prefix exclusive to CredStore |
 | Response not valid JSON or not the KV v2 shape | `Internal` | Check for a proxy between the plugin and Vault |
 | `put` times out after the request was sent | `ServiceUnavailable`; a version may exist | None: the gear's write intent tracks it and the record's next write or delete removes it |
 | Wrong or not permitted `namespace` | Vault answers with an error status; the plugin reports it by the table of §3.3 (`Internal` for an explained `404`, `ServiceUnavailable` for `403`) | Fix `namespace` or the token's access to it |
