@@ -22,16 +22,14 @@ in `$select` — there is no separate address for the secret alone.
   implies secret access
 - Suppression: `fallback: none` lets a tenant block an inherited secret
   locally without touching the ancestor's credential
-- List credential records (`$filter`/`$orderby`/`limit`/`cursor`), and read the secrets of a page by
-  selecting `secret`
+- List credential records (`$filter`/`$orderby`/`limit`/`cursor`), or bulk-read
+  several secrets at once by selecting `secret`
 - Immutable value versions: every write announces itself in PostgreSQL (a
   write intent), stores a new version in the backend and switches the record's
-  pointer to it; no in-place overwrite. The cleanup of superseded and removed
-  versions, and the purge of a deleted record's key, are debts recorded in
-  PostgreSQL in the same transaction that made them necessary and executed by
-  the same request right after the commit; leftovers of a live record are
-  healed by a later request that touches it. The process runs no background
-  work. Deleting a record frees the reference at once
+  pointer to it; no in-place overwrite, no reaper and no maintenance job. The
+  cleanup of superseded and removed versions, and the purge of a deleted
+  record's key, are outbox tasks enqueued in the same transaction that made
+  them necessary. Deleting a record frees the reference at once
 - Best-effort audit of secret reads and writes through `event-broker`
   (`audit_publish_failed` metric on failure)
 - Access denial returned as `404` (not an error) to prevent credential
@@ -61,25 +59,28 @@ gears:
   credstore:
     config:
       vendor: "constructorfabric"  # selects backend plugin by vendor name (default: "constructorfabric"; "constructorfabric" -> static-credstore-plugin, "openbao" -> vault-credstore-plugin)
+      hierarchy:
+        ancestor_cache_ttl_secs: 300 # ancestor-chain cache TTL (default: 300)
       write:
-        intent_lease_secs: 300      # lease of a write intent, database clock (default: 300; minimum: 60; time after which the intent of a crashed writer may be healed; must be far above the longest store request)
+        intent_lease_secs: 300      # lease of a write intent, database clock (default: 300; minimum: 60; must be far above the plugin's put timeout)
+        reclaim_batch: 16           # expired intents one reclaim pass handles (default: 16)
       list:
-        max_limit: 200              # cap for a page's `limit` (default: 200)
+        max_limit: 200              # cap for a metadata-mode page's `limit` (default: 200)
+        secret_mode_cap: 25         # cap on how many references a secret-mode ($select=…,secret) request may match (default: 25)
 ```
 
-There is no `reaper:` or `gc:` block and no `reclaim_batch` key: the gear runs
-no background work, and unknown config keys (including these) are rejected at
-startup. Expired write intents (left by a writer that crashed or stalled
-between announcing a store write and committing it) are healed on access: by
-the next successful secret write to the same record, or by a create or read of
-the same reference when the earlier create failed.
+There is no `reaper:` or `gc:` block: the gear runs no resident loop and no
+maintenance job, and unknown config keys (including those two) are rejected
+at startup. Expired write intents (left by a writer that crashed or stalled
+between announcing a store write and committing it) are reclaimed at startup,
+before the gear reports ready, and by a pass after every secret write.
 
 **Secrets are provisioned only through this API.** A backend plugin (e.g.
 `static-credstore-plugin` for development) (`CredStorePluginClientV2`) is a versioned
 byte store keyed by `(tenant_id, record_id)`: `put` returns the version, `get`
-reads one, `delete_key` drops the key (called by the request that deletes a record, right after the commit,
-or for a key no record will ever use), and `destroy` is optional
-(`supports_destroy`; called after the commit that recorded the cleanup, never inside a transaction). There is no way to
+reads one, `delete_key` drops the key (called by the outbox after a record
+delete, or for a key no record will ever use), and `destroy` is optional
+(`supports_destroy`; called only by the outbox, never inline in a write). There is no way to
 seed a value directly in the plugin's own configuration: the static plugin's
 config carries only `vendor` and `priority`, and any other key (including the
 withdrawn `secrets` block) fails validation at boot. It is a non-durable
@@ -199,16 +200,15 @@ Response: **200 OK** (`ETag`, `Cache-Control: no-store`)
 A winning record with no secret (`declared`, or `suppressed`) is the
 canonical **404** — indistinguishable from "does not exist". Requires
 `read_secret`; a `$select` naming both a record field and `secret` requires
-`read` and `read_secret` together (on the collection that combination is
-rejected, below).
+`read` and `read_secret` together.
 
 **Expired records.** Expiry applies to the secret, not to the record. Once an
 `active` record's `expires_at` has passed, a read without `secret` still
 returns it, with `status: "expired"` and its normal `ETag`; a read that
 selects `secret` fails **409** with reason `SECRET_EXPIRED` (only for a
 caller allowed to read the secret — anyone else gets the usual **404**), and
-the answer never falls through to an ancestor's value. In a collection read
-with `secret` selected an expired item is returned with `status: "expired"` and no
+the answer never falls through to an ancestor's value. In the collection's
+secret mode an expired item is returned with `status: "expired"` and no
 `secret`. Renew it in place with
 `PATCH` `{"expires_at": "<future RFC 3339 instant>"}` (or a replace); a
 create-only `PUT` over it is **409** `ALREADY_EXISTS`.
@@ -344,38 +344,36 @@ as `cursor` to continue. `$filter` accepts `reference`/`type` (`eq`/`in`)
 and `sharing`/`fallback`/`expires_at`; `$orderby` accepts only `reference`.
 Requires `list`.
 
-### Read secrets through the collection
+### Bulk-read secrets (secret mode)
 
-Selecting `secret` in `$select` on the collection is the same paginated read
-as the listing above: `limit`, `cursor`, `$orderby` and `$filter` work exactly
-as without it. Each item additionally carries its secret. Besides `secret`,
-`$select` on the collection may name only `reference`, `type` and
-`expires_at`; any other field with `secret` is **400** `SECRET_SELECT_FIELDS`.
-To manage credentials, list metadata without `secret` and read one secret per
-request through the point read.
+Selecting `secret` in `$select` switches the collection into secret mode:
+bounded, unpaginated, one request for several secrets at once.
 
 ```bash
-curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?limit=25&\$filter=reference+in+('smtp-default','stripe-key')&\$select=reference,type,secret" \
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?\$filter=reference+in+('smtp-default','stripe-key')&\$select=reference,type,secret" \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
-Response: **200 OK** with `Cache-Control: no-store` — the same page envelope
-(continue with `page_info.next_cursor` as usual); each item additionally
-carries the decrypted `secret`:
+Response: **200 OK** — the same page envelope, `page_info.next_cursor`
+always `null`; each item additionally carries the decrypted `secret`:
 ```json
 {
   "items": [
-    {"reference": "smtp-default", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~", "secret": "smtp-pass"}
+    {"reference": "smtp-default", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~", "sharing": "tenant", "status": "active", "inheritance": "own", "secret": "smtp-pass"}
   ],
   "page_info": {"next_cursor": null, "prev_cursor": null, "limit": 25}
 }
 ```
 
-Requires `read_secret` alone, evaluated per item: a record of a type or reference the caller may
-not `read_secret` is omitted, never reported. An expired item comes back with
-its metadata and without a secret, while one whose stored version the backend
-cannot return fails the whole request (**500**, as on a point read). Every
-returned secret is audited.
+`limit`/`cursor` are rejected (**400** `SECRET_MODE_NO_PAGINATION`),
+`$orderby` is rejected (**400** `SECRET_MODE_NO_ORDER`), and `$filter` must
+be exactly `reference eq/in (...)` or `type eq/in (...)` (**400**
+`SECRET_MODE_SELECTOR`). A match set over `list.secret_mode_cap` (default 25)
+fails the whole request with **400** `TOO_MANY_MATCHES` rather than
+truncating it. A refused or missing item is
+omitted, never reported; an expired item, or one whose stored version the
+backend cannot return (**409** `SECRET_UNREADABLE` on a point read), comes
+back with its metadata and without a secret. Requires `read_secret`, evaluated per item.
 
 ### Delete a credential
 
@@ -388,8 +386,7 @@ curl -si -X DELETE "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-op
 Response: **204 No Content**. `If-Match` is mandatory: a version validator,
 or `*` to delete whatever is there. Removes the record in one transaction and releases the reference at once
 (a create-only `PUT` right after succeeds); the secret's backend key is purged
-by the same request right after the commit (a failed purge stays recorded in the
-gear's database).
+asynchronously by the outbox.
 
 ## Using the SDK
 
@@ -416,7 +413,7 @@ async fn secret_length(
 A missing or inaccessible credential is `Ok(None)`; an explicit denial of
 `read_secret` is `Err(CredStoreError::AccessDenied)`. The record read (metadata
 only, never the value) is `get_record`. A version the backend cannot return is
-`Err(CredStoreError::Internal)` (REST **500**, logged):
+`Err(CredStoreError::SecretUnreadable)` (REST **409** `SECRET_UNREADABLE`):
 retrying does not help, rewrite the secret (`PUT`/`PATCH`) or delete the record.
 
 For every endpoint's full parameter and schema reference, see

@@ -1,3 +1,4 @@
+// Updated: 2026-10-06 by Constructor Tech
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 //! Single source of truth for the database container images this workspace's
 //! integration tests start.
@@ -30,6 +31,7 @@
 //! | `GEARS_TEST_TIMESCALEDB_TAG` | [`TIMESCALEDB_TAG`] |
 //! | `GEARS_TEST_MARIADB_TAG` | [`MARIADB_TAG`] |
 //! | `GEARS_TEST_CLICKHOUSE_TAG` | [`CLICKHOUSE_TAG`] |
+//! | `GEARS_TEST_VAULT_TAG` | [`VAULT_TAG`] |
 //!
 //! An unset *or empty* variable means "use the constant".
 //!
@@ -117,6 +119,16 @@ pub const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server";
 /// `ClickHouse` version than `E2E` runs.
 pub const CLICKHOUSE_TAG: &str = "25.6";
 
+/// Repository of the `HashiCorp` `Vault` server image.
+pub const VAULT_IMAGE: &str = "hashicorp/vault";
+
+/// Tag of the `Vault` server image.
+///
+/// Used only by the manual (`#[ignore]`) `Docker` suites of the `CredStore`
+/// `Vault` plugin and its migration rehearsal; no `E2E` sidecar pins it, so
+/// there is no second copy to keep in sync.
+pub const VAULT_TAG: &str = "2.1.1";
+
 /// Environment variable overriding [`POSTGRES_TAG`].
 pub const ENV_POSTGRES_TAG: &str = "GEARS_TEST_PG_TAG";
 /// Environment variable overriding [`POSTGRES_GRAPH_TAG`].
@@ -129,6 +141,8 @@ pub const ENV_TIMESCALEDB_TAG: &str = "GEARS_TEST_TIMESCALEDB_TAG";
 pub const ENV_MARIADB_TAG: &str = "GEARS_TEST_MARIADB_TAG";
 /// Environment variable overriding [`CLICKHOUSE_TAG`].
 pub const ENV_CLICKHOUSE_TAG: &str = "GEARS_TEST_CLICKHOUSE_TAG";
+/// Environment variable overriding [`VAULT_TAG`].
+pub const ENV_VAULT_TAG: &str = "GEARS_TEST_VAULT_TAG";
 
 /// Environment variable turning an unavailable `PostgreSQL` 19 image into a
 /// failure instead of a skip. See [`graph_lane_required()`].
@@ -197,6 +211,12 @@ pub fn mariadb_tag() -> String {
 #[must_use]
 pub fn clickhouse_tag() -> String {
     tag_from(env_override(ENV_CLICKHOUSE_TAG), CLICKHOUSE_TAG)
+}
+
+/// `Vault` tag in effect, honoring `GEARS_TEST_VAULT_TAG`.
+#[must_use]
+pub fn vault_tag() -> String {
+    tag_from(env_override(ENV_VAULT_TAG), VAULT_TAG)
 }
 
 /// A `PostgreSQL` container request on the pinned tag.
@@ -270,6 +290,16 @@ pub fn mariadb() -> GenericImage {
 /// `SELECT 1` over the mapped `HTTP` port instead.
 pub fn clickhouse() -> GenericImage {
     GenericImage::new(CLICKHOUSE_IMAGE.to_owned(), clickhouse_tag())
+}
+
+/// A `Vault` server image on the pinned tag. Same caveat as [`timescaledb()`]:
+/// the caller supplies the exposed port, wait strategy, environment and command
+/// (`server -dev` for a throwaway dev server).
+///
+/// Only the manual (`#[ignore]`) suites start it, so a CI version matrix never
+/// reaches it; the override exists to qualify another `Vault` release by hand.
+pub fn vault() -> GenericImage {
+    GenericImage::new(VAULT_IMAGE.to_owned(), vault_tag())
 }
 
 /// Whether an unavailable `PostgreSQL` 19 image must fail the run rather than
@@ -350,6 +380,8 @@ mod tests {
         assert_eq!(MARIADB_TAG, "11.8");
         assert_eq!(CLICKHOUSE_IMAGE, "clickhouse/clickhouse-server");
         assert_eq!(CLICKHOUSE_TAG, "25.6");
+        assert_eq!(VAULT_IMAGE, "hashicorp/vault");
+        assert_eq!(VAULT_TAG, "2.1.1");
     }
 
     /// Known floating-alias words. Checked per component (split on `-`/`_`),
@@ -373,6 +405,7 @@ mod tests {
             TIMESCALEDB_TAG,
             MARIADB_TAG,
             CLICKHOUSE_TAG,
+            VAULT_TAG,
         ] {
             assert!(
                 !is_floating_alias(tag),
@@ -399,6 +432,7 @@ mod tests {
             "2.29.2-pg18",
             "11.8",
             "25.6",
+            "2.1.1",
             "stablefoo",
         ] {
             assert!(!is_floating_alias(tag), "{tag} should not be flagged");
@@ -416,6 +450,7 @@ mod tests {
         assert_eq!(ENV_TIMESCALEDB_TAG, "GEARS_TEST_TIMESCALEDB_TAG");
         assert_eq!(ENV_MARIADB_TAG, "GEARS_TEST_MARIADB_TAG");
         assert_eq!(ENV_CLICKHOUSE_TAG, "GEARS_TEST_CLICKHOUSE_TAG");
+        assert_eq!(ENV_VAULT_TAG, "GEARS_TEST_VAULT_TAG");
         assert_eq!(ENV_GRAPH_LANE_REQUIRED, "GEARS_TEST_PG_GRAPH_REQUIRED");
     }
 
@@ -427,7 +462,7 @@ mod tests {
         /// (environment variable, accessor it must reach, constant it falls back to)
         type AccessorCase = (&'static str, fn() -> String, &'static str);
 
-        let cases: [AccessorCase; 6] = [
+        let cases: [AccessorCase; 7] = [
             (ENV_POSTGRES_TAG, postgres_tag, POSTGRES_TAG),
             (
                 ENV_POSTGRES_GRAPH_TAG,
@@ -438,6 +473,7 @@ mod tests {
             (ENV_TIMESCALEDB_TAG, timescaledb_tag, TIMESCALEDB_TAG),
             (ENV_MARIADB_TAG, mariadb_tag, MARIADB_TAG),
             (ENV_CLICKHOUSE_TAG, clickhouse_tag, CLICKHOUSE_TAG),
+            (ENV_VAULT_TAG, vault_tag, VAULT_TAG),
         ];
         for (var, accessor, default) in cases {
             temp_env::with_var(var, Some("sentinel-value"), || {
@@ -498,6 +534,8 @@ mod tests {
         assert_eq!(mariadb().tag(), mariadb_tag());
         assert_eq!(clickhouse().name(), CLICKHOUSE_IMAGE);
         assert_eq!(clickhouse().tag(), clickhouse_tag());
+        assert_eq!(vault().name(), VAULT_IMAGE);
+        assert_eq!(vault().tag(), vault_tag());
     }
 
     /// `postgres_tagged` exists so a higher local floor does not cost the

@@ -1,43 +1,159 @@
-//! Read-only repo methods: `resolve_for_get`, `find_own`, `inventory`,
-//! `scope_includes_tenant`.
+// Updated: 2026-10-06 by Constructor Tech
+//! Read-only repo methods: `resolve_for_get`, `find_own`, `find_for_write`,
+//! `scope_includes_tenant`, and the collection read's candidate queries
+//! (`list_candidate_references`, `list_candidates_for_references` —
+//! ADR-0005, ADR-0010).
+//!
+//! The three queries that read a record row for a secret read or a write
+//! (`resolve_for_get`, `find_own`, `find_for_write`) also return the two heal
+//! flags (ADR-0006, "Heal on access") in the same statement: correlated
+//! `EXISTS` point lookups on `(tenant_id, record_id)`, never a `COUNT`.
 
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
-use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
-use toolkit_db::secure::{ScopeError, SecureEntityExt};
-use toolkit_security::access_scope::ScopeFilter;
-use toolkit_security::{AccessScope, pep_properties};
+use sea_orm::{
+    ColumnTrait, Condition, DbBackend, EntityTrait, FromQueryResult, Iterable, QueryOrder,
+    QuerySelect,
+};
+use time::OffsetDateTime;
+use toolkit_db::secure::{DBRunner, ScopeError, Scoped, SecureEntityExt, SecureSelect};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use crate::domain::authz::scope_admits_tenant;
 use crate::domain::error::DomainError;
-use crate::domain::ports::metrics::SecretCounts;
-use crate::domain::secret::model::{SecretRow, SecretStatus};
+use crate::domain::secret::model::{Fallback, HealFlags, SecretRow, SecretStatus};
 use crate::infra::canonical_mapping::classify_db_err_to_domain;
 use crate::infra::storage::entity;
 use crate::infra::storage::repo_impl::helpers::{
-    SecretRepoImpl, entity_to_model, map_scope_err, sharing_from_i16, sharing_to_i16,
+    SecretRepoImpl, db_now_sql, entity_to_model, map_scope_err, sharing_to_i16,
 };
-
-/// Minimal projection for inventory aggregate rows.
-#[derive(Debug, FromQueryResult)]
-struct InventoryRow {
-    sharing: i16,
-    status: i16,
-    c: i64,
-}
-
-/// Minimal projection for distinct-tenant count.
-#[derive(Debug, FromQueryResult)]
-struct TenantCount {
-    t: i64,
-}
 
 fn scope_err_to_domain(e: ScopeError) -> DomainError {
     match e {
         ScopeError::Db(db) => classify_db_err_to_domain(db),
         other => map_scope_err(other),
     }
+}
+
+/// A `credstore_secrets` row with the two heal flags computed beside it.
+#[derive(FromQueryResult)]
+struct RowWithFlags {
+    id: Uuid,
+    tenant_id: Uuid,
+    reference: String,
+    sharing: i16,
+    owner_id: Uuid,
+    status: i16,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+    version: i64,
+    secret_type_uuid: Uuid,
+    expires_at: Option<OffsetDateTime>,
+    value_version: Option<String>,
+    fallback: i16,
+    has_debts: bool,
+    has_expired_intents: bool,
+}
+
+impl RowWithFlags {
+    fn into_row(self) -> Result<SecretRow, DomainError> {
+        let heal = HealFlags {
+            debts: self.has_debts,
+            expired_intents: self.has_expired_intents,
+        };
+        let row = entity_to_model(entity::secrets::Model {
+            id: self.id,
+            tenant_id: self.tenant_id,
+            reference: self.reference,
+            sharing: self.sharing,
+            owner_id: self.owner_id,
+            status: self.status,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            version: self.version,
+            secret_type_uuid: self.secret_type_uuid,
+            expires_at: self.expires_at,
+            value_version: self.value_version,
+            fallback: self.fallback,
+        })?;
+        Ok(SecretRow { heal, ..row })
+    }
+}
+
+/// Runs `select` projecting every column of the row plus the heal flags:
+/// "this record has pending debts" and "this record has expired intents"
+/// (`lease_until < now()` on the database clock), as correlated `EXISTS`
+/// point lookups served by the `(tenant_id, record_id)` indexes of the two
+/// bookkeeping tables. One statement: the scope clamp of `select` still
+/// applies to the row.
+async fn rows_with_flags(
+    select: SecureSelect<entity::secrets::Entity, Scoped>,
+    runner: &impl DBRunner,
+    backend: DbBackend,
+) -> Result<Vec<RowWithFlags>, DomainError> {
+    let has_debts = Expr::cust(
+        "EXISTS (SELECT 1 FROM credstore_store_cleanup c \
+         WHERE c.tenant_id = credstore_secrets.tenant_id AND c.record_id = credstore_secrets.id)",
+    );
+    let has_expired_intents = Expr::cust(format!(
+        "EXISTS (SELECT 1 FROM credstore_write_intents i \
+         WHERE i.tenant_id = credstore_secrets.tenant_id AND i.record_id = credstore_secrets.id \
+         AND i.lease_until < {})",
+        db_now_sql(backend)
+    ));
+    select
+        .project_all(runner, |sel| {
+            sel.select_only()
+                .columns(entity::secrets::Column::iter())
+                .column_as(has_debts, "has_debts")
+                .column_as(has_expired_intents, "has_expired_intents")
+                .into_model::<RowWithFlags>()
+        })
+        .await
+        .map_err(scope_err_to_domain)
+}
+
+/// Resolution-eligible statuses (ADR-0004, Suppression): `active` (expired
+/// or not — expiry applies to the secret, not to the record, so an expired
+/// record stays the decisive one and the service refuses to serve its
+/// secret), or `declared` with `fallback = none` (a suppressing row that
+/// competes and blocks regardless of any stale `expires_at` it carries — a
+/// suppression policy does not expire). A `declared`/`inherit` row is
+/// excluded by construction — it is simply not one of these two `(status,
+/// fallback)` shapes.
+fn resolution_eligible_condition() -> Condition {
+    Condition::any()
+        .add(
+            Condition::all()
+                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint())),
+        )
+        .add(
+            Condition::all()
+                .add(entity::secrets::Column::Status.eq(SecretStatus::Declared.as_smallint()))
+                .add(entity::secrets::Column::Fallback.eq(Fallback::None.as_smallint())),
+        )
+}
+
+/// Sharing-visibility predicate for `tenant`'s own rows: private rows only
+/// for `subject`, tenant/shared rows visible to the whole tenant. Shared by
+/// [`resolve_for_get`], [`resolve_candidates`] and (indirectly) `find_own`.
+fn own_tenant_visibility_condition(tenant: Uuid, subject: Uuid) -> Condition {
+    Condition::any()
+        .add(
+            Condition::all()
+                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Private)))
+                .add(entity::secrets::Column::TenantId.eq(tenant))
+                .add(entity::secrets::Column::OwnerId.eq(subject)),
+        )
+        .add(
+            Condition::all()
+                .add(entity::secrets::Column::Sharing.is_in([
+                    sharing_to_i16(SharingMode::Tenant),
+                    sharing_to_i16(SharingMode::Shared),
+                ]))
+                .add(entity::secrets::Column::TenantId.eq(tenant)),
+        )
 }
 
 pub(super) async fn resolve_for_get(
@@ -51,21 +167,17 @@ pub(super) async fn resolve_for_get(
     let req = req_tenant.0;
     // resolve_for_get applies its own chain + sharing predicates;
     // PDP authorization runs upstream. allow_all skips the scope WHERE clamp.
-    let rows = entity::secrets::Entity::find()
+    // The predicate is `status = active OR (status = declared AND fallback =
+    // none)` (ADR-0004, Suppression): a suppressing row competes and, when
+    // nearest, wins — the walk stops there rather than falling through.
+    let select = entity::secrets::Entity::find()
         .secure()
         .scope_with(&AccessScope::allow_all())
         .filter(Condition::all().add(entity::secrets::Column::Reference.eq(key.as_ref())))
-        .filter(
-            Condition::all()
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint())),
-        )
-        // Expired secrets resolve as not-found (write paths still see the
-        // row: overwrite refreshes it, delete revokes it, the reaper sweeps it).
-        .filter(
-            Condition::any()
-                .add(entity::secrets::Column::ExpiresAt.is_null())
-                .add(entity::secrets::Column::ExpiresAt.gt(time::OffsetDateTime::now_utc())),
-        )
+        // An expired `active` row stays eligible: it is the decisive record
+        // and the service answers `SecretExpired` for its secret rather than
+        // walking on to an ancestor's value.
+        .filter(resolution_eligible_condition())
         .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
         // Visibility by sharing class, within the ancestor `chain`:
         //   * Private — own tenant + owner only (`tenant_id == req AND
@@ -98,10 +210,8 @@ pub(super) async fn resolve_for_get(
                         )
                         .add(entity::secrets::Column::TenantId.eq(req)),
                 ),
-        )
-        .all(&conn)
-        .await
-        .map_err(scope_err_to_domain)?;
+        );
+    let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
 
     // Winner: closest tenant in chain; private beats non-private at same level.
     let pos = |t: Uuid| chain.iter().position(|c| *c == t).unwrap_or(usize::MAX);
@@ -111,7 +221,168 @@ pub(super) async fn resolve_for_get(
                 .cmp(&(b.sharing != sharing_to_i16(SharingMode::Private))),
         )
     });
-    best.map(entity_to_model).transpose()
+    best.map(RowWithFlags::into_row).transpose()
+}
+
+/// Visibility predicate shared by [`resolve_candidates`] and the collection
+/// read's candidate queries (ADR-0005): in the caller's own tenant, every
+/// sharing-visible row of any status (so the record view can report a
+/// `declared` own row's `status`/`fallback`/validator even though it never
+/// resolves); in ancestor tenants, `shared` rows only, and only those that
+/// pass [`resolution_eligible_condition`] — an ancestor's `declared`/
+/// `inherit` row is invisible here exactly as it is to a value read.
+fn chain_visibility_condition(req: Uuid, subject: Uuid, ancestors: &[Uuid]) -> Condition {
+    let mut visibility = Condition::any().add(
+        Condition::all()
+            .add(entity::secrets::Column::TenantId.eq(req))
+            .add(own_tenant_visibility_condition(req, subject)),
+    );
+    if !ancestors.is_empty() {
+        visibility = visibility.add(
+            Condition::all()
+                .add(entity::secrets::Column::TenantId.is_in(ancestors.to_vec()))
+                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Shared)))
+                .add(resolution_eligible_condition()),
+        );
+    }
+    visibility
+}
+
+pub(super) async fn resolve_candidates(
+    repo: &SecretRepoImpl,
+    req_tenant: TenantId,
+    subject: OwnerId,
+    key: &SecretRef,
+    chain: &[Uuid],
+) -> Result<Vec<SecretRow>, DomainError> {
+    let conn = repo.db.conn()?;
+    let req = req_tenant.0;
+    let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
+    let visibility = chain_visibility_condition(req, subject.0, &ancestors);
+
+    let rows = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(Condition::all().add(entity::secrets::Column::Reference.eq(key.as_ref())))
+        .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
+        .filter(visibility)
+        .all(&conn)
+        .await
+        .map_err(scope_err_to_domain)?;
+
+    rows.into_iter().map(entity_to_model).collect()
+}
+
+/// Row-shape helper for a `SELECT DISTINCT reference` projection.
+#[derive(FromQueryResult)]
+struct ReferenceRow {
+    reference: String,
+}
+
+/// Collection read, step 1 (ADR-0005): candidate **references** visible
+/// across `chain`, under [`chain_visibility_condition`], clamped by an exact
+/// `reference` set when the caller's `$filter` named one, and by
+/// `type_scope` - a type-only scope (`secret_type IN (...)`) the service
+/// derived from ONE PDP decision on the base credential type, already
+/// intersected with the caller's own `$filter type in (…)` (ADR-0010). The
+/// scope is applied through the secure ORM, so the type predicate is
+/// compiled to SQL exactly like any other PDP constraint. Both clamps are
+/// invariant across a reference's chain, so both are sound SQL clamps
+/// (ADR-0005 §"What stays out of the filter"). `DISTINCT reference`, ordered
+/// by `reference` (`desc` when `desc`), keyset-paginated by `cursor`
+/// (exclusive: `reference > cursor` ascending, `reference < cursor`
+/// descending). Fetches at most `limit` references — the caller passes
+/// `page_limit + 1` in metadata mode to detect a next page, or
+/// `secret_mode_cap + 1` in secret mode (no cursor, always ascending); both
+/// counts reflect only references admitted by the permitted-type clamp.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every clamp the collection read's step 1 query supports, named rather than \
+              bundled into an ad-hoc struct only this call site would use"
+)]
+pub(super) async fn list_candidate_references(
+    repo: &SecretRepoImpl,
+    req_tenant: TenantId,
+    subject: OwnerId,
+    chain: &[Uuid],
+    reference_in: Option<&[String]>,
+    type_scope: &AccessScope,
+    cursor: Option<&str>,
+    desc: bool,
+    limit: u64,
+) -> Result<Vec<String>, DomainError> {
+    let conn = repo.db.conn()?;
+    let req = req_tenant.0;
+    let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
+    let visibility = chain_visibility_condition(req, subject.0, &ancestors);
+
+    let mut filter = Condition::all()
+        .add(entity::secrets::Column::TenantId.is_in(chain.to_vec()))
+        .add(visibility);
+    if let Some(refs) = reference_in {
+        filter = filter.add(entity::secrets::Column::Reference.is_in(refs.to_vec()));
+    }
+    if let Some(after) = cursor {
+        filter = filter.add(if desc {
+            entity::secrets::Column::Reference.lt(after)
+        } else {
+            entity::secrets::Column::Reference.gt(after)
+        });
+    }
+
+    let rows: Vec<ReferenceRow> = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(type_scope)
+        .filter(filter)
+        .project_all(&conn, |sel| {
+            let sel = sel
+                .select_only()
+                .column(entity::secrets::Column::Reference)
+                .distinct();
+            let sel = if desc {
+                sel.order_by_desc(entity::secrets::Column::Reference)
+            } else {
+                sel.order_by_asc(entity::secrets::Column::Reference)
+            };
+            sel.limit(limit).into_model::<ReferenceRow>()
+        })
+        .await
+        .map_err(scope_err_to_domain)?;
+
+    Ok(rows.into_iter().map(|r| r.reference).collect())
+}
+
+/// Collection read, step 2 (ADR-0005): every visible row of `references`,
+/// whole and unclamped by type, exactly as [`resolve_candidates`] would
+/// return for each reference individually — so reduction sees every row a
+/// value read would see, never fewer because a `$filter=type…`/authorization
+/// clamp narrowed the candidate set before reduction ran.
+pub(super) async fn list_candidates_for_references(
+    repo: &SecretRepoImpl,
+    req_tenant: TenantId,
+    subject: OwnerId,
+    chain: &[Uuid],
+    references: &[String],
+) -> Result<Vec<SecretRow>, DomainError> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = repo.db.conn()?;
+    let req = req_tenant.0;
+    let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
+    let visibility = chain_visibility_condition(req, subject.0, &ancestors);
+
+    let rows = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(Condition::all().add(entity::secrets::Column::Reference.is_in(references.to_vec())))
+        .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
+        .filter(visibility)
+        .all(&conn)
+        .await
+        .map_err(scope_err_to_domain)?;
+
+    rows.into_iter().map(entity_to_model).collect()
 }
 
 pub(super) async fn find_own(
@@ -122,9 +393,11 @@ pub(super) async fn find_own(
     key: &SecretRef,
 ) -> Result<Option<SecretRow>, DomainError> {
     let conn = repo.db.conn()?;
-    // Active rows plus deprovisioning ones — a DELETE retry must be able to
-    // resume a stuck delete saga. Provisioning rows stay invisible.
-    let rows = entity::secrets::Entity::find()
+    // Active or declared — there is no delete saga to resume any more
+    // (ADR-0006: `delete_by_id` is one transaction), but a `declared` row is
+    // a legitimate "own record" `patch`/`delete` must be able to find
+    // (ADR-0004).
+    let select = entity::secrets::Entity::find()
         .secure()
         .scope_with(scope)
         .filter(
@@ -133,7 +406,7 @@ pub(super) async fn find_own(
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
                 .add(entity::secrets::Column::Status.is_in([
                     SecretStatus::Active.as_smallint(),
-                    SecretStatus::Deprovisioning.as_smallint(),
+                    SecretStatus::Declared.as_smallint(),
                 ]))
                 .add(
                     Condition::any()
@@ -150,16 +423,14 @@ pub(super) async fn find_own(
                             sharing_to_i16(SharingMode::Shared),
                         ])),
                 ),
-        )
-        .all(&conn)
-        .await
-        .map_err(scope_err_to_domain)?;
+        );
+    let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
 
     // Prefer the private row if both exist.
     let best = rows
         .into_iter()
         .min_by_key(|r| i32::from(r.sharing != sharing_to_i16(SharingMode::Private)));
-    best.map(entity_to_model).transpose()
+    best.map(RowWithFlags::into_row).transpose()
 }
 
 pub(super) async fn find_for_write(
@@ -184,137 +455,29 @@ pub(super) async fn find_for_write(
             sharing_to_i16(SharingMode::Shared),
         ]))
     };
-    let row = entity::secrets::Entity::find()
+    let select = entity::secrets::Entity::find()
         .secure()
         .scope_with(scope)
         .filter(
             Condition::all()
                 .add(entity::secrets::Column::Reference.eq(key.as_ref()))
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint()))
+                .add(entity::secrets::Column::Status.is_in([
+                    SecretStatus::Active.as_smallint(),
+                    SecretStatus::Declared.as_smallint(),
+                ]))
                 .add(class),
         )
-        .one(&conn)
-        .await
-        .map_err(scope_err_to_domain)?;
-    row.map(entity_to_model).transpose()
-}
-
-#[allow(clippy::cognitive_complexity)]
-pub(super) async fn inventory(repo: &SecretRepoImpl) -> Result<SecretCounts, DomainError> {
-    let conn = repo.db.conn()?;
-
-    // Aggregate counts grouped by sharing + status.
-    let rows: Vec<InventoryRow> = entity::secrets::Entity::find()
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .project_all(&conn, |q| {
-            q.select_only()
-                .column(entity::secrets::Column::Sharing)
-                .column(entity::secrets::Column::Status)
-                .column_as(entity::secrets::Column::Id.count(), "c")
-                .group_by(entity::secrets::Column::Sharing)
-                .group_by(entity::secrets::Column::Status)
-                .into_model::<InventoryRow>()
-        })
-        .await
-        .map_err(scope_err_to_domain)?;
-
-    let mut counts = SecretCounts::default();
-    for r in rows {
-        // Decode through the typed enums (not magic numbers) so a future encoding
-        // change can't silently miscount; an unknown encoding is logged, not dropped.
-        match SecretStatus::from_smallint(r.status) {
-            Some(SecretStatus::Provisioning) => counts.provisioning += r.c,
-            Some(SecretStatus::Deprovisioning) => counts.deprovisioning += r.c,
-            Some(SecretStatus::Active) => match sharing_from_i16(r.sharing) {
-                Some(SharingMode::Private) => counts.private += r.c,
-                Some(SharingMode::Tenant) => counts.tenant += r.c,
-                Some(SharingMode::Shared) => counts.shared += r.c,
-                None => tracing::warn!(
-                    sharing = r.sharing,
-                    "inventory: unknown sharing encoding, row not counted"
-                ),
-            },
-            None => tracing::warn!(
-                status = r.status,
-                "inventory: unknown status encoding, row not counted"
-            ),
-        }
-    }
-
-    // Distinct-tenant count for active rows.
-    let tenant_rows: Vec<TenantCount> = entity::secrets::Entity::find()
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .filter(
-            Condition::all()
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint())),
-        )
-        .project_all(&conn, |q| {
-            q.select_only()
-                .column_as(
-                    Expr::col(entity::secrets::Column::TenantId).count_distinct(),
-                    "t",
-                )
-                .into_model::<TenantCount>()
-        })
-        .await
-        .map_err(scope_err_to_domain)?;
-
-    if let Some(row) = tenant_rows.into_iter().next() {
-        counts.tenants = row.t;
-    }
-    Ok(counts)
+        .limit(1);
+    let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
+    rows.into_iter()
+        .next()
+        .map(RowWithFlags::into_row)
+        .transpose()
 }
 
 pub(super) fn scope_includes_tenant(scope: &AccessScope, tenant: Uuid) -> bool {
-    if scope.is_unconstrained() {
-        return true;
-    }
-    if scope.is_deny_all() {
-        return false;
-    }
-    // Fail-closed tenant-membership check. A scope's constraints are OR-ed
-    // (alternative grants) and the filters within a constraint are AND-ed, so
-    // a constraint admits `tenant` only when *every* one of its filters is a
-    // tenant-level predicate on `OWNER_TENANT_ID` satisfied by `tenant`. Any
-    // sibling filter that narrows below tenant granularity (`owner_id`,
-    // `resource_id`, group membership, …) or any filter this gate cannot
-    // evaluate makes the whole constraint non-admitting. That way a scope
-    // stricter than tenant granularity fails closed (403) instead of being
-    // silently widened to the whole tenant on a lone `OWNER_TENANT_ID` match.
-    'constraints: for constraint in scope.constraints() {
-        // A constraint always carries at least one filter: `ScopeConstraint`
-        // refuses to build an empty one, because an AND over nothing is TRUE
-        // and would match every row.
-        for filter in constraint.filters() {
-            // Only `OWNER_TENANT_ID` predicates can affirm tenant-level access.
-            if filter.property() != pep_properties::OWNER_TENANT_ID {
-                continue 'constraints;
-            }
-            let admits = match filter {
-                ScopeFilter::Eq(_) | ScopeFilter::In(_) => {
-                    filter.values().iter().any(|v| v.as_uuid() == Some(tenant))
-                }
-                // Fail closed on everything structured. Credstore advertises
-                // no PDP capabilities, so subtree grants arrive pre-expanded
-                // as flat `Eq`/`In` predicates (AUTHZ_USAGE_SCENARIOS
-                // S09–S11) — the gear projects no `tenant_closure` and cannot
-                // resolve a structured subtree predicate; receiving one is a
-                // capability-contract breach. Group membership over
-                // `OWNER_TENANT_ID` is likewise not a plain tenant predicate
-                // this gate resolves.
-                // ...and on any variant added later, for the same reason: a
-                // predicate this build cannot resolve is not one it may ignore.
-                _ => false,
-            };
-            if !admits {
-                continue 'constraints;
-            }
-        }
-        // Every filter affirmed `tenant` (or the constraint was empty).
-        return true;
-    }
-    false
+    // Fail-closed own-tenant gate shared with the domain's row clamp: row
+    // predicates (type, reference) narrow rows (applied by SQL), never the tenant.
+    scope_admits_tenant(scope, tenant)
 }
