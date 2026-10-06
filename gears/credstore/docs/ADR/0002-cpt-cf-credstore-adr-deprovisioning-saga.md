@@ -22,4 +22,4 @@ Delete was a saga: the row moved to a `deprovisioning` status that held the refe
 
 ## Why it was replaced
 
-The saga and its name retention existed because a successor's value shared the deleted value's backend key. With immutable value versions that race cannot occur: deleting a record is one row transaction that records a purge of the record's key, executed by the request and healed on a later access if it fails. There is no `deprovisioning` status, no reaper and no name retention. See ADR-0006.
+The saga and its name retention existed because a successor's value shared the deleted value's backend key. With immutable value versions that race cannot occur: deleting a record is one row transaction that records a purge of the record's key, executed by the request; a failed purge stays recorded until a possible external cleanup job. There is no `deprovisioning` status, no reaper and no name retention. See ADR-0006.

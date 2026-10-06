@@ -1,8 +1,7 @@
-//! Infra adapter: `TenantDirectory` backed by `TenantResolverClient` with a TTL cache.
+//! Infra adapter: `TenantDirectory` backed by `TenantResolverClient` without a cache.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tenant_resolver_sdk::{BarrierMode, GetAncestorsOptions, TenantResolverClient};
@@ -14,24 +13,15 @@ use crate::domain::ports::metrics::{CredStoreMetricsPort, Dep, DepOp, Outcome};
 use crate::domain::resolver::TenantDirectory;
 use credstore_sdk::TenantId;
 
-/// Maximum cache entries before a full eviction.
-const CACHE_CAP: usize = 4096;
-
-/// Entry: `(chain, inserted_at)`.
-type CacheEntry = (Vec<Uuid>, Instant);
-
 /// Infra implementation of [`TenantDirectory`] backed by [`TenantResolverClient`].
+///
+/// Keeps no cache: every call reads the ancestor chain from tenant-resolver, so
+/// a tenant change is followed at once. If this ever becomes slow, a single
+/// shared cache belongs in tenant-resolver (for every gear, with its own
+/// invalidation), not here.
 pub struct TenantResolverDir {
     client: Arc<dyn TenantResolverClient>,
     metrics: Arc<dyn CredStoreMetricsPort>,
-    /// Ancestor chains keyed by tenant id. Safe to share across security
-    /// contexts: the chain is a pure function of the tenant topology and the
-    /// fixed barrier-ignoring mode — it carries no caller-specific data — and
-    /// all authorization is enforced downstream (`scope_includes_tenant` +
-    /// `resolve_for_get`). So a chain populated under one caller's `ctx` is
-    /// valid for any caller resolving the same tenant.
-    cache: Mutex<HashMap<Uuid, CacheEntry>>,
-    ttl: Duration,
 }
 
 impl TenantResolverDir {
@@ -40,14 +30,8 @@ impl TenantResolverDir {
     pub fn new(
         client: Arc<dyn TenantResolverClient>,
         metrics: Arc<dyn CredStoreMetricsPort>,
-        ttl_secs: u64,
     ) -> Self {
-        Self {
-            client,
-            metrics,
-            cache: Mutex::new(HashMap::new()),
-            ttl: Duration::from_secs(ttl_secs),
-        }
+        Self { client, metrics }
     }
 }
 
@@ -58,19 +42,6 @@ impl TenantDirectory for TenantResolverDir {
         ctx: &SecurityContext,
         req: TenantId,
     ) -> Result<Vec<Uuid>, DomainError> {
-        // Cache lookup — no metric on hit.
-        {
-            let guard = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((chain, inserted)) = guard.get(&req.0)
-                && inserted.elapsed() < self.ttl
-            {
-                return Ok(chain.clone());
-            }
-        }
-
         let t0 = Instant::now();
         // Walk the full ancestry: `shared` secrets inherit through self-managed
         // (isolation-barrier) boundaries by design — a partner key stays
@@ -110,29 +81,6 @@ impl TenantDirectory for TenantResolverDir {
         let mut chain = Vec::with_capacity(1 + resp.ancestors.len());
         chain.push(req.0);
         chain.extend(resp.ancestors.iter().map(|a| a.id.0));
-
-        {
-            let mut guard = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.len() >= CACHE_CAP {
-                // Drop expired entries first; only if still at cap evict the
-                // single oldest. A blunt clear() would periodically blow away
-                // every still-fresh chain and cause a thundering herd of misses.
-                let ttl = self.ttl;
-                guard.retain(|_, (_, inserted)| inserted.elapsed() < ttl);
-                if guard.len() >= CACHE_CAP
-                    && let Some(oldest) = guard
-                        .iter()
-                        .min_by_key(|(_, (_, inserted))| *inserted)
-                        .map(|(k, _)| *k)
-                {
-                    guard.remove(&oldest);
-                }
-            }
-            guard.insert(req.0, (chain.clone(), Instant::now()));
-        }
 
         Ok(chain)
     }

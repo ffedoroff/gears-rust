@@ -19,7 +19,7 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
   `supports_destroy`. It holds no sharing/hierarchy/policy — that lives in the
   gear (ADR-0006)
 - **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`Credential`** / **`Secret`** — Domain models
-- **`CredStoreError`** — Error types for all operations; `SecretExpired` means the decisive record's secret has expired (its metadata stays readable with status `expired`; never served, never replaced by an ancestor's value); `SecretUnreadable` means the record points at a stored version the backend can never return (lost or rotated decryption key, corrupt entry, or a version gone although the pointer did not move) — permanent, retrying does not help, the record must be rewritten or deleted (REST: `409 SECRET_UNREADABLE`; in secret-mode `list` such an item is returned with its metadata and no secret)
+- **`CredStoreError`** — Error types for all operations; `SecretExpired` means the decisive record's secret has expired (its metadata stays readable with status `expired`; never served, never replaced by an ancestor's value); a stored version the backend can never return (lost or rotated decryption key, corrupt entry, or a version gone although the pointer did not move) surfaces as `Internal` — permanent, retrying does not help, the record must be rewritten or deleted (REST: `500`; in secret-mode `list` such an item fails the request)
 - **`CredStorePluginSpecV1`** — GTS schema for plugin registration
 
 ## `CredStoreClientV1`
@@ -65,7 +65,7 @@ pre-0.3 `put` preserved the expiry), so use `patch` to change one field.
 `StoreKey { tenant_id, record_id }`: `put` stores a new immutable version and
 returns the provider's `ValueVersion`; `get` reads exactly that version
 (`Ok(None)` when it is gone, `ServiceUnavailable` for a transient failure,
-`SecretUnreadable` for a version held but permanently unreadable);
+`Internal` for a version held but permanently unreadable);
 `delete_key` removes the key with all versions (idempotent); `destroy` is
 optional and declared through `supports_destroy`. The gear calls both from the
 request that recorded the cleanup, right after the commit, or when it heals a
@@ -162,7 +162,7 @@ ordered versions, observed through `destroy(Below(..))` because versions are
 opaque. A plugin that does not declare `destroy` skips those checks and is
 never asked to destroy. Every check uses fresh random ids, so checks can share
 one backend. See the module docs for the full list and what the suite leaves
-to the plugin (`SecretUnreadable`, `ServiceUnavailable`, durability across a
+to the plugin (a permanently unreadable version, `ServiceUnavailable`, durability across a
 restart).
 
 ## Usage

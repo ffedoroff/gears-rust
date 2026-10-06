@@ -56,10 +56,11 @@ provides a **KV v2** mount with:
 - a `max_versions` the versions of one key stay below. Vault keeps **10
   versions per key by default**; `max_versions = 0` or unset also means 10,
   not unlimited. Superseded versions are destroyed after each commit, so a key
-  normally holds one or two. If more versions than the limit pile up (failed
-  or ambiguous writes, a backlog of destroy tasks), Vault drops the oldest,
+  normally holds one or two. If more versions than the limit pile up above
+  a record's pointer (orphans of failed or ambiguous writes, versions of CAS
+  losers, destroyed or not), Vault drops the oldest,
   possibly the one a record points at, and that record answers
-  `SECRET_UNREADABLE` until it is rewritten. Set a larger `max_versions` on
+  an internal error (500) until it is rewritten. Set a larger `max_versions` on
   the mount if that is a concern.
 
 The token needs only this policy (replace `secret` and `credstore` with the

@@ -36,7 +36,7 @@ The `cf-gears-credstore` module provides:
   `AccessScope` enforced in SQL via `SecureORM` clamps; out-of-scope access
   is fail-closed (canonical 404, anti-enumeration)
 - **Hierarchical resolution** — a single indexed query over the ancestor chain
-  (TTL+LRU cached, barriers ignored — `shared` inherits through them); the backend is read once for the winner's value
+  (barriers ignored — `shared` inherits through them); the backend is read once for the winner's value
 - **Versioning** — strong generation-bound `ETag` (`"<id>.<version>"`) on `GET`,
   mandatory `If-Match` on `PUT`/`DELETE` (a validator, or `*` for explicit
   last-writer-wins; no ABA across recreation)
@@ -80,7 +80,7 @@ The `cf-gears-credstore` module provides:
   unaffected
 - **Metrics** — `read_outcome`, `walkup_depth`, dependency latency/health,
   `cross_tenant_denied`, `read_retry`, `audit_publish_failed`,
-  `secret_unreadable`, and for the write protocol `write_intents_healed`,
+  and for the write protocol `write_intents_healed`,
   `write_commit_verified{op,outcome}`, `store_cleanup_recorded{op}` and
   `store_cleanup_failed{op}` with `op` = `purge` | `destroy`
   (`credstore_*_total` OpenTelemetry instruments); no inventory gauge, never a
@@ -115,11 +115,10 @@ falling through to an ancestor's value. The owner renews it in place with a
 
 A version the backend holds but can never return (lost or rotated decryption
 key, corrupt entry) — or one that is gone although the row's pointer did not
-move — is permanent: the read fails `409 SECRET_UNREADABLE` (SDK
-`CredStoreError::SecretUnreadable`, counted in `secret_unreadable`), unlike the
-transient `503` for a version that vanished while the pointer moved. The
-record must be rewritten or deleted; in secret-mode collection reads such an
-item is returned with its metadata and no secret, like an expired one. Rotating
+move — is permanent: the read fails `500` (SDK `CredStoreError::Internal`, logged),
+unlike the transient `503` for a version that vanished while the pointer moved.
+The record must be rewritten or deleted; in secret-mode collection reads such
+an item fails the whole request. Rotating
 only the secret is a `PATCH` with only `secret`; `PUT` is a whole replace, so an
 omitted expiry is cleared and `fallback` resets to `inherit` (the pre-0.3 `PUT`
 preserved the expiry).
@@ -160,8 +159,6 @@ credstore:
     file: "credstore.db"
   config:
     vendor: "constructorfabric" # GTS vendor used to discover the value-store plugin
-    hierarchy:
-      ancestor_cache_ttl_secs: 300
     list:
       max_limit: 200             # metadata-mode page-size cap
       secret_mode_cap: 25        # secret-mode ($select=…,secret) match-set cap

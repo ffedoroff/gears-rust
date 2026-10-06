@@ -119,11 +119,7 @@ impl Gear for CredStoreGear {
 
         let metrics: Arc<dyn CredStoreMetricsPort> = Arc::new(CredStoreMetricsMeter::from_global());
 
-        let dir = Arc::new(TenantResolverDir::new(
-            tr_client,
-            Arc::clone(&metrics),
-            cfg.hierarchy.ancestor_cache_ttl_secs,
-        ));
+        let dir = Arc::new(TenantResolverDir::new(tr_client, Arc::clone(&metrics)));
 
         let plugins = Arc::new(GtsCredStorePluginSelector::new(
             ctx.client_hub(),

@@ -4,36 +4,36 @@ What can go wrong in CredStore's secret writes, reads and deletes: the faults th
 
 ## Tolerated faults (support now: 9)
 
-Handled by the request itself, with no background workers, timers or deferred jobs: a crash's leftovers are healed on the next access to the record, a transaction that definitely rolled back is retried up to 3 times, and an ambiguous commit of a secret write or a delete is verified once with a locking read. Handled one at a time and in the combinations of "Failure scenarios: tolerated". Guarantees:
+Handled by the request itself, with no background workers, timers or deferred jobs: a crash's leftovers are healed by a later request to the same record or reference, a transaction that definitely rolled back is retried up to 3 times, and an ambiguous commit of a secret write or a delete is verified once with a locking read. Handled one at a time and in the combinations of "Failure scenarios: tolerated". Guarantees:
 
-- the record's pointer always references an existing version with exactly the bytes written; a confirmed write is not lost;
-- the client gets success or an error that is safe to retry (409, 503);
-- leftovers (an intent, a debt row, an extra version) are tracked in the DB and removed on the next access to the record, with no background processes;
-- the failure is visible in logs and metrics.
+- the record's pointer always references an existing version with exactly the bytes written; a confirmed write is not lost while fewer versions than the store keeps pile up above the pointer (`201-STORAGE-EVICT`);
+- the client gets success or an error after which a retry is safe (404, 409, 503); if the process stops (`149-APP-CRASH`), the connection drops, and a retry is safe too;
+- leftovers (an intent, a debt row, an extra version) are tracked in the DB and removed by a later request, with no background processes: debts by the next read or write of the record, an expired intent and its version by the record's next successful secret write or its delete, a failed create's leftovers by the next create or read of its reference; a `purge` debt of a key that has no row stays until a possible external cleanup job (residual R4b);
+- the failure is visible in logs or metrics; a crash (`149-APP-CRASH`) only later, through the heal and cleanup counters.
 
 - `149-APP-CRASH` — the process stopped or was killed between two steps of a request.
 - `178-DB-DOWN` — PostgreSQL is unavailable or the connection was lost during a step; the outcome of the step is definite: nothing was written.
 - `168-DB-COMMIT-LOST` — the connection was lost around COMMIT: the DB client does not know whether the transaction committed.
 - `151-DB-CONTENTION` — serialization conflict, deadlock or SQLite busy: the transaction definitely rolled back and is retried up to 3 times (pauses of ~10 and 20 ms).
 - `130-STORAGE-DOWN` — Vault is unavailable or returns an error.
-- `161-STORAGE-TIMEOUT` — the request to Vault got no answer within 5 s: the client gave up, and Vault may or may not have applied the request.
+- `161-STORAGE-TIMEOUT` — the request to Vault got no answer within 5 s: the client gave up, and Vault may or may not have applied the request. An apply within Vault's maximum request duration (90 s by default) is still covered by the writer's intent.
 - `169-RACE-WRITE` — a concurrent write to the same record (or the same reference) by another request or instance.
 - `142-RACE-DELETE` — a concurrent delete of the record by another request.
 - `182-AUDIT-DOWN` — the audit broker is unavailable or rejected the event: the event is simply not written, the request is unaffected (log and metric).
 
-## Out-of-model faults (accepted risks: 14)
+## Out-of-model faults (accepted risks: 12)
 
 Known, not handled in this version; scenarios in "Failure scenarios: out-of-model". They are:
 
 - rare: a long VM freeze, a late apply by the store, version eviction;
 - outside the service: manual changes in Vault or the DB, backup restore, misconfiguration, mixed rollout, backend quirks;
-- functional gaps: a stale cache.
+- functional gaps: leftovers cannot be counted (no `COUNT`).
 
 Their effects are worse: untracked leftovers, an unreadable record, silent wrong behavior. Covered by the runbook and monitoring; a code that starts to matter goes to a future version or a ticket.
 
 - `218-VM-DELAY` — the process or VM froze (VM freeze, a long process pause, CPU starvation) for a time comparable to the lease (300 s) or longer.
 - `267-DB-STORAGE-NOT-SYNCED` — the DB and Vault diverged: a row points to a version that is not in Vault, or Vault holds versions and keys that the DB does not track. Causes: the DB or Vault was restored from a backup separately from the other (or to a different point in time), data in Vault or in the DB was changed bypassing the service, a version was evicted or a request was applied late.
-- `239-STORAGE-LATE-APPLY` — Vault applied the request after the client had already given up.
+- `239-STORAGE-LATE-APPLY` — Vault applied a write after the writer's lease expired, when its intent may already have been healed.
 - `201-STORAGE-EVICT` — Vault evicted the oldest versions of a key by its `max_versions` limit (10 by default; destroyed versions still count): ten or more versions were written under the key while the record's pointer stayed put — failed writes in a row, or a burst of concurrent writers whose losing versions land after the winner's.
 - `276-STORAGE-EXTERNAL-CHANGE` — data in Vault was deleted, replaced or lost bypassing the service: a Vault administrator deleted or destroyed a version, `delete_version_after` on the mount expired it, someone with direct access to Vault storage replaced the bytes of a version or wrote a version, or a non-durable store (the in-memory plugin) lost its data on a process restart.
 - `230-DB-EXTERNAL-CHANGE` — rows of the gear's tables in PostgreSQL (records, write intents, cleanup debts) were changed or deleted bypassing the service: manual SQL, a hand-written migration.
@@ -42,15 +42,13 @@ Their effects are worse: untracked leftovers, an unreadable record, silent wrong
 - `291-OPS-BLIND` — the operator cannot see the state: open intents and cleanup debt rows are not measured (COUNT is forbidden).
 - `248-OPS-CONFIG` — a configuration error by the operator (Vault mount, lease, plugin timeout, limits).
 - `250-OPS-ROLLOUT` — instances of the old and new service versions run at the same time.
-- `234-MIGRATION-FAULT` — a transient error of the old or new store during migration.
-- `289-TENANT-CACHE-STALE` — the tenant ancestor cache lives until its TTL after the tenant was re-parented.
-- `258-TENANT-CHANGE` — a tenant changed in Account Management itself, not only in the service's cache, and the service is not told (Account Management sends no events, and the service checks nothing when it happens): the tenant was moved under another parent (re-parenting, not offered by Account Management yet); it was deleted; it or one of its ancestors was suspended or soft-deleted (the service ignores tenant status, so an ancestor's `shared` values keep resolving for its descendants); an isolation barrier was set or removed (inheritance ignores barriers by design, so values keep resolving; only the PDP's authority changes, and it is evaluated on every request).
+- `258-TENANT-CHANGE` — a tenant changed in Account Management, and the service is not told (Account Management sends no events, and the service checks nothing when it happens): the tenant was moved under another parent (re-parenting, not offered by Account Management yet); it was deleted; it or one of its ancestors was suspended or soft-deleted (the service ignores tenant status, so an ancestor's `shared` values keep resolving for its descendants); an isolation barrier was set or removed (inheritance ignores barriers by design, so values keep resolving; only the PDP's authority changes, and it is evaluated on every request).
 
 ## Failure effects (9)
 
-What remains after a failure and what the client sees; a scenario lists every effect that applies. Ordered by importance: correctness and security first (wrong behavior, type mismatch, lost audit), then leftovers and client errors, then internal overhead (logs, extra DB and Vault calls). Leftovers (`*-LEFTOVER`) never corrupt primary data; they are removed on the next access to the record, or may stay forever in out-of-model scenarios (stated per scenario).
+What remains after a failure and what the client sees; a scenario lists every effect that applies. Ordered by importance: correctness and security first (wrong behavior, type mismatch, lost audit), then leftovers and client errors, then internal overhead (logs, extra DB and Vault calls). Leftovers (`*-LEFTOVER`) never corrupt primary data; they are removed by a later request (see the tolerated guarantees; a dead key's `purge` debt waits for an external job), and in out-of-model scenarios they may stay forever (stated per scenario).
 
-- `382-WRONG-BEHAVIOR` — the service behaves differently from what the client or operator expects: the record's metadata in the DB is lost or stale (404 or the old state); the secret value in Vault cannot be read (409 `SECRET_UNREADABLE` until overwritten or deleted); a stale cache, tampering that goes unnoticed.
+- `382-WRONG-BEHAVIOR` — the service behaves differently from what the client or operator expects: the record's metadata in the DB is lost or stale (404 or the old state); the secret value in Vault cannot be read (500 until overwritten or deleted); tampering that goes unnoticed.
 - `347-TYPE-MISMATCH` — records of one reference in an ancestor tenant and in its descendant carry different secret types: a consumer that reads by reference gets a secret of another shape than it expects, depending on the tenant it reads in. Nothing fails; the mismatch stays until one of the records is deleted and re-created.
 - `367-AUDIT-LOST` — an audit event is lost or recorded with a wrong operation label.
 - `350-STORAGE-LEFTOVER` — an extra version or key remains in Vault: a leftover, the primary data is not corrupted.
@@ -102,7 +100,7 @@ CC-631 The writer executed `put` (version v) and tx1, but the connection was los
 `168-DB-COMMIT-LOST`
 `356-INTERNAL-DB-EXTRA-CALL`
 
-CC-527 The writer executed `put` (version v) and tx1, the connection was lost around the COMMIT of tx1, and the outcome is unknown. The verification transaction with a locking read sees: its own intent is absent, and the pointer is not at v. So the attempt did not take effect: its intent was removed by a committed CAS loss or by healing of another write. If no row points to v, this transaction records the cleanup debt `destroy exact v` (or `purge` if there is no row with this record_id), it is executed after the commit, and the client gets 503 (a retry is safe). The writer's version is removed, no leftovers remain in the DB; an extra DB query remains.
+CC-527 The writer executed `put` (version v) and tx1, the connection was lost around the COMMIT of tx1, and the outcome is unknown. The verification transaction with a locking read sees: its own intent is absent, and the pointer is not at v. So the attempt did not take effect: its intent was removed by a committed CAS loss. If no row points to v, this transaction records the cleanup debt `destroy exact v` (or `purge` if there is no row with this record_id), it is executed after the commit, and the client gets 503 (a retry is safe). The writer's version is removed, no leftovers remain in the DB; an extra DB query remains.
 `168-DB-COMMIT-LOST`
 `336-EXTERNAL-ERROR` + `356-INTERNAL-DB-EXTRA-CALL`
 
@@ -198,7 +196,7 @@ CC-709 The commit of a secret removal, a record delete or a debt row deletion ro
 `151-DB-CONTENTION`
 `336-EXTERNAL-ERROR` + `372-DB-LEFTOVER` + `395-INTERNAL-ERROR` + `374-INTERNAL-STORAGE-EXTRA-CALL`
 
-CC-775 A reader reads a record: the row with the pointer at v, then the secret `get`. In between, a successful rotation happened: its `destroy below` removed v, and the `get` missed. The reader re-reads the row once (the pointer moved to v2) and does a second `get`. But in the meantime a second rotation with a new `destroy below` happened, and the second `get` misses too. The second failure is 503, not an empty value and not a stale one (409 `SECRET_UNREADABLE` only when the pointer has not moved). The client retries the read. There are no leftovers, an extra row read and an extra `get` call remain.
+CC-775 A reader reads a record: the row with the pointer at v, then the secret `get`. In between, a successful rotation happened: its `destroy below` removed v, and the `get` missed. The reader re-reads the row once (the pointer moved to v2) and does a second `get`. But in the meantime a second rotation with a new `destroy below` happened, and the second `get` misses too. The second failure is 503, not an empty value and not a stale one (500 only when the pointer has not moved). The client retries the read. There are no leftovers, an extra row read and an extra `get` call remain.
 `169-RACE-WRITE`
 `336-EXTERNAL-ERROR` + `374-INTERNAL-STORAGE-EXTRA-CALL` + `356-INTERNAL-DB-EXTRA-CALL`
 
@@ -222,7 +220,7 @@ CC-794 A secret read or write request has completed, and the service publishes a
 `182-AUDIT-DOWN`
 `367-AUDIT-LOST` + `395-INTERNAL-ERROR`
 
-## Failure scenarios: out-of-model (25)
+## Failure scenarios: out-of-model (22)
 
 CC-970 Writer A passed tx0 and sent `put`, but the client gave up (5 s timeout, the process crashed), while the request is still on its way to Vault. The lease passed, and writer B successfully writes the same record: its tx1 moves the pointer to v6, removes A's expired intent and records `destroy below 6`. Then Vault applies A's `put`: version v7 sits above the pointer, with no intent and no cleanup debt. The version is not served and is not tracked anywhere; it will be removed by the next successful write to this record (`destroy below`) or by deleting the record (`purge`).
 `161-STORAGE-TIMEOUT` + `169-RACE-WRITE` + `267-DB-STORAGE-NOT-SYNCED` + `239-STORAGE-LATE-APPLY`
@@ -232,35 +230,31 @@ CC-864 Writer A passed tx0 and sent `put`, but the client gave up or the process
 `142-RACE-DELETE` + `267-DB-STORAGE-NOT-SYNCED` + `239-STORAGE-LATE-APPLY`
 `350-STORAGE-LEFTOVER`
 
-CC-983 Record R exists, the pointer is at v4. Writer A passed tx0 and froze (VM freeze) for longer than the lease before sending `put`; the 5 s HTTP timeout does not help here because there is no request yet. Meanwhile writer B successfully writes R: `put` gives v6, tx1 moves the pointer to v6 and deletes A's expired intent. A wakes up, its `put` gives v7 above the pointer, tx1 finds its intent deleted and rolls back, and the verification transaction (the same one as after an ambiguous commit) fails because the DB is unavailable: A's client gets 503 and nothing is executed. Version v7 is not served and is not tracked anywhere; it will be removed by the next successful write to R (`destroy below`) or by deleting R, and for a dead key, never.
-`178-DB-DOWN` + `169-RACE-WRITE` + `218-VM-DELAY` + `267-DB-STORAGE-NOT-SYNCED`
-`350-STORAGE-LEFTOVER` + `336-EXTERNAL-ERROR`
-
 CC-914 The operator set the Vault plugin timeout comparable to the lease (the lease minimum of 60 s is validated, its relation to the timeout is not). The `put` lasts longer than the lease or is applied by Vault after the timeout, when the client has already gone; no in-process check enforces the relation between the two. Meanwhile someone else's successful write heals the expired intent and moves the pointer. The late `put` lands above the new pointer with no intent and no cleanup debt (503 to the client, the version is not served). It will be removed by the next successful write or by deleting the record, and for a dead key the leftover remains forever.
 `239-STORAGE-LATE-APPLY` + `248-OPS-CONFIG`
 `350-STORAGE-LEFTOVER`
 
-CC-887 The record's pointer is at version v, and more than 10 versions have accumulated above it (Vault keeps `max_versions` = 10 by default, destroyed ones count too). The pointer did not move because at least 10 attempts to write this record did not reach tx1: the DB flaps on tx1 for longer than three retries, processes crash, the CAS is lost, and the operator did not raise `max_versions`. Each such attempt did a `put` and left a version above the pointer. Vault evicted the oldest one, that is, version v under the pointer. Secret read: `get` misses, the pointer has not moved, the answer is 409 `SECRET_UNREADABLE`. The record is unreadable until it is overwritten (a successful write sets the pointer to a new version) or deleted.
+CC-887 The record's pointer is at version v, and more than 10 versions have accumulated above it (Vault keeps `max_versions` = 10 by default, destroyed ones count too). The pointer did not move because at least 10 attempts to write this record did not reach tx1: the DB flaps on tx1 for longer than three retries, processes crash, the CAS is lost, and the operator did not raise `max_versions`. Each such attempt did a `put` and left a version above the pointer. Vault evicted the oldest one, that is, version v under the pointer. Secret read: `get` misses, the pointer has not moved, the answer is 500 Internal (logged). The record is unreadable until it is overwritten (a successful write sets the pointer to a new version) or deleted.
 `178-DB-DOWN` + `267-DB-STORAGE-NOT-SYNCED` + `201-STORAGE-EVICT`
 `382-WRONG-BEHAVIOR` + `336-EXTERNAL-ERROR`
 
-CC-966 Eleven or more writers update the same record R at the same time with `If-Match: <etag>` or create-only (with `If-Match: *`, roughly twenty or more, because each loser retries once). All of them read row version 7 and pass the precondition, and all of them `put` to Vault, which assigns v5…v15 in the order it applies the puts. The writer whose tx1 commits first wins the CAS (say the one holding v5) and its client gets 200; the others lose the CAS, record and execute `destroy exact` of their own versions, and answer 409. Because the winner is the first to commit, not the last to `put`, ten or more losing versions sit above its version, and Vault evicts it: the row still points at v5, which no longer exists, and reads answer 409 `SECRET_UNREADABLE` until the record is rewritten or deleted. No failure is involved, only concurrency on one record. A larger `max_versions` on the key raises the threshold; a single writer per record (a short claim taken in tx0, separate from the lease) or a conditional `put` would prevent it; neither is part of this version.
+CC-966 Eleven or more writers update the same record R at the same time with `If-Match: <etag>` or create-only (with `If-Match: *`, roughly twenty or more, because each loser retries once). All of them read row version 7 and pass the precondition, and all of them `put` to Vault, which assigns v5…v15 in the order it applies the puts. The writer whose tx1 commits first wins the CAS (say the one holding v5) and its client gets 200; the others lose the CAS, record and execute `destroy exact` of their own versions, and answer 409. Because the winner is the first to commit, not the last to `put`, ten or more losing versions sit above its version, and Vault evicts it: the row still points at v5, which no longer exists, and reads answer 500 until the record is rewritten or deleted. No failure is involved, only concurrency on one record. A larger `max_versions` on the key raises the threshold; a single writer per record (a short claim taken in tx0, separate from the lease) or a conditional `put` would prevent it; neither is part of this version.
 `169-RACE-WRITE` + `201-STORAGE-EVICT`
 `382-WRONG-BEHAVIOR` + `336-EXTERNAL-ERROR`
 
-CC-897 The version under the record's pointer is gone from Vault bypassing the service: a Vault administrator deleted or destroyed it, `delete_version_after` on the mount expired it, or the store is not durable (the in-memory plugin) and lost all values on a process restart while the rows kept their pointers. The reader reads the row, the secret `get` misses, the reader re-reads the row (an extra query), and the pointer has not moved: the answer is 409 `SECRET_UNREADABLE` (retrying is pointless). The service does not know about the loss in advance; the record is unreadable until it is overwritten (replace or PATCH with a secret) or deleted. A non-durable store also starts its version numbers over after the restart, so a version written later under the same number (for example the orphan of a failed write) can be served under an old pointer, which is not detected; such a store is forbidden for production.
+CC-897 The version under the record's pointer is gone from Vault bypassing the service: a Vault administrator deleted or destroyed it, `delete_version_after` on the mount expired it, or the store is not durable (the in-memory plugin) and lost all values on a process restart while the rows kept their pointers. The reader reads the row, the secret `get` misses, the reader re-reads the row (an extra query), and the pointer has not moved: the answer is 500 Internal, logged (retrying is pointless). The service does not know about the loss in advance; the record is unreadable until it is overwritten (replace or PATCH with a secret) or deleted. A non-durable store also starts its version numbers over after the restart, so a version written later under the same number (for example the orphan of a failed write) can be served under an old pointer, which is not detected; such a store is forbidden for production.
 `267-DB-STORAGE-NOT-SYNCED` + `276-STORAGE-EXTERNAL-CHANGE`
 `382-WRONG-BEHAVIOR` + `336-EXTERNAL-ERROR` + `356-INTERNAL-DB-EXTRA-CALL`
 
-CC-948 The DB was restored from a backup that is newer than the Vault state (Vault was rolled back or restored from an older snapshot). Rows point to versions that are not in Vault, because they were created after the Vault snapshot. Secret read: `get` misses, the pointer does not move, the answer is 409 `SECRET_UNREADABLE` until overwritten or deleted. Other behavior (versions in Vault and the DB are out of sync) is undefined; the service does not detect the divergence.
+CC-948 The DB was restored from a backup that is newer than the Vault state (Vault was rolled back or restored from an older snapshot). Rows point to versions that are not in Vault, because they were created after the Vault snapshot. Secret read: `get` misses, the pointer does not move, the answer is 500 Internal (logged) until overwritten or deleted. Other behavior (versions in Vault and the DB are out of sync) is undefined; the service does not detect the divergence.
 `267-DB-STORAGE-NOT-SYNCED`
 `382-WRONG-BEHAVIOR` + `336-EXTERNAL-ERROR`
 
-CC-902 The DB was restored from an old backup, while Vault is live and newer. The pointers in the rows are old: some of the versions under them were destroyed by `destroy below` after the snapshot, and a secret read of such records gives 409 `SECRET_UNREADABLE` until overwritten or deleted; the versions that remain serve the previous value. Records created after the backup have no rows, their keys with versions in Vault remain without a row, and the lost intents and cleanup debts are not tracked: the leftover remains forever, the behavior is undefined.
+CC-902 The DB was restored from an old backup, while Vault is live and newer. The pointers in the rows are old: some of the versions under them were destroyed by `destroy below` after the snapshot, and a secret read of such records gives 500 until overwritten or deleted; the versions that remain serve the previous value. Records created after the backup have no rows, their keys with versions in Vault remain without a row, and the lost intents and cleanup debts are not tracked: the leftover remains forever, the behavior is undefined.
 `267-DB-STORAGE-NOT-SYNCED`
 `382-WRONG-BEHAVIOR` + `350-STORAGE-LEFTOVER` + `336-EXTERNAL-ERROR`
 
-CC-884 The operator configured the Vault mount (`max_versions`, `delete_version_after`, `cas_required`), and the service neither reads nor checks these settings. A `max_versions` below 10 brings the eviction of the version under the pointer closer (as in CC-887). `delete_version_after` deletes versions over time, including the version under the pointer (as in CC-897), and a read gives 409 `SECRET_UNREADABLE`. With `cas_required`, every `put` without the `cas` parameter is rejected, writing secrets is impossible, and the client gets an error. This continues until the operator fixes the mount.
+CC-884 The operator configured the Vault mount (`max_versions`, `delete_version_after`, `cas_required`), and the service neither reads nor checks these settings. A `max_versions` below 10 brings the eviction of the version under the pointer closer (as in CC-887). `delete_version_after` deletes versions over time, including the version under the pointer (as in CC-897), and a read gives 500. With `cas_required`, every `put` without the `cas` parameter is rejected, writing secrets is impossible, and the client gets an error. This continues until the operator fixes the mount.
 `267-DB-STORAGE-NOT-SYNCED` + `248-OPS-CONFIG`
 `382-WRONG-BEHAVIOR` + `336-EXTERNAL-ERROR`
 
@@ -268,13 +262,9 @@ CC-967 Someone with direct access to Vault storage replaced the bytes of an exis
 `267-DB-STORAGE-NOT-SYNCED` + `276-STORAGE-EXTERNAL-CHANGE`
 `382-WRONG-BEHAVIOR` + `350-STORAGE-LEFTOVER`
 
-CC-998 Someone with direct access to PostgreSQL changed the gear's tables bypassing the service (manual SQL, a hand-written migration). A deleted record row: the record disappears (404), and its key with all versions stays in Vault with no `purge` debt, forever. An edited `value_version`: a secret read serves another version that still exists under the key (for example an orphan above the pointer) without noticing, or answers 409 `SECRET_UNREADABLE` when there is no such version. Deleted intent or cleanup debt rows: the versions they tracked stay in Vault untracked; for a live record they are removed by its next successful secret write (`destroy below`) or its delete (`purge`), for a key without a row never. The service detects none of this.
+CC-998 Someone with direct access to PostgreSQL changed the gear's tables bypassing the service (manual SQL, a hand-written migration). A deleted record row: the record disappears (404), and its key with all versions stays in Vault with no `purge` debt, forever. An edited `value_version`: a secret read serves another version that still exists under the key (for example an orphan above the pointer) without noticing, or answers 500 when there is no such version. Deleted intent or cleanup debt rows: the versions they tracked stay in Vault untracked; for a live record they are removed by its next successful secret write (`destroy below`) or its delete (`purge`), for a key without a row never. The service detects none of this.
 `267-DB-STORAGE-NOT-SYNCED` + `230-DB-EXTERNAL-CHANGE`
 `382-WRONG-BEHAVIOR` + `350-STORAGE-LEFTOVER` + `336-EXTERNAL-ERROR`
-
-CC-978 A tenant was re-parented to a different parent, and the ancestor chain cache lives until its TTL. Inheritance resolution by reference follows the old chain: the former parent's shared values are still served, while the new parent's values are not visible. The DB and Vault state is not affected, there are no leftovers; the divergence disappears when the cache TTL expires.
-`289-TENANT-CACHE-STALE`
-`382-WRONG-BEHAVIOR`
 
 CC-961 Two creates of reference X with different types run at the same time: one in tenant T1, one in its descendant T2 (or T1 deletes its record and re-creates it with another type while T2's create is in flight). Each checks the other direction before the other's row exists: T2's upward check finds nothing or the old type, and T1's downward check does not see T2's row, which T2 inserts only in its tx1 after `put` (the window is the duration of a create, normally milliseconds, at most the store timeout). Both creates succeed, and the records of one chain carry different types. There are no leftovers in the DB or Vault and the client gets no error; listings stay correct (a winner outside the permitted types is dropped); the mismatch remains until one of the records is deleted and re-created.
 `284-RACE-TYPE`
@@ -288,17 +278,17 @@ CC-805 Intents and cleanup debt rows pile up in the DB (crashed writes, unexecut
 `291-OPS-BLIND`
 `372-DB-LEFTOVER`
 
-CC-995 The writer executed tx0, but a slow DB or a suspension of the process delayed it so that most of the lease passed before `put`. There is no in-process check of the elapsed time: the writer calls `put` as usual and continues with tx1. The outcome depends on whether the intent was healed meanwhile: if not, the write completes normally; if yes, it ends as in CC-829 or CC-854 (tx1 finds no intent, verification, `destroy exact`, 503). The lease must comfortably exceed the time a store may still apply a received request (deployment requirement, see CC-914).
+CC-995 The writer executed tx0, but a slow DB or a suspension of the process delayed it so that most of the lease passed before `put`. There is no in-process check of the elapsed time: the writer calls `put` as usual and continues with tx1. The outcome depends on whether the intent was healed meanwhile: if not, the write completes normally; if yes, it ends as in CC-829 or CC-854 (tx1 finds no intent, rolls back, 503). The lease must comfortably exceed the time a store may still apply a received request (deployment requirement, see CC-914).
 `218-VM-DELAY`
-`336-EXTERNAL-ERROR` + `372-DB-LEFTOVER` + `356-INTERNAL-DB-EXTRA-CALL`
+`350-STORAGE-LEFTOVER` + `336-EXTERNAL-ERROR`
 
-CC-829 Record R exists. Writer A passed tx0 and `put`, received the answer (version vA), then froze (VM freeze) for longer than the lease. Meanwhile writer B successfully writes R: its tx1 removes A's expired intent, sets the pointer to vB > vA and records `destroy below vB`, which covers vA. A wakes up, its tx1 does not find its intent and rolls back; the same verification transaction as after an ambiguous commit (a locking read: the intent is gone and the row does not point at vA) records `destroy exact vA`, it is executed (idempotently, the version is already removed), and A's client gets 503 (`write_commit_verified_total{outcome=not_applied}`). There are no leftovers. If the verification itself fails, the client gets 503 and nothing is executed (the case of CC-983).
+CC-829 Record R exists. Writer A passed tx0 and `put`, received the answer (version vA), then froze (VM freeze) for longer than the lease. Meanwhile writer B successfully writes R: its tx1 removes A's expired intent, sets the pointer to vB > vA and records `destroy below vB`, which covers vA. A wakes up, its tx1 does not find its intent, rolls back and answers 503. Version vA is already removed by B's `destroy below vB`, so there are no leftovers.
 `218-VM-DELAY`
-`336-EXTERNAL-ERROR` + `356-INTERNAL-DB-EXTRA-CALL`
+`336-EXTERNAL-ERROR`
 
-CC-854 Record R exists, the pointer is at v4. Writer A passed tx0, then froze (VM freeze) for longer than the lease before `put` was applied in Vault. Meanwhile writer B successfully writes R: v6, tx1 moves the pointer to v6 and removes A's expired intent. A wakes up, its `put` reaches Vault, gives v7 above the pointer, and the answer is received; the DB is available. A's tx1 does not find its intent and rolls back; the verification transaction (locking read: intent gone, no row points at v7) records `destroy exact 7`, it is executed, and the client gets 503 (`not_applied`). There are no leftovers.
-`218-VM-DELAY`
-`336-EXTERNAL-ERROR` + `356-INTERNAL-DB-EXTRA-CALL`
+CC-854 Record R exists, the pointer is at v4. Writer A passed tx0, then froze (VM freeze) for longer than the lease before `put` was applied in Vault. Meanwhile writer B successfully writes R: v6, tx1 moves the pointer to v6 and removes A's expired intent. A wakes up, its `put` reaches Vault, gives v7 above the pointer, and the answer is received; the DB is available. A's tx1 does not find its intent, rolls back and answers 503. Version v7 stays above the pointer with no intent and no debt: it is not served and is removed by the next successful secret write to R (`destroy below`) or by deleting R. For a create the same leaves a key that has no row, and the version stays forever.
+`218-VM-DELAY` + `267-DB-STORAGE-NOT-SYNCED`
+`350-STORAGE-LEFTOVER` + `336-EXTERNAL-ERROR`
 
 CC-925 A writer crashed or lost the answer after `put` (CC-661, CC-619, CC-691): version v is above the pointer, the intent is expired. The client did not retry the write, and nobody writes or deletes the record anymore. A read does not remove expired intents (the orphan is not served, readers see the previous value), and cleanup is done only by the next successful write (`destroy below` and removal of the intent) or by deleting the record (`purge`). So the orphan version v and the intent remain in Vault and the DB, tracked in the DB (R1), until the record is touched; if it is never touched, they remain forever.
 `149-APP-CRASH` + `220-CLIENT-NO-RETRY`
@@ -308,11 +298,7 @@ CC-919 A create did not complete (CC-661, CC-619, CC-525, CC-691): there is no r
 `149-APP-CRASH` + `220-CLIENT-NO-RETRY`
 `350-STORAGE-LEFTOVER` + `372-DB-LEFTOVER`
 
-CC-928 A one-off migration of values from the old store to the new one is running (the operator stopped the old version and started `credstore-value-migration migrate`). During it the old or new store answers with a transient error. The tool retries the call, and if the retries are exhausted, it aborts without any wrong state marks. The run returns a non-zero exit code, and the operator repeats `migrate` until code 0. Extra calls to the old and new stores and to the DB, and the error is visible to the operator.
-`234-MIGRATION-FAULT`
-`336-EXTERNAL-ERROR` + `374-INTERNAL-STORAGE-EXTRA-CALL` + `356-INTERNAL-DB-EXTRA-CALL`
-
-CC-938 Tenant T2 holds its own record of reference X with type A, and Account Management moves T2 under a new parent T1 that holds a `shared` record of X with type B. No create runs, so neither type check runs: T2's record now overrides T1's record of another type, and T2's descendants that inherit X get type A while T1's other descendants get type B. Inheritance itself follows the new hierarchy as designed (after the ancestor cache TTL, see CC-978). There are no leftovers in the DB or Vault and nobody gets an error; the mismatch remains until one of the records is deleted and re-created.
+CC-938 Tenant T2 holds its own record of reference X with type A, and Account Management moves T2 under a new parent T1 that holds a `shared` record of X with type B. No create runs, so neither type check runs: T2's record now overrides T1's record of another type, and T2's descendants that inherit X get type A while T1's other descendants get type B. Inheritance itself follows the new hierarchy at once, as designed. There are no leftovers in the DB or Vault and nobody gets an error; the mismatch remains until one of the records is deleted and re-created.
 `258-TENANT-CHANGE`
 `347-TYPE-MISMATCH`
 
