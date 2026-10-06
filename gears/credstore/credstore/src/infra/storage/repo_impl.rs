@@ -78,6 +78,25 @@ impl SecretRepo for SecretRepoImpl {
         Ok(reads::scope_includes_tenant(scope, tenant))
     }
 
+    async fn list_tenants_with_other_type(
+        &self,
+        reference: &SecretRef,
+        requested_type: Uuid,
+        exclude_tenant: TenantId,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<Uuid>, DomainError> {
+        reads::list_tenants_with_other_type(
+            self,
+            reference,
+            requested_type,
+            exclude_tenant,
+            after,
+            limit,
+        )
+        .await
+    }
+
     async fn list_candidate_references(
         &self,
         req_tenant: TenantId,
@@ -121,10 +140,6 @@ impl SecretRepo for SecretRepoImpl {
         intents::begin_write_intent(self, attempt, lease).await
     }
 
-    async fn drop_write_intent(&self, attempt_id: Uuid) -> Result<(), DomainError> {
-        intents::drop_write_intent(self, attempt_id).await
-    }
-
     async fn insert_active(
         &self,
         scope: &AccessScope,
@@ -165,15 +180,6 @@ impl SecretRepo for SecretRepoImpl {
             attempt,
         )
         .await
-    }
-
-    async fn settle_lost_intent(
-        &self,
-        key: &StoreKey,
-        version: &ValueVersion,
-        destroy_supported: bool,
-    ) -> Result<Vec<CleanupDebt>, DomainError> {
-        intents::settle_lost_intent(self, key, version, destroy_supported).await
     }
 
     async fn heal_failed_creates(

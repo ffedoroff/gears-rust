@@ -130,10 +130,8 @@ struct SecretReadJob {
 }
 
 /// One finished secret-mode read: the credential, its reference and GTS type
-/// (for the audit record), and the secret if the read found one; the flag is
-/// set when the value can never be read (`SecretUnreadable`): the item is then
-/// returned with its metadata and no secret, like an expired one.
-type ReadResult = (Credential, SecretRef, String, Option<Secret>, bool);
+/// (for the audit record), and the secret if the read found one.
+type ReadResult = (Credential, SecretRef, String, Option<Secret>);
 
 /// One secret-mode result slot, in reference order: an item already complete
 /// (an expired record: metadata only, no secret) or the index of a value read
@@ -568,14 +566,8 @@ impl Service {
 
             let effective_type = reduced.effective.secret_type_uuid;
             if !allowed.admits(effective_type, &reduced.effective.reference) {
-                // Step 1 admitted this reference only because a row of a
-                // permitted type existed for it; the winner's type is not
-                // admitted regardless, so this is always the
-                // override-type-consistency invariant being violated
-                // (ADR-0005 §"Filter in SQL first…"), never an ordinary PDP
-                // denial — step 1's clamp already excluded every denied
-                // type before this reference was even fetched.
-                self.metrics.list_type_invariant_violation();
+                // An authorization guard: the winner's type is not admitted,
+                // so the reference is dropped rather than surfaced.
                 continue;
             }
             let resolved = match resolved_types.entry(effective_type) {
@@ -687,14 +679,7 @@ impl Service {
         while let Some((index, credential, key, gts_id, outcome)) = reads.next().await {
             match outcome {
                 Ok(secret) => {
-                    read_results[index] = Some((credential, key, gts_id, secret, false));
-                }
-                // A permanently unreadable value is a property of this one
-                // record, not an outage: the item keeps its metadata, loses
-                // its secret, and the request goes on (the metric and the
-                // log line were emitted where the outcome was produced).
-                Err(DomainError::SecretUnreadable) => {
-                    read_results[index] = Some((credential, key, gts_id, None, true));
+                    read_results[index] = Some((credential, key, gts_id, secret));
                 }
                 Err(err) => {
                     // The failed read was authorized and attempted; no
@@ -734,17 +719,9 @@ impl Service {
             // `None` only if the loop above exited without an error before
             // visiting every index, which cannot happen: the only early
             // exit is the `Err` branch, which returns above.
-            let Some((credential, key, gts_id, secret, unreadable)) = read_results[index].take()
-            else {
+            let Some((credential, key, gts_id, secret)) = read_results[index].take() else {
                 continue;
             };
-            if unreadable {
-                items.push(CredentialListItem {
-                    credential,
-                    secret: None,
-                });
-                continue;
-            }
             let Some(secret) = secret else {
                 // A refused or missing value is omitted,
                 // not reported (ADR-0004 "Bulk secret read: the collection in

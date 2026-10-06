@@ -162,10 +162,11 @@
 //!
 //! # What the suite does not cover
 //!
-//! * [`CredStoreError::SecretUnreadable`](crate::CredStoreError::SecretUnreadable)
-//!   and [`CredStoreError::ServiceUnavailable`](crate::CredStoreError::ServiceUnavailable):
-//!   a backend cannot be made to lose a decryption key or go down from the
-//!   outside. Test those in the plugin.
+//! * [`CredStoreError::ServiceUnavailable`](crate::CredStoreError::ServiceUnavailable)
+//!   and the permanent [`CredStoreError::Internal`](crate::CredStoreError::Internal)
+//!   of a version that exists but can never be read: a backend cannot be
+//!   made to go down or lose a decryption key from the outside. Test those
+//!   in the plugin.
 //! * Durability across a restart of the plugin or the backend (the suite can
 //!   only read back through the same plugin instance).
 //! * Behaviour the contract leaves open: `put` after `delete_key` on the same

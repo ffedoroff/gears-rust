@@ -356,7 +356,7 @@ mod tests {
         assert!(old_transient(&LegacyError::Unavailable("x".to_owned())));
         assert!(!old_transient(&LegacyError::Failed("x".to_owned())));
         assert!(new_transient(&CredStoreError::service_unavailable("x")));
-        assert!(!new_transient(&CredStoreError::SecretUnreadable));
+        assert!(!new_transient(&CredStoreError::internal("x")));
     }
 
     fn row(sharing: i16, reference: &str) -> ProgressRow {

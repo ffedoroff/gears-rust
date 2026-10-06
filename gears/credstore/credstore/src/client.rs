@@ -48,7 +48,6 @@ impl From<DomainError> for CredStoreError {
         match err {
             DomainError::NotFound => CredStoreError::NotFound,
             DomainError::SecretExpired => CredStoreError::SecretExpired,
-            DomainError::SecretUnreadable => CredStoreError::SecretUnreadable,
             // Both are 409-class; the SDK has no distinct optimistic-lock variant.
             DomainError::Conflict | DomainError::VersionConflict => CredStoreError::Conflict,
             DomainError::InvalidSecretRef { detail } => CredStoreError::invalid_ref(detail),

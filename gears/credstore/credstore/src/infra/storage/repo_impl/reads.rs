@@ -1,6 +1,7 @@
 // Updated: 2026-10-06 by Constructor Tech
 //! Read-only repo methods: `resolve_for_get`, `find_own`, `find_for_write`,
-//! `scope_includes_tenant`, and the collection read's candidate queries
+//! `scope_includes_tenant`, the create-time downward type check
+//! (`list_tenants_with_other_type`), and the collection read's candidate queries
 //! (`list_candidate_references`, `list_candidates_for_references` —
 //! ADR-0005, ADR-0010).
 //!
@@ -277,6 +278,50 @@ pub(super) async fn resolve_candidates(
 #[derive(FromQueryResult)]
 struct ReferenceRow {
     reference: String,
+}
+
+/// Row-shape helper for a `SELECT DISTINCT tenant_id` projection.
+#[derive(FromQueryResult)]
+struct TenantRow {
+    tenant_id: Uuid,
+}
+
+/// Create-time downward type check: the distinct tenants other than
+/// `exclude_tenant` holding `reference` with a type other than
+/// `requested_type`, any status, sharing and owner. Unscoped (internal
+/// lookup, like the create's own-row lookup), served by
+/// `idx_credstore_lookup`; keyset-paged by `tenant_id`, never a `COUNT`.
+pub(super) async fn list_tenants_with_other_type(
+    repo: &SecretRepoImpl,
+    reference: &SecretRef,
+    requested_type: Uuid,
+    exclude_tenant: TenantId,
+    after: Option<Uuid>,
+    limit: u64,
+) -> Result<Vec<Uuid>, DomainError> {
+    let conn = repo.db.conn()?;
+    let mut filter = Condition::all()
+        .add(entity::secrets::Column::Reference.eq(reference.as_ref()))
+        .add(entity::secrets::Column::SecretTypeUuid.ne(requested_type))
+        .add(entity::secrets::Column::TenantId.ne(exclude_tenant.0));
+    if let Some(after) = after {
+        filter = filter.add(entity::secrets::Column::TenantId.gt(after));
+    }
+    let rows: Vec<TenantRow> = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(filter)
+        .project_all(&conn, |sel| {
+            sel.select_only()
+                .column(entity::secrets::Column::TenantId)
+                .distinct()
+                .order_by_asc(entity::secrets::Column::TenantId)
+                .limit(limit)
+                .into_model::<TenantRow>()
+        })
+        .await
+        .map_err(scope_err_to_domain)?;
+    Ok(rows.into_iter().map(|r| r.tenant_id).collect())
 }
 
 /// Collection read, step 1 (ADR-0005): candidate **references** visible

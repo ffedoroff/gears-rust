@@ -25,16 +25,11 @@ const CREDSTORE_DEPENDENCY_QUERY_DURATION: &str = "credstore_dependency_query_du
 const CREDSTORE_DEPENDENCY_HEALTH: &str = "credstore_dependency_health_total";
 const CREDSTORE_CROSS_TENANT_DENIED: &str = "credstore_cross_tenant_denied_total";
 const CREDSTORE_WRITE_INTENTS_HEALED: &str = "credstore_write_intents_healed_total";
-const CREDSTORE_WRITE_INTENT_LOST: &str = "credstore_write_intent_lost_total";
-const CREDSTORE_WRITE_INTENT_SETTLE_FAILED: &str = "credstore_write_intent_settle_failed_total";
 const CREDSTORE_STORE_CLEANUP_RECORDED: &str = "credstore_store_cleanup_recorded_total";
 const CREDSTORE_STORE_CLEANUP_FAILED: &str = "credstore_store_cleanup_failed_total";
 const CREDSTORE_WRITE_COMMIT_VERIFIED: &str = "credstore_write_commit_verified_total";
 const CREDSTORE_READ_RETRY: &str = "credstore_read_retry_total";
-const CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION: &str =
-    "credstore_list_type_invariant_violation_total";
 const CREDSTORE_AUDIT_PUBLISH_FAILED: &str = "credstore_audit_publish_failed_total";
-const CREDSTORE_SECRET_UNREADABLE: &str = "credstore_secret_unreadable_total";
 
 /// OpenTelemetry-backed metrics handle for the credstore module.
 pub struct CredStoreMetricsMeter {
@@ -44,15 +39,11 @@ pub struct CredStoreMetricsMeter {
     dependency_health: Counter<u64>,
     cross_tenant_denied: Counter<u64>,
     write_intents_healed: Counter<u64>,
-    write_intent_lost: Counter<u64>,
-    write_intent_settle_failed: Counter<u64>,
     store_cleanup_recorded: Counter<u64>,
     store_cleanup_failed: Counter<u64>,
     write_commit_verified: Counter<u64>,
     read_retry: Counter<u64>,
-    list_type_invariant_violation: Counter<u64>,
     audit_publish_failed: Counter<u64>,
-    secret_unreadable: Counter<u64>,
 }
 
 impl std::fmt::Debug for CredStoreMetricsMeter {
@@ -93,25 +84,9 @@ impl CredStoreMetricsMeter {
             write_intents_healed: meter
                 .u64_counter(CREDSTORE_WRITE_INTENTS_HEALED)
                 .with_description(
-                    "Expired write intents (a writer that crashed or stalled between announcing \
+                    "Expired write intents (a writer that crashed between announcing \
                      a store write and committing it) removed by heal: the next write's commit \
                      transaction or the failed-create heal",
-                )
-                .build(),
-            write_intent_lost: meter
-                .u64_counter(CREDSTORE_WRITE_INTENT_LOST)
-                .with_description(
-                    "Secret writes whose commit found their own intent already healed (the \
-                     writer outlived its lease); the writer cleaned up its version itself",
-                )
-                .build(),
-            write_intent_settle_failed: meter
-                .u64_counter(CREDSTORE_WRITE_INTENT_SETTLE_FAILED)
-                .with_description(
-                    "Lost writes whose own cleanup could not be recorded after the intent was \
-                     healed; the version has no cleanup obligation: it stays until the \
-                     record's next secret write or delete, or leaks if the record is gone (any \
-                     non-zero value needs attention)",
                 )
                 .build(),
             store_cleanup_recorded: meter
@@ -145,28 +120,12 @@ impl CredStoreMetricsMeter {
                      outcome (second_miss = 503)",
                 )
                 .build(),
-            list_type_invariant_violation: meter
-                .u64_counter(CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION)
-                .with_description(
-                    "Collection read: a reduced reference's winner named a type outside the \
-                     authorized set (override-type-consistency violated); the reference was \
-                     dropped from the page",
-                )
-                .build(),
             audit_publish_failed: meter
                 .u64_counter(CREDSTORE_AUDIT_PUBLISH_FAILED)
                 .with_description(
                     "Audit events for secret reads and writes that the event broker could not \
                      accept (absent, unavailable, slow or rejecting); the operation itself was \
                      unaffected",
-                )
-                .build(),
-            secret_unreadable: meter
-                .u64_counter(CREDSTORE_SECRET_UNREADABLE)
-                .with_description(
-                    "Secret reads whose stored version can never be read (the plugin reported \
-                     it unreadable, or it was gone although the record's pointer did not \
-                     move); a rising value means records need a rewrite or delete",
                 )
                 .build(),
         }
@@ -215,14 +174,6 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
         self.write_intents_healed.add(n, &[]);
     }
 
-    fn write_intent_lost(&self) {
-        self.write_intent_lost.add(1, &[]);
-    }
-
-    fn write_intent_settle_failed(&self) {
-        self.write_intent_settle_failed.add(1, &[]);
-    }
-
     fn store_cleanup_recorded(&self, op: CleanupOp) {
         self.store_cleanup_recorded
             .add(1, &[KeyValue::new("op", op.as_str())]);
@@ -248,16 +199,8 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
             .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
     }
 
-    fn list_type_invariant_violation(&self) {
-        self.list_type_invariant_violation.add(1, &[]);
-    }
-
     fn audit_publish_failed(&self) {
         self.audit_publish_failed.add(1, &[]);
-    }
-
-    fn secret_unreadable(&self) {
-        self.secret_unreadable.add(1, &[]);
     }
 }
 

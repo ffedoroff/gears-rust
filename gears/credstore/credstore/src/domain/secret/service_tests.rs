@@ -6,7 +6,7 @@
 //! merged write surface (`put`/`patch`), suppression (`fallback`), the write
 //! protocol (create, overwrite, orphaned puts, lost and ambiguous CAS,
 //! concurrent last-writer-wins, with and without `destroy` support), the
-//! re-read-once read protocol, and delete with its outbox purge.
+//! re-read-once read protocol, and delete with its recorded purge debt.
 
 use std::sync::Arc;
 
@@ -514,7 +514,7 @@ async fn create_starts_at_version_one_then_overwrite_bumps() {
     assert_eq!(
         plugin.versions(&row2.store_key()),
         vec!["2"],
-        "the rotated version is destroyed by the outbox task"
+        "the rotated version is destroyed by the request that wrote it"
     );
 
     let got = svc
@@ -765,12 +765,12 @@ async fn ambiguous_cas_failure_with_a_failed_verification_keeps_the_new_version_
     assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("1")));
 
     // The version is NOT destroyed: the row may point at it. Nothing was
-    // enqueued either.
+    // recorded as a debt either.
     assert_eq!(plugin.versions(&key_k), vec!["1", "2"]);
     assert_eq!(plugin.destroy_calls().len(), destroys, "no destroy at all");
     assert!(repo.recorded_tasks().is_empty());
 
-    // The next successful write's destroy(Below) reclaims the orphan.
+    // The next successful write's destroy(Below) removes the orphan.
     svc.put(
         &ctx,
         &key("k"),
@@ -966,7 +966,7 @@ async fn exists_writer_re_reads_and_retries_once_after_a_lost_cas() {
     assert_eq!(
         plugin.versions(&key_k),
         vec!["3"],
-        "the lost put and the old version are destroyed by the outbox"
+        "the lost put and the old version are destroyed by the next write"
     );
 }
 
@@ -995,7 +995,7 @@ async fn exists_writer_that_loses_twice_returns_a_conflict() {
     assert_eq!(
         plugin.versions(&key_k),
         vec!["1"],
-        "both lost versions are destroyed by the outbox"
+        "both lost versions are destroyed by the request that lost"
     );
 }
 
@@ -1103,7 +1103,7 @@ async fn without_destroy_support_nothing_is_ever_destroyed_and_reads_still_work(
         .expect("some");
     assert_eq!(got.secret.as_bytes(), b"v3");
 
-    // Record deletion is unchanged: row delete plus an outbox purge.
+    // Record deletion is unchanged: row delete plus a recorded purge debt.
     svc.delete(&ctx, &key("k"), exists()).await.expect("delete");
     assert_eq!(repo.purged_keys(), vec![key_k]);
 }
@@ -1246,7 +1246,7 @@ async fn read_that_misses_twice_is_503_never_a_stale_or_empty_value() {
 }
 
 #[tokio::test]
-async fn read_miss_on_an_unmoved_pointer_is_unreadable_not_503() {
+async fn read_miss_on_an_unmoved_pointer_is_internal_without_a_second_get() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -1262,21 +1262,22 @@ async fn read_miss_on_an_unmoved_pointer_is_unreadable_not_503() {
     let ctx = make_ctx(Uuid::new_v4(), tenant);
     create_k(&svc, &repo, &ctx, "old").await;
 
+    let gets_before = plugin.get_calls();
     plugin.fail_next_gets_with_not_found(1);
     let err = svc
         .get_secret(&ctx, &key("k"))
         .await
         .expect_err("the version is gone but the row still names it");
-    assert!(matches!(err, DomainError::SecretUnreadable), "{err:?}");
-    assert_eq!(metrics.secret_unreadable_total(), 1);
+    assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
+    assert_eq!(plugin.get_calls() - gets_before, 1, "no second get");
     assert!(
         metrics.read_retries().is_empty(),
-        "no second-miss retry outcome for a permanent failure"
+        "no read-retry outcome for a permanent failure"
     );
 }
 
 #[tokio::test]
-async fn plugin_reporting_the_version_unreadable_is_unreadable() {
+async fn plugin_internal_error_on_get_is_internal_at_once() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -1292,13 +1293,15 @@ async fn plugin_reporting_the_version_unreadable_is_unreadable() {
     let ctx = make_ctx(Uuid::new_v4(), tenant);
     let row = create_k(&svc, &repo, &ctx, "old").await;
 
-    plugin.unreadable_get_for(&row.store_key());
+    let gets_before = plugin.get_calls();
+    plugin.internal_get_for(&row.store_key());
     let err = svc
         .get_secret(&ctx, &key("k"))
         .await
         .expect_err("the plugin can never return this version");
-    assert!(matches!(err, DomainError::SecretUnreadable), "{err:?}");
-    assert_eq!(metrics.secret_unreadable_total(), 1);
+    assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
+    assert_eq!(plugin.get_calls() - gets_before, 1, "no second get");
+    assert!(metrics.read_retries().is_empty());
 }
 
 #[tokio::test]
@@ -1793,7 +1796,7 @@ async fn ambiguous_create_failure_with_a_failed_verification_keeps_the_version()
         "the commit may have happened: the version is not destroyed"
     );
     assert!(repo.recorded_tasks().is_empty(), "nothing is enqueued");
-    assert_eq!(repo.intents().len(), 1, "the intent stays for the reclaim");
+    assert_eq!(repo.intents().len(), 1, "the intent stays for a later heal");
 }
 
 // ── delete ────────────────────────────────────────────────────────────────────
@@ -1911,7 +1914,7 @@ async fn delete_if_match_race_maps_zero_rows_to_version_conflict() {
 }
 
 #[tokio::test]
-async fn delete_needs_no_plugin_because_the_purge_runs_from_the_outbox() {
+async fn delete_with_no_resolvable_plugin_replies_ok_and_leaves_the_purge_debt() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let dir = Arc::new(FakeDir::single(tenant));
@@ -1941,9 +1944,14 @@ async fn delete_needs_no_plugin_because_the_purge_runs_from_the_outbox() {
     svc_no_plugin
         .delete(&ctx, &key("k"), exists())
         .await
-        .expect("delete resolves no plugin: the outbox handler does, and retries");
+        .expect("a failed purge execution does not change the reply");
     assert!(repo.rows().is_empty());
     assert_eq!(repo.purged_keys(), vec![row.store_key()]);
+    assert_eq!(
+        repo.pending_tasks(),
+        vec![CleanupTask::Purge(row.store_key())],
+        "the debt row stays for a later request to execute"
+    );
 }
 
 // ── PDP / scope gating ────────────────────────────────────────────────────────
@@ -3217,6 +3225,235 @@ async fn put_create_type_mismatch_with_inherited() {
             ..
         }
     ));
+}
+
+// ── Downward type consistency on create (`TYPE_MISMATCH_WITH_DESCENDANT`) ───
+
+/// A repo where `holder` already holds `k` through its own service
+/// (generic type unless `declared`/`typed` say otherwise), plus the plugin.
+struct DescendantFixture {
+    repo: Arc<FakeSecretRepo>,
+    plugin: Arc<FakePlugin>,
+    ancestor: Uuid,
+    holder: Uuid,
+}
+
+impl DescendantFixture {
+    async fn new(write: CredentialWrite) -> Self {
+        let repo = Arc::new(FakeSecretRepo::new());
+        let plugin = FakePlugin::new();
+        let holder = Uuid::new_v4();
+        let svc = make_service_noop(
+            repo.clone(),
+            plugin.clone(),
+            Arc::new(FakeDir::single(holder)),
+        );
+        svc.put(
+            &make_ctx(Uuid::new_v4(), holder),
+            &key("k"),
+            write,
+            create_only(),
+        )
+        .await
+        .expect("holder creates");
+        Self {
+            repo,
+            plugin,
+            ancestor: Uuid::new_v4(),
+            holder,
+        }
+    }
+
+    fn ancestor_service(&self, dir: FakeDir) -> Service {
+        make_service_noop(self.repo.clone(), self.plugin.clone(), Arc::new(dir))
+    }
+
+    fn ancestor_ctx(&self) -> toolkit_security::SecurityContext {
+        make_ctx(Uuid::new_v4(), self.ancestor)
+    }
+}
+
+fn assert_descendant_mismatch(err: &DomainError, holder: Uuid, ancestor: Uuid) {
+    let DomainError::TypeViolation { reason, detail, .. } = err else {
+        panic!("expected TypeViolation, got {err:?}");
+    };
+    assert_eq!(
+        *reason,
+        crate::domain::secret::typing::reasons::TYPE_MISMATCH_WITH_DESCENDANT
+    );
+    for forbidden in [
+        holder.to_string(),
+        ancestor.to_string(),
+        "generic".to_owned(),
+        "basic-auth".to_owned(),
+    ] {
+        assert!(
+            !detail.contains(&forbidden),
+            "detail leaks {forbidden}: {detail}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn put_create_type_mismatch_with_descendant() {
+    let f = DescendantFixture::new(write_create(SharingMode::Tenant, "v")).await;
+    let begun = f.repo.begun_attempts().len();
+    let svc = f.ancestor_service(FakeDir::single(f.ancestor).with_descendants(vec![f.holder]));
+    let err = svc
+        .put(
+            &f.ancestor_ctx(),
+            &key("k"),
+            write_create_typed(
+                SharingMode::Private,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect_err("descendant holds another type");
+    assert_descendant_mismatch(&err, f.holder, f.ancestor);
+    assert_eq!(f.repo.rows().len(), 1, "nothing written");
+    assert_eq!(f.repo.begun_attempts().len(), begun, "no intent announced");
+}
+
+#[tokio::test]
+async fn put_create_with_descendant_of_declared_row_still_mismatches() {
+    let f =
+        DescendantFixture::new(write_create_null(SharingMode::Tenant, SdkFallback::Inherit)).await;
+    assert_eq!(f.repo.rows()[0].status, SecretStatus::Declared);
+    let svc = f.ancestor_service(FakeDir::single(f.ancestor).with_descendants(vec![f.holder]));
+    let err = svc
+        .put(
+            &f.ancestor_ctx(),
+            &key("k"),
+            write_create_typed(
+                SharingMode::Tenant,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect_err("declared row counts");
+    assert_descendant_mismatch(&err, f.holder, f.ancestor);
+}
+
+#[tokio::test]
+async fn put_create_succeeds_when_holder_is_not_a_descendant() {
+    let f = DescendantFixture::new(write_create(SharingMode::Tenant, "v")).await;
+    // Sibling / unrelated tenant: tenant-resolver says "not an ancestor".
+    let svc = f.ancestor_service(FakeDir::single(f.ancestor));
+    let out = svc
+        .put(
+            &f.ancestor_ctx(),
+            &key("k"),
+            write_create_typed(
+                SharingMode::Tenant,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect("unrelated holder does not block");
+    assert!(out.created);
+}
+
+#[tokio::test]
+async fn put_create_succeeds_when_descendant_holds_the_same_type() {
+    let f = DescendantFixture::new(write_create(SharingMode::Tenant, "v")).await;
+    let svc = f.ancestor_service(FakeDir::single(f.ancestor).with_descendants(vec![f.holder]));
+    let out = svc
+        .put(
+            &f.ancestor_ctx(),
+            &key("k"),
+            write_create(SharingMode::Tenant, "w"),
+            create_only(),
+        )
+        .await
+        .expect("same type is consistent");
+    assert!(out.created);
+}
+
+#[tokio::test]
+async fn put_create_fails_503_when_tenant_resolver_fails_during_descendant_check() {
+    let f = DescendantFixture::new(write_create(SharingMode::Tenant, "v")).await;
+    let begun = f.repo.begun_attempts().len();
+    let svc = f.ancestor_service(FakeDir::single(f.ancestor).with_failing_is_ancestor());
+    let err = svc
+        .put(
+            &f.ancestor_ctx(),
+            &key("k"),
+            write_create_typed(
+                SharingMode::Tenant,
+                r#"{"username":"u","password":"p"}"#,
+                "basic-auth",
+            ),
+            create_only(),
+        )
+        .await
+        .expect_err("outage");
+    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
+    assert_eq!(f.repo.rows().len(), 1, "nothing written");
+    assert_eq!(f.repo.begun_attempts().len(), begun, "no intent announced");
+}
+
+#[tokio::test]
+async fn put_replace_and_patch_never_run_the_descendant_check() {
+    // The ancestor already holds `k` (generic); a descendant holds it with
+    // another type (seeded around the check, as a create would be refused).
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let ancestor = Uuid::new_v4();
+    let holder = Uuid::new_v4();
+    let anc_svc = make_service_noop(
+        repo.clone(),
+        plugin.clone(),
+        Arc::new(FakeDir::single(ancestor).with_failing_is_ancestor()),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), ancestor);
+    // The failing dir would turn any check into a 503, but an empty
+    // candidate list never asks it: seed the holder only afterwards.
+    anc_svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await
+        .expect("ancestor creates");
+    let mut row = repo.rows()[0].clone();
+    row.id = Uuid::new_v4();
+    row.tenant_id = TenantId(holder);
+    row.secret_type_uuid = SecretType::from_name("basic-auth").expect("known").uuid();
+    repo.seed(row);
+
+    let own = repo.rows()[0].clone();
+    anc_svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace(SharingMode::Tenant, "v2"),
+            put_matches(own.id, own.version),
+        )
+        .await
+        .expect("replace skips the check");
+    let own = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.tenant_id == TenantId(ancestor))
+        .expect("own row");
+    anc_svc
+        .patch(
+            &ctx,
+            &key("k"),
+            patch_value("v3"),
+            matches(own.id, own.version),
+        )
+        .await
+        .expect("patch skips the check");
 }
 
 #[tokio::test]

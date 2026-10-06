@@ -2,8 +2,7 @@
 //! lifecycle status set (`provisioning`/`active`/`deprovisioning`), the
 //! monotonic `version` column, GTS secret typing (`secret_type_uuid`,
 //! `expires_at`), the value-fingerprint fence columns (`value_fp`,
-//! `fp_key_id` — see `docs/features/001-value-fingerprint-fence.md`), and
-//! all indexes. Both fence columns are NULL together (out-of-band seeded
+//! `fp_key_id`), and all indexes. Both fence columns are NULL together (out-of-band seeded
 //! rows) or set together (API-written rows), enforced by CHECK.
 //!
 //! The secret type is stored as the deterministic v5 UUID of its GTS type
