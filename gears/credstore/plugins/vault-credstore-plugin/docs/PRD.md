@@ -137,7 +137,7 @@ flowchart LR
 
 - The deployment provides a Vault or OpenBao server with a **KV v2** mount reachable from the host process, and a token whose policy covers the plugin's key space (the minimal policy is in [DESIGN §4.1](./DESIGN.md#41-security-and-data-protection)).
 - The mount **MUST** have `delete_version_after = 0s` (no version expires by age) and `cas_required = false` (the plugin writes without compare-and-set; the gear's PostgreSQL compare-and-set decides the winner of concurrent writes).
-- The mount's `max_versions` **MUST** exceed the number of versions one key can hold at once. Vault keeps 10 versions per key by default, and `max_versions = 0` or unset also means 10, not unlimited. Superseded versions are destroyed by the gear right after each commit, so a key normally holds one or two; when more than the limit pile up (failed or ambiguous writes, destroy debts not yet executed), Vault drops the oldest, possibly the version a record points at, and that record answers `SECRET_UNREADABLE` until it is rewritten. An operator who wants more headroom sets a larger `max_versions` on the mount.
+- The mount's `max_versions` **MUST** exceed the number of versions one key can hold at once. Vault keeps 10 versions per key by default, and `max_versions = 0` or unset also means 10, not unlimited. Superseded versions are destroyed by the gear right after each commit, so a key normally holds one or two; when more than the limit pile up above the record's pointer (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not, since destroyed versions still count; versions below the pointer are evicted first and are harmless), Vault drops the oldest, possibly the version a record points at, and that record answers an internal error (500) until it is rewritten. An operator who wants more headroom sets a larger `max_versions` on the mount.
 - The plugin does not verify any of this at startup or later: these are operator obligations.
 - Exactly one backend plugin serves a CredStore instance; this plugin is selected by its configured vendor (default `openbao`) and cannot serve the same instance as `static-credstore-plugin`.
 
@@ -185,7 +185,7 @@ flowchart LR
 
 `get` **MUST** return exactly the bytes written by the `put` that returned the requested version. A version that is absent, soft-deleted, destroyed or evicted by Vault's retention, and a key that was never written, **MUST** answer "no value" and not an error. A version number that no write can have produced (`0`) **MUST** answer "no value" without asking Vault, because Vault would otherwise answer with the latest version. A stored entry that holds data this plugin did not write (no value field, or a value that is not valid base64) **MUST** be reported as permanently unreadable.
 
-- **Rationale**: The gear distinguishes "the version is gone" (it re-reads the record's pointer once) from "never readable" (it answers `SECRET_UNREADABLE`) and from an outage (retryable); a wrong mapping turns an outage into a data-loss answer or the reverse.
+- **Rationale**: The gear distinguishes "the version is gone" (it re-reads the record's pointer once) from "never readable" (it answers an internal error, 500) and from an outage (retryable); a wrong mapping turns an outage into a data-loss answer or the reverse.
 - **Actors**: `cpt-cf-credstore-vault-actor-credstore-gear`, `cpt-cf-credstore-vault-actor-vault`
 
 #### Idempotent Key Deletion
@@ -234,7 +234,7 @@ The plugin **MUST** authenticate every request with a Vault token and **MUST** a
 
 Every failure **MUST** be mapped to the SDK error taxonomy by a fixed table: no response, timeout, `5xx`, `408` and `429` are "service unavailable" (with the server's `Retry-After` when it sent one); a `403` that survived the token re-read is also "service unavailable" and **MUST NOT** be reported as "access denied" (the gear folds a plugin's access denial into "not found" on reads, which would hide a revoked or under-privileged token); a `400` or any other unexpected status is an internal error carrying Vault's error text; a `404` that explains itself (the mount does not exist) is an internal error and **MUST NOT** be read as a missing key; a response that is not the expected shape is an internal error. Error messages **MUST NOT** contain the token or secret bytes.
 
-- **Rationale**: The gear reacts differently to each category (retry, answer 503, answer `SECRET_UNREADABLE`, treat as a miss); a misclassified permission or routing error would be invisible or destructive.
+- **Rationale**: The gear reacts differently to each category (retry, answer 503, answer an internal error (500), treat as a miss); a misclassified permission or routing error would be invisible or destructive.
 - **Actors**: `cpt-cf-credstore-vault-actor-credstore-gear`
 
 ### 5.4 Configuration and Selection
@@ -456,7 +456,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| More versions than `max_versions` accumulate above a record's pointer (failed or ambiguous writes, a destroy backlog). | Vault drops the oldest versions, possibly the referenced one; the record answers `SECRET_UNREADABLE` until rewritten. | Documented mount obligation with the 10-version default spelled out; operators size `max_versions` for their failure profile; superseded versions are destroyed after each commit. |
+| More versions than `max_versions` accumulate above a record's pointer (orphans of failed or ambiguous writes, versions of CAS losers, destroyed or not). | Vault drops the oldest versions, possibly the referenced one (versions below the pointer go first); the record answers an internal error (500) until rewritten. | Documented mount obligation with the 10-version default spelled out; operators size `max_versions` for their failure profile; superseded versions are destroyed after each commit. |
 | The token is revoked or its policy is too narrow. | Every call fails as "service unavailable". | Explicit, logged `403` handling; documented minimal policy verified by the integration tests; sidecar rotation without restart. |
 | The mount is misconfigured (`delete_version_after`, `cas_required`, wrong name). | Versions expire, writes fail, or calls fail with an explained error. | Documented operator obligations; a missing mount is an error, not a miss; no silent success. |
 | A write is sent and its response is lost. | An unreferenced version stays in Vault. | The plugin never retries `put`; the gear's write intent covers the orphan and cleans it later. |

@@ -61,8 +61,6 @@ gears:
   credstore:
     config:
       vendor: "constructorfabric"  # selects backend plugin by vendor name (default: "constructorfabric"; "constructorfabric" -> static-credstore-plugin, "openbao" -> vault-credstore-plugin)
-      hierarchy:
-        ancestor_cache_ttl_secs: 300 # ancestor-chain cache TTL (default: 300)
       write:
         intent_lease_secs: 300      # lease of a write intent, database clock (default: 300; minimum: 60; time after which the intent of a crashed writer may be healed; must be far above the longest store request)
       list:
@@ -373,9 +371,9 @@ be exactly `reference eq/in (...)` or `type eq/in (...)` (**400**
 `SECRET_MODE_SELECTOR`). A match set over `list.secret_mode_cap` (default 25)
 fails the whole request with **400** `TOO_MANY_MATCHES` rather than
 truncating it. A refused or missing item is
-omitted, never reported; an expired item, or one whose stored version the
-backend cannot return (**409** `SECRET_UNREADABLE` on a point read), comes
-back with its metadata and without a secret. Requires `read_secret`, evaluated per item.
+omitted, never reported; an expired item comes back with its metadata and
+without a secret, while one whose stored version the backend cannot return
+fails the whole request (**500**, as on a point read). Requires `read_secret`, evaluated per item.
 
 ### Delete a credential
 
@@ -416,7 +414,7 @@ async fn secret_length(
 A missing or inaccessible credential is `Ok(None)`; an explicit denial of
 `read_secret` is `Err(CredStoreError::AccessDenied)`. The record read (metadata
 only, never the value) is `get_record`. A version the backend cannot return is
-`Err(CredStoreError::SecretUnreadable)` (REST **409** `SECRET_UNREADABLE`):
+`Err(CredStoreError::Internal)` (REST **500**, logged):
 retrying does not help, rewrite the secret (`PUT`/`PATCH`) or delete the record.
 
 For every endpoint's full parameter and schema reference, see

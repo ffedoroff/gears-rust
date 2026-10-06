@@ -132,7 +132,7 @@ an in-memory SQLite database is refused) and can also be given in
    transient ones, so 10 is enough unless many writes to the same record fail
    between successful ones; above the limit Vault permanently removes the oldest
    versions, which can be the one the database row points at, and that record then
-   answers `SECRET_UNREADABLE` until rewritten. These settings are the operator's
+   answers an internal error (500) until rewritten. These settings are the operator's
    obligation: the plugin does not check them at startup or later. A mount that
    expires versions by age (`delete_version_after` above zero) would lose values
    the database still points at.
@@ -478,9 +478,9 @@ while loading its `config` block), so pass resolved values. The Docker rehearsal
    - if it supports `destroy` (and `supports_destroy` returns `true`), it must
      provide **ordered versions** per key; without `destroy` there is no tidy and no
      cleanup of old versions (they stay until `delete_key`);
-   - `get` may report `SecretUnreadable` for a version it holds but can never
-     return (lost or rotated decryption key, corrupt entry), as opposed to a
-     transient `ServiceUnavailable`. The tool reads each copied value back and
+   - `get` reports a version it holds but can never return (lost or rotated
+     decryption key, corrupt entry) as a permanent error (`Internal`; the gear
+     answers 500), as opposed to a transient `ServiceUnavailable`. The tool reads each copied value back and
      stops on any difference, so a plugin that cannot read back what it just wrote
      is found during the rehearsal, not in production.
 2. The **old code kept compiling**, for the migration binary only: its `get` and

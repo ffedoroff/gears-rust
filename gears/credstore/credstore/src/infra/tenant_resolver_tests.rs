@@ -142,7 +142,7 @@ async fn chain_includes_self_then_ancestors() {
 
     let client: Arc<dyn TenantResolverClient> =
         Arc::new(FakeTenantResolverClient::new(child, parent, root));
-    let dir = TenantResolverDir::new(client, Arc::new(NoopMetrics), 60);
+    let dir = TenantResolverDir::new(client, Arc::new(NoopMetrics));
     let ctx = make_ctx();
 
     let chain = dir
@@ -154,28 +154,24 @@ async fn chain_includes_self_then_ancestors() {
 }
 
 #[tokio::test]
-async fn cache_hit_avoids_second_call() {
+async fn every_call_reads_tenant_resolver() {
     let child = Uuid::new_v4();
-    let parent = Uuid::new_v4();
-    let root = Uuid::new_v4();
-
-    let fake = Arc::new(FakeTenantResolverClient::new(child, parent, root));
+    let fake = Arc::new(FakeTenantResolverClient::new(
+        child,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    ));
     let client: Arc<dyn TenantResolverClient> = Arc::clone(&fake) as _;
-    let dir = TenantResolverDir::new(client, Arc::new(NoopMetrics), 60);
+    let dir = TenantResolverDir::new(client, Arc::new(NoopMetrics));
     let ctx = make_ctx();
 
-    dir.ancestor_chain(&ctx, DomainTenantId(child))
-        .await
-        .expect("first call");
-    dir.ancestor_chain(&ctx, DomainTenantId(child))
-        .await
-        .expect("second call");
+    for _ in 0..2 {
+        dir.ancestor_chain(&ctx, DomainTenantId(child))
+            .await
+            .expect("ancestor chain");
+    }
 
-    assert_eq!(
-        fake.call_count(),
-        1,
-        "client should be called only once within TTL"
-    );
+    assert_eq!(fake.call_count(), 2, "the adapter keeps no cache");
 }
 
 // `shared` secrets inherit through self-managed (isolation-barrier)
@@ -189,7 +185,7 @@ async fn ancestor_chain_requests_barrier_ignoring_mode() {
 
     let fake = Arc::new(FakeTenantResolverClient::new(child, parent, root));
     let client: Arc<dyn TenantResolverClient> = Arc::clone(&fake) as _;
-    let dir = TenantResolverDir::new(client, Arc::new(NoopMetrics), 60);
+    let dir = TenantResolverDir::new(client, Arc::new(NoopMetrics));
 
     dir.ancestor_chain(&make_ctx(), DomainTenantId(child))
         .await
