@@ -199,7 +199,8 @@ Response: **200 OK** (`ETag`, `Cache-Control: no-store`)
 A winning record with no secret (`declared`, or `suppressed`) is the
 canonical **404** — indistinguishable from "does not exist". Requires
 `read_secret`; a `$select` naming both a record field and `secret` requires
-`read` and `read_secret` together.
+`read` and `read_secret` together (on the collection that combination is
+rejected, below).
 
 **Expired records.** Expiry applies to the secret, not to the record. Once an
 `active` record's `expires_at` has passed, a read without `secret` still
@@ -347,7 +348,11 @@ Requires `list`.
 
 Selecting `secret` in `$select` on the collection is the same paginated read
 as the listing above: `limit`, `cursor`, `$orderby` and `$filter` work exactly
-as without it. Each item additionally carries its secret.
+as without it. Each item additionally carries its secret. Besides `secret`,
+`$select` on the collection may name only `reference`, `type` and
+`expires_at`; any other field with `secret` is **400** `SECRET_SELECT_FIELDS`.
+To manage credentials, list metadata without `secret` and read one secret per
+request through the point read.
 
 ```bash
 curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?limit=25&\$filter=reference+in+('smtp-default','stripe-key')&\$select=reference,type,secret" \
@@ -360,14 +365,13 @@ carries the decrypted `secret`:
 ```json
 {
   "items": [
-    {"reference": "smtp-default", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~", "sharing": "tenant", "status": "active", "inheritance": "own", "secret": "smtp-pass"}
+    {"reference": "smtp-default", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~", "secret": "smtp-pass"}
   ],
   "page_info": {"next_cursor": null, "prev_cursor": null, "limit": 25}
 }
 ```
 
-Requires `read_secret` (plus `list` when record fields are selected
-alongside), evaluated per item: a record of a type or reference the caller may
+Requires `read_secret` alone, evaluated per item: a record of a type or reference the caller may
 not `read_secret` is omitted, never reported. An expired item comes back with
 its metadata and without a secret, while one whose stored version the backend
 cannot return fails the whole request (**500**, as on a point read). Every

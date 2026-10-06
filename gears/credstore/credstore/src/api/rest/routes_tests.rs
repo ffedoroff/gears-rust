@@ -2088,9 +2088,10 @@ async fn list_shows_status_expired_and_selecting_secret_omits_only_the_secret() 
 
     let resp = h
         .router
+        .clone()
         .oneshot(json_request(
             "GET",
-            "/credstore/v1/credentials?%24select=reference%2Cstatus%2Csecret&%24filter=reference%20in%20(%27live%27%2C%27old%27)",
+            "/credstore/v1/credentials?%24select=reference%2Cexpires_at%2Csecret&%24filter=reference%20in%20(%27live%27%2C%27old%27)",
             None,
             test_ctx(),
         ))
@@ -2101,8 +2102,21 @@ async fn list_shows_status_expired_and_selecting_secret_omits_only_the_secret() 
     let items = body["items"].as_array().expect("items");
     assert_eq!(items.len(), 2, "body: {body}");
     assert_eq!(items[0]["secret"], "live-value");
-    assert_eq!(items[1]["status"], "expired");
+    assert_eq!(items[1]["reference"], "old");
     assert!(items[1].get("secret").is_none(), "body: {body}");
+
+    // On the collection `secret` may not ride with an administrative field.
+    let resp = h
+        .router
+        .oneshot(json_request(
+            "GET",
+            "/credstore/v1/credentials?%24select=reference%2Cstatus%2Csecret",
+            None,
+            test_ctx(),
+        ))
+        .await
+        .expect("router");
+    assert_problem(resp, StatusCode::BAD_REQUEST, Some("SECRET_SELECT_FIELDS")).await;
 }
 
 #[tokio::test]

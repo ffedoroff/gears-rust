@@ -991,7 +991,7 @@ async fn secret_selected_omits_items_of_a_refused_type() {
 }
 
 #[tokio::test]
-async fn secret_selected_with_record_field_selected_also_requires_list_per_type() {
+async fn secret_selected_collection_is_authorized_by_read_secret_alone() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -1015,47 +1015,69 @@ async fn secret_selected_with_record_field_selected_also_requires_list_per_type(
         .await
         .expect("create r1");
 
-    // A pure secret-only selector evaluates `read_secret` alone.
+    // `$select=secret` evaluates `read_secret` and not `list`.
     let (enforcer, resolver) = type_recording_enforcer();
     let svc = service_with(repo.clone(), plugin.clone(), dir.clone(), enforcer, 200);
-    let secret_only = secret_query("reference eq 'r1'");
-    let page = svc.list(&ctx, &secret_only).await.expect("list");
+    let query = ODataQuery::new()
+        .with_select(vec!["secret".to_owned()])
+        .with_filter(filter_expr("reference eq 'r1'"));
+    let page = svc.list(&ctx, &query).await.expect("list");
     assert_eq!(references_of(&page), vec!["r1"]);
     let seen = resolver.seen_actions();
     assert!(seen.contains(&"read_secret".to_owned()));
     assert!(
         !seen.contains(&"list".to_owned()),
-        "a secret-only selector must not evaluate list: {seen:?}"
+        "the collection with secret selected must not evaluate list: {seen:?}"
     );
 
-    // Selecting a record-only field alongside `secret` needs `list` too.
+    // The envelope fields may ride along with `secret`.
     let (enforcer2, resolver2) = type_recording_enforcer();
-    let svc2 = service_with(repo.clone(), plugin.clone(), dir.clone(), enforcer2, 200);
-    let combined = ODataQuery::new()
+    let svc2 = service_with(repo, plugin, dir, enforcer2, 200);
+    let envelope = ODataQuery::new()
         .with_select(vec![
             "reference".to_owned(),
-            "sharing".to_owned(),
+            "type".to_owned(),
+            "expires_at".to_owned(),
             "secret".to_owned(),
         ])
         .with_filter(filter_expr("reference eq 'r1'"));
-    let page2 = svc2.list(&ctx, &combined).await.expect("list");
+    let page2 = svc2.list(&ctx, &envelope).await.expect("list");
     assert_eq!(references_of(&page2), vec!["r1"]);
+    assert_eq!(
+        page2.items[0].secret.as_ref().expect("value").as_bytes(),
+        b"v1"
+    );
     let seen2 = resolver2.seen_actions();
     assert!(seen2.contains(&"read_secret".to_owned()));
-    assert!(seen2.contains(&"list".to_owned()));
+    assert!(!seen2.contains(&"list".to_owned()), "{seen2:?}");
+}
 
-    // And a caller denied `list` (but holding `read_secret`) loses the item
-    // entirely once a record field rides with `secret` — dropped, not
-    // returned without its record fields (ADR-0004 Amendment A).
-    let (enforcer3, _resolver3) = action_deny_enforcer(
-        SecretType::generic().gts_id().to_owned(),
-        crate::domain::authz::actions::LIST,
-    );
-    let svc3 = service_with(repo, plugin, dir, enforcer3, 200);
-    let page3 = svc3.list(&ctx, &combined).await.expect("list");
+#[tokio::test]
+async fn secret_selected_with_a_record_field_is_rejected_before_any_pdp_call() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let dir = Arc::new(FakeDir::single(tenant));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    let (enforcer, resolver) = type_recording_enforcer();
+    let svc = service_with(repo, FakePlugin::new(), dir, enforcer, 200);
+    let query = ODataQuery::new().with_select(vec![
+        "reference".to_owned(),
+        "sharing".to_owned(),
+        "secret".to_owned(),
+    ]);
+    let err = svc.list(&ctx, &query).await.expect_err("must reject");
+    assert!(matches!(
+        err,
+        DomainError::InvalidRequest {
+            field: "$select",
+            reason: "SECRET_SELECT_FIELDS",
+            ..
+        }
+    ));
     assert!(
-        page3.items.is_empty(),
-        "list denied must drop the type entirely when a record field rides with secret"
+        resolver.seen_actions().is_empty(),
+        "validation must precede every PDP call"
     );
 }
 

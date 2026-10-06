@@ -51005,7 +51005,7 @@
     },
     "/credstore/v1/credentials": {
       "get": {
-        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` adds each item's secret to the same paginated read (ADR-0004); an expired item is returned without its secret; an item whose stored version the backend cannot return fails the whole request.",
+        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Naming `secret` in `$select` requires `read_secret` and adds each item's secret to the same paginated read (ADR-0004); on the collection `secret` may be combined only with `reference`, `type`, `expires_at` (otherwise 400 `SECRET_SELECT_FIELDS`); an expired item is returned without its secret; an item whose stored version the backend cannot return fails the whole request.",
         "operationId": "credstore.list_credentials",
         "parameters": [
           {
