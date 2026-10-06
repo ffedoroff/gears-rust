@@ -1,7 +1,7 @@
 // Updated: 2026-10-06 by Constructor Tech
 //! Validated credential-store configuration.
 //!
-//! Controls backend plugin selection, hierarchy-cache lifetime, the
+//! Controls backend plugin selection, the
 //! collection-read caps and the secret-write intent lease. ADR-0006 withdraws the `reaper` block (`tick_secs`,
 //! `provisioning_timeout_secs`, `deprovisioning_timeout_secs`) and there is
 //! no `gc` block either: the gear has no resident loop and no maintenance
@@ -14,7 +14,6 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct CredStoreConfig {
     pub vendor: String,
-    pub hierarchy: HierarchyCfg,
     pub list: ListCfg,
     pub write: WriteCfg,
 }
@@ -23,23 +22,8 @@ impl Default for CredStoreConfig {
     fn default() -> Self {
         Self {
             vendor: "constructorfabric".to_owned(),
-            hierarchy: HierarchyCfg::default(),
             list: ListCfg::default(),
             write: WriteCfg::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HierarchyCfg {
-    pub ancestor_cache_ttl_secs: u64,
-}
-
-impl Default for HierarchyCfg {
-    fn default() -> Self {
-        Self {
-            ancestor_cache_ttl_secs: 300,
         }
     }
 }
@@ -106,9 +90,6 @@ impl CredStoreConfig {
         if self.vendor.trim().is_empty() {
             return Err("vendor must be non-empty".to_owned());
         }
-        if self.hierarchy.ancestor_cache_ttl_secs == 0 {
-            return Err("hierarchy.ancestor_cache_ttl_secs must be > 0".to_owned());
-        }
         if self.list.max_limit == 0 {
             return Err("list.max_limit must be > 0".to_owned());
         }
@@ -137,7 +118,6 @@ mod tests {
         // defaults to "constructorfabric"); otherwise a default-config deployment
         // resolves no backend plugin and 503s on every secret op.
         assert_eq!(cfg.vendor, "constructorfabric");
-        assert_eq!(cfg.hierarchy.ancestor_cache_ttl_secs, 300);
         assert_eq!(cfg.list.max_limit, 200);
         assert_eq!(cfg.list.secret_mode_cap, 25);
         assert_eq!(cfg.write.intent_lease_secs, 300);
@@ -153,7 +133,6 @@ mod tests {
         assert_eq!(cfg.list.max_limit, 5);
         // Unspecified fields fall back to defaults.
         assert_eq!(cfg.list.secret_mode_cap, 25);
-        assert_eq!(cfg.hierarchy.ancestor_cache_ttl_secs, 300);
     }
 
     #[test]
@@ -200,6 +179,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_the_withdrawn_hierarchy_block() {
+        // The ancestor-chain cache is gone: an old `hierarchy` block must fail
+        // config validation rather than being silently ignored.
+        let err = serde_json::from_str::<CredStoreConfig>(
+            r#"{"hierarchy":{"ancestor_cache_ttl_secs":300}}"#,
+        )
+        .expect_err("hierarchy block must be rejected");
+        assert!(err.to_string().contains("hierarchy"));
+    }
+
+    #[test]
     fn rejects_the_withdrawn_reclaim_batch_key() {
         // Reclaim is gone (heal on access has no batch): the old key must
         // fail config validation rather than being silently ignored.
@@ -210,21 +200,13 @@ mod tests {
 
     #[test]
     fn validate_rejects_each_invalid_field() {
-        use super::{HierarchyCfg, ListCfg};
+        use super::ListCfg;
 
         let empty_vendor = CredStoreConfig {
             vendor: String::new(),
             ..Default::default()
         };
         assert!(empty_vendor.validate().is_err());
-
-        let zero_ttl = CredStoreConfig {
-            hierarchy: HierarchyCfg {
-                ancestor_cache_ttl_secs: 0,
-            },
-            ..Default::default()
-        };
-        assert!(zero_ttl.validate().is_err());
 
         let zero_max_limit = CredStoreConfig {
             list: ListCfg {
