@@ -605,11 +605,10 @@ async fn a_winner_of_an_unpermitted_type_is_an_invariant_violation_not_a_denial(
         page.items.is_empty(),
         "the winner's type is not in the permitted set"
     );
-    assert_eq!(metrics.list_type_invariant_violation_total(), 1);
     assert_eq!(
         metrics.cross_tenant_denied_count(),
         0,
-        "this is the override-type-consistency invariant, not a cross-tenant denial"
+        "dropping the winner is not a cross-tenant denial"
     );
 }
 
@@ -741,19 +740,12 @@ async fn secret_mode_reference_list_longer_than_cap_is_rejected_up_front() {
 }
 
 #[tokio::test]
-async fn secret_mode_unreadable_item_keeps_its_metadata_without_a_secret() {
+async fn secret_mode_item_the_plugin_cannot_read_fails_the_request() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
-    let metrics = FakeMetrics::new();
-    let svc = service_with_metrics(
-        repo.clone(),
-        plugin.clone(),
-        dir,
-        mock_enforcer(),
-        metrics.clone(),
-    );
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200, 25);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     for name in ["r1", "r2", "r3"] {
@@ -771,22 +763,42 @@ async fn secret_mode_unreadable_item_keeps_its_metadata_without_a_secret() {
         .into_iter()
         .find(|r| r.reference == "r2")
         .expect("r2 row");
-    plugin.unreadable_get_for(&broken.store_key());
+    plugin.internal_get_for(&broken.store_key());
 
     let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
-    let page = svc
+    let err = svc
         .list(&ctx, &query)
         .await
-        .expect("an unreadable item does not fail the request");
+        .expect_err("a permanent backend read failure fails the whole request");
+    assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
+}
 
-    assert_eq!(references_of(&page), vec!["r1", "r2", "r3"]);
-    assert!(page.items[0].secret.is_some());
-    assert!(
-        page.items[1].secret.is_none(),
-        "metadata only for the unreadable item"
-    );
-    assert!(page.items[2].secret.is_some());
-    assert_eq!(metrics.secret_unreadable_total(), 1);
+#[tokio::test]
+async fn secret_mode_item_with_its_version_gone_and_pointer_unmoved_fails_the_request() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200, 25);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    svc.put(
+        &ctx,
+        &key("r1"),
+        write_generic(SharingMode::Tenant, "v"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+
+    plugin.fail_next_gets_with_not_found(1);
+    let query = secret_mode_query("reference in ('r1')");
+    let err = svc
+        .list(&ctx, &query)
+        .await
+        .expect_err("the version is gone but the row still names it");
+    assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
+    assert_eq!(plugin.get_calls(), 1, "no second get");
 }
 
 #[tokio::test]

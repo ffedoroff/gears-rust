@@ -51,7 +51,8 @@ pub fn register_routes(
              reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` \
              switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` \
              (`eq`/`in`) or `type` (`eq`/`in`) selector only, capped and unpaginated; an expired \
-             or unreadable item is returned without its secret.",
+             item is returned without its secret; an item whose stored version the backend \
+             cannot return fails the whole request.",
         )
         .tag(TAG)
         .authenticated()
@@ -89,11 +90,7 @@ pub fn register_routes(
              equivalent, and a secret-only projection resolving to a value-less winner is the \
              same canonical 404 that address gave. Selecting `secret` of a record whose expiry \
              has passed fails 409 `SECRET_EXPIRED` (only for a caller who may read the secret); \
-             without `secret` the record is returned with `status` `expired`. Selecting \
-             `secret` of a record whose stored version the backend cannot return (gone although \
-             the pointer did not move, or reported permanently unreadable) fails 409 \
-             `SECRET_UNREADABLE`, same disclosure rule; retrying does not help, rewrite the \
-             secret or delete the record.",
+             without `secret` the record is returned with `status` `expired`.",
         )
         .tag(TAG)
         .authenticated()

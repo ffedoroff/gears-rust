@@ -100,14 +100,20 @@ pub fn encode_value(bytes: &[u8]) -> String {
 /// Decodes the KV v2 `data.data.value` field back into secret bytes.
 ///
 /// # Errors
-/// Returns [`CredStoreError::SecretUnreadable`] if the stored value is not
-/// valid base64: the entry exists but is not something this plugin wrote (a
+/// Returns [`CredStoreError::Internal`] if the stored value is not valid
+/// base64: the entry exists but is not something this plugin wrote (a
 /// hand-edited or foreign row), so retrying cannot help. Never echoes the
 /// payload.
 pub fn decode_value(encoded: &str) -> Result<Vec<u8>, CredStoreError> {
-    BASE64
-        .decode(encoded)
-        .map_err(|_| CredStoreError::SecretUnreadable)
+    BASE64.decode(encoded).map_err(|_| not_a_written_value())
+}
+
+/// The permanent error for an entry that is present but not a value this
+/// plugin wrote. A curated message: no URL, no payload.
+fn not_a_written_value() -> CredStoreError {
+    CredStoreError::internal(
+        "vault credstore plugin: stored entry is not a value written by this plugin",
+    )
 }
 
 /// Body of a KV v2 write. No `options.cas`: the plugin relies on the
@@ -191,7 +197,7 @@ impl VersionMetadata {
 /// # Errors
 /// * [`CredStoreError::Internal`] if the body is not a KV v2 read response.
 ///   Never echoes the raw body (it could carry the secret's base64 form).
-/// * [`CredStoreError::SecretUnreadable`] if the entry has data but no
+/// * [`CredStoreError::Internal`] (permanent) if the entry has data but no
 ///   string `value`, or the value is not valid base64: a version Vault holds
 ///   but this plugin can never return.
 pub fn parse_get_body(body: &str) -> Result<Option<Vec<u8>>, CredStoreError> {
@@ -210,7 +216,7 @@ pub fn parse_get_body(body: &str) -> Result<Option<Vec<u8>>, CredStoreError> {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(data) => match data.get("value").and_then(serde_json::Value::as_str) {
             Some(value) => decode_value(value).map(Some),
-            None => Err(CredStoreError::SecretUnreadable),
+            None => Err(not_a_written_value()),
         },
     }
 }
