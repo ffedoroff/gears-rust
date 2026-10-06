@@ -14,6 +14,7 @@ Updated:  2026-09-18 by Constructor Tech
 - [Decision Drivers](#decision-drivers)
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
+  - [Two read use cases](#two-read-use-cases)
   - [Read actions follow the projection](#read-actions-follow-the-projection)
   - [Naming](#naming)
   - [Consequences](#consequences)

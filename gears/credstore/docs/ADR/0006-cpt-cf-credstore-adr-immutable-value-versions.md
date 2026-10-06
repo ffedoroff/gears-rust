@@ -165,6 +165,8 @@ Healing is a restricted reclaim: it acts only on a record or reference a request
 
 The lease decides *hygiene*: when a heal may act. An intent is protected until `lease_until`, and the lease is chosen well above the longest time a store may still apply a request (deployment requirement, see Data), so a live writer finishes its `put` before its intent can be healed. If that fails (a stall past the lease, or a store that applies a request late, both out-of-model), the writer's tx1 finds its intent gone, rolls back and answers 503, and its version stays untracked (residuals R2a, R2b).
 
+### What remains
+
 Residuals — R1 to R4b are garbage only and never affect consistency; R6 makes a record unreadable. The failure scenarios that leave them are catalogued in [CORNER-CASES.md](../CORNER-CASES.md):
 
 1. **R1 — Orphan above the pointer of a live record** (a crash, a failed tx1 or a lost `put` answer after `put`): never served; its intent tracks it; removed by the record's next successful secret write or by the record's delete. A record never written or deleted again keeps it.

@@ -16,6 +16,7 @@ Updated:  2026-10-02 by Constructor Tech
 - [Decision Outcome](#decision-outcome)
   - [Permissions as GTS instances; the type returned as a PDP constraint](#permissions-as-gts-instances-the-type-returned-as-a-pdp-constraint)
   - [Per-instance grants by reference](#per-instance-grants-by-reference)
+  - [Type consistency along a reference's chain](#type-consistency-along-a-references-chain)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
