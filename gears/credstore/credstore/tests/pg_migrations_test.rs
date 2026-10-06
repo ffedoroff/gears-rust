@@ -445,11 +445,32 @@ async fn assert_m0002_schema(conn: &DatabaseConnection) {
     assert_eq!(columns(conn, "credstore_secrets").await, migrated_columns());
     assert_eq!(
         columns(conn, "credstore_write_intents").await,
-        names(&["attempt_id", "tenant_id", "record_id", "lease_until"]),
+        names(&[
+            "attempt_id",
+            "tenant_id",
+            "record_id",
+            "reference",
+            "lease_until"
+        ]),
         "the write-intent journal"
     );
+    assert_eq!(
+        columns(conn, "credstore_store_cleanup").await,
+        names(&[
+            "id",
+            "tenant_id",
+            "record_id",
+            "op",
+            "selector",
+            "version",
+            "created_at"
+        ]),
+        "the store cleanup debts"
+    );
     for index in [
-        "idx_credstore_write_intents_lease",
+        "idx_credstore_write_intents_record",
+        "idx_credstore_write_intents_ref",
+        "idx_credstore_store_cleanup_record",
         "idx_credstore_type",
         "idx_credstore_lookup",
         "idx_credstore_expiry",
@@ -458,6 +479,10 @@ async fn assert_m0002_schema(conn: &DatabaseConnection) {
     ] {
         assert!(index_exists(conn, index).await, "index {index} must exist");
     }
+    assert!(
+        !index_exists(conn, "idx_credstore_write_intents_lease").await,
+        "nothing scans the journal, so it has no lease index"
+    );
     assert!(
         !index_exists(conn, "idx_credstore_pending").await,
         "the reaper's sweep index has nothing left to sweep"

@@ -97,10 +97,7 @@ impl Fixture {
             Arc::new(FakePluginSelector::new(plugin.clone())) as Arc<dyn PluginSelector>,
             catalog_type_resolver(),
             metrics.clone(),
-            ListSettings {
-                max_limit: 200,
-                secret_mode_cap: 25,
-            },
+            ListSettings { max_limit: 200 },
         )
         .with_write_settings(write);
         Self {

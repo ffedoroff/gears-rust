@@ -181,7 +181,6 @@ impl Gear for CredStoreGear {
                 Arc::clone(&metrics),
                 ListSettings {
                     max_limit: cfg.list.max_limit,
-                    secret_mode_cap: cfg.list.secret_mode_cap,
                 },
             )
             .with_audit(audit_sink)

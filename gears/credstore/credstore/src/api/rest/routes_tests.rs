@@ -92,10 +92,7 @@ fn build_harness_with(dir: FakeDir, enforcer: authz_resolver_sdk::PolicyEnforcer
         selector as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         metrics as Arc<dyn CredStoreMetricsPort>,
-        ListSettings {
-            max_limit: 200,
-            secret_mode_cap: 25,
-        },
+        ListSettings { max_limit: 200 },
     ));
     let openapi = OpenApiRegistryImpl::new();
     let router = register_routes(Router::new(), &openapi, Arc::clone(&svc));
@@ -1870,7 +1867,7 @@ async fn list_credentials_without_select_returns_the_full_credential_shape() {
             "updated_at",
             "version",
         ],
-        "no `secret` key outside secret mode (no expiry set on this fixture, so `expires_at` is \
+        "no `secret` key unless selected (no expiry set on this fixture, so `expires_at` is \
          skipped too)"
     );
     assert_eq!(item["status"], "active");
@@ -1907,7 +1904,7 @@ async fn list_credentials_select_projects_only_the_requested_fields() {
 }
 
 #[tokio::test]
-async fn list_credentials_secret_mode_returns_the_secret() {
+async fn list_credentials_selecting_secret_returns_the_secret() {
     let h = build_harness();
     seed_credential(&h, "list-value", "top-secret").await;
 
@@ -1928,21 +1925,60 @@ async fn list_credentials_secret_mode_returns_the_secret() {
 }
 
 #[tokio::test]
-async fn list_credentials_secret_mode_rejects_limit() {
+async fn list_credentials_selecting_secret_paginates_and_is_not_cached() {
     let h = build_harness();
-    let req = json_request(
-        "GET",
-        &list_uri("%24select=reference%2Csecret&%24filter=reference%20eq%20%27x%27&limit=5"),
-        None,
-        test_ctx(),
+    for name in ["page-a", "page-b", "page-c"] {
+        seed_credential(&h, name, &format!("value-{name}")).await;
+    }
+
+    let first = h
+        .router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &list_uri("%24select=reference%2Csecret&limit=2"),
+            None,
+            test_ctx(),
+        ))
+        .await
+        .expect("router");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(
+        first.headers().get(axum::http::header::CACHE_CONTROL),
+        Some(&axum::http::HeaderValue::from_static("no-store"))
     );
-    let resp = h.router.oneshot(req).await.expect("router");
-    assert_problem(
-        resp,
-        StatusCode::BAD_REQUEST,
-        Some("SECRET_MODE_NO_PAGINATION"),
-    )
-    .await;
+    let body = body_json(first).await;
+    let items = body["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["secret"], "value-page-a");
+    assert_eq!(items[1]["secret"], "value-page-b");
+    let cursor = body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("next cursor")
+        .to_owned();
+
+    let second = h
+        .router
+        .oneshot(json_request(
+            "GET",
+            &list_uri(&format!(
+                "%24select=reference%2Csecret&limit=2&cursor={cursor}"
+            )),
+            None,
+            test_ctx(),
+        ))
+        .await
+        .expect("router");
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(
+        second.headers().get(axum::http::header::CACHE_CONTROL),
+        Some(&axum::http::HeaderValue::from_static("no-store"))
+    );
+    let body = body_json(second).await;
+    let items = body["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["secret"], "value-page-c");
+    assert!(body["page_info"]["next_cursor"].is_null());
 }
 
 #[tokio::test]
@@ -2012,7 +2048,7 @@ async fn get_without_the_secret_of_an_expired_credential_shows_status_expired() 
 }
 
 #[tokio::test]
-async fn list_shows_status_expired_and_secret_mode_omits_only_the_secret() {
+async fn list_shows_status_expired_and_selecting_secret_omits_only_the_secret() {
     let h = build_harness();
     seed_credential(&h, "live", "live-value").await;
     seed_expired_credential(&h, "old").await;

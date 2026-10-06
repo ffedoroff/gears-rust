@@ -63,7 +63,6 @@ fn service_with(
     dir: Arc<dyn TenantDirectory>,
     enforcer: authz_resolver_sdk::PolicyEnforcer,
     max_limit: u64,
-    secret_mode_cap: u64,
 ) -> Service {
     Service::new(
         repo,
@@ -72,20 +71,17 @@ fn service_with(
         Arc::new(FakePluginSelector::new(plugin)) as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        ListSettings {
-            max_limit,
-            secret_mode_cap,
-        },
+        ListSettings { max_limit },
     )
 }
 
 fn default_service(repo: Arc<dyn SecretRepo>, dir: Arc<dyn TenantDirectory>) -> Service {
-    service_with(repo, FakePlugin::new(), dir, mock_enforcer(), 200, 25)
+    service_with(repo, FakePlugin::new(), dir, mock_enforcer(), 200)
 }
 
 /// Like [`service_with`], but with a caller-supplied metrics port (for
 /// asserting counters `NoopMetrics` swallows) and the same fixed
-/// `max_limit`/`secret_mode_cap` [`default_service`] uses.
+/// `max_limit` [`default_service`] uses.
 fn service_with_metrics(
     repo: Arc<dyn SecretRepo>,
     plugin: Arc<FakePlugin>,
@@ -100,10 +96,7 @@ fn service_with_metrics(
         Arc::new(FakePluginSelector::new(plugin)) as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         metrics,
-        ListSettings {
-            max_limit: 200,
-            secret_mode_cap: 25,
-        },
+        ListSettings { max_limit: 200 },
     )
 }
 
@@ -127,7 +120,7 @@ fn reason_of(err: &DomainError) -> &'static str {
     }
 }
 
-// ── metadata mode: own / inherited / overridden / suppressed ────────────────
+// ── own / inherited / overridden / suppressed ────────────────
 
 #[tokio::test]
 async fn metadata_page_reports_own_inherited_overridden_and_suppressed() {
@@ -138,15 +131,8 @@ async fn metadata_page_reports_own_inherited_overridden_and_suppressed() {
     let dir_t1 = Arc::new(FakeDir::single(t1));
     let dir_t3 = Arc::new(FakeDir::new(vec![t3, t1]));
     let enforcer = mock_enforcer();
-    let svc_t1 = service_with(
-        repo.clone(),
-        plugin.clone(),
-        dir_t1,
-        enforcer.clone(),
-        200,
-        25,
-    );
-    let svc_t3 = service_with(repo.clone(), plugin.clone(), dir_t3, enforcer, 200, 25);
+    let svc_t1 = service_with(repo.clone(), plugin.clone(), dir_t1, enforcer.clone(), 200);
+    let svc_t3 = service_with(repo.clone(), plugin.clone(), dir_t3, enforcer, 200);
 
     let owner1 = Uuid::new_v4();
     let ctx1 = make_ctx(owner1, t1);
@@ -265,7 +251,7 @@ async fn metadata_page_reports_own_inherited_overridden_and_suppressed() {
     assert!(d.credential.owner_id.is_some());
     assert_eq!(d.credential.status, CredentialStatus::Declared);
 
-    // Metadata mode never carries a value.
+    // Without `secret` selected the item never carries a value.
     assert!(page.items.iter().all(|i| i.secret.is_none()));
 }
 
@@ -292,7 +278,6 @@ async fn a_denied_types_references_never_appear() {
         dir.clone(),
         mock_enforcer(),
         200,
-        25,
     );
     svc_setup
         .put(
@@ -314,7 +299,7 @@ async fn a_denied_types_references_never_appear() {
         .expect("create api-key");
 
     let (enforcer, _resolver) = type_deny_enforcer(vec![denied_gts]);
-    let svc = service_with(repo, plugin, dir, enforcer, 200, 25);
+    let svc = service_with(repo, plugin, dir, enforcer, 200);
     let page = svc.list(&ctx, &ODataQuery::new()).await.expect("list");
     assert_eq!(references_of(&page), vec!["allowed-generic"]);
 }
@@ -400,7 +385,6 @@ async fn full_page_reflects_only_the_permitted_types_step_1_clamp() {
         dir.clone(),
         mock_enforcer(),
         200,
-        25,
     );
     for name in ["a1", "a2"] {
         svc_setup
@@ -427,7 +411,7 @@ async fn full_page_reflects_only_the_permitted_types_step_1_clamp() {
 
     // Only type A (generic) is permitted.
     let (enforcer, _resolver) = type_deny_enforcer(vec![api_key_gts]);
-    let svc = service_with(repo.clone(), plugin, dir, enforcer, 200, 25);
+    let svc = service_with(repo.clone(), plugin, dir, enforcer, 200);
     let page = svc
         .list(&ctx, &ODataQuery::new().with_limit(2))
         .await
@@ -465,7 +449,6 @@ async fn empty_permitted_type_set_returns_empty_page_without_running_step_1() {
         dir.clone(),
         mock_enforcer(),
         200,
-        25,
     );
     svc_setup
         .put(
@@ -477,7 +460,7 @@ async fn empty_permitted_type_set_returns_empty_page_without_running_step_1() {
         .await
         .expect("create");
 
-    let svc = service_with(repo.clone(), plugin, dir, deny_enforcer(), 200, 25);
+    let svc = service_with(repo.clone(), plugin, dir, deny_enforcer(), 200);
     let page = svc.list(&ctx, &ODataQuery::new()).await.expect("list");
     assert!(page.items.is_empty());
     assert_eq!(page.page_info.next_cursor, None);
@@ -507,7 +490,6 @@ async fn caller_type_filter_intersects_with_the_pdp_permitted_set() {
         dir.clone(),
         mock_enforcer(),
         200,
-        25,
     );
     svc_setup
         .put(
@@ -530,7 +512,7 @@ async fn caller_type_filter_intersects_with_the_pdp_permitted_set() {
 
     // The caller's own filter names both types; the PDP permits only A.
     let (enforcer, _resolver) = type_deny_enforcer(vec![api_key_gts.clone()]);
-    let svc = service_with(repo.clone(), plugin, dir, enforcer, 200, 25);
+    let svc = service_with(repo.clone(), plugin, dir, enforcer, 200);
     let filter = ODataQuery::new().with_filter(filter_expr(&format!(
         "type in ('{generic_gts}', '{api_key_gts}')"
     )));
@@ -671,81 +653,23 @@ async fn orderby_other_than_reference_is_rejected() {
     assert_eq!(reason_of(&err), "INVALID_ORDERBY_FIELD");
 }
 
-// ── secret mode ───────────────────────────────────────────────────────────────
+// ── `secret` selected ───────────────────────────────────────────────────────────────
 
-fn secret_mode_query(filter_raw: &str) -> ODataQuery {
-    ODataQuery::new()
-        .with_select(vec!["reference".to_owned(), "secret".to_owned()])
-        .with_filter(filter_expr(filter_raw))
+fn secret_select() -> ODataQuery {
+    ODataQuery::new().with_select(vec!["reference".to_owned(), "secret".to_owned()])
+}
+
+fn secret_query(filter_raw: &str) -> ODataQuery {
+    secret_select().with_filter(filter_expr(filter_raw))
 }
 
 #[tokio::test]
-async fn secret_mode_rejects_limit_and_cursor() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = default_service(repo, dir);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    let with_limit = secret_mode_query("reference eq 'r'").with_limit(10);
-    let err = svc
-        .list(&ctx, &with_limit)
-        .await
-        .expect_err("limit must be rejected in secret mode");
-    assert_eq!(reason_of(&err), "SECRET_MODE_NO_PAGINATION");
-}
-
-#[tokio::test]
-async fn secret_mode_over_cap_fails_closed() {
+async fn secret_selected_item_the_plugin_cannot_read_fails_the_request() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
-    let svc = service_with(repo, plugin, dir, mock_enforcer(), 200, 2);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    for name in ["r1", "r2", "r3"] {
-        svc.put(
-            &ctx,
-            &key(name),
-            write_generic(SharingMode::Tenant, "v"),
-            create_only(),
-        )
-        .await
-        .expect("create");
-    }
-
-    let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
-    let err = svc.list(&ctx, &query).await.expect_err("must fail closed");
-    assert_eq!(reason_of(&err), "TOO_MANY_MATCHES");
-}
-
-#[tokio::test]
-async fn secret_mode_reference_list_longer_than_cap_is_rejected_up_front() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = service_with(repo, plugin, dir, mock_enforcer(), 200, 2);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    // None of the references exist: only the list cardinality (cap + 1) can
-    // reject this request, never a candidate-query result.
-    let query = secret_mode_query("reference in ('n1', 'n2', 'n3')");
-    let err = svc
-        .list(&ctx, &query)
-        .await
-        .expect_err("a list longer than the cap is rejected before any query");
-    assert_eq!(reason_of(&err), "TOO_MANY_MATCHES");
-}
-
-#[tokio::test]
-async fn secret_mode_item_the_plugin_cannot_read_fails_the_request() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200, 25);
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     for name in ["r1", "r2", "r3"] {
@@ -765,7 +689,7 @@ async fn secret_mode_item_the_plugin_cannot_read_fails_the_request() {
         .expect("r2 row");
     plugin.internal_get_for(&broken.store_key());
 
-    let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
+    let query = secret_query("reference in ('r1', 'r2', 'r3')");
     let err = svc
         .list(&ctx, &query)
         .await
@@ -774,12 +698,12 @@ async fn secret_mode_item_the_plugin_cannot_read_fails_the_request() {
 }
 
 #[tokio::test]
-async fn secret_mode_item_with_its_version_gone_and_pointer_unmoved_fails_the_request() {
+async fn secret_selected_item_with_its_version_gone_and_pointer_unmoved_fails_the_request() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
-    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200, 25);
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     svc.put(
@@ -792,7 +716,7 @@ async fn secret_mode_item_with_its_version_gone_and_pointer_unmoved_fails_the_re
     .expect("create");
 
     plugin.fail_next_gets_with_not_found(1);
-    let query = secret_mode_query("reference in ('r1')");
+    let query = secret_query("reference in ('r1')");
     let err = svc
         .list(&ctx, &query)
         .await
@@ -802,7 +726,7 @@ async fn secret_mode_item_with_its_version_gone_and_pointer_unmoved_fails_the_re
 }
 
 #[tokio::test]
-async fn secret_mode_cap_counts_only_permitted_type_references() {
+async fn secret_selected_clamps_to_the_read_secret_permitted_types_and_paginates() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -819,55 +743,160 @@ async fn secret_mode_cap_counts_only_permitted_type_references() {
         dir.clone(),
         mock_enforcer(),
         200,
-        2,
     );
-    for name in ["b1", "b2", "b3"] {
+    for name in ["a1", "a3"] {
         svc_setup
             .put(
                 &ctx,
                 &key(name),
-                write_typed(SharingMode::Tenant, "v", "api-key"),
+                write_generic(SharingMode::Tenant, "v-a"),
+                create_only(),
+            )
+            .await
+            .expect("create type A");
+    }
+    for name in ["b1", "b2", "b4"] {
+        svc_setup
+            .put(
+                &ctx,
+                &key(name),
+                write_typed(SharingMode::Tenant, "v-b", "api-key"),
                 create_only(),
             )
             .await
             .expect("create type B");
     }
-    svc_setup
-        .put(
-            &ctx,
-            &key("a1"),
-            write_generic(SharingMode::Tenant, "v-a"),
-            create_only(),
-        )
-        .await
-        .expect("create type A");
 
-    // Cap is 2, and 4 references exist in total, but only "a1" (type A) is
-    // permitted — the cap must count that one reference, not all four.
-    let api_key_gts_filter = api_key_gts.clone();
+    // Five references exist, but only the two of type A (`generic`) are
+    // permitted: the page boundary and `next_cursor` count those two only,
+    // and the denied type's records are never returned.
     let (enforcer, _resolver) = type_deny_enforcer(vec![api_key_gts]);
-    let svc = service_with(repo, plugin, dir, enforcer, 200, 2);
-    // A `type` selector rather than a `reference in (…)` list: a reference
-    // list longer than the cap is rejected up front, before any query.
-    let generic_gts = SecretType::generic().gts_id().to_owned();
-    let query = secret_mode_query(&format!(
-        "type in ('{generic_gts}', '{api_key_gts_filter}')"
-    ));
-    let page = svc
-        .list(&ctx, &query)
+    let svc = service_with(repo, plugin, dir, enforcer, 200);
+    let first = svc
+        .list(&ctx, &secret_select().with_limit(1))
         .await
-        .expect("must not fail closed: only one reference is permitted");
-    assert_eq!(references_of(&page), vec!["a1"]);
+        .expect("first page");
+    assert_eq!(references_of(&first), vec!["a1"]);
+    let cursor =
+        toolkit_odata::CursorV1::decode(first.page_info.next_cursor.as_deref().expect("next page"))
+            .expect("decodable cursor");
+
+    let second = svc
+        .list(&ctx, &secret_select().with_limit(1).with_cursor(cursor))
+        .await
+        .expect("second page");
+    assert_eq!(references_of(&second), vec!["a3"]);
+    assert_eq!(second.page_info.next_cursor, None);
 }
 
 #[tokio::test]
-async fn secret_mode_items_carry_values_and_evaluate_read_secret_once_per_type() {
+async fn secret_selected_paginates_with_values_and_honours_orderby() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = default_service(repo, dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    for name in ["r1", "r2", "r3", "r4", "r5"] {
+        svc.put(
+            &ctx,
+            &key(name),
+            write_generic(SharingMode::Tenant, &format!("value-{name}")),
+            create_only(),
+        )
+        .await
+        .expect("create");
+    }
+
+    let walk = |first: ODataQuery| {
+        let svc = &svc;
+        let ctx = &ctx;
+        async move {
+            let mut seen = Vec::new();
+            let mut query = first;
+            loop {
+                let page = svc.list(ctx, &query).await.expect("list");
+                assert!(page.items.len() <= 2, "page honours limit");
+                for item in &page.items {
+                    let value = item.secret.as_ref().expect("secret on every item");
+                    assert_eq!(
+                        value.as_bytes(),
+                        format!("value-{}", item.credential.reference.as_ref()).as_bytes()
+                    );
+                }
+                seen.extend(references_of(&page));
+                match &page.page_info.next_cursor {
+                    Some(token) => {
+                        let cursor =
+                            toolkit_odata::CursorV1::decode(token).expect("decodable cursor");
+                        query = secret_select().with_limit(2).with_cursor(cursor);
+                    }
+                    None => break,
+                }
+                assert!(seen.len() <= 6, "pagination did not terminate");
+            }
+            seen
+        }
+    };
+
+    assert_eq!(
+        walk(secret_select().with_limit(2)).await,
+        ["r1", "r2", "r3", "r4", "r5"]
+    );
+    let desc = secret_select()
+        .with_limit(2)
+        .with_order(ODataOrderBy(vec![OrderKey {
+            field: "reference".to_owned(),
+            dir: SortDir::Desc,
+        }]));
+    assert_eq!(walk(desc).await, ["r5", "r4", "r3", "r2", "r1"]);
+}
+
+#[tokio::test]
+async fn secret_selected_accepts_a_sharing_filter_and_applies_limit_validation() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = service_with(repo, FakePlugin::new(), dir, mock_enforcer(), 3);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    for (name, sharing) in [
+        ("r1", SharingMode::Tenant),
+        ("r2", SharingMode::Shared),
+        ("r3", SharingMode::Tenant),
+    ] {
+        svc.put(&ctx, &key(name), write_generic(sharing, "v"), create_only())
+            .await
+            .expect("create");
+    }
+
+    // A filter the secret read rejected before: now an ordinary filter.
+    let page = svc
+        .list(
+            &ctx,
+            &secret_select().with_filter(filter_expr("sharing eq 'tenant'")),
+        )
+        .await
+        .expect("sharing filter with secret selected");
+    assert_eq!(references_of(&page), vec!["r1", "r3"]);
+    assert!(page.items.iter().all(|i| i.secret.is_some()));
+
+    // The same `list.max_limit` and reason code as the plain read.
+    let err = svc
+        .list(&ctx, &secret_select().with_limit(4))
+        .await
+        .expect_err("limit above max_limit");
+    assert_eq!(reason_of(&err), "INVALID_LIMIT");
+}
+
+#[tokio::test]
+async fn secret_selected_items_carry_values_and_evaluate_read_secret_once_per_type() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
     let (enforcer, resolver) = type_recording_enforcer();
-    let svc = service_with(repo, plugin, dir, enforcer, 200, 25);
+    let svc = service_with(repo, plugin, dir, enforcer, 200);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     svc.put(
@@ -887,7 +916,7 @@ async fn secret_mode_items_carry_values_and_evaluate_read_secret_once_per_type()
     .await
     .expect("create r2");
 
-    let query = secret_mode_query("reference in ('r1', 'r2')");
+    let query = secret_query("reference in ('r1', 'r2')");
     let page = svc.list(&ctx, &query).await.expect("list");
 
     assert_eq!(page.page_info.next_cursor, None);
@@ -913,7 +942,7 @@ async fn secret_mode_items_carry_values_and_evaluate_read_secret_once_per_type()
 }
 
 #[tokio::test]
-async fn secret_mode_omits_items_of_a_refused_type() {
+async fn secret_selected_omits_items_of_a_refused_type() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -930,7 +959,6 @@ async fn secret_mode_omits_items_of_a_refused_type() {
         dir.clone(),
         mock_enforcer(),
         200,
-        25,
     );
     svc_setup
         .put(
@@ -952,8 +980,8 @@ async fn secret_mode_omits_items_of_a_refused_type() {
         .expect("create denied");
 
     let (enforcer, _resolver) = type_deny_enforcer(vec![denied_gts]);
-    let svc = service_with(repo, plugin, dir, enforcer, 200, 25);
-    let query = secret_mode_query("reference in ('allowed', 'denied')");
+    let svc = service_with(repo, plugin, dir, enforcer, 200);
+    let query = secret_query("reference in ('allowed', 'denied')");
     let page = svc.list(&ctx, &query).await.expect("list");
     assert_eq!(references_of(&page), vec!["allowed"]);
     assert_eq!(
@@ -963,7 +991,7 @@ async fn secret_mode_omits_items_of_a_refused_type() {
 }
 
 #[tokio::test]
-async fn secret_mode_with_record_field_selected_also_requires_list_per_type() {
+async fn secret_selected_with_record_field_selected_also_requires_list_per_type() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -976,7 +1004,6 @@ async fn secret_mode_with_record_field_selected_also_requires_list_per_type() {
         dir.clone(),
         mock_enforcer(),
         200,
-        25,
     );
     svc_setup
         .put(
@@ -990,8 +1017,8 @@ async fn secret_mode_with_record_field_selected_also_requires_list_per_type() {
 
     // A pure secret-only selector evaluates `read_secret` alone.
     let (enforcer, resolver) = type_recording_enforcer();
-    let svc = service_with(repo.clone(), plugin.clone(), dir.clone(), enforcer, 200, 25);
-    let secret_only = secret_mode_query("reference eq 'r1'");
+    let svc = service_with(repo.clone(), plugin.clone(), dir.clone(), enforcer, 200);
+    let secret_only = secret_query("reference eq 'r1'");
     let page = svc.list(&ctx, &secret_only).await.expect("list");
     assert_eq!(references_of(&page), vec!["r1"]);
     let seen = resolver.seen_actions();
@@ -1003,14 +1030,7 @@ async fn secret_mode_with_record_field_selected_also_requires_list_per_type() {
 
     // Selecting a record-only field alongside `secret` needs `list` too.
     let (enforcer2, resolver2) = type_recording_enforcer();
-    let svc2 = service_with(
-        repo.clone(),
-        plugin.clone(),
-        dir.clone(),
-        enforcer2,
-        200,
-        25,
-    );
+    let svc2 = service_with(repo.clone(), plugin.clone(), dir.clone(), enforcer2, 200);
     let combined = ODataQuery::new()
         .with_select(vec![
             "reference".to_owned(),
@@ -1031,7 +1051,7 @@ async fn secret_mode_with_record_field_selected_also_requires_list_per_type() {
         SecretType::generic().gts_id().to_owned(),
         crate::domain::authz::actions::LIST,
     );
-    let svc3 = service_with(repo, plugin, dir, enforcer3, 200, 25);
+    let svc3 = service_with(repo, plugin, dir, enforcer3, 200);
     let page3 = svc3.list(&ctx, &combined).await.expect("list");
     assert!(
         page3.items.is_empty(),
@@ -1039,15 +1059,15 @@ async fn secret_mode_with_record_field_selected_also_requires_list_per_type() {
     );
 }
 
-// ── secret mode: bounded-concurrency value reads ─────────────────────────────
+// ── `secret` selected: bounded-concurrency value reads ─────────────────────────────
 
 #[tokio::test]
-async fn secret_mode_reads_values_with_bounded_concurrency() {
+async fn secret_selected_reads_values_with_bounded_concurrency() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
-    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200, 25);
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     let refs: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
@@ -1073,7 +1093,7 @@ async fn secret_mode_reads_values_with_bounded_concurrency() {
         .map(|r| format!("'{r}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    let query = secret_mode_query(&format!("reference in ({selector})"));
+    let query = secret_query(&format!("reference in ({selector})"));
     let page = svc.list(&ctx, &query).await.expect("list");
     assert_eq!(page.items.len(), 6);
 
@@ -1089,12 +1109,12 @@ async fn secret_mode_reads_values_with_bounded_concurrency() {
 }
 
 #[tokio::test]
-async fn secret_mode_value_reads_preserve_reference_order() {
+async fn secret_selected_value_reads_preserve_reference_order() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
-    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200, 25);
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     let refs: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
@@ -1125,7 +1145,7 @@ async fn secret_mode_value_reads_preserve_reference_order() {
         .map(|r| format!("'{r}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    let query = secret_mode_query(&format!("reference in ({selector})"));
+    let query = secret_query(&format!("reference in ({selector})"));
     let page = svc.list(&ctx, &query).await.expect("list");
 
     assert_eq!(references_of(&page), refs);
@@ -1139,12 +1159,12 @@ async fn secret_mode_value_reads_preserve_reference_order() {
 }
 
 #[tokio::test]
-async fn secret_mode_one_read_failure_fails_the_whole_request() {
+async fn secret_selected_one_read_failure_fails_the_whole_request() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
-    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200, 25);
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     for name in ["r1", "r2", "r3"] {
@@ -1164,7 +1184,7 @@ async fn secret_mode_one_read_failure_fails_the_whole_request() {
         .expect("r2 row");
     plugin.fail_get_for(&failing_row.store_key());
 
-    let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
+    let query = secret_query("reference in ('r1', 'r2', 'r3')");
     let err = svc
         .list(&ctx, &query)
         .await
@@ -1176,12 +1196,12 @@ async fn secret_mode_one_read_failure_fails_the_whole_request() {
 }
 
 #[tokio::test]
-async fn secret_mode_refused_item_is_omitted_others_present() {
+async fn secret_selected_refused_item_is_omitted_others_present() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
-    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200, 25);
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     for name in ["r1", "r2", "r3"] {
@@ -1201,7 +1221,7 @@ async fn secret_mode_refused_item_is_omitted_others_present() {
         .expect("r2 row");
     plugin.deny_get_for(&refused_row.store_key());
 
-    let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
+    let query = secret_query("reference in ('r1', 'r2', 'r3')");
     let page = svc.list(&ctx, &query).await.expect("list");
     assert_eq!(references_of(&page), vec!["r1", "r3"]);
 }
@@ -1286,9 +1306,8 @@ async fn metadata_list_shows_an_expired_record_with_status_expired() {
         dir_parent,
         mock_enforcer(),
         200,
-        25,
     );
-    let svc_child = service_with(repo.clone(), plugin, dir_child, mock_enforcer(), 200, 25);
+    let svc_child = service_with(repo.clone(), plugin, dir_child, mock_enforcer(), 200);
     let parent_ctx = make_ctx(Uuid::new_v4(), parent);
     let child_ctx = make_ctx(Uuid::new_v4(), child);
 
@@ -1363,7 +1382,7 @@ async fn metadata_list_shows_an_expired_record_with_status_expired() {
 }
 
 #[tokio::test]
-async fn secret_mode_returns_an_expired_item_without_a_secret_and_does_not_fail() {
+async fn secret_selected_returns_an_expired_item_without_a_secret_and_does_not_fail() {
     let parent = Uuid::new_v4();
     let child = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
@@ -1376,9 +1395,8 @@ async fn secret_mode_returns_an_expired_item_without_a_secret_and_does_not_fail(
         dir_parent,
         mock_enforcer(),
         200,
-        25,
     );
-    let svc_child = service_with(repo.clone(), plugin, dir_child, mock_enforcer(), 200, 25);
+    let svc_child = service_with(repo.clone(), plugin, dir_child, mock_enforcer(), 200);
     let parent_ctx = make_ctx(Uuid::new_v4(), parent);
     let child_ctx = make_ctx(Uuid::new_v4(), child);
 
@@ -1410,7 +1428,7 @@ async fn secret_mode_returns_an_expired_item_without_a_secret_and_does_not_fail(
         .expect("child r1");
     repo.force_expire(expired.id);
 
-    let query = secret_mode_query("reference in ('r0', 'r1', 'r2')");
+    let query = secret_query("reference in ('r0', 'r1', 'r2')");
     let page = svc_child
         .list(&child_ctx, &query)
         .await
@@ -1433,7 +1451,7 @@ async fn secret_mode_returns_an_expired_item_without_a_secret_and_does_not_fail(
 }
 
 #[tokio::test]
-async fn secret_mode_with_only_expired_items_returns_them_without_secrets() {
+async fn secret_selected_with_only_expired_items_returns_them_without_secrets() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let dir = Arc::new(FakeDir::single(tenant));
@@ -1450,7 +1468,7 @@ async fn secret_mode_with_only_expired_items_returns_them_without_secrets() {
     repo.force_expire(repo.rows()[0].id);
 
     let page = svc
-        .list(&ctx, &secret_mode_query("reference eq 'only'"))
+        .list(&ctx, &secret_query("reference eq 'only'"))
         .await
         .expect("list");
     assert_eq!(page.items.len(), 1);
@@ -1461,7 +1479,7 @@ async fn secret_mode_with_only_expired_items_returns_them_without_secrets() {
 // ── reference-scoped grants (ADR-0010) ───────────────────────────────────────
 
 #[tokio::test]
-async fn listing_omits_non_admitted_references_in_metadata_and_secret_mode() {
+async fn listing_omits_non_admitted_references_with_and_without_secret_selected() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -1474,7 +1492,6 @@ async fn listing_omits_non_admitted_references_in_metadata_and_secret_mode() {
         dir.clone(),
         mock_enforcer(),
         200,
-        25,
     );
     for name in ["smtp-password", "other", "third"] {
         setup
@@ -1494,12 +1511,11 @@ async fn listing_omits_non_admitted_references_in_metadata_and_secret_mode() {
         dir,
         reference_enforcer(&["smtp-password"], None),
         200,
-        25,
     );
     let page = svc.list(&ctx, &ODataQuery::new()).await.expect("list");
     assert_eq!(references_of(&page), vec!["smtp-password"]);
 
-    let query = secret_mode_query("reference in ('smtp-password', 'other', 'third')");
+    let query = secret_query("reference in ('smtp-password', 'other', 'third')");
     let page = svc.list(&ctx, &query).await.expect("list secrets");
     assert_eq!(references_of(&page), vec!["smtp-password"]);
     assert_eq!(

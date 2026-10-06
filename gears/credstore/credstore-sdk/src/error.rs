@@ -41,9 +41,9 @@ pub enum CredStoreError {
     /// create over a reference that currently resolves, for the creating
     /// caller (its tenant, owner and ancestor chain), to a record of a
     /// different type (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's `shared`
-    /// record or, when creating a private record, the tenant's own
-    /// non-private one — or over a reference a descendant tenant already holds
-    /// with a different type (`TYPE_MISMATCH_WITH_DESCENDANT`).
+    /// record — or over a reference a descendant tenant already holds as a
+    /// non-private record with a different type
+    /// (`TYPE_MISMATCH_WITH_DESCENDANT`). Private records are exempt.
     /// `reason` is a stable machine-readable code.
     #[error("secret type violation ({reason}): {detail}")]
     TypeViolation { reason: String, detail: String },
