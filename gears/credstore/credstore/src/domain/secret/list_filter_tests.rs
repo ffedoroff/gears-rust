@@ -144,6 +144,30 @@ fn secret_selected_detects_secret_in_select() {
 }
 
 #[test]
+fn collection_select_with_secret_admits_only_envelope_fields() {
+    let sel = |f: &[&str]| f.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+    assert!(validate_collection_select(&sel(&["secret"])).is_ok());
+    assert!(
+        validate_collection_select(&sel(&["reference", "type", "expires_at", "secret"])).is_ok()
+    );
+    // Without `secret`, any allowlisted field is fine on the collection.
+    assert!(validate_collection_select(&sel(&["sharing", "version"])).is_ok());
+    for field in [
+        "sharing",
+        "status",
+        "fallback",
+        "inheritance",
+        "version",
+        "updated_at",
+        "owner_id",
+    ] {
+        let err = validate_collection_select(&sel(&["reference", field, "secret"]))
+            .expect_err("must reject");
+        assert_eq!(reason_of(&err), reasons::SECRET_SELECT_FIELDS, "{field}");
+    }
+}
+
+#[test]
 fn admin_field_selected_detects_each_administrative_field_but_not_envelope_fields() {
     for field in [
         "sharing",

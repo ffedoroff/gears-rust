@@ -48,7 +48,8 @@ and its optional secret (ADR-0004, ADR-0007):
   `cursor`) over credential records; an item's `secret` is present only when
   `select` names it. Selecting `secret` keeps the call paginated
   (ADR-0005): `limit`, `cursor`, `orderby` and `filter` behave as without it,
-  and it requires `read_secret`; records of a type the caller may not
+  and it requires `read_secret` alone (besides `secret`, `select` may name only
+  `reference`, `type`, `expires_at`); records of a type the caller may not
   `read_secret` are omitted. Without `secret` selected, `list` never carries
   secrets
 - `delete` — precondition-guarded delete of the record and its secret
