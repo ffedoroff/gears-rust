@@ -560,7 +560,7 @@ Other deployments follow the same shape: any process that keeps a valid token in
 
 | Condition | What the plugin does | Operator action |
 |---|---|---|
-| Vault unreachable, timeouts, `5xx`, `429` | Idempotent calls retried within their budget, then `ServiceUnavailable`; `put` fails after one attempt | Restore Vault; the gear keeps cleanup debts and retries them on a later access |
+| Vault unreachable, timeouts, `5xx`, `429` | Idempotent calls retried within their budget, then `ServiceUnavailable`; `put` fails after one attempt | Restore Vault; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job) |
 | Vault sealed (`503`) | As above; the message includes `Vault is sealed` | Unseal |
 | Token revoked, expired, or policy too narrow (`403`) | Token source re-read once; if unchanged or still rejected, `ServiceUnavailable` with a `403` message and a `warn` log naming the token source, never the token | Renew the token or fix the policy; a changed `token_file` is picked up without restart |
 | `token_file` missing, empty or malformed | `ServiceUnavailable` for the calls that need a token; startup is not affected | Provide the file |

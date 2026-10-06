@@ -49,7 +49,7 @@ The plugin runs as a Gear in the host process next to CredStore. It exposes no p
 
 ### 1.2 Background / Problem Statement
 
-CredStore stores secret values through a versioned key-value contract ([ADR-0006](../../../docs/ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)): every write creates a new immutable version under the record's key, the gear keeps the version it wants in its own database, and superseded versions are removed by the gear from recorded cleanup debts, right after the commit or when it heals a record on a later access. A production deployment needs a real secret store behind that contract. The in-memory `static-credstore-plugin` loses its content on restart and is meant for development and tests.
+CredStore stores secret values through a versioned key-value contract ([ADR-0006](../../../docs/ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)): every write creates a new immutable version under the record's key, the gear keeps the version it wants in its own database, and superseded versions are removed by the gear from recorded cleanup debts, right after the commit or when it heals a live record on a later access. A production deployment needs a real secret store behind that contract. The in-memory `static-credstore-plugin` loses its content on restart and is meant for development and tests.
 
 Vault and OpenBao KV v2 already provide what the contract asks for: server-assigned, ordered, immutable versions per key, destruction of individual versions and removal of a whole key. The plugin maps the contract onto them one to one, and adds what the contract leaves to the backend: authentication with a token that may be rotated while the gear runs, bounded retries of idempotent calls, and a precise classification of Vault's answers (a soft-deleted or destroyed version is "gone", a missing mount is a configuration error and not a missing secret, a rejected token is an outage of the backend and not a denial of the caller).
 
@@ -388,7 +388,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 
 **Alternative Flows**:
 - **Nothing left to destroy or the key is gone**: success without a destroy call.
-- **Vault unavailable**: the call is retried within its budget; if it still fails the gear keeps the debt and calls again on a later access to the record.
+- **Vault unavailable**: the call is retried within its budget; if it still fails the gear keeps the debt and, for a live record, calls again on a later access to it.
 
 #### Rotate the Vault Token Without a Restart
 
@@ -416,7 +416,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 **Actor**: `cpt-cf-credstore-vault-actor-credstore-gear`
 
 **Main Flow**:
-1. After a record delete the gear calls `delete_key` right after the commit, or when it heals the reference on a later access.
+1. After a record delete the gear calls `delete_key` right after the commit. If that call fails, the key stays until a possible external cleanup job (no later access retries it); the same call also purges the key of a failed create when the gear heals the reference.
 2. The plugin removes the key with all its versions.
 
 **Postconditions**:
@@ -460,7 +460,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 | The token is revoked or its policy is too narrow. | Every call fails as "service unavailable". | Explicit, logged `403` handling; documented minimal policy verified by the integration tests; sidecar rotation without restart. |
 | The mount is misconfigured (`delete_version_after`, `cas_required`, wrong name). | Versions expire, writes fail, or calls fail with an explained error. | Documented operator obligations; a missing mount is an error, not a miss; no silent success. |
 | A write is sent and its response is lost. | An unreferenced version stays in Vault. | The plugin never retries `put`; the gear's write intent covers the orphan and cleans it later. |
-| Vault is sealed or unreachable. | All operations fail as "service unavailable". | Bounded retries for idempotent calls; the gear keeps cleanup debts and retries them on a later access; recovery needs no restart. |
+| Vault is sealed or unreachable. | All operations fail as "service unavailable". | Bounded retries for idempotent calls; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job); recovery needs no restart. |
 | The Vault token file is world-readable or the token is exposed in the environment. | Token compromise. | Documented least-privilege file permissions and the sidecar pattern; the plugin never logs the token. |
 
 ## 13. Open Questions
