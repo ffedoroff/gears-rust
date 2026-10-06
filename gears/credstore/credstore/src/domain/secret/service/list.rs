@@ -151,7 +151,9 @@ impl Service {
     ///
     /// Returns [`DomainError::InvalidRequest`] for every validation failure
     /// this endpoint defines (see [`crate::domain::secret::list_filter`]):
-    /// an unsupported `$filter`/`$orderby`/`$select` field or shape, an
+    /// an unsupported `$filter`/`$orderby`/`$select` field or shape (including
+    /// `secret` selected beside a field other than `reference`/`type`/
+    /// `expires_at`, `SECRET_SELECT_FIELDS`), an
     /// out-of-range `limit`, or a malformed or inconsistent cursor.
     pub async fn list(
         &self,
@@ -160,6 +162,7 @@ impl Service {
     ) -> Result<Page<CredentialListItem>, DomainError> {
         if let Some(fields) = query.selected_fields() {
             list_filter::validate_select(fields)?;
+            list_filter::validate_collection_select(fields)?;
         }
         let parsed_filter = &match query.filter() {
             Some(expr) => list_filter::parse_filter(expr)?,
@@ -210,19 +213,13 @@ impl Service {
         let subject = OwnerId(ctx.subject_id());
         let chain = self.dir.ancestor_chain(ctx, req).await?;
 
-        // Selecting `secret` requires `read_secret`; a record-only field named
-        // alongside it additionally requires `list` (ADR-0004 Amendment A) —
-        // disclosing `sharing`/`inheritance`/... is `list`'s privilege, not
-        // `read_secret`'s, exactly as the point read's `get_item` splits the
-        // two.
-        let required_actions = if with_secrets {
-            let mut required = vec![actions::READ_SECRET];
-            if list_filter::admin_field_selected(query.selected_fields()) {
-                required.push(actions::LIST);
-            }
-            required
+        // Selecting `secret` requires `read_secret` alone (the collection
+        // admits no record-only field beside it, validated above); any other
+        // projection requires `list`.
+        let required_action = if with_secrets {
+            actions::READ_SECRET
         } else {
-            vec![actions::LIST]
+            actions::LIST
         };
 
         // Before step 1: one PDP evaluation per required action on the base
@@ -235,7 +232,7 @@ impl Service {
                 ctx,
                 req,
                 parsed_filter.type_uuid_in.as_deref(),
-                &required_actions,
+                required_action,
             )
             .await?;
         // A caller the gate refuses gets an empty page, never a refusal
@@ -338,24 +335,23 @@ impl Service {
     /// The PDP-permitted type clamp (ADR-0005, ADR-0010) — computed **before**
     /// step 1 so it becomes step 1's own SQL type predicate, rather than an
     /// in-memory filter applied after unpermitted rows have already reached
-    /// the process. ONE PDP evaluation per action in `required_actions` on the
-    /// base credential type (all must permit and include the caller's tenant)
-    /// — a plain read names `[list]`; selecting `secret` names `[read_secret]`,
-    /// plus `list` too when a record-only field is selected alongside
-    /// `secret` (ADR-0004 Amendment A) — each answering with a constraint on
-    /// the credential type and/or reference; the scopes are intersected and
-    /// reduced to the row predicates admitted for the caller's tenant, then narrowed by the caller's
-    /// own `$filter type in (…)`. `AccessDenied` and a scope that excludes the
-    /// caller's tenant (counted via `cross_tenant_denied`) both yield an empty
-    /// clamp; any other PDP error propagates.
+    /// the process. ONE PDP evaluation of `required_action` on the base
+    /// credential type (it must permit and include the caller's tenant) — a
+    /// plain read names `list`; selecting `secret` names `read_secret` alone
+    /// (ADR-0004) — answering with a constraint on the credential type
+    /// and/or reference, reduced to the row predicates admitted for the
+    /// caller's tenant, then narrowed by the caller's own `$filter type in
+    /// (…)`. `AccessDenied` and a scope that excludes the caller's tenant
+    /// (counted via `cross_tenant_denied`) both yield an empty clamp; any
+    /// other PDP error propagates.
     async fn permitted_rows(
         &self,
         ctx: &SecurityContext,
         req: TenantId,
         caller_type_in: Option<&[Uuid]>,
-        required_actions: &[&str],
+        required_action: &str,
     ) -> Result<RowClamp, DomainError> {
-        let scope = match self.authorize_actions(ctx, req, required_actions).await {
+        let scope = match self.authorize_actions(ctx, req, &[required_action]).await {
             Ok(scope) => scope,
             Err(DomainError::AccessDenied { .. }) => return Ok(RowClamp::Constraints(Vec::new())),
             Err(e) => return Err(e),
