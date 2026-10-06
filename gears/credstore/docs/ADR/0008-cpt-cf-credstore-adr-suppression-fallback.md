@@ -90,6 +90,6 @@ Candidates: `status = active OR (status = declared AND fallback = none)`. A `dec
 
 ## Traceability
 
-- **PRD**: [PRD.md](../PRD.md) · **DESIGN**: [DESIGN.md](../DESIGN.md) §4.3.1, §6.1
+- **PRD**: [PRD.md](../PRD.md) · **DESIGN**: [DESIGN.md](../DESIGN.md) §4.3.2, §6.1
 - `cpt-cf-credstore-fr-suppression`.
 - Builds on [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md) and [ADR-0007](0007-cpt-cf-credstore-adr-record-write-verbs.md); read by [ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md) for the `declared`/`none` winner rule.

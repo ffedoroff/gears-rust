@@ -77,6 +77,6 @@ Today's metadata carries `owner_tenant_id` and `is_inherited`; for an inherited 
 
 ## Traceability
 
-- **PRD**: [PRD.md](../PRD.md) · **DESIGN**: [DESIGN.md](../DESIGN.md) §4.3.1
+- **PRD**: [PRD.md](../PRD.md) · **DESIGN**: [DESIGN.md](../DESIGN.md) §4.3.2
 - `cpt-cf-credstore-fr-inheritance-status`, `cpt-cf-credstore-nfr-tenant-isolation`.
 - Builds on [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md) and [ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md).

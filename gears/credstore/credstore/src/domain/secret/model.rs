@@ -1,38 +1,112 @@
-//! Domain models for secret metadata and write concurrency.
+// Updated: 2026-10-06 by Constructor Tech
+//! Domain models for secret metadata and write concurrency (ADR-0006:
+//! immutable value versions).
 //!
-//! Models lifecycle status, sharing, expiry, optimistic preconditions, and the
-//! metadata persisted separately from secret values.
+//! Models the two resting statuses (`active`/`declared`), the fallback
+//! policy, the value-version pointer and optimistic preconditions, all
+//! persisted separately from secret values.
 
-use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId, WriteOptions};
+use credstore_sdk::{
+    DestroySelector, OwnerId, SecretRef, SharingMode, StoreKey, TenantId, ValueVersion,
+};
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use crate::domain::ports::metrics::CleanupOp;
+
+/// A row's lifecycle status. `CHECK (status IN (2, 4))` at the storage layer
+/// admits only these two; codes `1` (`provisioning`) and `3`
+/// (`deprovisioning`) are retired by ADR-0006 and never reassigned — a stray
+/// reference to either in an old dashboard or log line stays unambiguous.
+///
+/// There is no in-flight status: a write is a value-and-pointer switch inside
+/// one database transaction, not a sequence of externally observable saga
+/// steps, so nothing observable precedes the commit that makes a row
+/// consistent.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretStatus {
-    Provisioning,
+    /// The row resolves and points at a value (`value_version IS NOT NULL`).
     Active,
-    /// Delete saga in flight: invisible to resolution, still holds the
-    /// partial unique index until backend cleanup completes.
-    Deprovisioning,
+    /// The row holds its reference but carries no value (`value_version IS
+    /// NULL`), reached only via a value-removal write (`PATCH {"secret":
+    /// null}`, or a `PATCH` that suppresses an active row in the same
+    /// transaction). A resolution candidate only when its `fallback` is
+    /// `None` (ADR-0004, Suppression): `status = 2 OR (status = 4 AND
+    /// fallback = 2)`.
+    Declared,
 }
 impl SecretStatus {
     #[must_use]
     pub fn as_smallint(self) -> i16 {
         match self {
-            Self::Provisioning => 1,
             Self::Active => 2,
-            Self::Deprovisioning => 3,
+            Self::Declared => 4,
         }
     }
+
+    /// Decode a stored status code. `1`/`3` (retired) and any other value are
+    /// out-of-domain — a storage corruption, not a reachable application
+    /// state — so this returns `None` for the caller to map onto
+    /// [`crate::domain::error::DomainError::Internal`], never a panic.
     #[must_use]
     pub fn from_smallint(v: i16) -> Option<Self> {
         match v {
-            1 => Some(Self::Provisioning),
             2 => Some(Self::Active),
-            3 => Some(Self::Deprovisioning),
+            4 => Some(Self::Declared),
             _ => None,
+        }
+    }
+}
+
+/// Suppression policy for a `declared` row (ADR-0004): a record's policy for
+/// the time it holds no value. `write` sets it (`PUT`, or `PATCH
+/// {"fallback": …}`); it is stored on every row (both `Active` and
+/// `Declared`) and consulted only while the row is `Declared`.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallback {
+    /// Resolution keeps walking up the tenant chain past this row (default).
+    Inherit,
+    /// This row blocks resolution outright when it is the nearest candidate.
+    None,
+}
+impl Fallback {
+    #[must_use]
+    pub fn as_smallint(self) -> i16 {
+        match self {
+            Self::Inherit => 1,
+            Self::None => 2,
+        }
+    }
+
+    /// Decode a stored fallback code; out-of-domain values are storage
+    /// corruption, mapped by the caller onto `DomainError::Internal`.
+    #[must_use]
+    pub fn from_smallint(v: i16) -> Option<Self> {
+        match v {
+            1 => Some(Self::Inherit),
+            2 => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+impl From<credstore_sdk::Fallback> for Fallback {
+    fn from(f: credstore_sdk::Fallback) -> Self {
+        match f {
+            credstore_sdk::Fallback::Inherit => Self::Inherit,
+            credstore_sdk::Fallback::None => Self::None,
+        }
+    }
+}
+
+impl From<Fallback> for credstore_sdk::Fallback {
+    fn from(f: Fallback) -> Self {
+        match f {
+            Fallback::Inherit => Self::Inherit,
+            Fallback::None => Self::None,
         }
     }
 }
@@ -40,100 +114,81 @@ impl SecretStatus {
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct SecretRow {
+    /// Record identity, minted at create and never reused; also the record
+    /// part of the store key.
     pub id: Uuid,
     pub tenant_id: TenantId,
     pub reference: String,
     pub sharing: SharingMode,
     pub owner_id: OwnerId,
     pub status: SecretStatus,
-    /// Monotonic version (optimistic-locking groundwork); 1 on create.
+    /// Monotonic version (optimistic-locking); 1 on create, bumped by every
+    /// successful value switch or metadata update.
     pub version: i64,
+    /// Last-write instant; bumped alongside `version` by every successful
+    /// value switch or metadata update. Surfaced on `Credential` for the
+    /// caller's own row only (ADR-0004).
+    pub updated_at: OffsetDateTime,
     /// Deterministic v5 UUID of the secret's GTS type id (the stored
     /// representation); immutable for the row's lifetime. Resolved to the
     /// type id + traits via the types-registry per operation.
     pub secret_type_uuid: Uuid,
-    /// Expiry instant for expirable types; expired rows do not resolve.
+    /// Expiry instant for expirable types. Expiry applies to the secret, not
+    /// to the record: an expired `active` row still resolves (it is the
+    /// decisive record) but its secret is never served.
     pub expires_at: Option<OffsetDateTime>,
-    /// Value-fingerprint fence (`HMAC-SHA256(fence_key, value)`) binding this
-    /// row's metadata to the backend value it was written for. `None` only
-    /// for out-of-band seeded rows, which are served on trust and backfilled
-    /// on first read / reaper sweep. Internal-only: never serialized to any
-    /// API response or log.
-    pub value_fp: Option<Vec<u8>>,
-    /// Fence-key id `value_fp` was computed under; `None` iff `value_fp` is.
-    pub fp_key_id: Option<i16>,
+    /// The value version the provider returned from `put` for the secret
+    /// this row serves (the pointer into the store). `None` iff `status =
+    /// Declared` (`credstore_secrets_value_version_check`). Opaque: never
+    /// parsed or compared by the gear, and distinct from [`Self::version`],
+    /// the row's optimistic-concurrency counter.
+    pub value_version: Option<ValueVersion>,
+    /// Suppression policy of this row (ADR-0004): consulted only while the
+    /// row is `Declared` — an `Active` row's own value always wins,
+    /// `fallback` stays stored but not consulted.
+    pub fallback: Fallback,
+    /// What heal on access found next to this row (ADR-0006, DESIGN section
+    /// 6.2). Filled only by the queries that read the row for a secret read
+    /// or a write; every other read leaves it at the default (nothing to
+    /// heal).
+    pub heal: HealFlags,
 }
 
-/// Everything a write needs beyond identity and value: sharing mode,
-/// create-only vs update, optimistic-concurrency precondition, and typed
-/// options (secret type + expiry).
+/// The two existence flags the single SQL that reads a record row returns
+/// beside it (`EXISTS` point lookups, never a `COUNT`).
 #[domain_model]
-#[derive(Debug, Clone, Default)]
-pub struct WriteSpec {
-    pub sharing: SharingMode,
-    pub create_only: bool,
-    /// Mandatory for updates (`Some` from [`Self::update`]), absent only on
-    /// the create path (`None` from [`Self::create`]) — creates are the one
-    /// preconditionless write.
-    pub precondition: Option<WritePrecondition>,
-    pub opts: WriteOptions,
-    /// When overwriting an existing secret, keep the stored sharing mode
-    /// instead of applying `sharing`. Set for a PUT that omitted `sharing`, so
-    /// a value rotation (`{"value": "..."}`) never silently narrows a `shared`
-    /// secret back to `tenant`. `sharing` is still the class selector.
-    pub preserve_sharing: bool,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealFlags {
+    /// The record has pending cleanup debts.
+    pub debts: bool,
+    /// The record has expired write intents (`lease_until < now()` on the
+    /// database clock).
+    pub expired_intents: bool,
 }
 
-impl WriteSpec {
-    /// Update of an existing secret with default options. The
-    /// optimistic-concurrency precondition is mandatory: a version validator
-    /// for read-modify-write, [`WritePrecondition::Exists`] for an explicit
-    /// last-writer-wins overwrite. An update never creates.
+impl SecretRow {
+    /// `true` iff this is an `active` row whose `expires_at` has passed at
+    /// `now`. A `declared` row never expires (a suppression policy does not).
+    /// Derived at read time; never stored.
     #[must_use]
-    pub fn update(sharing: SharingMode, precondition: WritePrecondition) -> Self {
-        Self {
-            sharing,
-            precondition: Some(precondition),
-            ..Self::default()
-        }
-    }
-
-    /// Create-only (409 on same-class duplicate) with default options.
-    #[must_use]
-    pub fn create(sharing: SharingMode) -> Self {
-        Self {
-            sharing,
-            create_only: true,
-            ..Self::default()
-        }
-    }
-
-    /// Attach typed write options (secret type, expiry).
-    #[must_use]
-    pub fn with_opts(mut self, opts: WriteOptions) -> Self {
-        self.opts = opts;
-        self
-    }
-
-    /// Preserve the existing secret's sharing on overwrite (see field docs).
-    #[must_use]
-    pub fn preserve_sharing(mut self, preserve: bool) -> Self {
-        self.preserve_sharing = preserve;
-        self
+    pub fn is_expired(&self, now: OffsetDateTime) -> bool {
+        self.status == SecretStatus::Active && self.expires_at.is_some_and(|at| at <= now)
     }
 }
 
-/// Optimistic-concurrency precondition for a write, parsed from `If-Match`.
+/// Optimistic-concurrency precondition for `patch`/`delete`, parsed from
+/// `If-Match`. `put` uses the distinct [`PutPrecondition`], which additionally
+/// carries the create-only intent (`If-None-Match: *`).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WritePrecondition {
-    /// `If-Match: *` — the target secret must already exist.
+    /// `If-Match: *` — the target credential must already exist.
     Exists,
     /// `If-Match: "<id>.<version>"` — the generation-bound strong validator.
-    /// `id` is the row UUID (a fresh one per recreated secret), so a
-    /// validator from a deleted-and-recreated secret's earlier generation can
-    /// never match the current row even when the version counters coincide
-    /// (no ABA); `version` is the per-row monotonic counter.
+    /// `id` is the row UUID (a fresh one per recreated credential), so a
+    /// validator from a deleted-and-recreated credential's earlier generation
+    /// can never match the current row even when the version counters
+    /// coincide (no ABA); `version` is the per-row monotonic counter.
     Version {
         /// Row (generation) UUID the caller's validator was minted for.
         id: Uuid,
@@ -146,6 +201,34 @@ pub enum WritePrecondition {
     AnyVersion(Vec<(Uuid, i64)>),
 }
 
+/// Precondition for `put` (ADR-0004, "Two write verbs on one resource"):
+/// distinguishes create-only from a guarded or unconditional replace, parsed
+/// from `If-None-Match`/`If-Match`.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutPrecondition {
+    /// `If-None-Match: *` — create-only; `Conflict` if the caller's own
+    /// tenant already holds a row under the reference (of any status —
+    /// `declared` counts as "holds a row" too).
+    CreateOnly,
+    /// `If-Match: *` — replace, last-writer-wins; `Conflict` (mapped to
+    /// [`crate::domain::error::DomainError::VersionConflict`] by the caller,
+    /// mirroring `WritePrecondition::Exists`) if no own row exists.
+    Exists,
+    /// `If-Match: "<id>.<version>"` — guarded replace.
+    Version {
+        /// Row (generation) UUID the caller's validator was minted for.
+        id: Uuid,
+        /// Version counter the caller last observed.
+        version: i64,
+    },
+    /// `If-Match: "<id>.<v>", "<id2>.<v2>", …` — a multi-valued list (RFC 7232
+    /// §3.1); satisfied if the current row matches **any** listed validator.
+    AnyVersion(Vec<(Uuid, i64)>),
+}
+
+/// A new active row: a create always inserts `active`, pointing at the
+/// value version its `plugin.put` already returned.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct NewSecret {
@@ -157,35 +240,224 @@ pub struct NewSecret {
     /// Deterministic v5 UUID of the (registry-validated) GTS type id.
     pub secret_type_uuid: Uuid,
     pub expires_at: Option<OffsetDateTime>,
-    /// Fence fingerprint of the value this create will write to the backend
-    /// (API creates always stamp; only out-of-band seeding leaves it NULL).
-    pub value_fp: Vec<u8>,
-    /// Fence-key id `value_fp` was computed under.
-    pub fp_key_id: i16,
+    /// The value version `plugin.put` returned for this create's value.
+    pub value_version: ValueVersion,
+    /// Suppression policy carried into the row at create time (ADR-0004);
+    /// `PUT`'s default is [`Fallback::Inherit`] when the body omits it.
+    pub fallback: Fallback,
+}
+
+/// A new declared row (ADR-0004 Amendment B, "The value-less record: reached
+/// only on purpose"): a create whose `value` is an explicit `null` inserts
+/// the row `declared` directly — no `value_version`, no backend call. Distinct from [`NewSecret`], which always carries a
+/// written value.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct NewDeclaredSecret {
+    pub id: Uuid,
+    pub tenant_id: TenantId,
+    pub reference: SecretRef,
+    pub sharing: SharingMode,
+    pub owner_id: OwnerId,
+    /// Deterministic v5 UUID of the (registry-validated) GTS type id.
+    pub secret_type_uuid: Uuid,
+    pub expires_at: Option<OffsetDateTime>,
+    /// Suppression policy carried into the row at create time (ADR-0004).
+    pub fallback: Fallback,
+}
+
+/// One secret-write attempt, as the repository needs to know it: the
+/// identity of its write intent (`credstore_write_intents` row; inserted by
+/// tx0 before `plugin.put`, deleted by tx1 in the transaction that commits
+/// or definitively loses the write), the store key the attempt `put`s under,
+/// the record's reference (stored in the intent so a failed create can be
+/// healed by reference), and whether the selected plugin supports `destroy`
+/// (destroy debts are recorded only then; purges always).
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct WriteAttempt {
+    /// Minted per write attempt (v4), never reused: a retried write gets a
+    /// new one.
+    pub attempt_id: Uuid,
+    /// The store key the attempt `put`s under.
+    pub key: StoreKey,
+    /// The reference of the record the attempt writes.
+    pub reference: String,
+    pub destroy_supported: bool,
+    /// The row read in step 1 reported expired intents of the record: tx1
+    /// deletes them (the expiry is re-checked in the DELETE). Always `false`
+    /// for a create.
+    pub heal_expired_intents: bool,
+}
+
+/// A store-cleanup obligation a repository transaction recorded in
+/// `credstore_store_cleanup`, next to the row change or intent deletion that
+/// learned it was needed. Executed by the request that recorded it once the
+/// commit is confirmed, or by a later request that touches the record.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupTask {
+    /// `plugin.delete_key(key)`: the key will never hold a live value
+    /// (record deleted, or the attempt's fresh key lost its row).
+    Purge(StoreKey),
+    /// `plugin.destroy(key, selector)`; recorded only for destroy-capable
+    /// plugins.
+    Destroy {
+        key: StoreKey,
+        selector: DestroySelector,
+    },
+}
+
+impl CleanupTask {
+    /// The metric label of this task.
+    #[must_use]
+    pub fn op(&self) -> CleanupOp {
+        match self {
+            Self::Purge(_) => CleanupOp::Purge,
+            Self::Destroy { .. } => CleanupOp::Destroy,
+        }
+    }
+
+    /// The store key the task acts on.
+    #[must_use]
+    pub fn key(&self) -> &StoreKey {
+        match self {
+            Self::Purge(key) | Self::Destroy { key, .. } => key,
+        }
+    }
+}
+
+/// A recorded cleanup obligation: the row of `credstore_store_cleanup` (`id`
+/// is its primary key, used to delete it after a successful execution) and
+/// the task it carries.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupDebt {
+    pub id: Uuid,
+    pub task: CleanupTask,
+}
+
+/// How a secret write's commit transaction (tx1) ended. Everything but an
+/// error is a definite outcome: the intent is retired in the same
+/// transaction as the row change, and every debt listed was recorded in that
+/// same transaction.
+#[domain_model]
+#[derive(Debug)]
+pub enum IntentCommit<T> {
+    /// The row change committed (`value`: the post-write row, if the method
+    /// returns one); the intent is gone, and `healed` expired intents of the
+    /// record were deleted with it.
+    Committed {
+        value: T,
+        debts: Vec<CleanupDebt>,
+        healed: u64,
+    },
+    /// The row change lost definitively (the create hit the reference's
+    /// unique index, or the compare-and-set matched no row). The intent
+    /// deletion committed anyway, together with the debt for this attempt's
+    /// version.
+    Lost { debts: Vec<CleanupDebt> },
+    /// The intent had already been healed: the transaction changed nothing.
+    /// The writer is alive and knows its version, so it settles it itself
+    /// ([`crate::domain::secret::repo::SecretRepo::settle_lost_intent`]).
+    IntentLost,
+}
+
+/// What the verification transaction after an ambiguous commit of a secret
+/// write's tx1 found (ADR-0006, "Verification after an ambiguous commit").
+/// The transaction takes a locking read of the attempt's own intent, so it
+/// waits for the ambiguous transaction to resolve instead of racing a late
+/// commit.
+#[domain_model]
+#[derive(Debug)]
+pub enum WriteVerification<T> {
+    /// The own intent is gone and the row points at the attempt's version:
+    /// tx1 committed. `row` is the row as read; its pending debts (tx1's
+    /// own among them) are executed by the caller.
+    Committed { row: SecretRow },
+    /// The own intent was still present: tx1 had not committed, and it ran
+    /// again in the verification transaction. Never
+    /// [`IntentCommit::IntentLost`] in practice (the transaction holds the
+    /// intent's lock), but the caller handles it like any other tx1 result.
+    Retried(IntentCommit<T>),
+    /// The own intent is gone and the row does not point at the attempt's
+    /// version: the attempt took no effect. The transaction recorded the
+    /// cleanup of the attempt's version (`destroy exact`, or `purge` when no
+    /// row has the record id); nothing points at that version.
+    NotApplied { debts: Vec<CleanupDebt> },
+}
+
+/// What the verification transaction after an ambiguous commit of a record
+/// delete found.
+#[domain_model]
+#[derive(Debug)]
+pub enum DeleteVerification {
+    /// The row is gone: the delete committed. Its `purge` debt is pending
+    /// and executed by the caller.
+    Committed,
+    /// The row was still there: the delete had not committed, and it ran
+    /// again in the verification transaction; `debts` is the recorded
+    /// `purge`.
+    Retried { debts: Vec<CleanupDebt> },
+    /// The row was still there but its version no longer satisfies the
+    /// delete's precondition: nothing was deleted.
+    PreconditionFailed,
+}
+
+/// Result of [`crate::domain::secret::repo::SecretRepo::heal_failed_creates`].
+#[domain_model]
+#[derive(Debug, Default)]
+pub struct HealedCreates {
+    /// Expired intents deleted.
+    pub intents: u64,
+    /// The `purge` debts recorded for their keys.
+    pub debts: Vec<CleanupDebt>,
+}
+
+impl SecretRow {
+    /// The store key of this record: `(tenant_id, id)`.
+    #[must_use]
+    pub fn store_key(&self) -> StoreKey {
+        StoreKey::new(self.tenant_id, self.id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SecretStatus;
+    use super::{Fallback, SecretStatus};
 
     #[test]
     fn secret_status_smallint_round_trips() {
-        for s in [
-            SecretStatus::Provisioning,
-            SecretStatus::Active,
-            SecretStatus::Deprovisioning,
-        ] {
+        for s in [SecretStatus::Active, SecretStatus::Declared] {
             assert_eq!(SecretStatus::from_smallint(s.as_smallint()), Some(s));
         }
-        assert_eq!(SecretStatus::Provisioning.as_smallint(), 1);
         assert_eq!(SecretStatus::Active.as_smallint(), 2);
-        assert_eq!(SecretStatus::Deprovisioning.as_smallint(), 3);
+        assert_eq!(SecretStatus::Declared.as_smallint(), 4);
     }
 
     #[test]
-    fn secret_status_from_smallint_rejects_out_of_domain() {
+    fn secret_status_from_smallint_rejects_retired_and_out_of_domain_codes() {
+        // 1 (provisioning) and 3 (deprovisioning) are retired by ADR-0006:
+        // reserved, never reassigned, never stored again.
+        assert_eq!(SecretStatus::from_smallint(1), None);
+        assert_eq!(SecretStatus::from_smallint(3), None);
         assert_eq!(SecretStatus::from_smallint(0), None);
-        assert_eq!(SecretStatus::from_smallint(4), None);
+        assert_eq!(SecretStatus::from_smallint(5), None);
         assert_eq!(SecretStatus::from_smallint(-1), None);
+    }
+
+    #[test]
+    fn fallback_smallint_round_trips() {
+        for f in [Fallback::Inherit, Fallback::None] {
+            assert_eq!(Fallback::from_smallint(f.as_smallint()), Some(f));
+        }
+        assert_eq!(Fallback::Inherit.as_smallint(), 1);
+        assert_eq!(Fallback::None.as_smallint(), 2);
+    }
+
+    #[test]
+    fn fallback_from_smallint_rejects_out_of_domain() {
+        assert_eq!(Fallback::from_smallint(0), None);
+        assert_eq!(Fallback::from_smallint(3), None);
     }
 }

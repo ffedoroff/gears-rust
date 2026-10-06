@@ -1,10 +1,15 @@
+// Updated: 2026-10-06 by Constructor Tech
 //! `ToolKit` gear declaration, dependency wiring, and managed lifecycle.
 //!
-//! Initialization builds the domain service, registers its SDK client and REST
-//! routes, and the stateful lifecycle runs recovery and fence-backfill sweeps.
+//! Initialization builds the domain service and registers its SDK client and
+//! REST routes. The gear runs no background work at all (ADR-0006): no
+//! outbox, no workers, no timers, no database polling, no work at startup.
+//! Every store side effect is executed by the request that caused it, and the
+//! leftovers of an interrupted request are healed by a later request that
+//! touches the same record. The lifecycle entry only reports ready and waits
+//! for cancellation.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
@@ -21,8 +26,11 @@ use types_registry_sdk::TypesRegistryClient;
 
 use crate::client::CredStoreLocalClient;
 use crate::config::CredStoreConfig;
+use crate::domain::ports::audit::AuditSink;
 use crate::domain::ports::metrics::CredStoreMetricsPort;
-use crate::domain::secret::service::{ReaperSettings, Service};
+use crate::domain::ports::plugin::PluginSelector;
+use crate::domain::secret::service::{ListSettings, Service, WriteSettings};
+use crate::infra::audit::{self, BrokerResolver, DEFAULT_PUBLISH_TIMEOUT, EventBrokerAuditSink};
 use crate::infra::metrics::CredStoreMetricsMeter;
 use crate::infra::plugin_select::GtsCredStorePluginSelector;
 use crate::infra::storage::repo_impl::SecretRepoImpl;
@@ -62,32 +70,19 @@ impl CredStoreGear {
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
-        let Some(svc) = self.service.get().cloned() else {
+        if self.service.get().is_none() {
             anyhow::bail!("credstore: serve invoked before init");
-        };
-
-        let tick = Duration::from_secs(svc.reaper_tick_secs());
-        let mut interval = tokio::time::interval(tick);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
 
         ready.notify();
         info!(
             target: "credstore.lifecycle",
-            reaper_tick_secs = tick.as_secs(),
-            "credstore reaper tick started"
+            "credstore gear serving; no background work: store cleanup runs inside requests"
         );
 
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    svc.reap_and_refresh().await;
-                }
-            }
-        }
+        cancel.cancelled().await;
 
-        info!(target: "credstore.lifecycle", "credstore reaper tick cancelled");
+        info!(target: "credstore.lifecycle", "credstore lifecycle cancelled");
         Ok(())
     }
 }
@@ -142,22 +137,62 @@ impl Gear for CredStoreGear {
             .client_hub()
             .get::<dyn TypesRegistryClient>()
             .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryClient: {e}"))?;
-        let types = Arc::new(GtsSecretTypeResolver::new(registry, Arc::clone(&metrics)));
+        let types = Arc::new(GtsSecretTypeResolver::new(
+            Arc::clone(&registry),
+            Arc::clone(&metrics),
+        ));
         info!("types-registry client resolved from client hub; secret-type resolver wired");
 
-        let svc = Arc::new(Service::new(
-            repo,
-            dir,
-            enforcer,
-            plugins,
-            types,
-            metrics,
-            ReaperSettings {
-                tick_secs: cfg.reaper.tick_secs,
-                provisioning_timeout_secs: cfg.reaper.provisioning_timeout_secs,
-                deprovisioning_timeout_secs: cfg.reaper.deprovisioning_timeout_secs,
-            },
+        // Audit (`cpt-cf-credstore-nfr-audit`): the event broker is a
+        // non-blocking dependency. It is deliberately NOT in `deps` and its
+        // client is resolved per event, so credstore starts and works with
+        // the broker absent; every dropped event is counted instead.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            audit::register_audit_types(registry.as_ref()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                target: "credstore.audit",
+                error = %e,
+                "credstore audit topic/event type not registered; publishing will fail and be \
+                 counted until they are"
+            ),
+            Err(_) => tracing::warn!(
+                target: "credstore.audit",
+                "registering the credstore audit topic/event type timed out; publishing will \
+                 fail and be counted until they are registered"
+            ),
+        }
+        let hub = ctx.client_hub();
+        let resolve: BrokerResolver =
+            Arc::new(move || hub.try_get::<dyn event_broker_sdk::EventBrokerApi>());
+        let audit_sink: Arc<dyn AuditSink> = Arc::new(EventBrokerAuditSink::new(
+            resolve,
+            Arc::clone(&metrics),
+            DEFAULT_PUBLISH_TIMEOUT,
         ));
+
+        let svc = Arc::new(
+            Service::new(
+                repo,
+                dir,
+                enforcer,
+                Arc::clone(&plugins) as Arc<dyn PluginSelector>,
+                types,
+                Arc::clone(&metrics),
+                ListSettings {
+                    max_limit: cfg.list.max_limit,
+                    secret_mode_cap: cfg.list.secret_mode_cap,
+                },
+            )
+            .with_audit(audit_sink)
+            .with_write_settings(WriteSettings {
+                intent_lease: std::time::Duration::from_secs(cfg.write.intent_lease_secs),
+            }),
+        );
 
         self.service
             .set(Arc::clone(&svc))

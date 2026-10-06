@@ -10,13 +10,12 @@ paths:
       description: 'Upward-rooted collection read (ADR-0005): one reduced item per reference, from the
         caller''s tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped,
         eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only
-        `reference`. Naming `secret` in `$select` requires `read_secret` and adds each item''s secret
-        to the same paginated read (ADR-0004); on the collection `secret` may be combined only with `reference`,
-        `type`, `expires_at` (otherwise 400 `SECRET_SELECT_FIELDS`); an expired item is returned without
-        its secret; an item whose stored version the backend cannot return fails the whole request.'
+        `reference`. Selecting `secret` in `$select` switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`,
+        a `reference` (`eq`/`in`) or `type` (`eq`/`in`) selector only, capped and unpaginated; an expired
+        or unreadable item is returned without its secret.'
       operationId: credstore.list_credentials
       parameters:
-      - description: Page size
+      - description: Page size (metadata mode only)
         in: query
         name: limit
         required: false
@@ -82,7 +81,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Page_CredentialDto'
-          description: A page of reduced credential items (items additionally carry `secret` when selected)
+          description: A page of reduced credential items (secret-mode items additionally carry `secret`)
         '400':
           content:
             application/problem+json:
@@ -262,7 +261,10 @@ paths:
         `GET .../{ref}?$select=reference,type,expires_at,secret` is its equivalent, and a secret-only
         projection resolving to a value-less winner is the same canonical 404 that address gave. Selecting
         `secret` of a record whose expiry has passed fails 409 `SECRET_EXPIRED` (only for a caller who
-        may read the secret); without `secret` the record is returned with `status` `expired`.'
+        may read the secret); without `secret` the record is returned with `status` `expired`. Selecting
+        `secret` of a record whose stored version the backend cannot return (gone although the pointer
+        did not move, or reported permanently unreadable) fails 409 `SECRET_UNREADABLE`, same disclosure
+        rule; retrying does not help, rewrite the secret or delete the record.'
       operationId: credstore.get_credential
       parameters:
       - description: Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
@@ -504,15 +506,15 @@ components:
 
         addresses. `secret` is populated only when `$select` names it (point
 
-        read or collection read), and only for an item the caller may
+        read) or in secret mode (collection) and only for an item the caller may
 
         read; absent from the wire entirely otherwise — including when the item''s
 
-        value could not be served (refused or missing — omitted by the
+        value could not be served (refused, missing, fingerprint mismatch —
 
-        domain layer already — or the record has expired, in which case the item
+        omitted by the domain layer already, never reported as an error for one
 
-        stays with its metadata).
+        item).
 
 
         `Debug` is hand-written to redact `secret`.'
@@ -549,9 +551,9 @@ components:
         secret:
           description: 'The decrypted secret — present only when `$select` names it (point
 
-            read or collection read), and only for an item the caller may
+            read) or in secret mode (collection), and only for an item the caller
 
-            read.'
+            may read.'
           type:
           - string
           - 'null'

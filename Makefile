@@ -687,7 +687,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-credstore-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -889,6 +889,15 @@ test-rg-pg: install-tools
 ## runs, on the backend it runs it on.
 test-settings-service-pg: install-tools
 	cargo nextest run -p cf-gears-settings-service --features integration --test pg_migrations_test
+
+## Run the credstore gear's PostgreSQL migration suite (Docker required; spins up
+## its own postgres container via testcontainers -- see
+## gears/credstore/credstore/tests/pg_migrations_test.rs). The SQLite suite beside
+## `m0002_value_versions` runs a table rebuild; PostgreSQL gets in-place DDL
+## (`DO` blocks, `pg_constraint` look-ups) that suite never executes; this lane
+## runs the migration on the backend it ships on.
+test-credstore-pg: install-tools
+	cargo nextest run -p cf-gears-credstore --features integration --test pg_migrations_test
 
 ## Run bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).
