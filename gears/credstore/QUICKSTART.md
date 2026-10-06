@@ -26,10 +26,12 @@ in `$select` — there is no separate address for the secret alone.
   several secrets at once by selecting `secret`
 - Immutable value versions: every write announces itself in PostgreSQL (a
   write intent), stores a new version in the backend and switches the record's
-  pointer to it; no in-place overwrite, no reaper and no maintenance job. The
-  cleanup of superseded and removed versions, and the purge of a deleted
-  record's key, are outbox tasks enqueued in the same transaction that made
-  them necessary. Deleting a record frees the reference at once
+  pointer to it; no in-place overwrite. The cleanup of superseded and removed
+  versions, and the purge of a deleted record's key, are debts recorded in
+  PostgreSQL in the same transaction that made them necessary and executed by
+  the same request right after the commit; leftovers of a live record are
+  healed by a later request that touches it. The process runs no background
+  work. Deleting a record frees the reference at once
 - Best-effort audit of secret reads and writes through `event-broker`
   (`audit_publish_failed` metric on failure)
 - Access denial returned as `404` (not an error) to prevent credential
@@ -62,25 +64,25 @@ gears:
       hierarchy:
         ancestor_cache_ttl_secs: 300 # ancestor-chain cache TTL (default: 300)
       write:
-        intent_lease_secs: 300      # lease of a write intent, database clock (default: 300; minimum: 60; must be far above the plugin's put timeout)
-        reclaim_batch: 16           # expired intents one reclaim pass handles (default: 16)
+        intent_lease_secs: 300      # lease of a write intent, database clock (default: 300; minimum: 60; time after which the intent of a crashed writer may be healed; must be far above the longest store request)
       list:
         max_limit: 200              # cap for a metadata-mode page's `limit` (default: 200)
         secret_mode_cap: 25         # cap on how many references a secret-mode ($select=…,secret) request may match (default: 25)
 ```
 
-There is no `reaper:` or `gc:` block: the gear runs no resident loop and no
-maintenance job, and unknown config keys (including those two) are rejected
-at startup. Expired write intents (left by a writer that crashed or stalled
-between announcing a store write and committing it) are reclaimed at startup,
-before the gear reports ready, and by a pass after every secret write.
+There is no `reaper:` or `gc:` block and no `reclaim_batch` key: the gear runs
+no background work, and unknown config keys (including these) are rejected at
+startup. Expired write intents (left by a writer that crashed or stalled
+between announcing a store write and committing it) are healed on access: by
+the next successful secret write to the same record, or by a create or read of
+the same reference when the earlier create failed.
 
 **Secrets are provisioned only through this API.** A backend plugin (e.g.
 `static-credstore-plugin` for development) (`CredStorePluginClientV2`) is a versioned
 byte store keyed by `(tenant_id, record_id)`: `put` returns the version, `get`
-reads one, `delete_key` drops the key (called by the outbox after a record
-delete, or for a key no record will ever use), and `destroy` is optional
-(`supports_destroy`; called only by the outbox, never inline in a write). There is no way to
+reads one, `delete_key` drops the key (called by the request that deletes a record, right after the commit,
+or for a key no record will ever use), and `destroy` is optional
+(`supports_destroy`; called after the commit that recorded the cleanup, never inside a transaction). There is no way to
 seed a value directly in the plugin's own configuration: the static plugin's
 config carries only `vendor` and `priority`, and any other key (including the
 withdrawn `secrets` block) fails validation at boot. It is a non-durable
@@ -386,7 +388,8 @@ curl -si -X DELETE "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-op
 Response: **204 No Content**. `If-Match` is mandatory: a version validator,
 or `*` to delete whatever is there. Removes the record in one transaction and releases the reference at once
 (a create-only `PUT` right after succeeds); the secret's backend key is purged
-asynchronously by the outbox.
+by the same request right after the commit (a failed purge stays recorded in the
+gear's database).
 
 ## Using the SDK
 

@@ -46,7 +46,7 @@ cannot carry values; it reshapes the schema and leaves every surviving row
   `credstore_write_intents` (in-flight secret writes, with the record's
   reference) and the cleanup-debt table `credstore_store_cleanup`
   (obligations on the value store that the gear executes right after a commit
-  or heals on a later access).
+  or heals a live record on a later access).
 
 `m0002` moves no store bytes and mints no `value_version`. There is **no gc
 table, no maintenance job, no background work and no fingerprint fence** after
@@ -268,7 +268,9 @@ copied; `m0002` deletes them.
 non-private row with one reference whose secret types differ. Both rows keep
 working after the cutover. What changes is that a **new** private override whose
 type differs from the type it overrides is rejected with
-`TYPE_MISMATCH_WITH_INHERITED`; records that already exist are not touched. The
+`TYPE_MISMATCH_WITH_INHERITED`, and a **new** record whose descendant tenants
+already hold the reference with another type is rejected with
+`TYPE_MISMATCH_WITH_DESCENDANT`; records that already exist are not touched. The
 report is information for the owners of those references (they may want to align
 the types before writing new overrides). A divergence between a tenant and an
 **ancestor** needs the tenant hierarchy and is not computed by the tool.
