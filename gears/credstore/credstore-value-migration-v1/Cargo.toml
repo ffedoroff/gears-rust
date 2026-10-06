@@ -1,0 +1,185 @@
+[package]
+name = "credstore-value-migration-v1"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Constructor Fabric"]
+repository = "https://github.com/constructorfabric/gears-rust"
+description = "Operator-facing front of the CredStore value migration for an old plugin of the published V1 contract (not published; deleted with the tool)"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "credstore_value_migration_v1"
+
+# This crate is OUTSIDE the root workspace on purpose (like `tools/fuzz`): it depends on the
+# published `cf-gears-credstore-sdk` 0.2, and two versions of one package name in the root
+# workspace make every `cargo -p cf-gears-credstore-sdk` (and `-p` of every crate the old SDK
+# drags in a second copy of) ambiguous. It is its own workspace with its own `Cargo.lock`;
+# `[workspace.lints]` below is a copy of the root's, so the same strict lints apply.
+[workspace]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The engine (in the root workspace): the `LegacyStore` seam, `run`, the phases.
+credstore-value-migration = { package = "cf-gears-credstore-value-migration", path = "../credstore-value-migration" }
+# The NEW store contract (`CredStorePluginClientV2`), the workspace's current SDK.
+credstore-sdk = { package = "cf-gears-credstore-sdk", path = "../credstore-sdk" }
+# The OLD store contract, as published: `CredStorePluginClientV1` (get/put/delete by tenant,
+# reference and owner). Renamed so both SDK generations coexist; an out-of-tree plugin's existing
+# V1 implementation plugs in without an adapter of its own.
+credstore-sdk-v02 = { package = "cf-gears-credstore-sdk", version = "0.2.17" }
+# The old contract's `SecurityContext`: the published SDK depends on the REGISTRY
+# `cf-gears-toolkit-security`, so the V1 methods take that crate's type.
+toolkit-security-v02 = { package = "cf-gears-toolkit-security", version = "0.11.0" }
+
+async-trait = "0.1"
+anyhow = "1.0"
+uuid = "1.23.3"
+# Reference old store over Vault KV v2 (`vault`).
+reqwest = "0.13"
+base64 = "0.22"
+serde_json = "1.0"
+
+[dev-dependencies]
+# The V2 target of the rehearsal; the gear for its migrations, as the engine's own tests use.
+vault-credstore-plugin = { package = "cf-gears-vault-credstore-plugin", path = "../plugins/vault-credstore-plugin" }
+credstore = { package = "cf-gears-credstore", path = "../credstore" }
+toolkit-security = { package = "cf-gears-toolkit-security", path = "../../../libs/toolkit-security" }
+toolkit-db = { package = "cf-gears-toolkit-db", path = "../../../libs/toolkit-db", features = ["pg", "sqlite"] }
+sea-orm = { version = "2.0", default-features = false, features = ["runtime-tokio", "with-uuid", "macros", "sqlite-use-returning-for-3_35"] }
+tempfile = "3"
+tokio = { version = "1.47", features = ["full"] }
+# Docker-backed manual tests (`#[ignore]`, never run in CI).
+testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres"] }
+test-containers = { package = "cf-gears-test-containers", path = "../../../libs/test-containers" }
+
+[workspace.lints.rust]
+deprecated = "warn"
+non_ascii_idents = "forbid"
+unsafe_code = "forbid"
+unused_mut = "warn"
+noop_method_call = "warn"
+unused_import_braces = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
+[workspace.lints.clippy]
+# See clippy rules details https://rust-lang.github.io/rust-clippy/master/index.html
+# Here will be workspace global rules
+pedantic = { level = "deny", priority = -1 }
+async_yields_async = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+cast_sign_loss = "deny"
+clone_on_copy = "deny"
+cognitive_complexity = "deny"
+dbg_macro = "deny"
+debug_assert_with_mut_call = "deny"
+default_trait_access = "deny"
+doc_link_with_quotes = "deny"
+doc_markdown = "deny"
+elidable_lifetime_names = "deny"
+empty_line_after_outer_attr = "deny"
+empty_structs_with_brackets = "deny"
+enum_glob_use = "deny"
+expect_used = "deny"
+explicit_iter_loop = "deny"
+float_cmp = "deny"
+float_cmp_const = "deny"
+format_push_string = "deny"
+if_not_else = "deny"
+ignore_without_reason = "deny"
+ignored_unit_patterns = "deny"
+implicit_clone = "deny"
+items_after_statements = "deny"
+implicit_hasher = "deny"
+inefficient_to_string = "deny"
+integer_division = "deny"
+ip_constant = "deny"
+let_underscore_must_use = "deny"
+lossy_float_literal = "deny"
+manual_assert = "deny"
+manual_let_else = "deny"
+manual_string_new = "deny"
+many_single_char_names = "deny"
+map_clone = "deny"
+map_unwrap_or = "deny"
+match_same_arms = "deny"
+match_wildcard_for_single_variants = "deny"
+missing_errors_doc = "deny"
+missing_fields_in_debug = "deny"
+missing_panics_doc = "deny"
+must_use_candidate = "deny"
+mutex_atomic = "deny"
+needless_borrow = "deny"
+needless_lifetimes = "deny"
+needless_pass_by_value = "deny"
+no_effect_underscore_binding = "deny"
+non_ascii_literal = "deny"
+non_std_lazy_statics = "deny"
+option_as_ref_cloned = "deny"
+redundant_closure_for_method_calls = "deny"
+redundant_else = "deny"
+ref_option = "deny"
+regex_creation_in_loops = "deny"
+return_self_not_must_use = "deny"
+semicolon_if_nothing_returned = "deny"
+single_char_pattern = "deny"
+similar_names = "deny"
+single_match_else = "deny"
+struct_excessive_bools = "deny"
+suspicious_operation_groupings = "deny"
+too_many_lines = "deny"
+trivially_copy_pass_by_ref = "deny"
+type_complexity = "deny"
+unchecked_time_subtraction = "deny"
+unnecessary_debug_formatting = "deny"
+uninlined_format_args = "deny"
+unnecessary_literal_bound = "deny"
+unnecessary_wraps = "deny"
+unnested_or_patterns = "deny"
+unreadable_literal = "deny"
+unused_async = "deny"
+# Trait impls stay `async fn` to mirror the trait; the lint's `future::ready`
+# rewrite runs the body at call time instead of first poll.
+unused_async_trait_impl = "allow"
+unused_self = "deny"
+unwrap_used = "deny"
+use_debug = "deny"
+used_underscore_binding = "deny"
+used_underscore_items = "deny"
+useless_let_if_seq = "deny"
+wildcard_dependencies = "deny"
+wildcard_imports = "deny"
+
+# Additional lints for LLM-generated code quality
+# Catches redundant/inefficient patterns
+redundant_clone = "deny"
+redundant_pattern_matching = "deny"
+redundant_pub_crate = "deny"
+str_to_string = "deny"
+manual_ok_or = "deny"
+manual_map = "deny"
+manual_filter_map = "deny"
+manual_find_map = "deny"
+
+# Prevents verbose/non-idiomatic code
+match_bool = "deny"
+needless_for_each = "deny"
+needless_collect = "deny"
+needless_late_init = "deny"
+needless_option_as_deref = "deny"
+
+# Memory efficiency and correctness
+large_stack_arrays = "deny"
+large_types_passed_by_value = "deny"
+rc_buffer = "deny"
+rc_mutex = "deny"
+string_lit_as_bytes = "deny"
+verbose_file_reads = "deny"

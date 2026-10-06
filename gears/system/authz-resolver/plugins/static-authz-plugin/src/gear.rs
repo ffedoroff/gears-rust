@@ -1,3 +1,4 @@
+// Updated: 2026-10-06 by Constructor Tech
 //! Static `AuthZ` resolver plugin gear.
 
 use std::sync::{Arc, OnceLock};
@@ -12,7 +13,7 @@ use tracing::info;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::StaticAuthZPluginConfig;
-use crate::domain::Service;
+use crate::domain::{PropertyGrant, Service};
 
 /// Static `AuthZ` resolver plugin gear.
 #[toolkit::gear(
@@ -54,8 +55,14 @@ impl Gear for StaticAuthZPlugin {
         let results = registry.register(vec![instance_json]).await?;
         RegisterResult::ensure_all_ok(&results)?;
 
-        // Create service
-        let service = Arc::new(Service::new());
+        // Create service (grant values are parsed once, here; a bad value
+        // fails the init).
+        let grants = cfg
+            .property_grants
+            .iter()
+            .map(PropertyGrant::try_from_config)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let service = Arc::new(Service::with_grants(grants));
         self.service
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;

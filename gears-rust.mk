@@ -489,7 +489,7 @@ test-eb-kafka: install-tools
 
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
-	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg \
+	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg credstore-gear-pg \
 	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
@@ -609,6 +609,15 @@ lane_args_settings-service-pg = -p cf-gears-settings-service --features integrat
 ## otherwise the test skips silently.
 lane_args_credstore-pg = -p cf-gears-credstore-v2 --features integration --test pg_migrations_test
 lane_env_credstore-pg = CREDSTORE_PG_REQUIRE_DOCKER=1
+
+## The credstore gear (rewritten in place, non-v2 path) PostgreSQL migration suite (Docker required; spins up
+## its own postgres container via testcontainers -- see
+## gears/credstore/credstore/tests/pg_migrations_test.rs). The SQLite suite beside
+## `m0002_value_versions` runs a table rebuild; PostgreSQL gets in-place DDL
+## (`DO` blocks, `pg_constraint` look-ups) that suite never executes; this lane
+## runs the migration on the backend it ships on.
+lane_args_credstore-gear-pg = -p cf-gears-credstore --features integration --test pg_migrations_test
+lane_env_credstore-gear-pg = CREDSTORE_PG_REQUIRE_DOCKER=1
 
 ## bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

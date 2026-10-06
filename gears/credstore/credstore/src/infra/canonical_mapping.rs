@@ -1,3 +1,4 @@
+// Updated: 2026-10-06 by Constructor Tech
 //! `DbErr` → [`DomainError`] classification ladder.
 
 use sea_orm::DbErr;
@@ -17,16 +18,19 @@ pub(crate) fn classify_db_err_to_domain(db_err: DbErr) -> DomainError {
         warn!(
             target: "credstore.db",
             error = %db_err,
-            "serialization conflict (retry-exhausted)"
+            "serialization conflict"
         );
+        // The `DbErr` stays as the cause: the transaction retry
+        // (`SecretRepoImpl::run_tx`) reads it back to decide whether to run
+        // the body again.
         return DomainError::ServiceUnavailable {
             detail: "serialization conflict; retry budget exhausted".to_owned(),
             retry_after: None,
-            cause: None,
+            cause: Some(Box::new(db_err)),
         };
     }
     // Every CHECK in the schema (reference length, sharing/status domains, the
-    // fingerprint fence pairing) guards data the code validates or produces
+    // value-version/status pairing) guards data the code validates or produces
     // before the write — `reference` is rejected at both the SDK and REST
     // boundaries, the rest never comes from user input. A firing CHECK is
     // therefore a broken server-side invariant, not a bad secret reference:
