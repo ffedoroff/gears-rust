@@ -173,7 +173,7 @@ docker_test! {
 }
 
 docker_test! {
-    async fn entries_not_written_by_the_plugin_are_secret_unreadable(vault) {
+    async fn entries_not_written_by_the_plugin_are_internal(vault) {
         let svc = vault.plugin();
         let key = fresh_key();
         let data = key_path(&vault, "data", &key);
@@ -185,7 +185,7 @@ docker_test! {
 
         for n in [1, 2] {
             let err = svc.get_value(&key, &vv(n)).await.unwrap_err();
-            assert!(matches!(err, CredStoreError::SecretUnreadable), "version {n}: {err:?}");
+            assert!(matches!(err, CredStoreError::Internal(_)), "version {n}: {err:?}");
         }
     }
 }

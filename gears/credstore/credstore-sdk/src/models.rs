@@ -561,9 +561,9 @@ pub struct CredentialListItem {
     /// (`CredStoreClientV1::get`) of that reference would resolve to.
     pub credential: Credential,
     /// The decrypted value, present only in secret mode and only for an item
-    /// the caller may read (`read_secret`); a refused, missing, or
-    /// fingerprint-mismatched item is omitted from the page entirely rather
-    /// than carrying `None` here.
+    /// the caller may read (`read_secret`); an item the caller may not read
+    /// is omitted from the page entirely, and an expired item is returned
+    /// with `None` here.
     pub secret: Option<SecretValue>,
 }
 

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, EqPredicate, InPredicate, Predicate};
@@ -22,7 +22,6 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::audit::{AuditEvent, AuditSink};
-use crate::domain::ports::clock::MonotonicClock;
 pub use crate::domain::ports::metrics::NoopMetrics;
 use crate::domain::ports::metrics::{
     CleanupOp, CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome, VerifyOp,
@@ -530,18 +529,41 @@ impl SecretTypeResolver for FailingTypeResolver {
 /// Returns a preset ancestor chain (self first, root last).
 pub struct FakeDir {
     chain: Vec<Uuid>,
+    /// Tenants `is_ancestor` reports as descendants of every asked ancestor.
+    descendants: Vec<Uuid>,
+    /// Every `is_ancestor` fails as a tenant-resolver outage.
+    is_ancestor_fails: bool,
 }
 
 impl FakeDir {
     #[must_use]
     pub fn new(chain: Vec<Uuid>) -> Self {
-        Self { chain }
+        Self {
+            chain,
+            descendants: Vec::new(),
+            is_ancestor_fails: false,
+        }
     }
 
     /// Single-tenant chain (only self).
     #[must_use]
     pub fn single(id: Uuid) -> Self {
-        Self { chain: vec![id] }
+        Self::new(vec![id])
+    }
+
+    /// `is_ancestor` answers true for these tenants (barriers are ignored,
+    /// as the adapter asks).
+    #[must_use]
+    pub fn with_descendants(mut self, descendants: Vec<Uuid>) -> Self {
+        self.descendants = descendants;
+        self
+    }
+
+    /// `is_ancestor` fails like a tenant-resolver outage.
+    #[must_use]
+    pub fn with_failing_is_ancestor(mut self) -> Self {
+        self.is_ancestor_fails = true;
+        self
     }
 }
 
@@ -553,6 +575,22 @@ impl TenantDirectory for FakeDir {
         _req: TenantId,
     ) -> Result<Vec<Uuid>, DomainError> {
         Ok(self.chain.clone())
+    }
+
+    async fn is_ancestor(
+        &self,
+        _ctx: &SecurityContext,
+        _ancestor: TenantId,
+        descendant: TenantId,
+    ) -> Result<bool, DomainError> {
+        if self.is_ancestor_fails {
+            return Err(DomainError::ServiceUnavailable {
+                detail: "tenant resolver unavailable".to_owned(),
+                retry_after: None,
+                cause: None,
+            });
+        }
+        Ok(self.descendants.contains(&descendant.0))
     }
 }
 
@@ -578,8 +616,9 @@ enum FakeGetFault {
     /// A generic backend outage (`CredStoreError::ServiceUnavailable`) - a
     /// non-`NotFound` error that fails the whole request.
     Error,
-    /// A permanently unreadable version (`CredStoreError::SecretUnreadable`).
-    Unreadable,
+    /// A permanent plugin failure (`CredStoreError::Internal`): a version
+    /// that exists but can never be read.
+    Internal,
 }
 
 /// All versions of one key plus its monotonic counter.
@@ -872,17 +911,17 @@ impl FakePlugin {
     }
 
     /// Always fail `get` for `key` with the permanent
-    /// `CredStoreError::SecretUnreadable` (a lost key or corrupt entry),
-    /// targeted at one specific winner (see [`Self::deny_get_for`]).
+    /// `CredStoreError::Internal` (a lost key or an entry the plugin did not
+    /// write), targeted at one specific winner (see [`Self::deny_get_for`]).
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn unreadable_get_for(&self, key: &StoreKey) {
+    pub fn internal_get_for(&self, key: &StoreKey) {
         self.get_faults
             .lock()
             .expect("lock")
-            .insert(plugin_key(key), FakeGetFault::Unreadable);
+            .insert(plugin_key(key), FakeGetFault::Internal);
     }
 
     /// Make every future `get` for `key` sleep `ms` milliseconds, with the
@@ -970,7 +1009,9 @@ impl CredStorePluginClientV2 for FakePlugin {
                     detail: "simulated backend get failure".to_owned(),
                     retry_after: None,
                 }),
-                FakeGetFault::Unreadable => Err(CredStoreError::SecretUnreadable),
+                FakeGetFault::Internal => {
+                    Err(CredStoreError::internal("simulated permanent get failure"))
+                }
             };
         }
         if Self::take_one(&self.not_found_gets) {
@@ -1108,38 +1149,6 @@ struct FakeIntent {
     expired: bool,
 }
 
-/// Manually advanced [`MonotonicClock`]: time moves only when a test says so,
-/// so the lease guard is tested without sleeping.
-pub struct ManualClock {
-    base: Instant,
-    offset: Mutex<Duration>,
-}
-
-impl ManualClock {
-    #[must_use]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            base: Instant::now(),
-            offset: Mutex::new(Duration::ZERO),
-        })
-    }
-
-    /// Moves the clock forward by `by`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    pub fn advance(&self, by: Duration) {
-        *self.offset.lock().expect("lock") += by;
-    }
-}
-
-impl MonotonicClock for ManualClock {
-    fn now(&self) -> Instant {
-        self.base + *self.offset.lock().expect("lock")
-    }
-}
-
 /// In-memory [`SecretRepo`] replicating the real (transactional) semantics of
 /// each method, for domain-service unit tests.
 ///
@@ -1162,19 +1171,15 @@ pub struct FakeSecretRepo {
     begin_intent_failures: Mutex<usize>,
     /// When `> 0`, the next `heal_failed_creates` fails.
     heal_failures: Mutex<usize>,
-    /// When `> 0`, the next `settle_lost_intent` fails.
-    settle_failures: Mutex<usize>,
     /// When `> 0`, a heal "runs just before" each of the next commits
     /// (`insert_active`/`switch_value`): every held intent expires and is
     /// deleted, so the commit finds its own intent gone. The concurrent heal
-    /// records no debt (a stalled writer records its own).
+    /// records no debt (the writer whose intent was healed rolls back and
+    /// answers 503, recording nothing).
     heal_before_commit: Mutex<usize>,
     /// One-shot: a concurrent delete (that records nothing itself) removes
     /// this row just before the next commit.
     vanish_before_commit: Mutex<Option<Uuid>>,
-    /// Advance this clock by this much whenever `begin_write_intent`
-    /// succeeds (a slow tx0, or a stall right after it).
-    advance_on_begin: Mutex<Option<(Arc<ManualClock>, Duration)>>,
     pub scope_allows: bool,
     /// When `> 0`, the next `insert_active` call fails with a simulated
     /// internal error (before touching rows) and decrements; consumed
@@ -1248,10 +1253,8 @@ impl FakeSecretRepo {
             begun: Mutex::new(Vec::new()),
             begin_intent_failures: Mutex::new(0),
             heal_failures: Mutex::new(0),
-            settle_failures: Mutex::new(0),
             heal_before_commit: Mutex::new(0),
             vanish_before_commit: Mutex::new(None),
-            advance_on_begin: Mutex::new(None),
             scope_allows: true,
             insert_active_failures: Mutex::new(0),
             insert_active_conflicts: Mutex::new(0),
@@ -1597,15 +1600,6 @@ impl FakeSecretRepo {
         *self.heal_failures.lock().expect("lock") += n;
     }
 
-    /// Arrange for the next `n` `settle_lost_intent` calls to fail.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    pub fn fail_next_settle(&self, n: usize) {
-        *self.settle_failures.lock().expect("lock") += n;
-    }
-
     /// Models another request healing just before each of the next `n`
     /// commits (`insert_active`/`switch_value`): the writer's intent is
     /// expired and deleted before its commit transaction runs, so the commit
@@ -1627,16 +1621,6 @@ impl FakeSecretRepo {
     /// Panics if the internal mutex is poisoned.
     pub fn delete_row_before_next_commit(&self, row_id: Uuid) {
         *self.vanish_before_commit.lock().expect("lock") = Some(row_id);
-    }
-
-    /// Advance `clock` by `by` every time a write intent is recorded (a
-    /// stall between tx0 and the `put`).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    pub fn advance_clock_on_begin_write_intent(&self, clock: &Arc<ManualClock>, by: Duration) {
-        *self.advance_on_begin.lock().expect("lock") = Some((Arc::clone(clock), by));
     }
 
     /// Records `tasks` as debt rows (the same step as the change that made
@@ -2138,6 +2122,29 @@ impl SecretRepo for FakeSecretRepo {
         Ok(self.scope_allows)
     }
 
+    async fn list_tenants_with_other_type(
+        &self,
+        reference: &SecretRef,
+        requested_type: Uuid,
+        exclude_tenant: TenantId,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<Uuid>, DomainError> {
+        let rows = self.rows.lock().expect("lock");
+        let tenants: std::collections::BTreeSet<Uuid> = rows
+            .iter()
+            .filter(|r| r.reference == reference.as_ref())
+            .filter(|r| r.secret_type_uuid != requested_type)
+            .filter(|r| r.tenant_id != exclude_tenant)
+            .map(|r| r.tenant_id.0)
+            .filter(|t| after.is_none_or(|a| *t > a))
+            .collect();
+        Ok(tenants
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .collect())
+    }
+
     async fn list_candidate_references(
         &self,
         req_tenant: TenantId,
@@ -2212,15 +2219,6 @@ impl SecretRepo for FakeSecretRepo {
             expired: false,
         });
         self.begun.lock().expect("lock").push(attempt.attempt_id);
-        let advance = self.advance_on_begin.lock().expect("lock").clone();
-        if let Some((clock, by)) = advance {
-            clock.advance(by);
-        }
-        Ok(())
-    }
-
-    async fn drop_write_intent(&self, attempt_id: Uuid) -> Result<(), DomainError> {
-        self.retire_intent(attempt_id);
         Ok(())
     }
 
@@ -2317,21 +2315,6 @@ impl SecretRepo for FakeSecretRepo {
             ));
         }
         Ok(out)
-    }
-
-    async fn settle_lost_intent(
-        &self,
-        key: &StoreKey,
-        version: &ValueVersion,
-        destroy_supported: bool,
-    ) -> Result<Vec<CleanupDebt>, DomainError> {
-        if Self::take_failure(&self.settle_failures) {
-            return Err(DomainError::internal(
-                "simulated settle_lost_intent failure",
-            ));
-        }
-        let tasks = self.lost_write_tasks(key, version, destroy_supported);
-        Ok(self.record(tasks))
     }
 
     async fn heal_failed_creates(
@@ -2613,15 +2596,11 @@ pub struct FakeMetrics {
     pub read_outcomes: Mutex<Vec<ReadOutcome>>,
     pub deps: Mutex<Vec<(Dep, DepOp, Outcome)>>,
     pub write_intents_healed_total: Mutex<u64>,
-    pub write_intent_lost_total: Mutex<u64>,
-    pub write_intent_settle_failed_total: Mutex<u64>,
     pub store_cleanup_recorded: Mutex<Vec<CleanupOp>>,
     pub store_cleanup_failed: Mutex<Vec<CleanupOp>>,
     pub read_retries: Mutex<Vec<ReadRetryOutcome>>,
     pub commit_verifications: Mutex<Vec<(VerifyOp, VerifyOutcome)>>,
-    pub list_type_invariant_violation_total: Mutex<u64>,
     pub audit_publish_failed_total: Mutex<u64>,
-    pub secret_unreadable_total: Mutex<u64>,
 }
 
 impl FakeMetrics {
@@ -2665,22 +2644,6 @@ impl FakeMetrics {
         *self.write_intents_healed_total.lock().expect("lock")
     }
 
-    /// Number of commits that found their own intent healed.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
-    pub fn write_intent_lost_total(&self) -> u64 {
-        *self.write_intent_lost_total.lock().expect("lock")
-    }
-
-    /// Number of failed settlements of a healed intent recorded.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
-    pub fn write_intent_settle_failed_total(&self) -> u64 {
-        *self.write_intent_settle_failed_total.lock().expect("lock")
-    }
-
     /// Every recorded store-cleanup debt's op, in order.
     ///
     /// # Panics
@@ -2712,15 +2675,6 @@ impl FakeMetrics {
     pub fn read_retries(&self) -> Vec<ReadRetryOutcome> {
         self.read_retries.lock().expect("lock").clone()
     }
-
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
-    pub fn list_type_invariant_violation_total(&self) -> u64 {
-        *self
-            .list_type_invariant_violation_total
-            .lock()
-            .expect("lock")
-    }
 }
 
 impl FakeMetrics {
@@ -2731,14 +2685,6 @@ impl FakeMetrics {
     pub fn audit_publish_failed_total(&self) -> u64 {
         *self.audit_publish_failed_total.lock().expect("lock")
     }
-
-    /// Number of permanently unreadable secret reads recorded.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
-    pub fn secret_unreadable_total(&self) -> u64 {
-        *self.secret_unreadable_total.lock().expect("lock")
-    }
 }
 
 impl Default for FakeMetrics {
@@ -2748,15 +2694,11 @@ impl Default for FakeMetrics {
             read_outcomes: Mutex::new(Vec::new()),
             deps: Mutex::new(Vec::new()),
             write_intents_healed_total: Mutex::new(0),
-            write_intent_lost_total: Mutex::new(0),
-            write_intent_settle_failed_total: Mutex::new(0),
             store_cleanup_recorded: Mutex::new(Vec::new()),
             store_cleanup_failed: Mutex::new(Vec::new()),
             read_retries: Mutex::new(Vec::new()),
             commit_verifications: Mutex::new(Vec::new()),
-            list_type_invariant_violation_total: Mutex::new(0),
             audit_publish_failed_total: Mutex::new(0),
-            secret_unreadable_total: Mutex::new(0),
         }
     }
 }
@@ -2775,12 +2717,6 @@ impl CredStoreMetricsPort for FakeMetrics {
     fn write_intents_healed(&self, n: u64) {
         *self.write_intents_healed_total.lock().expect("lock") += n;
     }
-    fn write_intent_lost(&self) {
-        *self.write_intent_lost_total.lock().expect("lock") += 1;
-    }
-    fn write_intent_settle_failed(&self) {
-        *self.write_intent_settle_failed_total.lock().expect("lock") += 1;
-    }
     fn store_cleanup_recorded(&self, op: CleanupOp) {
         self.store_cleanup_recorded.lock().expect("lock").push(op);
     }
@@ -2796,17 +2732,8 @@ impl CredStoreMetricsPort for FakeMetrics {
     fn read_retry(&self, outcome: ReadRetryOutcome) {
         self.read_retries.lock().expect("lock").push(outcome);
     }
-    fn list_type_invariant_violation(&self) {
-        *self
-            .list_type_invariant_violation_total
-            .lock()
-            .expect("lock") += 1;
-    }
     fn audit_publish_failed(&self) {
         *self.audit_publish_failed_total.lock().expect("lock") += 1;
-    }
-    fn secret_unreadable(&self) {
-        *self.secret_unreadable_total.lock().expect("lock") += 1;
     }
 }
 

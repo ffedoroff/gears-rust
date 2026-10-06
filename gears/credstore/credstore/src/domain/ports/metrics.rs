@@ -2,13 +2,11 @@
 //! Metrics vocabulary and recording port for credential-store operations.
 //!
 //! Defines bounded labels for outcomes and dependencies, plus the lifecycle
-//! counters of ADR-0006: the write-intent counters
-//! (`write_intents_healed`, `write_intent_lost`, `write_intent_settle_failed`),
-//! the store-cleanup counters (`store_cleanup_recorded`,
+//! counters of ADR-0006: the write-intent counter
+//! (`write_intents_healed`), the store-cleanup counters (`store_cleanup_recorded`,
 //! `store_cleanup_failed`, by debt op), `write_commit_verified` (the
-//! verification after an ambiguous commit) and `read_retry`. No inventory gauges: the shipped reaper's per-status
-//! row-count gauges were `COUNT … GROUP BY` queries, forbidden by the
-//! platform's no-`COUNT` rule, and are withdrawn rather than reimplemented.
+//! verification after an ambiguous commit) and `read_retry`. No inventory
+//! gauges: counting rows is forbidden by the platform's no-`COUNT` rule.
 
 use toolkit_macros::domain_model;
 
@@ -57,6 +55,7 @@ impl Dep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepOp {
     GetAncestors,
+    IsAncestor,
     PluginGet,
     PluginPut,
     PluginDeleteKey,
@@ -69,6 +68,7 @@ impl DepOp {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::GetAncestors => "get_ancestors",
+            Self::IsAncestor => "is_ancestor",
             Self::PluginGet => "plugin_get",
             Self::PluginPut => "plugin_put",
             Self::PluginDeleteKey => "plugin_delete_key",
@@ -186,15 +186,6 @@ pub trait CredStoreMetricsPort: Send + Sync + 'static {
     /// `n` expired write intents were removed by heal (the next write's
     /// commit transaction, or the failed-create heal).
     fn write_intents_healed(&self, n: u64);
-    /// A secret write's commit transaction found its own intent already
-    /// healed (the writer outlived its lease); the writer settled its
-    /// version itself.
-    fn write_intent_lost(&self);
-    /// Step 5c could not record the cleanup of the writer's own version
-    /// after its intent was healed. The version has no cleanup obligation:
-    /// it stays until the record's next secret write or delete, or leaks if
-    /// the record is gone (residual R5). Any non-zero value needs attention.
-    fn write_intent_settle_failed(&self);
     /// A store-cleanup debt (`purge` or `destroy`) was recorded in the
     /// transaction that made store content dead.
     fn store_cleanup_recorded(&self, op: CleanupOp);
@@ -209,26 +200,11 @@ pub trait CredStoreMetricsPort: Send + Sync + 'static {
     fn write_commit_verified(&self, op: VerifyOp, outcome: VerifyOutcome);
     /// A secret read found its version gone and re-read the row once.
     fn read_retry(&self, outcome: ReadRetryOutcome);
-    /// Collection read (ADR-0005): a reference's reduced winner named a
-    /// `secret_type_uuid` outside the set the request authorized per
-    /// distinct type found in the candidate-reference query. The reference
-    /// is dropped from the page rather than surfaced — a missing catalogue
-    /// entry, not a false one — and this is the operational signal: it means
-    /// the override-type-consistency invariant
-    /// (`cpt-cf-credstore-fr-override-type-consistency`) was violated for
-    /// that reference, which should never happen if every write went
-    /// through the write path's own check.
-    fn list_type_invariant_violation(&self);
     /// An audit event for a secret read or write could not be published
     /// (event broker absent, unavailable, slow or rejecting); the operation
     /// itself was unaffected (`cpt-cf-credstore-nfr-audit`). A persistently
     /// rising value means audit events are being lost.
     fn audit_publish_failed(&self);
-    /// A secret read produced the permanent "unreadable" outcome: the plugin
-    /// reported the version unreadable, or the version was gone although the
-    /// record's pointer did not move. Persistently rising means records
-    /// need a rewrite or delete (lost key, corrupt entry).
-    fn secret_unreadable(&self);
 }
 
 #[domain_model]
@@ -240,15 +216,11 @@ impl CredStoreMetricsPort for NoopMetrics {
     fn dependency(&self, _: Dep, _: DepOp, _: Outcome, _: f64) {}
     fn cross_tenant_denied(&self) {}
     fn write_intents_healed(&self, _: u64) {}
-    fn write_intent_lost(&self) {}
-    fn write_intent_settle_failed(&self) {}
     fn store_cleanup_recorded(&self, _: CleanupOp) {}
     fn store_cleanup_failed(&self, _: CleanupOp) {}
     fn write_commit_verified(&self, _: VerifyOp, _: VerifyOutcome) {}
     fn read_retry(&self, _: ReadRetryOutcome) {}
-    fn list_type_invariant_violation(&self) {}
     fn audit_publish_failed(&self) {}
-    fn secret_unreadable(&self) {}
 }
 
 #[cfg(test)]
@@ -270,6 +242,7 @@ mod tests {
         assert_eq!(Dep::Pdp.as_str(), "pdp");
         assert_eq!(Dep::TypesRegistry.as_str(), "types_registry");
         assert_eq!(DepOp::GetAncestors.as_str(), "get_ancestors");
+        assert_eq!(DepOp::IsAncestor.as_str(), "is_ancestor");
         assert_eq!(DepOp::PluginPut.as_str(), "plugin_put");
         assert_eq!(DepOp::PluginDeleteKey.as_str(), "plugin_delete_key");
         assert_eq!(DepOp::PluginDestroy.as_str(), "plugin_destroy");
@@ -304,14 +277,10 @@ mod tests {
         noop.dependency(Dep::Pdp, DepOp::Evaluate, Outcome::Success, 0.1);
         noop.cross_tenant_denied();
         noop.write_intents_healed(2);
-        noop.write_intent_lost();
-        noop.write_intent_settle_failed();
         noop.store_cleanup_recorded(CleanupOp::Purge);
         noop.store_cleanup_failed(CleanupOp::Destroy);
         noop.write_commit_verified(VerifyOp::Write, VerifyOutcome::Committed);
         noop.read_retry(ReadRetryOutcome::Recovered);
-        noop.list_type_invariant_violation();
         noop.audit_publish_failed();
-        noop.secret_unreadable();
     }
 }

@@ -36,8 +36,6 @@ fn global_meter_records_all_instruments() {
     m.dependency(Dep::Pdp, DepOp::Evaluate, Outcome::Error, 0.02);
     m.cross_tenant_denied();
     m.write_intents_healed(3);
-    m.write_intent_lost();
-    m.write_intent_settle_failed();
     m.store_cleanup_recorded(CleanupOp::Purge);
     m.store_cleanup_recorded(CleanupOp::Destroy);
     m.store_cleanup_failed(CleanupOp::Purge);
@@ -46,9 +44,7 @@ fn global_meter_records_all_instruments() {
     m.write_commit_verified(VerifyOp::Delete, VerifyOutcome::Failed);
     m.read_retry(ReadRetryOutcome::Recovered);
     m.read_retry(ReadRetryOutcome::SecondMiss);
-    m.list_type_invariant_violation();
     m.audit_publish_failed();
-    m.secret_unreadable();
 }
 
 #[test]
@@ -178,36 +174,15 @@ fn store_cleanup_counters_are_labelled_by_op() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn write_intent_counters_accumulate_independently() {
+fn write_intents_healed_accumulates() {
     let h = MetricsHarness::new();
     let m = h.metrics();
     m.write_intents_healed(3);
     m.write_intents_healed(2);
-    m.write_intent_lost();
-    m.write_intent_settle_failed();
     h.force_flush();
     assert_eq!(
         h.counter_value("credstore_write_intents_healed_total", &[]),
         5
-    );
-    assert_eq!(h.counter_value("credstore_write_intent_lost_total", &[]), 1);
-    assert_eq!(
-        h.counter_value("credstore_write_intent_settle_failed_total", &[]),
-        1
-    );
-}
-
-#[test]
-#[cfg(feature = "test-support")]
-fn list_type_invariant_violation_accumulates() {
-    let h = MetricsHarness::new();
-    let m = h.metrics();
-    m.list_type_invariant_violation();
-    m.list_type_invariant_violation();
-    h.force_flush();
-    assert_eq!(
-        h.counter_value("credstore_list_type_invariant_violation_total", &[]),
-        2
     );
 }
 
@@ -224,15 +199,4 @@ fn audit_publish_failed_accumulates() {
         h.counter_value("credstore_audit_publish_failed_total", &[]),
         3
     );
-}
-
-#[test]
-#[cfg(feature = "test-support")]
-fn secret_unreadable_accumulates() {
-    let h = MetricsHarness::new();
-    let m = h.metrics();
-    m.secret_unreadable();
-    m.secret_unreadable();
-    h.force_flush();
-    assert_eq!(h.counter_value("credstore_secret_unreadable_total", &[]), 2);
 }

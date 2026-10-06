@@ -24,7 +24,7 @@ use credstore_sdk::{
 use sea_orm::{ActiveValue, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::secure::{ScopeError, SecureEntityExt, SecureInsertExt};
+use toolkit_db::secure::{DbTx, ScopeError, SecureEntityExt, SecureInsertExt};
 use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
@@ -38,7 +38,8 @@ use crate::domain::secret::repo::SecretRepo;
 use crate::infra::storage::entity;
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo_impl::SecretRepoImpl;
-use crate::infra::storage::repo_impl::helpers::entity_to_debt;
+use crate::infra::storage::repo_impl::helpers::{TxFuture, entity_to_debt};
+use crate::infra::storage::repo_impl::intents::{delete_intent_tx, record_debts};
 
 /// Build a repo backed by a fresh, isolated in-memory SQLite database.
 async fn setup() -> SecretRepoImpl {
@@ -112,6 +113,26 @@ async fn intent_ids(repo: &SecretRepoImpl) -> Vec<Uuid> {
         .into_iter()
         .map(|i| i.attempt_id)
         .collect()
+}
+
+/// Deletes the attempt's intent (what a later heal does to an expired one).
+async fn drop_intent(repo: &SecretRepoImpl, attempt_id: Uuid) {
+    repo.run_tx(move |tx: &DbTx<'_>| {
+        Box::pin(async move { delete_intent_tx(tx, attempt_id).await.map(|_| ()) })
+            as TxFuture<'_, ()>
+    })
+    .await
+    .expect("drop intent");
+}
+
+/// Records `tasks` as debt rows in one transaction.
+async fn record_tasks(repo: &SecretRepoImpl, tasks: Vec<CleanupTask>) -> Vec<CleanupDebt> {
+    repo.run_tx(move |tx: &DbTx<'_>| {
+        let tasks = tasks.clone();
+        Box::pin(async move { record_debts(tx, tasks).await }) as TxFuture<'_, Vec<CleanupDebt>>
+    })
+    .await
+    .expect("record debts")
 }
 
 /// An attempt that `put`s under the store key of record `id` in `tenant`,
@@ -523,64 +544,6 @@ async fn begin_write_intent_stores_the_key_the_reference_and_a_database_clock_le
         .expect_err("attempt_id is unique");
 }
 
-#[tokio::test]
-async fn drop_write_intent_deletes_the_intent_and_is_idempotent() {
-    let repo = setup().await;
-    let attempt = begin(&repo, Uuid::new_v4(), Uuid::new_v4()).await;
-    assert_eq!(intent_ids(&repo).await, vec![attempt.attempt_id]);
-
-    repo.drop_write_intent(attempt.attempt_id)
-        .await
-        .expect("drop");
-    assert!(intent_ids(&repo).await.is_empty());
-    repo.drop_write_intent(attempt.attempt_id)
-        .await
-        .expect("dropping an absent intent is not an error");
-}
-
-#[tokio::test]
-async fn settle_lost_intent_destroys_exactly_when_the_row_exists_else_purges() {
-    let repo = setup().await;
-    let tenant = Uuid::new_v4();
-    let owner = Uuid::new_v4();
-    let (id, _) = seed_active(&repo, tenant, owner, "live", SharingMode::Tenant).await;
-    let live_key = StoreKey::new(TenantId(tenant), id);
-
-    let debts = repo
-        .settle_lost_intent(&live_key, &vv("2"), true)
-        .await
-        .expect("settle");
-    assert_eq!(
-        tasks_of(debts),
-        vec![CleanupTask::Destroy {
-            key: live_key.clone(),
-            selector: DestroySelector::Exactly(vv("2")),
-        }]
-    );
-
-    // The row exists but the plugin has no destroy: nothing to record.
-    let debts = repo
-        .settle_lost_intent(&live_key, &vv("2"), false)
-        .await
-        .expect("settle");
-    assert!(debts.is_empty());
-
-    // No row: the whole key is dead, whatever the plugin supports.
-    let dead_key = some_key(tenant);
-    for destroy_supported in [true, false] {
-        let debts = repo
-            .settle_lost_intent(&dead_key, &vv("1"), destroy_supported)
-            .await
-            .expect("settle");
-        assert_eq!(tasks_of(debts), vec![CleanupTask::Purge(dead_key.clone())]);
-    }
-    assert_eq!(
-        debt_tasks(&repo).await.len(),
-        3,
-        "exactly the debts returned"
-    );
-}
-
 // ── cleanup debts: pending / delete ─────────────────────────────────────────
 
 #[tokio::test]
@@ -589,13 +552,8 @@ async fn pending_debts_are_the_records_own_rows_and_delete_debt_is_idempotent() 
     let tenant = Uuid::new_v4();
     let mine = some_key(tenant);
     let other = some_key(tenant);
-    let mine_debts = repo
-        .settle_lost_intent(&mine, &vv("1"), true)
-        .await
-        .expect("record");
-    repo.settle_lost_intent(&other, &vv("1"), true)
-        .await
-        .expect("record");
+    let mine_debts = record_tasks(&repo, vec![CleanupTask::Purge(mine.clone())]).await;
+    record_tasks(&repo, vec![CleanupTask::Purge(other.clone())]).await;
 
     let pending = repo.pending_debts(&mine).await.expect("pending");
     assert_eq!(
@@ -670,13 +628,15 @@ async fn row_reads_return_the_heal_flags_from_the_same_query() {
     }
 
     // A pending debt of the record (and none for another record's).
-    let debts = repo
-        .settle_lost_intent(&key, &vv("2"), true)
-        .await
-        .expect("record");
-    repo.settle_lost_intent(&some_key(tenant), &vv("2"), true)
-        .await
-        .expect("record");
+    let debts = record_tasks(
+        &repo,
+        vec![CleanupTask::Destroy {
+            key: key.clone(),
+            selector: DestroySelector::Exactly(vv("2")),
+        }],
+    )
+    .await;
+    record_tasks(&repo, vec![CleanupTask::Purge(some_key(tenant))]).await;
     for heal in read_all().await {
         assert!(heal.expired_intents && heal.debts, "{heal:?}");
     }
@@ -765,7 +725,7 @@ async fn a_write_that_was_not_told_of_expired_intents_leaves_them() {
 
 #[tokio::test]
 async fn heal_by_the_next_write_makes_a_stalled_writers_commit_intent_lost() {
-    // ADR-0006 step 5c, end to end on SQL: a writer announces and stalls,
+    // End to end on SQL: a writer announces and stalls,
     // another writer of the record commits and heals the expired intent, the
     // stalled writer's own commit finds its intent gone.
     let repo = setup().await;
@@ -1225,17 +1185,15 @@ async fn switch_value_commit_enqueues_destroy_below_the_new_version_with_the_int
 }
 
 #[tokio::test]
-async fn switch_value_with_a_reclaimed_intent_changes_nothing() {
+async fn switch_value_with_a_healed_intent_changes_nothing() {
     let repo = setup().await;
     let tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
     let (id, old_value) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
 
-    // The attempt's intent is gone before its commit (reclaimed).
+    // The attempt's intent is gone before its commit (healed).
     let attempt = begin(&repo, tenant, id).await;
-    repo.drop_write_intent(attempt.attempt_id)
-        .await
-        .expect("drop");
+    drop_intent(&repo, attempt.attempt_id).await;
     let outcome = repo
         .switch_value(
             &AccessScope::for_tenant(tenant),
@@ -1262,7 +1220,7 @@ async fn switch_value_with_a_reclaimed_intent_changes_nothing() {
 }
 
 #[tokio::test]
-async fn insert_active_with_a_reclaimed_intent_changes_nothing() {
+async fn insert_active_with_a_healed_intent_changes_nothing() {
     let repo = setup().await;
     let tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
@@ -1270,9 +1228,7 @@ async fn insert_active_with_a_reclaimed_intent_changes_nothing() {
     let new = new_secret(tenant, owner, "k", SharingMode::Tenant, vv("1"));
 
     let attempt = begin(&repo, tenant, new.id).await;
-    repo.drop_write_intent(attempt.attempt_id)
-        .await
-        .expect("drop");
+    drop_intent(&repo, attempt.attempt_id).await;
     let outcome = repo
         .insert_active(&scope, &new, &attempt)
         .await
@@ -1429,9 +1385,7 @@ async fn verify_insert_active_without_intent_or_row_records_a_purge() {
     let scope = AccessScope::for_tenant(tenant);
     let new = new_secret(tenant, Uuid::new_v4(), "k", SharingMode::Tenant, vv("1"));
     let attempt = begin(&repo, tenant, new.id).await;
-    repo.drop_write_intent(attempt.attempt_id)
-        .await
-        .expect("drop");
+    drop_intent(&repo, attempt.attempt_id).await;
 
     let out = repo
         .verify_insert_active(&scope, &new, &attempt)
@@ -1574,9 +1528,7 @@ async fn verify_switch_value_destroys_exactly_only_when_no_row_points_at_the_ver
     // The intent is gone (healed) and the row is at version "1", not "2":
     // the attempt did not take effect.
     let attempt = begin(&repo, tenant, id).await;
-    repo.drop_write_intent(attempt.attempt_id)
-        .await
-        .expect("drop");
+    drop_intent(&repo, attempt.attempt_id).await;
     let out = repo
         .verify_switch_value(
             &scope,
@@ -1606,9 +1558,7 @@ async fn verify_switch_value_destroys_exactly_only_when_no_row_points_at_the_ver
         destroy_supported: false,
         ..begin(&repo, tenant, id).await
     };
-    repo.drop_write_intent(attempt.attempt_id)
-        .await
-        .expect("drop");
+    drop_intent(&repo, attempt.attempt_id).await;
     let out = repo
         .verify_switch_value(
             &scope,
@@ -3182,5 +3132,83 @@ async fn uuid_shaped_reference_in_a_scope_finds_the_row() {
             .await
             .expect("find")
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn tenants_with_other_type_exclude_creator_and_same_type_and_page_by_tenant() {
+    let repo = setup().await;
+    let type_a = SecretType::generic().uuid();
+    let type_b = SecretType::from_name("personal-token")
+        .expect("known")
+        .uuid();
+    let name = Uuid::new_v4().to_string();
+    let other = Uuid::new_v4().to_string();
+    let creator = Uuid::new_v4();
+    let mut holders = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    holders.sort();
+    let same_type_tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+
+    // Holders with another type: one tenant holds two rows (a tenant-shared
+    // and another owner's private one) and must be returned once.
+    for t in holders {
+        seed_active_typed(&repo, t, owner, &name, SharingMode::Tenant, type_b).await;
+    }
+    seed_active_typed(
+        &repo,
+        holders[1],
+        Uuid::new_v4(),
+        &name,
+        SharingMode::Private,
+        type_b,
+    )
+    .await;
+    // Excluded: the creator's own tenant, a same-type holder, another reference.
+    seed_active_typed(&repo, creator, owner, &name, SharingMode::Tenant, type_b).await;
+    seed_active_typed(
+        &repo,
+        same_type_tenant,
+        owner,
+        &name,
+        SharingMode::Tenant,
+        type_a,
+    )
+    .await;
+    seed_active_typed(
+        &repo,
+        Uuid::new_v4(),
+        owner,
+        &other,
+        SharingMode::Tenant,
+        type_b,
+    )
+    .await;
+
+    let key = sref(&name);
+    let all = repo
+        .list_tenants_with_other_type(&key, type_a, TenantId(creator), None, 100)
+        .await
+        .expect("query");
+    assert_eq!(all, holders.to_vec(), "distinct, ordered, filtered");
+
+    let mut walked = Vec::new();
+    let mut after = None;
+    loop {
+        let page = repo
+            .list_tenants_with_other_type(&key, type_a, TenantId(creator), after, 2)
+            .await
+            .expect("page");
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2);
+        after = page.last().copied();
+        walked.extend(page);
+    }
+    assert_eq!(
+        walked,
+        holders.to_vec(),
+        "keyset paging visits each tenant once"
     );
 }

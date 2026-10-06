@@ -343,7 +343,7 @@ async fn get_version_zero_is_none_without_asking_vault() {
 }
 
 #[tokio::test]
-async fn get_entry_without_value_is_secret_unreadable() {
+async fn get_entry_without_value_is_internal() {
     let server = MockServer::start();
     server.mock(|when, then| {
         when.method(GET).path_includes("/v1/secret/data/credstore/");
@@ -352,7 +352,7 @@ async fn get_entry_without_value_is_secret_unreadable() {
     });
     let svc = service_from(&config_for(&server));
     let err = svc.get_value(&key(), &vv("1")).await.unwrap_err();
-    assert!(matches!(err, CredStoreError::SecretUnreadable));
+    assert!(matches!(err, CredStoreError::Internal(_)));
 }
 
 #[tokio::test]

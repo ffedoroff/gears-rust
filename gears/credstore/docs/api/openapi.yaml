@@ -12,7 +12,8 @@ paths:
         eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only
         `reference`. Selecting `secret` in `$select` switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`,
         a `reference` (`eq`/`in`) or `type` (`eq`/`in`) selector only, capped and unpaginated; an expired
-        or unreadable item is returned without its secret.'
+        item is returned without its secret; an item whose stored version the backend cannot return fails
+        the whole request.'
       operationId: credstore.list_credentials
       parameters:
       - description: Page size (metadata mode only)
@@ -261,10 +262,7 @@ paths:
         `GET .../{ref}?$select=reference,type,expires_at,secret` is its equivalent, and a secret-only
         projection resolving to a value-less winner is the same canonical 404 that address gave. Selecting
         `secret` of a record whose expiry has passed fails 409 `SECRET_EXPIRED` (only for a caller who
-        may read the secret); without `secret` the record is returned with `status` `expired`. Selecting
-        `secret` of a record whose stored version the backend cannot return (gone although the pointer
-        did not move, or reported permanently unreadable) fails 409 `SECRET_UNREADABLE`, same disclosure
-        rule; retrying does not help, rewrite the secret or delete the record.'
+        may read the secret); without `secret` the record is returned with `status` `expired`.'
       operationId: credstore.get_credential
       parameters:
       - description: Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
@@ -510,11 +508,11 @@ components:
 
         read; absent from the wire entirely otherwise — including when the item''s
 
-        value could not be served (refused, missing, fingerprint mismatch —
+        value could not be served (refused or missing — omitted by the
 
-        omitted by the domain layer already, never reported as an error for one
+        domain layer already — or the record has expired, in which case the item
 
-        item).
+        stays with its metadata).
 
 
         `Debug` is hand-written to redact `secret`.'
