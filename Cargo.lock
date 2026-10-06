@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-credstore"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2656,24 +2656,32 @@ dependencies = [
  "axum",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-credstore-sdk",
+ "cf-gears-event-broker-sdk",
  "cf-gears-tenant-resolver",
  "cf-gears-tenant-resolver-sdk",
+ "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "chrono",
+ "futures",
+ "gts",
+ "inventory",
  "jsonschema 0.40.2",
  "opentelemetry",
  "opentelemetry_sdk",
- "rand 0.10.3",
  "sea-orm",
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -2682,18 +2690,19 @@ dependencies = [
  "tracing",
  "utoipa",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
 name = "cf-gears-credstore-sdk"
-version = "0.2.19"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
+ "futures-util",
  "gts",
  "gts-macros",
  "schemars 1.2.3",
@@ -2701,6 +2710,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
+ "tokio",
+ "tracing",
  "uuid",
  "zeroize",
 ]
@@ -2744,6 +2755,31 @@ dependencies = [
  "tokio",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "cf-gears-credstore-value-migration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "cf-gears-credstore",
+ "cf-gears-credstore-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-security",
+ "clap",
+ "sea-orm",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2944,6 +2980,7 @@ dependencies = [
  "cf-gears-tr-authz-plugin",
  "cf-gears-types-registry",
  "cf-gears-usage-collector",
+ "cf-gears-vault-credstore-plugin",
  "clap",
  "mimalloc",
  "sea-orm",
@@ -4412,7 +4449,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-static-credstore-plugin"
-version = "0.2.17"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5417,6 +5454,34 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-vault-credstore-plugin"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "cf-gears-credstore-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "httpmock",
+ "inventory",
+ "reqwest",
+ "serde",
+ "serde-saphyr 1.3.0",
+ "serde_json",
+ "temp-env",
+ "tempfile",
+ "testcontainers",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -96,7 +96,9 @@ members = [
     "gears/credstore/credstore",
     "gears/credstore/v2/credstore-sdk",
     "gears/credstore/v2/credstore",
+    "gears/credstore/credstore-value-migration",
     "gears/credstore/plugins/static-credstore-plugin",
+    "gears/credstore/plugins/vault-credstore-plugin",
     "gears/graph-storage/graph-storage-sdk",
     "gears/graph-storage/graph-storage",
     "gears/graph-storage/onnx-embedding-plugin",
@@ -411,7 +413,7 @@ authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.39", path
 authz-resolver = { package = "cf-gears-authz-resolver", version = "0.3.1", path = "gears/system/authz-resolver/authz-resolver" }
 tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.43", path = "gears/system/tenant-resolver/tenant-resolver" }
 resource-group = { package = "cf-gears-resource-group", version = "0.4.7", path = "gears/system/resource-group/resource-group" }
-credstore = { package = "cf-gears-credstore", version = "0.6.1", path = "gears/credstore/credstore" }
+credstore = { package = "cf-gears-credstore", version = "0.7.0", path = "gears/credstore/credstore" }
 oagw = { package = "cf-gears-oagw", version = "0.6.1", path = "gears/system/oagw/oagw" }
 account-management = { package = "cf-gears-account-management", version = "0.11.1", path = "gears/system/account-management/account-management" }
 usage-collector = { package = "cf-gears-usage-collector", version = "0.5.1", path = "gears/system/usage-collector/usage-collector" }
@@ -487,7 +489,7 @@ settings-service-sdk = { package = "cf-gears-settings-service-sdk", version = "0
 settings-service = { package = "cf-gears-settings-service", version = "0.1.8", path = "gears/settings-service/settings-service" }
 
 # credstore
-credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.19", path = "gears/credstore/credstore-sdk" }
+credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.3.0", path = "gears/credstore/credstore-sdk" }
 
 # graph-storage
 graph-storage = { package = "cf-gears-graph-storage", version = "0.2.1", path = "gears/graph-storage/graph-storage" }
