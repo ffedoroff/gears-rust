@@ -9,7 +9,7 @@ via the types registry.
 
 > Design: the [technical design](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/DESIGN.md) is the baseline; the decision to
 > ship a stateful gear (`credstore_secrets` table, PDP-scope authz,
-> versioning/ETag, write saga) instead of the original stateless design is
+> versioning/ETag, write protocol) instead of the original stateless design is
 > recorded in [ADR-0001](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0001-cpt-cf-credstore-adr-stateful-gear.md);
 > the addendum document that used to carry this history was folded into that
 > ADR and removed (see git history for its prior content).
@@ -46,60 +46,45 @@ The `cf-gears-credstore` module provides:
   returns an immutable version; one transaction then deletes the intent and
   switches the row's `value_version` pointer to the new version. Every store
   side effect is either announced before it happens or recorded as a cleanup
-  debt in the transaction that learned it was needed — no best-effort store
-  call is ever relied on for cleanup. A writer that finds more than half the
-  lease spent before its `put` abandons the write (`503`). No background work
-  runs in the process: no workers or tasks, no timers, no database polling,
-  no deferred tasks, no work at startup, no resident reaper, no maintenance
-  job; every store side effect is executed by the request that caused it, and
-  leftovers of an interrupted request are healed by a later request that
-  touches the same record
+  debt in the transaction that learned it was needed. An ambiguous commit is
+  resolved by one verification transaction (a locking read), and a
+  transaction the database rolled back definitively is retried (up to 3
+  attempts). No background work runs in the process: no workers or tasks, no
+  timers, no database polling, no deferred tasks, no work at startup; every
+  store side effect is executed by the request that caused it
 - **Store cleanup debt in `PostgreSQL`** — the `credstore_store_cleanup` table
-  holds one row per obligation: `purge` (`delete_key`) or `destroy` with a
-  `below` or `exact` selector and a version (`destroy`, only where the plugin
-  declares `supports_destroy`). A debt is written in the same transaction
-  that makes store content dead: rotating a secret records `destroy(below
-  new)`; removing it records `destroy(below old)` and `destroy(exact old)`
-  with the compare-and-set; a write that lost its compare-and-set records the
-  cleanup of its own version (or `purge` when the record has no row); a write
-  that finds its own intent gone records the same in a new transaction, then
-  answers `503`. After a **confirmed** commit the same request executes the
-  debts it just recorded and deletes each row on success; a failure is logged
-  and counted (`store_cleanup_failed{op}`), the row stays and the answer does
-  not change; after an ambiguous commit nothing is executed until one
-  verification transaction (a locking read) has resolved it. Every debt is
-  idempotent and safe to execute later, any number of times, by any instance
-- **Heal on access** — the SQL that reads a record row also returns two
-  existence flags (point lookups, no `COUNT`): the record has pending debts,
-  and the record has expired intents. A read or write of a record with
-  pending debts executes them best effort and deletes the rows on success.
-  Expired intents of a live record are deleted in the transaction of the
-  next successful secret write to it (the lease is re-checked in the
-  `DELETE`), and that write's `destroy(below)` also covers a version a
-  crashed writer may have landed; reads never touch them. A write intent
-  also stores the record's `reference` (and the owner for private-class
-  references), so a create or read of a reference whose earlier create failed
-  finds the expired intents with no record row, deletes them and records and
-  executes the `purge` of their keys. A stalled writer whose intent was
-  healed cannot commit and cleans up its own version itself (`503`)
+  holds one row per obligation: `purge` (`delete_key`) or `destroy` (only where
+  the plugin declares `supports_destroy`). A debt is written in the same
+  transaction that makes store content dead (a rotation, a secret removal, a
+  lost compare-and-set, a record delete). After a **confirmed** commit the
+  same request executes the debts it just recorded and deletes each row on
+  success; a failure is logged and counted (`store_cleanup_failed{op}`), the
+  row stays and the answer does not change. Every debt is idempotent and safe
+  to execute later by any instance
+- **Heal on access** — a read or write of a live record executes its pending
+  debts; expired intents of a live record are deleted by the next successful
+  secret write to it (its `destroy(below)` also covers a version a crashed
+  writer may have landed), and a create or read of a reference whose earlier
+  create failed deletes the expired intents and purges their keys. A writer
+  whose intent was healed cannot commit and cleans up its own version (`503`).
+  Safety never depends on the lease or on cleanup having run
 - **Delete and purge** — deleting a record is one row transaction that also
   records a key purge debt; after the commit the same request calls the
-  plugin's `delete_key(key)` and deletes the debt (a failed purge is healed by
-  a later access to the reference). The reference is free at once, so
-  delete-then-recreate works immediately
+  plugin's `delete_key(key)` and deletes the debt. The reference is free at
+  once, so delete-then-recreate works immediately. A failed purge stays
+  recorded: no later access retries it (the row is gone and the record id is
+  never reused) until a possible external job
 - **Audit** — every secret read and write is published to the credstore audit
   topic through the `event-broker` gear, best effort: a failure logs an error
   (never the secret) and counts `audit_publish_failed`, and the operation is
   unaffected
 - **Metrics** — `read_outcome`, `walkup_depth`, dependency latency/health,
-  `cross_tenant_denied`, `read_retry`, `list_type_invariant_violation`,
-  `audit_publish_failed`, `secret_unreadable`, and for the write protocol
-  `write_intents_healed` (expired intents removed by heal),
-  `write_intent_lost` (a commit found its own intent healed away),
-  `write_intent_settle_failed` (a lost write's own cleanup could not be
-  recorded), `store_cleanup_recorded{op}` and `store_cleanup_failed{op}`
-  with `op` = `purge` | `destroy` (`credstore_*_total` OpenTelemetry
-  instruments); no inventory gauge, never a `COUNT` query
+  `cross_tenant_denied`, `read_retry`, `audit_publish_failed`,
+  `secret_unreadable`, and for the write protocol `write_intents_healed`,
+  `write_commit_verified{op,outcome}`, `store_cleanup_recorded{op}` and
+  `store_cleanup_failed{op}` with `op` = `purge` | `destroy`
+  (`credstore_*_total` OpenTelemetry instruments); no inventory gauge, never a
+  `COUNT` query
 - **Backend plugin** — a versioned value store (`CredStorePluginClientV2`: `put`, `get`, `delete_key`, optional `destroy`) keyed by `(tenant_id, record_id)`, discovered via the types registry (vendor)
 - **`ClientHub` + REST** — registers `CredStoreClientV1`; exposes `/credstore/v1/credentials`
 
@@ -119,7 +104,7 @@ secret is read by naming it in `$select` on that same address or on the
 collection — there is no dedicated secret address. Every value write stores a new immutable version in the backend under the
 record key `(tenant_id, record_id)`, switches the row's `value_version`
 pointer to it in one transaction, and the replaced versions are destroyed by
-an cleanup debt recorded in that same transaction and executed by the request —
+a cleanup debt recorded in that same transaction and executed by the request —
 the model of Vault KV v2 and the cloud secret managers.
 Expiry applies to the secret, not to the record. Nothing sweeps expired rows:
 an expired record stays visible (status `expired`, normal validator) but its
@@ -181,24 +166,17 @@ credstore:
       max_limit: 200             # metadata-mode page-size cap
       secret_mode_cap: 25        # secret-mode ($select=…,secret) match-set cap
     write:
-      intent_lease_secs: 300     # after this, an intent may be healed on access (>= 60)
+      intent_lease_secs: 300     # after this, the intent of a crashed writer may be healed (>= 60);
+                                 # must well exceed the longest store request (Vault: 90 s by default)
 ```
 
 The config is `deny_unknown_fields`: the withdrawn `reaper:` and `gc:` blocks
 are rejected at startup.
 
-Residuals of the write protocol, by design: an orphan version above the
-highest committed pointer of a live record (a crash or an ambiguous commit
-after `put` on a replace or patch) is never served and is removed by the
-record's next secret write or its delete; a writer paused for longer than the
-remaining lease between its lease guard and the end of `put` may land a
-version after a later write healed its expired intent, or after the key was purged
-(hygiene only — the pointer is never dangling and reads return exact bytes
-whatever the lease does; closing it needs a conditional put in the plugin
-contract, which is not part of it); backends without `destroy` keep rotated
-and removed versions until the record is deleted; recorded debts and expired
-intents of records nobody touches again stay until the record or reference
-is accessed again (no in-process retry).
+Residual garbage (never a dangling pointer or wrong bytes) and the failure
+scenarios this version does not handle are catalogued in
+[`CORNER-CASES.md`](../docs/CORNER-CASES.md); the protocol is described in
+[`DESIGN.md`](../docs/DESIGN.md).
 
 ## License
 
