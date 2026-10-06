@@ -1,12 +1,9 @@
 // Updated: 2026-10-06 by Constructor Tech
 //! Validated credential-store configuration.
 //!
-//! Controls backend plugin selection, the
-//! collection-read caps and the secret-write intent lease. ADR-0006 withdraws the `reaper` block (`tick_secs`,
-//! `provisioning_timeout_secs`, `deprovisioning_timeout_secs`) and there is
-//! no `gc` block either: the gear has no resident loop and no maintenance
-//! job. `deny_unknown_fields` makes an old `reaper:` or `gc:` key a hard
-//! config-validation failure rather than a silently ignored no-op.
+//! Controls backend plugin selection (vendor), the collection-read caps and
+//! the secret-write intent lease. Unknown keys are rejected
+//! (`deny_unknown_fields`).
 
 use serde::Deserialize;
 
@@ -55,9 +52,10 @@ impl Default for ListCfg {
     }
 }
 
-/// Smallest accepted `write.intent_lease_secs`. The lease must comfortably
-/// exceed a plugin `put`: the writer refuses to start a put after half the
-/// lease, and the gear cannot see the plugin's own per-call timeout.
+/// Smallest accepted `write.intent_lease_secs`. The lease must be well
+/// above the longest time the value store may still apply a request; the
+/// gear cannot see the plugin's own per-call timeout, so that is a
+/// deployment requirement, not checked in process.
 pub const MIN_INTENT_LEASE_SECS: u64 = 60;
 
 /// Settings for the secret-write protocol's write intents (ADR-0006): a
@@ -67,10 +65,10 @@ pub const MIN_INTENT_LEASE_SECS: u64 = 60;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WriteCfg {
-    /// How long, on the database clock, an intent is protected from
-    /// heal. A writer that finds more than half of it spent before its
-    /// `put` abandons the write (`503`), which bounds how long a stalled
-    /// writer can still land a version after its intent was healed.
+    /// The time, on the database clock, after which an expired intent of a
+    /// crashed writer may be healed by a later request. It must be well
+    /// above the longest time the value store may still apply a request
+    /// (a deployment requirement, not checked in process).
     /// Seconds, `>= MIN_INTENT_LEASE_SECS` (60).
     pub intent_lease_secs: u64,
 }
@@ -98,9 +96,9 @@ impl CredStoreConfig {
         }
         if self.write.intent_lease_secs < MIN_INTENT_LEASE_SECS {
             return Err(format!(
-                "write.intent_lease_secs must be >= {MIN_INTENT_LEASE_SECS}: the lease must \
-                 comfortably exceed a plugin put (the writer refuses to start a put after \
-                 half the lease, and the gear cannot see the plugin's own per-call timeout)"
+                "write.intent_lease_secs must be >= {MIN_INTENT_LEASE_SECS}: the lease is the time \
+                 after which the intent of a crashed writer may be healed, and it must be well \
+                 above the longest time the value store may still apply a request"
             ));
         }
         Ok(())
@@ -179,26 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_withdrawn_hierarchy_block() {
-        // The ancestor-chain cache is gone: an old `hierarchy` block must fail
-        // config validation rather than being silently ignored.
-        let err = serde_json::from_str::<CredStoreConfig>(
-            r#"{"hierarchy":{"ancestor_cache_ttl_secs":300}}"#,
-        )
-        .expect_err("hierarchy block must be rejected");
-        assert!(err.to_string().contains("hierarchy"));
-    }
-
-    #[test]
-    fn rejects_the_withdrawn_reclaim_batch_key() {
-        // Reclaim is gone (heal on access has no batch): the old key must
-        // fail config validation rather than being silently ignored.
-        let err = serde_json::from_str::<CredStoreConfig>(r#"{"write":{"reclaim_batch":16}}"#)
-            .expect_err("reclaim_batch key must be rejected");
-        assert!(err.to_string().contains("reclaim_batch"));
-    }
-
-    #[test]
     fn validate_rejects_each_invalid_field() {
         use super::ListCfg;
 
@@ -233,27 +211,5 @@ mod tests {
             ..Default::default()
         };
         assert!(zero_intent_lease.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_the_withdrawn_reaper_config_block() {
-        // ADR-0006 withdraws the reaper outright, not a rename: an old
-        // `reaper:` key must fail config validation rather than being
-        // silently ignored (`deny_unknown_fields`).
-        let err = serde_json::from_str::<CredStoreConfig>(
-            r#"{"reaper":{"tick_secs":60,"provisioning_timeout_secs":300,"deprovisioning_timeout_secs":300}}"#,
-        )
-        .expect_err("reaper key must be rejected");
-        assert!(err.to_string().contains("reaper"));
-    }
-
-    #[test]
-    fn rejects_the_withdrawn_gc_config_block() {
-        // ADR-0006 withdraws the maintenance job and its `gc` block.
-        let err = serde_json::from_str::<CredStoreConfig>(
-            r#"{"gc":{"pending_max_age_secs":3600,"batch_size":256}}"#,
-        )
-        .expect_err("gc key must be rejected");
-        assert!(err.to_string().contains("gc"));
     }
 }

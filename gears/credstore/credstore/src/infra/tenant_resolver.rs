@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use tenant_resolver_sdk::{BarrierMode, GetAncestorsOptions, TenantResolverClient};
+use tenant_resolver_sdk::{
+    BarrierMode, GetAncestorsOptions, IsAncestorOptions, TenantResolverClient, TenantResolverError,
+};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -83,6 +85,61 @@ impl TenantDirectory for TenantResolverDir {
         chain.extend(resp.ancestors.iter().map(|a| a.id.0));
 
         Ok(chain)
+    }
+
+    async fn is_ancestor(
+        &self,
+        ctx: &SecurityContext,
+        ancestor: TenantId,
+        descendant: TenantId,
+    ) -> Result<bool, DomainError> {
+        let t0 = Instant::now();
+        // Barriers ignored, like the ancestor walk: a row behind an isolation
+        // barrier still holds its reference under the creator's hierarchy
+        // (`fr-override-type-consistency`).
+        let opts = IsAncestorOptions {
+            barrier_mode: BarrierMode::Ignore,
+        };
+        let res = self
+            .client
+            .is_ancestor(ctx, ancestor, descendant, &opts)
+            .await;
+        match res {
+            Ok(is) => {
+                self.metrics.dependency(
+                    Dep::TenantResolver,
+                    DepOp::IsAncestor,
+                    Outcome::Success,
+                    t0.elapsed().as_secs_f64(),
+                );
+                Ok(is)
+            }
+            // A tenant deleted in Account Management while its rows remain:
+            // not a descendant of anything.
+            Err(TenantResolverError::TenantNotFound { .. }) => {
+                self.metrics.dependency(
+                    Dep::TenantResolver,
+                    DepOp::IsAncestor,
+                    Outcome::Success,
+                    t0.elapsed().as_secs_f64(),
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                self.metrics.dependency(
+                    Dep::TenantResolver,
+                    DepOp::IsAncestor,
+                    Outcome::Error,
+                    t0.elapsed().as_secs_f64(),
+                );
+                tracing::warn!(err = %e, "tenant_resolver is_ancestor failed");
+                Err(DomainError::ServiceUnavailable {
+                    detail: "tenant resolver unavailable".to_owned(),
+                    retry_after: None,
+                    cause: Some(Box::new(e)),
+                })
+            }
+        }
     }
 }
 

@@ -115,23 +115,6 @@ pub(super) async fn begin_write_intent(
     .await
 }
 
-/// Best-effort retirement of an intent whose attempt will not `put` (the
-/// lease guard fired).
-pub(super) async fn drop_write_intent(
-    repo: &SecretRepoImpl,
-    attempt_id: Uuid,
-) -> Result<(), DomainError> {
-    let conn = repo.db.conn()?;
-    entity::write_intents::Entity::delete_many()
-        .filter(Condition::all().add(entity::write_intents::Column::AttemptId.eq(attempt_id)))
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .exec(&conn)
-        .await
-        .map_err(map_scope_err)?;
-    Ok(())
-}
-
 /// Deletes the attempt's intent inside `tx`. `true` iff it existed (the
 /// delete affected exactly one row); `false` means it was healed.
 pub(super) async fn delete_intent_tx(tx: &DbTx<'_>, attempt_id: Uuid) -> Result<bool, DomainError> {
@@ -237,26 +220,6 @@ pub(super) async fn record_debts(
         debts.push(CleanupDebt { id, task });
     }
     Ok(debts)
-}
-
-/// Step 5c: ONE transaction recording what the writer's version needs after
-/// its intent was healed (see [`lost_write_tasks`]).
-pub(super) async fn settle_lost_intent(
-    repo: &SecretRepoImpl,
-    key: &StoreKey,
-    version: &ValueVersion,
-    destroy_supported: bool,
-) -> Result<Vec<CleanupDebt>, DomainError> {
-    let key = key.clone();
-    let version = version.clone();
-    repo.run_tx(move |tx: &DbTx<'_>| {
-        let (key, version) = (key.clone(), version.clone());
-        Box::pin(async move {
-            let tasks = lost_write_tasks(tx, &key, &version, destroy_supported).await?;
-            record_debts(tx, tasks).await
-        }) as TxFuture<'_, Vec<CleanupDebt>>
-    })
-    .await
 }
 
 /// The expired intents of `(tenant, reference)` whose record id has no row:

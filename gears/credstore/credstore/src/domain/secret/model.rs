@@ -357,9 +357,8 @@ pub enum IntentCommit<T> {
     /// deletion committed anyway, together with the debt for this attempt's
     /// version.
     Lost { debts: Vec<CleanupDebt> },
-    /// The intent had already been healed: the transaction changed nothing.
-    /// The writer is alive and knows its version, so it settles it itself
-    /// ([`crate::domain::secret::repo::SecretRepo::settle_lost_intent`]).
+    /// The intent had already been healed: the transaction changed nothing
+    /// and the writer answers 503.
     IntentLost,
 }
 

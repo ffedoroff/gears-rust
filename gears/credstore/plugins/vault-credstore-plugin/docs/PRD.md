@@ -183,7 +183,7 @@ flowchart LR
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-vault-fr-get`
 
-`get` **MUST** return exactly the bytes written by the `put` that returned the requested version. A version that is absent, soft-deleted, destroyed or evicted by Vault's retention, and a key that was never written, **MUST** answer "no value" and not an error. A version number that no write can have produced (`0`) **MUST** answer "no value" without asking Vault, because Vault would otherwise answer with the latest version. A stored entry that holds data this plugin did not write (no value field, or a value that is not valid base64) **MUST** be reported as permanently unreadable.
+`get` **MUST** return exactly the bytes written by the `put` that returned the requested version. A version that is absent, soft-deleted, destroyed or evicted by Vault's retention, and a key that was never written, **MUST** answer "no value" and not an error. A version number that no write can have produced (`0`) **MUST** answer "no value" without asking Vault, because Vault would otherwise answer with the latest version. A stored entry that holds data this plugin did not write (no value field, or a value that is not valid base64) **MUST** be reported as an internal (permanent) error, distinct from "no value" and from a transient outage; the gear answers 500. The same holds for a version the plugin holds but can never read (a lost key).
 
 - **Rationale**: The gear distinguishes "the version is gone" (it re-reads the record's pointer once) from "never readable" (it answers an internal error, 500) and from an outage (retryable); a wrong mapping turns an outage into a data-loss answer or the reverse.
 - **Actors**: `cpt-cf-credstore-vault-actor-credstore-gear`, `cpt-cf-credstore-vault-actor-vault`
@@ -425,7 +425,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 ## 9. Acceptance Criteria
 
 - [ ] The SDK conformance suite passes against `hashicorp/vault` with a token that holds only the minimal ACL policy.
-- [ ] `get` answers "no value" for absent, soft-deleted, destroyed and evicted versions and for version `0`; it answers "unreadable" for an entry the plugin did not write; the answers are verified against the real server's response shapes.
+- [ ] `get` answers "no value" for absent, soft-deleted, destroyed and evicted versions and for version `0`; it reports an internal (permanent) error, distinct from "no value" and from a transient outage (the gear answers 500), for an entry the plugin did not write or can never read; the answers are verified against the real server's response shapes.
 - [ ] `destroy(Below)` over a key with many versions destroys exactly the versions below the cut, soft-deleted ones included, and is idempotent.
 - [ ] A rotated token file is used after one rejected request; a persistent `403` is "service unavailable" and never leaks the token.
 - [ ] Idempotent operations retry transient failures up to the configured attempts; `put` is never retried.

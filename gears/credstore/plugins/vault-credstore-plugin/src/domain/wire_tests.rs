@@ -75,9 +75,9 @@ fn encode_decode_value_round_trips() {
 }
 
 #[test]
-fn decode_value_rejects_invalid_base64_as_unreadable() {
+fn decode_value_rejects_invalid_base64_as_internal() {
     let err = decode_value("not-valid-base64!!").unwrap_err();
-    assert!(matches!(err, CredStoreError::SecretUnreadable));
+    assert!(matches!(err, CredStoreError::Internal(_)));
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn parse_get_body_value_with_deletion_metadata_is_none() {
 }
 
 #[test]
-fn parse_get_body_entry_without_a_value_is_unreadable() {
+fn parse_get_body_entry_without_a_value_is_internal() {
     for body in [
         r#"{"data":{"data":{"password":"x"}}}"#,
         r#"{"data":{"data":{"value":7}}}"#,
@@ -165,7 +165,7 @@ fn parse_get_body_entry_without_a_value_is_unreadable() {
         r#"{"data":{"data":{"value":"not base64!!"}}}"#,
     ] {
         assert!(
-            matches!(parse_get_body(body), Err(CredStoreError::SecretUnreadable)),
+            matches!(parse_get_body(body), Err(CredStoreError::Internal(_))),
             "{body}"
         );
     }

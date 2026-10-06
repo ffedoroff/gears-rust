@@ -99,6 +99,22 @@ pub trait SecretRepo: Send + Sync {
         tenant: Uuid,
     ) -> Result<bool, DomainError>;
 
+    /// Create-time downward type check
+    /// (`cpt-cf-credstore-fr-override-type-consistency`): the distinct
+    /// tenants, other than `exclude_tenant`, holding a row under `reference`
+    /// of a type other than `requested_type` — any status, sharing and owner.
+    /// An unscoped internal lookup (no PDP clamp), keyset-paged by tenant id:
+    /// tenants after `after` in ascending order, at most `limit`. Never a
+    /// `COUNT`.
+    async fn list_tenants_with_other_type(
+        &self,
+        reference: &SecretRef,
+        requested_type: Uuid,
+        exclude_tenant: TenantId,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<Uuid>, DomainError>;
+
     // ── Collection read (ADR-0005) ──────────────────────────────────────────
 
     /// Step 1: candidate **references** visible across `chain`, under the
@@ -154,11 +170,6 @@ pub trait SecretRepo: Send + Sync {
         attempt: &WriteAttempt,
         lease: Duration,
     ) -> Result<(), DomainError>;
-
-    /// Best-effort retirement of an intent whose attempt will not `put` (the
-    /// lease guard fired): delete `attempt_id`, whether or not it still
-    /// exists.
-    async fn drop_write_intent(&self, attempt_id: Uuid) -> Result<(), DomainError>;
 
     /// Create step 3 (tx1): ONE transaction that deletes the attempt's
     /// intent (which must affect exactly one row) and `INSERT`s the row
@@ -237,20 +248,6 @@ pub trait SecretRepo: Send + Sync {
         new_value_version: ValueVersion,
         attempt: &WriteAttempt,
     ) -> Result<IntentCommit<SecretRow>, DomainError>;
-
-    /// Step 5c, after [`IntentCommit::IntentLost`]: the writer is alive and
-    /// knows the version `version` it `put` under `key`, but its intent was
-    /// healed, so nobody else will clean that version up. ONE new
-    /// transaction: record a `destroy(key, Exactly(version))` debt if the
-    /// row with `key.record_id` exists (and `destroy_supported`), else a
-    /// `purge(key)` debt. Returns what it recorded. If this fails the version
-    /// leaks until the record's next secret write or delete (residual R5).
-    async fn settle_lost_intent(
-        &self,
-        key: &StoreKey,
-        version: &ValueVersion,
-        destroy_supported: bool,
-    ) -> Result<Vec<CleanupDebt>, DomainError>;
 
     /// Failed-create heal: the expired intents of `(tenant, reference)`
     /// whose record id has NO `credstore_secrets` row (`NOT EXISTS`, never a

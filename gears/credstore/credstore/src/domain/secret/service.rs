@@ -31,7 +31,6 @@ use authz_resolver_sdk::pep::ResourceType;
 use crate::domain::authz::{self, actions, scope_for};
 use crate::domain::error::DomainError;
 use crate::domain::ports::audit::{AuditEvent, AuditOperation, AuditOutcome, AuditSink, NoopAudit};
-use crate::domain::ports::clock::{MonotonicClock, SystemClock};
 use crate::domain::ports::metrics::{
     CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome, VerifyOp,
     VerifyOutcome,
@@ -49,6 +48,10 @@ use crate::domain::secret::model::{
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
 use crate::domain::secret::typing;
+
+/// Page size of the create-time downward type check's keyset walk over the
+/// tenants holding a reference with another type.
+const DESCENDANT_CHECK_PAGE: u64 = 100;
 
 /// Maps a [`CredStoreError`] from the plugin layer to a [`DomainError`].
 #[must_use]
@@ -90,9 +93,6 @@ pub fn map_plugin_err(e: CredStoreError) -> DomainError {
         // Expiry is the gear's own read-time verdict, never a plugin's: a
         // plugin only stores versioned bytes. Treat it as a contract
         // violation.
-        // The one permanent read failure a plugin may report: the version is
-        // held but can never be returned. Counted where it is produced.
-        CredStoreError::SecretUnreadable => DomainError::SecretUnreadable,
         CredStoreError::SecretExpired => DomainError::Internal {
             diagnostic: "plugin returned SecretExpired".to_owned(),
             cause: None,
@@ -132,13 +132,22 @@ pub fn map_plugin_err(e: CredStoreError) -> DomainError {
             ),
             cause: None,
         },
-        CredStoreError::Internal(s) => DomainError::Internal {
-            diagnostic: format!(
-                "plugin returned Internal error (detail redacted, {} bytes)",
-                s.len()
-            ),
-            cause: None,
-        },
+        CredStoreError::Internal(s) => {
+            // Permanent (a version that exists but can never be read, or any
+            // other plugin fault): surfaced at once. Only the length of the
+            // text is logged - it is not curated for this boundary.
+            tracing::error!(
+                detail_len = s.len(),
+                "credstore: storage plugin reported an internal error (detail redacted)"
+            );
+            DomainError::Internal {
+                diagnostic: format!(
+                    "plugin returned Internal error (detail redacted, {} bytes)",
+                    s.len()
+                ),
+                cause: None,
+            }
+        }
     }
 }
 
@@ -181,7 +190,6 @@ pub struct Service {
     audit: Arc<dyn AuditSink>,
     list: ListSettings,
     write: WriteSettings,
-    clock: Arc<dyn MonotonicClock>,
 }
 
 /// What a write is about to do to a secret, known once the write is
@@ -238,7 +246,6 @@ impl Service {
             audit: Arc::new(NoopAudit),
             list,
             write: WriteSettings::default(),
-            clock: Arc::new(SystemClock),
         }
     }
 
@@ -254,13 +261,6 @@ impl Service {
     #[must_use]
     pub fn with_write_settings(mut self, write: WriteSettings) -> Self {
         self.write = write;
-        self
-    }
-
-    /// Use `clock` for the lease guard (default: the system monotonic clock).
-    #[must_use]
-    pub fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
-        self.clock = clock;
         self
     }
 
@@ -869,10 +869,13 @@ impl Service {
     /// version is destroyed only after the pointer left it - mapped onto
     /// [`DomainError::ServiceUnavailable`] (retryable), never a stale or empty
     /// value. A re-read row still naming the version that was just reported
-    /// gone, or a plugin reporting the version unreadable, is permanent
-    /// instead: [`DomainError::SecretUnreadable`] (and the
-    /// `secret_unreadable` metric). A row found `declared` on the re-read (suppressed/removed
-    /// concurrently) is a legitimate miss instead - `Ok(None)`.
+    /// gone is permanent instead: [`DomainError::Internal`] at once, logged
+    /// at error level, with no second `get` - no concurrent switch explains
+    /// it and a retry cannot bring the version back. A plugin `Internal`
+    /// error (a version that exists but can never be read) is likewise
+    /// surfaced at once. A row found `declared` on the re-read
+    /// (suppressed/removed concurrently) is a legitimate miss instead -
+    /// `Ok(None)`.
     ///
     /// The re-read re-runs the *same* `resolve_for_get` call (same requesting
     /// tenant/subject/key/chain) rather than looking up the row by id. If it
@@ -908,7 +911,6 @@ impl Service {
         {
             Ok(Some(v)) => Ok(Some((v, row.clone()))),
             Err(DomainError::AccessDenied { .. }) => Ok(None),
-            Err(DomainError::SecretUnreadable) => Err(Self::log_unreadable(row, "plugin")),
             Err(e) => Err(e),
             Ok(None) => {
                 let fresh = self.repo.resolve_for_get(req, subject, key, chain).await?;
@@ -931,8 +933,7 @@ impl Service {
                     // The pointer did not move, yet its version is gone: no
                     // concurrent switch explains it, and a retry cannot bring
                     // it back - permanent, not a transient 503.
-                    self.metrics.secret_unreadable();
-                    return Err(Self::log_unreadable(row, "pointer_unchanged"));
+                    return Err(Self::version_lost());
                 }
                 match self
                     .plugin_get_timed(plugin, ctx, &fresh.store_key(), fresh_version)
@@ -947,27 +948,24 @@ impl Service {
                         Err(Self::version_missing())
                     }
                     Err(DomainError::AccessDenied { .. }) => Ok(None),
-                    Err(DomainError::SecretUnreadable) => {
-                        Err(Self::log_unreadable(&fresh, "plugin"))
-                    }
                     Err(e) => Err(e),
                 }
             }
         }
     }
 
-    /// The permanent "unreadable" outcome for `row`: logs the identifiers
-    /// (never the value) and returns the error. The metric is counted where
-    /// the outcome arises (`plugin_get_timed`, or the unchanged-pointer miss).
-    fn log_unreadable(row: &SecretRow, cause: &'static str) -> DomainError {
-        tracing::warn!(
-            tenant_id = %row.tenant_id.0,
-            record_id = %row.id,
-            reference = %row.reference,
-            cause,
-            "credstore: stored secret version is unreadable (permanent)"
+    /// The permanent outcome for a version that is gone although the row's
+    /// pointer did not move: logs the fact (no secret, no reference) at error
+    /// level and answers an internal error.
+    fn version_lost() -> DomainError {
+        tracing::error!(
+            "credstore: stored secret version is gone although its pointer did not move"
         );
-        DomainError::SecretUnreadable
+        DomainError::Internal {
+            diagnostic: "stored secret version is gone although its pointer did not move"
+                .to_owned(),
+            cause: None,
+        }
     }
 
     fn version_missing() -> DomainError {
@@ -994,9 +992,6 @@ impl Service {
             Ok(None) => Outcome::NotFound,
             Err(_) => Outcome::Error,
         };
-        if matches!(result, Err(DomainError::SecretUnreadable)) {
-            self.metrics.secret_unreadable();
-        }
         self.metrics
             .dependency(Dep::Plugin, DepOp::PluginGet, outcome, secs);
         result
@@ -1061,7 +1056,10 @@ impl Service {
     /// that currently resolves, for the creating caller (its tenant, owner
     /// and ancestor chain), to a record of a different type
     /// (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's `shared` record or,
-    /// when creating a private record, the tenant's own non-private one.
+    /// when creating a private record, the tenant's own non-private one — or
+    /// over a reference a descendant tenant of the creator already holds, in
+    /// any status and sharing mode, with a different type
+    /// (`TYPE_MISMATCH_WITH_DESCENDANT`).
     pub async fn put(
         &self,
         ctx: &SecurityContext,
@@ -1403,6 +1401,11 @@ impl Service {
             });
         }
 
+        // Downward: a descendant of the creator already holding the reference
+        // with another type would diverge from the new record the same way.
+        self.ensure_no_descendant_type_mismatch(ctx, tenant, key, type_uuid)
+            .await?;
+
         let validator = if let Some(v) = value {
             let plugin = self.plugins.resolve().await?;
             self.create_new(
@@ -1442,6 +1445,48 @@ impl Service {
             created: true,
             validator,
         }))
+    }
+
+    /// Downward half of the create-time type-consistency check
+    /// (`fr-override-type-consistency`): walks, page by page, the distinct
+    /// tenants holding `key` with another type outside the creator's tenant
+    /// (any status, sharing and owner) and stops at the first one the creator
+    /// is an ancestor of, barriers ignored. Cost follows the number of rows of
+    /// that reference with another type, usually none, never the subtree size.
+    /// The wire detail names neither the tenant nor the type.
+    async fn ensure_no_descendant_type_mismatch(
+        &self,
+        ctx: &SecurityContext,
+        tenant: TenantId,
+        key: &SecretRef,
+        type_uuid: Uuid,
+    ) -> Result<(), DomainError> {
+        let mut after = None;
+        loop {
+            let page = self
+                .repo
+                .list_tenants_with_other_type(key, type_uuid, tenant, after, DESCENDANT_CHECK_PAGE)
+                .await?;
+            for candidate in &page {
+                if self
+                    .dir
+                    .is_ancestor(ctx, tenant, TenantId(*candidate))
+                    .await?
+                {
+                    return Err(DomainError::TypeViolation {
+                        field: "type",
+                        reason: typing::reasons::TYPE_MISMATCH_WITH_DESCENDANT,
+                        detail: "a descendant tenant already holds this reference with \
+                                 another credential type"
+                            .to_owned(),
+                    });
+                }
+            }
+            match page.last() {
+                Some(last) if page.len() as u64 >= DESCENDANT_CHECK_PAGE => after = Some(*last),
+                _ => return Ok(()),
+            }
+        }
     }
 
     /// Apply a partial change to the record, the value, or both (ADR-0004,
@@ -1808,8 +1853,8 @@ impl Service {
     /// (nothing can ever reference it), the debt is executed after the
     /// commit, and the caller answers `Conflict`. An ambiguous failure (the
     /// commit may have happened) is a 503 and leaves the intent for a later
-    /// heal; nothing is executed. An intent found already healed is settled
-    /// by the writer itself (503).
+    /// heal; nothing is executed. An intent found already healed is a
+    /// 503 and nothing else.
     async fn create_new(
         &self,
         ctx: &SecurityContext,
@@ -1855,9 +1900,7 @@ impl Service {
                 self.after_commit(&debts, 0).await;
                 Err(DomainError::Conflict)
             }
-            Ok(IntentCommit::IntentLost) => {
-                Err(self.settle_lost_intent(&attempt, &value_version).await)
-            }
+            Ok(IntentCommit::IntentLost) => Err(Self::write_intent_expired()),
             // Ambiguous: resolve it under a lock before answering.
             Err(_) => self.verify_create(scope, &new, &attempt).await,
         }
@@ -1874,8 +1917,8 @@ impl Service {
     /// `destroy(Below(new))` and deletes the record's expired intents when
     /// the row read reported any; the debts are executed after the commit.
     /// Any other repo failure is ambiguous: 503, the intent stays for a later
-    /// heal and nothing is executed. An intent found already healed is
-    /// settled by the writer itself (503). Shared by `put`'s replace leg and
+    /// heal and nothing is executed. An intent found already healed is a
+    /// 503 and nothing else. Shared by `put`'s replace leg and
     /// `patch {"secret": ...}` (ADR-0004); accepts a `declared` row too,
     /// switching it back to `active`.
     #[allow(
@@ -1942,9 +1985,7 @@ impl Service {
                 self.after_commit(&debts, 0).await;
                 Ok(None)
             }
-            Ok(IntentCommit::IntentLost) => {
-                Err(self.settle_lost_intent(&attempt, &value_version).await)
-            }
+            Ok(IntentCommit::IntentLost) => Err(Self::write_intent_expired()),
             // Ambiguous: resolve it under a lock before answering.
             Err(_) => Ok(self
                 .verify_overwrite(
@@ -1964,20 +2005,10 @@ impl Service {
         }
     }
 
-    /// Steps 2-3 of a secret write: announce the attempt (tx0), then the
-    /// lease guard. `Err` means the caller must not `put`, and nothing is
-    /// left behind: either the intent could not be inserted, or it was
-    /// abandoned.
-    ///
-    /// The lease guard bounds the one residual the intent protocol has:
-    /// heal never takes an intent before `lease_until`, so a writer that
-    /// finds more than half the lease spent between announcing and its `put`
-    /// (a stalled instance, a slow database) would risk landing a version
-    /// after its intent was healed, and abandons the write instead. The
-    /// monotonic start instant is taken BEFORE tx0 is issued, so the
-    /// database-clock lease can never start earlier than the writer thinks.
+    /// Step 2 of a secret write: announce the attempt (tx0). `Err` means the
+    /// caller must not `put`: the intent could not be inserted, so nothing
+    /// was written to the store.
     async fn announce_write(&self, attempt: &WriteAttempt) -> Result<(), DomainError> {
-        let started = self.clock.now();
         if let Err(e) = self
             .repo
             .begin_write_intent(attempt, self.write.intent_lease)
@@ -1992,58 +2023,15 @@ impl Service {
                 e,
             ));
         }
-        if self.clock.now().saturating_duration_since(started) > self.write.intent_lease / 2 {
-            if let Err(e) = self.repo.drop_write_intent(attempt.attempt_id).await {
-                // Best effort: the intent expires and is healed anyway.
-                tracing::warn!(
-                    record = %attempt.key.record_id,
-                    err = %e,
-                    "credstore: could not delete the abandoned write intent; it will be healed"
-                );
-            }
-            return Err(DomainError::ServiceUnavailable {
-                detail: "the write took too long to start; retry".to_owned(),
-                retry_after: None,
-                cause: None,
-            });
-        }
         Ok(())
     }
 
-    /// Step 5c: the commit found the writer's own intent healed. The writer
-    /// is alive and knows its version, so in a new transaction it records the
-    /// cleanup nobody else will (`destroy(Exactly(version))` if the record
-    /// has a row, else `purge(key)`), executes it after the commit and
-    /// answers 503. If that transaction fails too, the version stays until
-    /// the record's next secret write or delete (residual R5): logged and
-    /// counted (`write_intent_settle_failed`).
-    async fn settle_lost_intent(
-        &self,
-        attempt: &WriteAttempt,
-        version: &ValueVersion,
-    ) -> DomainError {
-        self.metrics.write_intent_lost();
-        match self
-            .repo
-            .settle_lost_intent(&attempt.key, version, attempt.destroy_supported)
-            .await
-        {
-            Ok(debts) => {
-                self.count_recorded(&debts);
-                self.execute_debts(&debts).await;
-            }
-            Err(e) => {
-                self.metrics.write_intent_settle_failed();
-                tracing::error!(
-                    record = %attempt.key.record_id,
-                    err = %e,
-                    "credstore: write intent was healed and its version could not be settled; \
-                     it stays until the record's next secret write or delete"
-                );
-            }
-        }
+    /// Tx1 found the writer's own intent gone (a later request
+    /// healed it and recorded the cleanup of this version), so nothing was
+    /// applied. The answer is a retryable 503; nothing else is done.
+    fn write_intent_expired() -> DomainError {
         DomainError::ServiceUnavailable {
-            detail: "the write outlived its lease and was not applied; retry".to_owned(),
+            detail: "write intent expired; retry".to_owned(),
             retry_after: None,
             cause: None,
         }
@@ -2107,9 +2095,7 @@ impl Service {
                         self.after_commit(&debts, 0).await;
                         Err(DomainError::Conflict)
                     }
-                    IntentCommit::IntentLost => {
-                        Err(self.settle_lost_intent(attempt, &new.value_version).await)
-                    }
+                    IntentCommit::IntentLost => Err(Self::write_intent_expired()),
                 }
             }
             Ok(WriteVerification::NotApplied { debts }) => {
@@ -2175,9 +2161,7 @@ impl Service {
                         self.after_commit(&debts, 0).await;
                         Ok(None)
                     }
-                    IntentCommit::IntentLost => {
-                        Err(self.settle_lost_intent(attempt, &value_version).await)
-                    }
+                    IntentCommit::IntentLost => Err(Self::write_intent_expired()),
                 }
             }
             Ok(WriteVerification::NotApplied { debts }) => {

@@ -177,9 +177,8 @@ impl Service {
     /// # Errors
     /// [`CredStoreError::ServiceUnavailable`] on a network failure, a backend
     /// `5xx`/`429`, or a token Vault rejects; [`CredStoreError::Internal`] on
-    /// an unexpected response shape or a non-numeric version;
-    /// [`CredStoreError::SecretUnreadable`] when the stored entry is not a
-    /// value this plugin wrote.
+    /// an unexpected response shape, a non-numeric version, or a stored entry
+    /// that is not a value this plugin wrote (permanent).
     pub async fn get_value(
         &self,
         key: &StoreKey,
@@ -201,12 +200,7 @@ impl Service {
             .call(Self::request(HttpMethod::Get, url, None), self.retry, &[])
             .await?;
 
-        let value =
-            wire::classify_get_response(response.status, &response.body).inspect_err(|e| {
-                if matches!(e, CredStoreError::SecretUnreadable) {
-                    warn!("vault credstore plugin: a stored entry is not a readable value");
-                }
-            })?;
+        let value = wire::classify_get_response(response.status, &response.body)?;
         Ok(value.map(SecretValue::new))
     }
 

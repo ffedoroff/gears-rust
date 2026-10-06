@@ -1,10 +1,10 @@
 // Created: 2026-10-03 by Constructor Tech
 // Updated: 2026-10-06 by Constructor Tech
 //! Tests for the write-intent protocol of secret writes (ADR-0006): the
-//! intent announced before `plugin.put`, the lease guard, the commit
+//! intent announced before `plugin.put`, the commit
 //! transaction's definite outcomes with the cleanup debt recorded in that same
 //! transaction and executed by the same request after the confirmed commit,
-//! the writer's own settlement of a healed intent, and heal on access.
+//! the 503 of a writer whose intent was healed, and heal on access.
 //!
 //! The fake repo models "recorded in the same transaction": a debt appears in
 //! `FakeSecretRepo::recorded_tasks` only in the step that applies the row
@@ -13,7 +13,6 @@
 //! successful execution.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use credstore_sdk::{
     CredentialPatch, CredentialWrite, DestroySelector, Fallback as SdkFallback, PatchField,
@@ -22,7 +21,6 @@ use credstore_sdk::{
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::ports::clock::MonotonicClock;
 use crate::domain::ports::metrics::{CleanupOp, VerifyOp, VerifyOutcome};
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::secret::model::{CleanupTask, PutPrecondition, SecretRow, WritePrecondition};
@@ -80,7 +78,6 @@ struct Fixture {
     repo: Arc<FakeSecretRepo>,
     plugin: Arc<FakePlugin>,
     metrics: Arc<FakeMetrics>,
-    clock: Arc<ManualClock>,
     ctx: toolkit_security::SecurityContext,
 }
 
@@ -93,7 +90,6 @@ impl Fixture {
         let tenant = Uuid::new_v4();
         let repo = Arc::new(FakeSecretRepo::new());
         let metrics = FakeMetrics::new();
-        let clock = ManualClock::new();
         let svc = Service::new(
             repo.clone(),
             Arc::new(FakeDir::single(tenant)),
@@ -106,14 +102,12 @@ impl Fixture {
                 secret_mode_cap: 25,
             },
         )
-        .with_write_settings(write)
-        .with_clock(clock.clone() as Arc<dyn MonotonicClock>);
+        .with_write_settings(write);
         Self {
             svc,
             repo,
             plugin,
             metrics,
-            clock,
             ctx: make_ctx(Uuid::new_v4(), tenant),
         }
     }
@@ -613,7 +607,6 @@ async fn late_writer_whose_row_was_deleted_records_and_executes_a_purge() {
         "no row exists any more: purge, recorded with the intent deletion"
     );
     assert!(f.repo.intents().is_empty());
-    assert_eq!(f.metrics.write_intent_lost_total(), 0, "not a lost intent");
     assert_eq!(f.plugin.delete_key_calls(), [row.store_key()]);
     assert!(!f.plugin.holds_key(&row.store_key()));
     assert!(f.repo.pending_tasks().is_empty());
@@ -645,10 +638,10 @@ async fn late_patch_whose_row_was_deleted_records_a_purge() {
     );
 }
 
-// ── 6. intent lost: a heal races a live writer ──────────────────────────────
+// ── 6. intent gone at tx1: a heal raced a live writer ───────────────────────
 
 #[tokio::test]
-async fn heal_before_the_replace_commit_leaves_the_row_and_the_writer_destroys_its_version() {
+async fn heal_before_the_replace_commit_answers_503_and_does_nothing_else() {
     let f = Fixture::new();
     let row = f.create_k().await;
     let store_key = row.store_key();
@@ -658,30 +651,28 @@ async fn heal_before_the_replace_commit_leaves_the_row_and_the_writer_destroys_i
         .replace_k("slow", matches(&row))
         .await
         .expect_err("the intent was healed");
-    assert!(
-        matches!(err, DomainError::ServiceUnavailable { .. }),
-        "{err:?}"
-    );
+    let DomainError::ServiceUnavailable { detail, .. } = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(detail, "write intent expired; retry");
 
     // tx1 aborted: the row is unchanged.
     let after = f.repo.rows()[0].clone();
     assert_eq!(after.version, row.version);
     assert_eq!(after.value_version, row.value_version);
-    // The writer knows its version and the row exists: it records and
-    // executes destroy exactly it, in a new transaction.
-    assert_eq!(f.repo.recorded_tasks(), [destroy(&store_key, exactly("2"))]);
-    assert_eq!(
-        f.plugin.destroy_calls(),
-        [(store_key.clone(), exactly("2"))]
-    );
+    // Nothing else: no debt, no destroy, no verification. Whoever healed the
+    // intent owns the cleanup of the writer's version.
+    assert!(f.repo.recorded_tasks().is_empty());
     assert!(f.repo.pending_tasks().is_empty());
-    assert_eq!(f.metrics.write_intent_lost_total(), 1);
+    assert!(f.plugin.destroy_calls().is_empty());
+    assert!(f.plugin.delete_key_calls().is_empty());
+    assert!(f.metrics.commit_verifications().is_empty());
     assert_eq!(f.metrics.write_intents_healed_total(), 0, "not by us");
-    assert_eq!(f.plugin.versions(&store_key), vec!["1"]);
+    assert_eq!(f.plugin.versions(&store_key), vec!["1", "2"]);
 }
 
 #[tokio::test]
-async fn heal_before_the_create_commit_purges_the_key_and_inserts_no_row() {
+async fn heal_before_the_create_commit_answers_503_and_does_nothing_else() {
     let f = Fixture::new();
 
     f.repo.heal_intents_before_next_commits(1);
@@ -695,115 +686,16 @@ async fn heal_before_the_create_commit_purges_the_key_and_inserts_no_row() {
         )
         .await
         .expect_err("the intent was healed");
-    assert!(
-        matches!(err, DomainError::ServiceUnavailable { .. }),
-        "{err:?}"
-    );
+    let DomainError::ServiceUnavailable { detail, .. } = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(detail, "write intent expired; retry");
     assert!(f.repo.rows().is_empty(), "no row was inserted");
-    let purged = f.repo.purged_keys();
-    assert_eq!(purged.len(), 1, "the writer purges its own fresh key");
-    assert_eq!(f.metrics.write_intent_lost_total(), 1);
-    assert_eq!(f.plugin.delete_key_calls(), purged);
-    assert!(!f.plugin.holds_key(&purged[0]));
-}
-
-#[tokio::test]
-async fn healed_intent_on_a_plugin_without_destroy_records_nothing_for_a_live_row() {
-    let f = Fixture::with(FakePlugin::without_destroy(), WriteSettings::default());
-    let row = f.create_k().await;
-
-    f.repo.heal_intents_before_next_commits(1);
-    f.replace_k("slow", matches(&row))
-        .await
-        .expect_err("the intent was healed");
     assert!(f.repo.recorded_tasks().is_empty());
-    assert_eq!(f.metrics.write_intent_lost_total(), 1);
-}
-
-#[tokio::test]
-async fn failed_settlement_of_a_healed_intent_is_counted_and_still_503() {
-    let f = Fixture::new();
-    let row = f.create_k().await;
-
-    f.repo.heal_intents_before_next_commits(1);
-    f.repo.fail_next_settle(1);
-    let err = f
-        .replace_k("slow", matches(&row))
-        .await
-        .expect_err("the intent was healed");
-    assert!(
-        matches!(err, DomainError::ServiceUnavailable { .. }),
-        "{err:?}"
-    );
-    assert!(f.repo.recorded_tasks().is_empty(), "the settlement failed");
+    assert!(f.repo.pending_tasks().is_empty());
     assert!(f.plugin.destroy_calls().is_empty());
-    assert_eq!(f.metrics.write_intent_lost_total(), 1);
-    assert_eq!(f.metrics.write_intent_settle_failed_total(), 1);
-}
-
-// ── 7. lease guard ──────────────────────────────────────────────────────────
-
-fn short_lease() -> WriteSettings {
-    WriteSettings {
-        intent_lease: Duration::from_secs(100),
-    }
-}
-
-#[tokio::test]
-async fn lease_guard_abandons_a_write_that_started_too_late() {
-    let f = Fixture::with(FakePlugin::new(), short_lease());
-    let row = f.create_k().await;
-    let store_key = row.store_key();
-
-    // More than half the lease passes between announcing and the put.
-    f.repo
-        .advance_clock_on_begin_write_intent(&f.clock, Duration::from_secs(51));
-    let err = f
-        .replace_k("late", matches(&row))
-        .await
-        .expect_err("the guard must refuse");
-    assert!(
-        matches!(err, DomainError::ServiceUnavailable { .. }),
-        "{err:?}"
-    );
-    assert_eq!(
-        f.plugin.versions(&store_key),
-        vec!["1"],
-        "no put was issued"
-    );
-    assert!(f.repo.intents().is_empty(), "its own intent was deleted");
-    assert!(f.repo.recorded_tasks().is_empty());
-    assert_eq!(f.repo.rows()[0].version, row.version);
-
-    // A create is guarded the same way.
-    let err = f
-        .svc
-        .put(
-            &f.ctx,
-            &key("other"),
-            write_create("late"),
-            PutPrecondition::CreateOnly,
-        )
-        .await
-        .expect_err("the guard must refuse");
-    assert!(
-        matches!(err, DomainError::ServiceUnavailable { .. }),
-        "{err:?}"
-    );
-    assert!(f.repo.intents().is_empty());
-}
-
-#[tokio::test]
-async fn lease_guard_allows_a_write_that_used_at_most_half_the_lease() {
-    let f = Fixture::with(FakePlugin::new(), short_lease());
-    let row = f.create_k().await;
-
-    f.repo
-        .advance_clock_on_begin_write_intent(&f.clock, Duration::from_secs(50));
-    f.replace_k("ok", matches(&row))
-        .await
-        .expect("exactly half the lease is still within it");
-    assert_eq!(f.repo.rows()[0].value_version, Some(ValueVersion::new("2")));
+    assert!(f.plugin.delete_key_calls().is_empty());
+    assert!(f.metrics.commit_verifications().is_empty());
 }
 
 // ── 8. create unique violation ──────────────────────────────────────────────

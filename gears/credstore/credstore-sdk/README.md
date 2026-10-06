@@ -65,7 +65,7 @@ pre-0.3 `put` preserved the expiry), so use `patch` to change one field.
 `StoreKey { tenant_id, record_id }`: `put` stores a new immutable version and
 returns the provider's `ValueVersion`; `get` reads exactly that version
 (`Ok(None)` when it is gone, `ServiceUnavailable` for a transient failure,
-`Internal` for a version held but permanently unreadable);
+`Internal` for a version that exists but can never be read);
 `delete_key` removes the key with all versions (idempotent); `destroy` is
 optional and declared through `supports_destroy`. The gear calls both from the
 request that recorded the cleanup, right after the commit, or when it heals a
@@ -162,8 +162,8 @@ ordered versions, observed through `destroy(Below(..))` because versions are
 opaque. A plugin that does not declare `destroy` skips those checks and is
 never asked to destroy. Every check uses fresh random ids, so checks can share
 one backend. See the module docs for the full list and what the suite leaves
-to the plugin (a permanently unreadable version, `ServiceUnavailable`, durability across a
-restart).
+to the plugin (a permanent `Internal` for an unreadable version, `ServiceUnavailable`,
+durability across a restart).
 
 ## Usage
 

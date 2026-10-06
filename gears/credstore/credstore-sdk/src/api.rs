@@ -174,8 +174,10 @@ pub trait CredStoreClientV1: Send + Sync {
     /// selector in `query.filter()` must be exactly `reference` or `type`
     /// (`eq`/`in`), the match set is capped, and each returned item's
     /// [`CredentialListItem::secret`] carries the decrypted value for the
-    /// items the caller may read — a refused, missing, or
-    /// fingerprint-mismatched item is omitted rather than reported.
+    /// items the caller may read — an item the caller may not read is
+    /// omitted rather than reported; an expired item is returned with its
+    /// metadata and without a secret; an item whose stored version the
+    /// backend cannot return fails the whole request.
     /// `Page::page_info.next_cursor` is always `None` in this mode; there is
     /// no pagination over a secret-mode match set.
     ///

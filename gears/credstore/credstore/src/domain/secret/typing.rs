@@ -28,6 +28,11 @@ pub mod reasons {
     /// (`cpt-cf-credstore-fr-override-type-consistency`). Canonical `Aborted`
     /// (409), like `TYPE_IMMUTABLE`.
     pub const TYPE_MISMATCH_WITH_INHERITED: &str = "TYPE_MISMATCH_WITH_INHERITED";
+    /// ADR-0010: a `PUT` creating a record over a reference that a descendant
+    /// tenant of the creator already holds (any status, any sharing) with a
+    /// *different* type (`cpt-cf-credstore-fr-override-type-consistency`).
+    /// Canonical `Aborted` (409), like `TYPE_MISMATCH_WITH_INHERITED`.
+    pub const TYPE_MISMATCH_WITH_DESCENDANT: &str = "TYPE_MISMATCH_WITH_DESCENDANT";
     /// ADR-0004: `PUT` creation requires an explicit `secret_type`; there is
     /// no default-to-generic on create as there was pre-ADR-0004. Canonical
     /// `InvalidArgument` (400), like the other `*_REQUIRED`/`*_ALLOWED`

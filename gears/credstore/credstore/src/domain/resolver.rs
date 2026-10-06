@@ -16,4 +16,15 @@ pub trait TenantDirectory: Send + Sync {
         ctx: &SecurityContext,
         req: TenantId,
     ) -> Result<Vec<Uuid>, DomainError>;
+
+    /// True iff `ancestor` is a strict ancestor of `descendant` in the
+    /// tenant hierarchy, isolation barriers ignored (the hierarchy
+    /// inheritance walks). A `descendant` tenant-resolver does not know
+    /// (deleted, rows left behind) is simply not a descendant.
+    async fn is_ancestor(
+        &self,
+        ctx: &SecurityContext,
+        ancestor: TenantId,
+        descendant: TenantId,
+    ) -> Result<bool, DomainError>;
 }
