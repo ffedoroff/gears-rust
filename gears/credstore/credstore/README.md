@@ -169,9 +169,9 @@ credstore:
 The config is `deny_unknown_fields`: the withdrawn `reaper:` and `gc:` blocks
 are rejected at startup.
 
-Residual garbage (never a dangling pointer or wrong bytes) and the failure
-scenarios this version does not handle are catalogued in
-[`CORNER-CASES.md`](../docs/CORNER-CASES.md); the protocol is described in
+The cases this version does not handle are listed in
+[`out-of-scope.md`](../docs/out-of-scope.md); the protocol and its residual
+garbage (never a dangling pointer or wrong bytes) are described in
 [`DESIGN.md`](../docs/DESIGN.md).
 
 ## License
