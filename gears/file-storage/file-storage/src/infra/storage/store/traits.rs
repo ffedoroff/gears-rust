@@ -334,6 +334,30 @@ impl crate::domain::ports::PolicyStore for Store {
         Store::list_retention_rules(self, scope, tenant_id).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn list_retention_rules_page(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        tenant_id: Uuid,
+        admin: bool,
+        subject_kind: &str,
+        subject_id: Uuid,
+        limit: u64,
+        cursor: Option<&str>,
+    ) -> Result<toolkit_odata::Page<crate::domain::policy::StoredRetentionRule>, DomainError> {
+        Store::list_retention_rules_page(
+            self,
+            scope,
+            tenant_id,
+            admin,
+            subject_kind,
+            subject_id,
+            limit,
+            cursor,
+        )
+        .await
+    }
+
     async fn insert_retention_rule(
         &self,
         scope: &toolkit_security::AccessScope,

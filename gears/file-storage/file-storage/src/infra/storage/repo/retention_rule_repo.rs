@@ -1,15 +1,17 @@
 //! Repository for the `retention_rules` table.
 
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
+use sea_orm::sea_query::Query;
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::policy::{RetentionRuleBody, RetentionScope, StoredRetentionRule};
+use crate::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
 use crate::infra::storage::entity::retention_rule::{ActiveModel, Column, Entity, Model};
 
-use super::InsertRetentionRule;
+use super::{InsertRetentionRule, RetentionRuleListParams};
 
 /// Repository over the `retention_rules` table.
 #[derive(Clone, Default)]
@@ -30,6 +32,83 @@ impl RetentionRuleRepo {
     ) -> Result<Vec<StoredRetentionRule>, DomainError> {
         let rows = Entity::find()
             .filter(Column::TenantId.eq(tenant_id))
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(DomainError::from)?;
+
+        rows.into_iter().map(map_model).collect()
+    }
+
+    /// List retention rules for a tenant, keyset-paginated in either direction, with the
+    /// non-admin visibility filter applied in SQL (see `RetentionRuleListParams` and
+    /// `PolicyStore::list_retention_rules_page`).
+    ///
+    /// Ordered `(created_at, rule_id)` descending; `params.after` seeks as in
+    /// `FileRepo::list_page`, mirrored on `rule_id`.
+    pub async fn list_page<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        params: RetentionRuleListParams<'_>,
+    ) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        use crate::domain::pagination::Direction;
+
+        let mut filter = Condition::all().add(Column::TenantId.eq(params.tenant_id));
+        if !params.admin {
+            // Uncorrelated `IN` subquery over the caller's own files (a small, owner-scoped set).
+            let own_files = Query::select()
+                .column(FileColumn::FileId)
+                .from(FileEntity)
+                .and_where(FileColumn::TenantId.eq(params.tenant_id))
+                .and_where(FileColumn::OwnerKind.eq(params.subject_kind))
+                .and_where(FileColumn::OwnerId.eq(params.subject_id))
+                .to_owned();
+            let visible = Condition::any()
+                .add(Column::Scope.eq(RetentionScope::Tenant.as_str()))
+                .add(
+                    Condition::all()
+                        .add(Column::Scope.eq(RetentionScope::User.as_str()))
+                        .add(Column::ScopeTargetId.eq(params.subject_id)),
+                )
+                .add(
+                    Condition::all()
+                        .add(Column::Scope.eq(RetentionScope::File.as_str()))
+                        .add(Column::ScopeTargetId.in_subquery(own_files)),
+                );
+            filter = filter.add(visible);
+        }
+        let direction = params.after.map_or(Direction::Forward, |s| s.direction);
+        if let Some(seek) = params.after {
+            let pred = match direction {
+                Direction::Forward => super::tuple_lt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::RuleId),
+                    seek.created_at,
+                    seek.id,
+                ),
+                Direction::Backward => super::tuple_gt(
+                    (Entity, Column::CreatedAt),
+                    (Entity, Column::RuleId),
+                    seek.created_at,
+                    seek.id,
+                ),
+            };
+            filter = filter.add(pred);
+        }
+
+        let mut query = Entity::find().filter(filter);
+        query = match direction {
+            Direction::Forward => query
+                .order_by_desc(Column::CreatedAt)
+                .order_by_desc(Column::RuleId),
+            Direction::Backward => query
+                .order_by_asc(Column::CreatedAt)
+                .order_by_asc(Column::RuleId),
+        };
+        let rows = query
+            .limit(params.limit)
             .secure()
             .scope_with(scope)
             .all(conn)
