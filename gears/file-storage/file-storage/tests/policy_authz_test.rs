@@ -1,6 +1,3 @@
-//! Cross-user policy/retention authorization tests.
-//! `ScopedTestAuthorizer` denies `WRITE` per file and `ADMIN_POLICY` unless `set_admin(true)`.
-
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
@@ -29,11 +26,12 @@ use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBack
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{NewFile, OwnerKind};
+use file_storage_sdk::{NewFile, OwnerFilter, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-/// Grants everything except `ADMIN_POLICY` (only while `is_admin` is set) and denied writes.
+/// Grants `READ`/`WRITE`/`DELETE` unconditionally (subject to `deny_write_for`), but only grants
+/// `ADMIN_POLICY` while `is_admin` is set.
 #[derive(Default)]
 pub struct ScopedTestAuthorizer {
     is_admin: AtomicBool,
@@ -50,10 +48,8 @@ impl ScopedTestAuthorizer {
         self.is_admin.store(admin, Ordering::SeqCst);
     }
 
-    /// Mark `file_id` as `WRITE`-denied.
-    ///
     /// # Panics
-    /// Panics if the mutex is poisoned.
+    /// Panics if the internal mutex is poisoned.
     pub fn deny_write_for_file(&self, file_id: Uuid) {
         *self.deny_write_for.lock().expect("lock poisoned") = Some(file_id);
     }
@@ -127,6 +123,8 @@ async fn build_harness() -> Harness {
         max_page_size: 1000,
         idempotency_ttl_secs: 86400,
     };
+    let default_page_size = cfg.default_page_size;
+    let max_page_size = cfg.max_page_size;
     let store = Store::new(Arc::clone(&db));
     let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
     let file_svc = Arc::new(FileService::new(
@@ -141,8 +139,8 @@ async fn build_harness() -> Harness {
     let policy_svc = Arc::new(PolicyService::new(
         Arc::clone(&policy_store),
         Arc::clone(&authorizer),
-        50,
-        1000,
+        default_page_size,
+        max_page_size,
     ));
     Harness {
         file_svc,
@@ -160,7 +158,6 @@ fn ctx(tenant: Uuid, subject: Uuid) -> SecurityContext {
         .expect("ctx")
 }
 
-/// A semantically valid retention-rule body, for tests focused on authorization.
 fn valid_rule_body() -> RetentionRuleBody {
     RetentionRuleBody {
         age: Some(AgeRetention { max_age_days: 30 }),
@@ -180,6 +177,8 @@ fn new_file(owner_id: Uuid) -> NewFile {
     }
 }
 
+/// `PUT /policy?scope=user&scope_owner_id=<victim>` from a non-owner, non-admin caller must be
+/// denied and must not write a row.
 #[tokio::test]
 async fn set_policy_foreign_owner_without_admin_scope_is_denied() {
     let h = build_harness().await;
@@ -216,6 +215,7 @@ async fn set_policy_foreign_owner_without_admin_scope_is_denied() {
     assert!(row.is_none(), "no policy row should exist for user_b");
 }
 
+/// Positive control: setting one's own user-scope policy is always allowed.
 #[tokio::test]
 async fn set_policy_self_owner_is_allowed() {
     let h = build_harness().await;
@@ -285,6 +285,61 @@ async fn set_policy_tenant_admin_scope_allows_foreign_owner() {
 }
 
 #[tokio::test]
+async fn get_own_policy_user_scope_without_owner_is_rejected() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let result = h
+        .policy_svc
+        .get_own_policy(&ctx_a, PolicyScope::User, None)
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Validation { .. })),
+        "expected Validation, got {result:?}"
+    );
+}
+
+/// Positive control: `scope=tenant` with no `scope_owner_id` is the normal (and only valid) shape
+/// for a tenant-scope read, and must not be rejected.
+#[tokio::test]
+async fn get_own_policy_tenant_scope_without_owner_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let result = h
+        .policy_svc
+        .get_own_policy(&ctx_a, PolicyScope::Tenant, None)
+        .await;
+    assert!(
+        result.is_ok(),
+        "tenant-scope read with no owner must be allowed, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_own_policy_tenant_scope_with_owner_is_rejected() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let result = h
+        .policy_svc
+        .get_own_policy(&ctx_a, PolicyScope::Tenant, Some(owner))
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Validation { .. })),
+        "expected Validation, got {result:?}"
+    );
+}
+
+/// A `scope=file` retention rule staged against a file the caller cannot `WRITE` must be denied,
+/// and no row may be written.
+#[tokio::test]
 async fn create_retention_rule_file_scope_target_not_writable_is_denied() {
     let h = build_harness().await;
     let tenant = Uuid::now_v7();
@@ -293,7 +348,7 @@ async fn create_retention_rule_file_scope_target_not_writable_is_denied() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner), None)
+        .create_file(&ctx_a, new_file(owner), None, false)
         .await
         .expect("create victim file");
     h.authz.deny_write_for_file(ticket.file_id);
@@ -304,7 +359,7 @@ async fn create_retention_rule_file_scope_target_not_writable_is_denied() {
             &ctx_a,
             RetentionScope::File,
             Some(ticket.file_id),
-            RetentionRuleBody::default(),
+            valid_rule_body(),
         )
         .await;
     assert!(
@@ -320,8 +375,7 @@ async fn create_retention_rule_file_scope_target_not_writable_is_denied() {
     assert_eq!(rules.len(), 0, "no retention rule row should be written");
 }
 
-/// A `scope=file` rule on a writable file succeeds; a nonexistent `scope_target_id` yields
-/// `FileNotFound` and writes no row.
+/// Positive control: a `scope=file` rule against a real, writable file succeeds.
 #[tokio::test]
 async fn create_retention_rule_file_scope_target_writable_is_allowed() {
     let h = build_harness().await;
@@ -331,7 +385,7 @@ async fn create_retention_rule_file_scope_target_writable_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner), None)
+        .create_file(&ctx_a, new_file(owner), None, false)
         .await
         .expect("create file");
 
@@ -347,6 +401,7 @@ async fn create_retention_rule_file_scope_target_writable_is_allowed() {
         .expect("create_retention_rule should succeed for a writable file");
     assert_eq!(rule.scope_target_id, Some(ticket.file_id));
 
+    // B4: a nonexistent scope_target_id must 404, not silently pre-stage.
     let nonexistent = Uuid::now_v7();
     let result = h
         .policy_svc
@@ -354,7 +409,7 @@ async fn create_retention_rule_file_scope_target_writable_is_allowed() {
             &ctx_a,
             RetentionScope::File,
             Some(nonexistent),
-            RetentionRuleBody::default(),
+            valid_rule_body(),
         )
         .await;
     assert!(
@@ -370,6 +425,50 @@ async fn create_retention_rule_file_scope_target_writable_is_allowed() {
     assert_eq!(rules.len(), 1, "only the writable-file rule should exist");
 }
 
+#[tokio::test]
+async fn create_retention_rule_file_scope_target_foreign_tenant_is_not_found() {
+    let h = build_harness().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let owner_a = Uuid::now_v7();
+    let owner_b = Uuid::now_v7();
+    let ctx_a = ctx(tenant_a, owner_a);
+    let ctx_b = ctx(tenant_b, owner_b);
+
+    let ticket = h
+        .file_svc
+        .create_file(&ctx_a, new_file(owner_a), None, false)
+        .await
+        .expect("tenant A creates a file");
+
+    let result = h
+        .policy_svc
+        .create_retention_rule(
+            &ctx_b,
+            RetentionScope::File,
+            Some(ticket.file_id),
+            valid_rule_body(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::FileNotFound { id }) if id == ticket.file_id),
+        "expected FileNotFound (foreign-tenant file must not resolve), got {result:?}"
+    );
+
+    let rules = h
+        .policy_store
+        .list_retention_rules(&AccessScope::allow_all(), tenant_b)
+        .await
+        .expect("list_retention_rules");
+    assert_eq!(
+        rules.len(),
+        0,
+        "no rule should be created under tenant B pointing at tenant A's file"
+    );
+}
+
+/// A `User`-scope retention rule created by user A must not be deletable by user B (same tenant, no
+/// `ADMIN_POLICY`).
 #[tokio::test]
 async fn delete_retention_rule_foreign_owner_is_denied() {
     let h = build_harness().await;
@@ -408,7 +507,174 @@ async fn delete_retention_rule_foreign_owner_is_denied() {
     assert_eq!(still_there.rule_id, rule.rule_id);
 }
 
-/// A missing rule id must surface `RetentionRuleNotFound`, not `FileNotFound`.
+#[tokio::test]
+async fn delete_file_cascade_removes_file_scope_retention_rule() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let ticket = h
+        .file_svc
+        .create_file(&ctx_a, new_file(owner), None, false)
+        .await
+        .expect("create file");
+
+    let rule = h
+        .policy_svc
+        .create_retention_rule(
+            &ctx_a,
+            RetentionScope::File,
+            Some(ticket.file_id),
+            valid_rule_body(),
+        )
+        .await
+        .expect("create file-scope rule");
+
+    // Delete the target file (unconditional delete) -- the rule must go with it, in the same
+    // delete, with no separate cleanup step.
+    h.file_svc
+        .delete_file(&ctx_a, ticket.file_id, Some("*"))
+        .await
+        .expect("delete target file");
+
+    let gone = h
+        .policy_store
+        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
+        .await
+        .expect("get_retention_rule");
+    assert!(
+        gone.is_none(),
+        "the file-scope rule must be removed along with its target file"
+    );
+
+    let result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_a, rule.rule_id)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::RetentionRuleNotFound { rule_id }) if rule_id == rule.rule_id
+        ),
+        "expected RetentionRuleNotFound for an already-cascaded rule, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_retention_rule_after_file_cascade_is_not_found_for_any_tenant() {
+    let h = build_harness().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let owner_a = Uuid::now_v7();
+    let owner_b = Uuid::now_v7();
+    let ctx_a = ctx(tenant_a, owner_a);
+    let ctx_b = ctx(tenant_b, owner_b);
+
+    let ticket = h
+        .file_svc
+        .create_file(&ctx_a, new_file(owner_a), None, false)
+        .await
+        .expect("tenant A creates a file");
+
+    let rule = h
+        .policy_svc
+        .create_retention_rule(
+            &ctx_a,
+            RetentionScope::File,
+            Some(ticket.file_id),
+            valid_rule_body(),
+        )
+        .await
+        .expect("tenant A creates a file-scope rule");
+
+    h.file_svc
+        .delete_file(&ctx_a, ticket.file_id, Some("*"))
+        .await
+        .expect("tenant A deletes the target file");
+
+    let still_there = h
+        .policy_store
+        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
+        .await
+        .expect("get_retention_rule");
+    assert!(
+        still_there.is_none(),
+        "the rule must have been cascaded away with tenant A's file"
+    );
+
+    let result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_b, rule.rule_id)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::RetentionRuleNotFound { rule_id }) if rule_id == rule.rule_id
+        ),
+        "tenant B must see RetentionRuleNotFound rather than Forbidden or a silent no-op; \
+         got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_retention_rule_foreign_tenant_gets_same_error_as_nonexistent_id() {
+    let h = build_harness().await;
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let owner_a = Uuid::now_v7();
+    let owner_b = Uuid::now_v7();
+    let ctx_a = ctx(tenant_a, owner_a);
+    let ctx_b = ctx(tenant_b, owner_b);
+
+    h.authz.set_admin(true);
+    let rule = h
+        .policy_svc
+        .create_retention_rule(&ctx_a, RetentionScope::Tenant, None, valid_rule_body())
+        .await
+        .expect("tenant A creates a tenant-scope rule");
+    h.authz.set_admin(false);
+
+    let foreign_result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_b, rule.rule_id)
+        .await;
+
+    let missing_rule_id = Uuid::now_v7();
+    let missing_result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_b, missing_rule_id)
+        .await;
+
+    match (&foreign_result, &missing_result) {
+        (
+            Err(DomainError::RetentionRuleNotFound {
+                rule_id: foreign_id,
+            }),
+            Err(DomainError::RetentionRuleNotFound {
+                rule_id: missing_id,
+            }),
+        ) => {
+            assert_eq!(*foreign_id, rule.rule_id);
+            assert_eq!(*missing_id, missing_rule_id);
+        }
+        other => panic!(
+            "both a foreign-tenant existing rule_id and a nonexistent rule_id must produce \
+             RetentionRuleNotFound identically, got {other:?}"
+        ),
+    }
+
+    // Sanity: the rule must genuinely still exist (owned by tenant A) — the 404 tenant B sees is a
+    // scoping artifact, not an actual deletion.
+    let still_there = h
+        .policy_store
+        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
+        .await
+        .expect("get_retention_rule")
+        .expect("rule must still exist, owned by tenant A");
+    assert_eq!(still_there.tenant_id, tenant_a);
+}
+
 #[tokio::test]
 async fn delete_missing_retention_rule_returns_retention_not_found() {
     let h = build_harness().await;
@@ -450,7 +716,6 @@ async fn delete_missing_retention_rule_returns_retention_not_found() {
     );
 }
 
-/// `max_age_days = 0` would match every file; it must be rejected with no row written.
 #[tokio::test]
 async fn create_retention_rule_zero_max_age_is_rejected() {
     let h = build_harness().await;
@@ -484,7 +749,6 @@ async fn create_retention_rule_zero_max_age_is_rejected() {
     assert_eq!(rules.len(), 0, "no retention rule row should be written");
 }
 
-/// A rule with `age`/`inactivity`/`metadata` all `None` can never match and must be rejected.
 #[tokio::test]
 async fn create_retention_rule_all_criteria_none_is_rejected() {
     let h = build_harness().await;
@@ -514,8 +778,8 @@ async fn create_retention_rule_all_criteria_none_is_rejected() {
     assert_eq!(rules.len(), 0, "no retention rule row should be written");
 }
 
-/// A `User`-scope rule without `scope_target_id` is dead; `validate_retention_rule` must reject
-/// it even for an `ADMIN_POLICY` caller.
+/// A `User`-scope retention rule with `scope_target_id = None` is a dead rule (it can never resolve
+/// to a target user).
 #[tokio::test]
 async fn create_retention_rule_user_scope_without_target_is_rejected() {
     let h = build_harness().await;
@@ -541,8 +805,6 @@ async fn create_retention_rule_user_scope_without_target_is_rejected() {
     assert_eq!(rules.len(), 0, "no retention rule row should be written");
 }
 
-/// A `User`-scope policy with `scope_owner_id = None` can never be read back; `set_policy`
-/// must reject it.
 #[tokio::test]
 async fn set_policy_user_scope_without_owner_is_rejected() {
     let h = build_harness().await;
@@ -560,8 +822,28 @@ async fn set_policy_user_scope_without_owner_is_rejected() {
     );
 }
 
-/// `*/*` never matches a real mime type (acts as deny-all); `set_policy` must reject it in
-/// `allowed_mime_types` and in per-mime size overrides.
+#[tokio::test]
+async fn set_policy_tenant_scope_with_owner_is_rejected() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let ctx_a = ctx(tenant, owner);
+
+    let result = h
+        .policy_svc
+        .set_policy(
+            &ctx_a,
+            PolicyScope::Tenant,
+            Some(owner),
+            PolicyBody::default(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Validation { .. })),
+        "expected Validation, got {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn set_policy_star_slash_star_mime_is_rejected_or_defined() {
     let h = build_harness().await;
@@ -620,4 +902,409 @@ async fn set_policy_star_slash_star_mime_is_rejected_or_defined() {
         .await
         .expect("get_policy");
     assert!(row.is_none(), "no policy row should be written");
+}
+
+/// `PUT /policy?scope=tenant` (no `scope_owner_id`) applies to every subject in the tenant.
+#[tokio::test]
+async fn set_policy_tenant_scope_without_admin_is_denied() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user = Uuid::now_v7();
+    let ctx_a = ctx(tenant, user);
+
+    let result = h
+        .policy_svc
+        .set_policy(&ctx_a, PolicyScope::Tenant, None, PolicyBody::default())
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Forbidden)),
+        "expected Forbidden, got {result:?}"
+    );
+
+    let row = h
+        .policy_store
+        .get_policy(
+            &AccessScope::allow_all(),
+            tenant,
+            &PolicyScope::Tenant,
+            None,
+        )
+        .await
+        .expect("get_policy");
+    assert!(row.is_none(), "no tenant policy row should exist");
+}
+
+/// Positive control: an `ADMIN_POLICY`-authorized caller may set the tenant-scope policy.
+#[tokio::test]
+async fn set_policy_tenant_scope_with_admin_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let admin = Uuid::now_v7();
+    let ctx_admin = ctx(tenant, admin);
+    h.authz.set_admin(true);
+
+    let stored = h
+        .policy_svc
+        .set_policy(&ctx_admin, PolicyScope::Tenant, None, PolicyBody::default())
+        .await
+        .expect("admin should be able to set the tenant-scope policy");
+    assert_eq!(stored.scope, PolicyScope::Tenant);
+    assert_eq!(stored.scope_owner_id, None);
+
+    let row = h
+        .policy_store
+        .get_policy(
+            &AccessScope::allow_all(),
+            tenant,
+            &PolicyScope::Tenant,
+            None,
+        )
+        .await
+        .expect("get_policy")
+        .expect("tenant policy row must exist");
+    assert_eq!(row.scope, PolicyScope::Tenant);
+}
+
+/// A `scope=tenant` retention rule is a standing instruction for the cleanup job to
+/// permanently delete every matching file in the tenant, with no owner filter.
+#[tokio::test]
+async fn create_retention_rule_tenant_scope_without_admin_is_denied() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user = Uuid::now_v7();
+    let ctx_a = ctx(tenant, user);
+
+    let result = h
+        .policy_svc
+        .create_retention_rule(&ctx_a, RetentionScope::Tenant, None, valid_rule_body())
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Forbidden)),
+        "expected Forbidden, got {result:?}"
+    );
+
+    let rules = h
+        .policy_store
+        .list_retention_rules(&AccessScope::allow_all(), tenant)
+        .await
+        .expect("list_retention_rules");
+    assert_eq!(
+        rules.len(),
+        0,
+        "no tenant-scope retention rule should be written"
+    );
+}
+
+/// Positive control: an `ADMIN_POLICY`-authorized caller may create a `scope=tenant` retention
+/// rule.
+#[tokio::test]
+async fn create_retention_rule_tenant_scope_with_admin_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let admin = Uuid::now_v7();
+    let ctx_admin = ctx(tenant, admin);
+    h.authz.set_admin(true);
+
+    let rule = h
+        .policy_svc
+        .create_retention_rule(&ctx_admin, RetentionScope::Tenant, None, valid_rule_body())
+        .await
+        .expect("admin should be able to create a tenant-scope retention rule");
+    assert_eq!(rule.scope, RetentionScope::Tenant);
+    assert_eq!(rule.scope_target_id, None);
+
+    let rules = h
+        .policy_store
+        .list_retention_rules(&AccessScope::allow_all(), tenant)
+        .await
+        .expect("list_retention_rules");
+    assert_eq!(rules.len(), 1, "the tenant-scope rule should be stored");
+    assert_eq!(rules[0].rule_id, rule.rule_id);
+}
+
+#[tokio::test]
+async fn delete_retention_rule_tenant_scope_without_admin_is_denied() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let admin = Uuid::now_v7();
+    let user = Uuid::now_v7();
+    let ctx_admin = ctx(tenant, admin);
+    let ctx_user = ctx(tenant, user);
+
+    h.authz.set_admin(true);
+    let rule = h
+        .policy_svc
+        .create_retention_rule(&ctx_admin, RetentionScope::Tenant, None, valid_rule_body())
+        .await
+        .expect("admin creates the tenant-scope rule");
+    h.authz.set_admin(false);
+
+    let result = h
+        .policy_svc
+        .delete_retention_rule(&ctx_user, rule.rule_id)
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Forbidden)),
+        "expected Forbidden, got {result:?}"
+    );
+
+    let still_there = h
+        .policy_store
+        .get_retention_rule(&AccessScope::allow_all(), rule.rule_id)
+        .await
+        .expect("get_retention_rule")
+        .expect("rule must still exist");
+    assert_eq!(still_there.rule_id, rule.rule_id);
+}
+
+#[tokio::test]
+async fn get_effective_policy_foreign_owner_without_admin_is_denied() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user_a = Uuid::now_v7();
+    let user_b = Uuid::now_v7();
+    let ctx_a = ctx(tenant, user_a);
+
+    let result = h
+        .policy_svc
+        .get_effective_policy(&ctx_a, Some(user_b))
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Forbidden)),
+        "expected Forbidden, got {result:?}"
+    );
+}
+
+/// Positive control: a caller reading their own effective policy (`user_owner_id ==
+/// ctx.subject_id()`) is always allowed.
+#[tokio::test]
+async fn get_effective_policy_self_owner_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user_a = Uuid::now_v7();
+    let ctx_a = ctx(tenant, user_a);
+
+    let result = h
+        .policy_svc
+        .get_effective_policy(&ctx_a, Some(user_a))
+        .await;
+    assert!(
+        result.is_ok(),
+        "reading one's own effective policy must be allowed, got {result:?}"
+    );
+}
+
+/// Positive control: `user_owner_id = None` (tenant-level effective policy only) is always allowed
+/// -- there is no victim's user-level policy being disclosed.
+#[tokio::test]
+async fn get_effective_policy_no_owner_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user_a = Uuid::now_v7();
+    let ctx_a = ctx(tenant, user_a);
+
+    let result = h.policy_svc.get_effective_policy(&ctx_a, None).await;
+    assert!(
+        result.is_ok(),
+        "no user_owner_id must be allowed, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_effective_policy_foreign_owner_with_admin_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let admin = Uuid::now_v7();
+    let user_b = Uuid::now_v7();
+    let ctx_admin = ctx(tenant, admin);
+    h.authz.set_admin(true);
+
+    h.policy_svc
+        .set_policy(
+            &ctx_admin,
+            PolicyScope::User,
+            Some(user_b),
+            PolicyBody {
+                allowed_mime_types: vec!["image/png".to_owned()],
+                ..PolicyBody::default()
+            },
+        )
+        .await
+        .expect("admin sets user_b's policy");
+
+    let effective = h
+        .policy_svc
+        .get_effective_policy(&ctx_admin, Some(user_b))
+        .await
+        .expect("admin should be able to read a foreign owner's effective policy");
+    assert_eq!(
+        effective.allowed_mime_types,
+        Some(vec!["image/png".to_owned()]),
+        "effective policy must reflect user_b's own policy, not an empty default"
+    );
+}
+
+/// A non-admin caller must see tenant-scope rules (nothing owner-specific to hide) and their own
+/// user-scope rules, but not another user's user-scope rule.
+#[tokio::test]
+async fn list_retention_rules_filters_by_scope_for_non_admin() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let admin = Uuid::now_v7();
+    let subject = Uuid::now_v7();
+    let other_user = Uuid::now_v7();
+    let ctx_admin = ctx(tenant, admin);
+    let ctx_subject = ctx(tenant, subject);
+
+    h.authz.set_admin(true);
+    let tenant_rule = h
+        .policy_svc
+        .create_retention_rule(&ctx_admin, RetentionScope::Tenant, None, valid_rule_body())
+        .await
+        .expect("admin creates the tenant-scope rule");
+    let subject_rule = h
+        .policy_svc
+        .create_retention_rule(
+            &ctx_admin,
+            RetentionScope::User,
+            Some(subject),
+            valid_rule_body(),
+        )
+        .await
+        .expect("admin creates the subject's user-scope rule");
+    let other_rule = h
+        .policy_svc
+        .create_retention_rule(
+            &ctx_admin,
+            RetentionScope::User,
+            Some(other_user),
+            valid_rule_body(),
+        )
+        .await
+        .expect("admin creates the other user's user-scope rule");
+    h.authz.set_admin(false);
+
+    let visible = h
+        .policy_svc
+        .list_retention_rules(&ctx_subject, None, None)
+        .await
+        .expect("list_retention_rules should succeed for a non-admin")
+        .items;
+    let visible_ids: std::collections::HashSet<Uuid> = visible.iter().map(|r| r.rule_id).collect();
+    let expected_visible: std::collections::HashSet<Uuid> =
+        [tenant_rule.rule_id, subject_rule.rule_id]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        visible_ids, expected_visible,
+        "non-admin must see exactly the tenant-scope rule and their own user-scope rule"
+    );
+    assert!(
+        !visible_ids.contains(&other_rule.rule_id),
+        "non-admin must not see another user's user-scope rule"
+    );
+
+    h.authz.set_admin(true);
+    let all = h
+        .policy_svc
+        .list_retention_rules(&ctx_admin, None, None)
+        .await
+        .expect("list_retention_rules should succeed for admin")
+        .items;
+    let all_ids: std::collections::HashSet<Uuid> = all.iter().map(|r| r.rule_id).collect();
+    let expected_all: std::collections::HashSet<Uuid> = [
+        tenant_rule.rule_id,
+        subject_rule.rule_id,
+        other_rule.rule_id,
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        all_ids, expected_all,
+        "admin must see every rule in the tenant"
+    );
+}
+
+/// `POST /files` with `owner_id` different from `ctx.subject_id()` must be denied for a non-admin
+/// caller, and must not create a file row.
+#[tokio::test]
+async fn create_file_foreign_owner_without_admin_is_denied() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user_a = Uuid::now_v7();
+    let user_b = Uuid::now_v7();
+    let ctx_a = ctx(tenant, user_a);
+
+    let result = h
+        .file_svc
+        .create_file(&ctx_a, new_file(user_b), None, false)
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Forbidden)),
+        "expected Forbidden, got {result:?}"
+    );
+
+    h.authz.set_admin(true);
+    let listed = h
+        .file_svc
+        .list_files(
+            &ctx_a,
+            OwnerFilter {
+                owner_kind: OwnerKind::User,
+                owner_id: user_b,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("list_files as admin-scope check");
+    assert!(
+        listed.items.is_empty(),
+        "denied create_file must not have written a file row for user_b"
+    );
+}
+
+/// Positive control: creating a file under one's own `owner_id` is always allowed.
+#[tokio::test]
+async fn create_file_self_owner_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user_a = Uuid::now_v7();
+    let ctx_a = ctx(tenant, user_a);
+
+    let ticket = h
+        .file_svc
+        .create_file(&ctx_a, new_file(user_a), None, false)
+        .await
+        .expect("create_file should succeed for self owner");
+
+    let file = h
+        .file_svc
+        .get_file(&ctx_a, ticket.file_id)
+        .await
+        .expect("created file must be readable");
+    assert_eq!(file.owner_id, user_a);
+}
+
+#[tokio::test]
+async fn create_file_foreign_owner_with_admin_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let admin = Uuid::now_v7();
+    let user_b = Uuid::now_v7();
+    let ctx_admin = ctx(tenant, admin);
+    h.authz.set_admin(true);
+
+    let ticket = h
+        .file_svc
+        .create_file(&ctx_admin, new_file(user_b), None, false)
+        .await
+        .expect("admin should be able to create a file under a foreign owner");
+
+    let file = h
+        .file_svc
+        .get_file(&ctx_admin, ticket.file_id)
+        .await
+        .expect("created file must be readable");
+    assert_eq!(file.owner_id, user_b);
 }

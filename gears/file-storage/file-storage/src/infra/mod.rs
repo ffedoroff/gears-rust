@@ -1,4 +1,4 @@
-//! Infrastructure layer (adapters).
+//! Infrastructure layer (adapters): persistence, storage backends.
 //!
 //! - `storage` — SeaORM entities + tenant-scoped repositories + migrations
 //! - `content` — hashing, magic-byte mime validation, Range parsing

@@ -14,7 +14,6 @@ use uuid::Uuid;
 use file_storage::domain::audit::{AuditEntry, AuditOperation, FileEvent};
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::MultipartUploadSession;
 use file_storage::domain::multipart_service::MultipartService;
@@ -22,9 +21,10 @@ use file_storage::domain::policy::{
     AgeRetention, RetentionRuleBody, RetentionScope, StoredRetentionRule,
 };
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore, PolicyStore};
+use file_storage::domain::ports::{CleanupStore, MultipartStore, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
@@ -32,7 +32,87 @@ use file_storage_sdk::{CustomMetadataEntry, File, FileVersion, NewFile, OwnerKin
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.cleanup_test.file.type.v1~");
 
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
+
+/// Test-only whole-object `put` built on `put_stream`.
+async fn write_all(backend: &Arc<dyn StorageBackend>, path: &str, bytes: Bytes) {
+    let len = bytes.len() as u64;
+    let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(bytes) }));
+    backend
+        .put_stream(path, stream, Some(len))
+        .await
+        .expect("put_stream");
+}
+
+/// Test-only whole-object `get` built on `get_stream`.
+async fn read_all(backend: &Arc<dyn StorageBackend>, path: &str, expected_len: u64) -> Bytes {
+    use futures::StreamExt;
+
+    let mut stream = backend
+        .get_stream(path, expected_len)
+        .await
+        .expect("get_stream");
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.expect("chunk"));
+    }
+    Bytes::from(buf)
+}
+
 async fn build_db() -> Arc<DBProvider<DbError>> {
+    build_db_with_dsn().await.0
+}
+
+async fn build_db_with_dsn() -> (Arc<DBProvider<DbError>>, String) {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-cleanup-test-{}.db", Uuid::now_v7().simple()));
     let dsn = format!("sqlite://{}?mode=rwc", path.display());
@@ -45,20 +125,35 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     run_migrations_for_testing(&db, Migrator::migrations())
         .await
         .expect("migrations");
-    Arc::new(DBProvider::new(db))
+    (Arc::new(DBProvider::new(db)), dsn)
 }
 
-/// `grace_secs = 0` makes every pending version immediately eligible for the sweep.
 async fn build_all(
     grace_secs: u64,
 ) -> (
     Arc<FileService>,
     Arc<PolicyService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
     CleanupEngine,
     Arc<dyn StorageBackend>,
+) {
+    let (svc, psvc, msvc, dp, store, engine, backend, _db) = build_all_full(grace_secs).await;
+    (svc, psvc, msvc, dp, store, engine, backend)
+}
+
+async fn build_all_full(
+    grace_secs: u64,
+) -> (
+    Arc<FileService>,
+    Arc<PolicyService>,
+    Arc<MultipartService>,
+    TestDataPlane,
+    Store,
+    CleanupEngine,
+    Arc<dyn StorageBackend>,
+    Arc<DBProvider<DbError>>,
 ) {
     let db = build_db().await;
 
@@ -93,7 +188,7 @@ async fn build_all(
     ));
     let msvc = Arc::new(MultipartService::new(
         multipart_store,
-        backends,
+        backends.clone(),
         Arc::clone(&authorizer),
         None,
         Arc::new(Issuer::generate(3600).expect("issuer")),
@@ -101,7 +196,7 @@ async fn build_all(
         3600,
     ));
     let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     let engine = CleanupEngine::new(
         sweep_store,
         sweep_backends,
@@ -109,11 +204,97 @@ async fn build_all(
             orphan_grace_secs: grace_secs,
         },
     );
-    (svc, psvc, msvc, dp, store, engine, backend)
+    (svc, psvc, msvc, dp, store, engine, backend, db)
 }
 
-/// Like `build_all` but also returns the `DBProvider`, to backdate `created_at`/`expires_at`
-/// (there is no public API for that).
+async fn backdate_version_created_at(
+    db: &DBProvider<DbError>,
+    version_id: Uuid,
+    when: time::OffsetDateTime,
+) {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file_version::{
+        Column as VersionColumn, Entity as VersionEntity,
+    };
+
+    let conn = db.conn().expect("conn");
+    VersionEntity::update_many()
+        .col_expr(VersionColumn::CreatedAt, Expr::value(when))
+        .filter(VersionColumn::VersionId.eq(version_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file_versions.created_at");
+}
+
+async fn build_all_with_dsn(
+    grace_secs: u64,
+) -> (
+    Arc<FileService>,
+    Arc<PolicyService>,
+    Arc<MultipartService>,
+    TestDataPlane,
+    Store,
+    CleanupEngine,
+    Arc<dyn StorageBackend>,
+    String,
+) {
+    let (db, dsn) = build_db_with_dsn().await;
+
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let store = Store::new(Arc::clone(&db));
+
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
+    let sweep_backends = backends.clone();
+
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        Arc::clone(&authorizer),
+        cfg,
+        None,
+        None,
+    ));
+    let msvc = Arc::new(MultipartService::new(
+        multipart_store,
+        backends.clone(),
+        Arc::clone(&authorizer),
+        None,
+        Arc::new(Issuer::generate(3600).expect("issuer")),
+        "http://sidecar.test".to_owned(),
+        3600,
+    ));
+    let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+    let engine = CleanupEngine::new(
+        sweep_store,
+        sweep_backends,
+        CleanupConfig {
+            orphan_grace_secs: grace_secs,
+        },
+    );
+    (svc, psvc, msvc, dp, store, engine, backend, dsn)
+}
+
 async fn build_all_with_db(
     grace_secs: u64,
 ) -> (
@@ -122,6 +303,7 @@ async fn build_all_with_db(
     Store,
     CleanupEngine,
     Arc<DBProvider<DbError>>,
+    Arc<dyn StorageBackend>,
 ) {
     let db = build_db().await;
 
@@ -169,12 +351,12 @@ async fn build_all_with_db(
             orphan_grace_secs: grace_secs,
         },
     );
-    (svc, msvc, store, engine, db)
+    (svc, msvc, store, engine, db, backend)
 }
 
 async fn build_all_dual_backend(
     grace_secs: u64,
-) -> (Arc<FileService>, DataPlaneService, Store, CleanupEngine) {
+) -> (Arc<FileService>, TestDataPlane, Store, CleanupEngine) {
     let db = build_db().await;
 
     let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -200,14 +382,14 @@ async fn build_all_dual_backend(
 
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     let engine = CleanupEngine::new(
         sweep_store,
         sweep_backends,
@@ -237,8 +419,71 @@ fn new_file() -> NewFile {
     }
 }
 
-/// `CleanupStore` wrapper whose `list_versions` fails for one `file_id`; every other method
-/// delegates to a real `Store`.
+fn one_shot_part_stream(
+    data: Bytes,
+) -> (
+    futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+    u64,
+) {
+    let len = data.len() as u64;
+    (
+        Box::pin(futures::stream::once(async move { Ok(data) })),
+        len,
+    )
+}
+
+/// [`new_file`] with the owner set explicitly, for tests whose authorizer
+/// denies `ADMIN_POLICY`.
+fn new_file_owned_by(owner_id: Uuid) -> NewFile {
+    NewFile {
+        owner_id,
+        ..new_file()
+    }
+}
+
+fn raw_file(
+    file_id: Uuid,
+    tenant_id: Uuid,
+    content_id: Option<Uuid>,
+    created_at: time::OffsetDateTime,
+) -> File {
+    File {
+        file_id,
+        tenant_id,
+        owner_kind: OwnerKind::User,
+        owner_id: Uuid::now_v7(),
+        name: "batch.bin".to_owned(),
+        gts_file_type: GTS.to_owned(),
+        content_id,
+        meta_version: 0,
+        created_at,
+        last_modified_at: created_at,
+    }
+}
+
+fn raw_pending_version(
+    file_id: Uuid,
+    version_id: Uuid,
+    created_at: time::OffsetDateTime,
+) -> FileVersion {
+    FileVersion {
+        file_id,
+        version_id,
+        mime_type: "text/plain".to_owned(),
+        size: 0,
+        hash_algorithm: "SHA-256".to_owned(),
+        hash_value: vec![0u8; 32],
+        hash_mode: "whole-sha256".to_owned(),
+        part_count: None,
+        status: VersionStatus::Pending,
+        is_current: false,
+        backend_id: "mem".to_owned(),
+        backend_path: format!("/{file_id}/{version_id}"),
+        created_at,
+        bound_on_finalize: false,
+    }
+}
+
 struct FaultyListVersionsStore {
     inner: Store,
     fault_file_id: Uuid,
@@ -250,9 +495,22 @@ impl CleanupStore for FaultyListVersionsStore {
         &self,
         older_than: time::OffsetDateTime,
         now: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
         self.inner
-            .list_abandoned_pending_versions(older_than, now)
+            .list_abandoned_pending_versions(older_than, now, limit, after)
+            .await
+    }
+
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit, after)
             .await
     }
 
@@ -279,8 +537,12 @@ impl CleanupStore for FaultyListVersionsStore {
     async fn list_expired_multipart_uploads(
         &self,
         now: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
-        self.inner.list_expired_multipart_uploads(now).await
+        self.inner
+            .list_expired_multipart_uploads(now, limit, after)
+            .await
     }
 
     async fn abort_multipart_upload(
@@ -315,12 +577,15 @@ impl CleanupStore for FaultyListVersionsStore {
         self.inner.list_metadata(file_id).await
     }
 
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.inner.list_metadata_for_files(file_ids).await
+    }
+
     async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
-        if file_id == self.fault_file_id {
-            Err(DomainError::InternalError)
-        } else {
-            self.inner.list_versions(file_id).await
-        }
+        self.inner.list_versions(file_id).await
     }
 
     async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError> {
@@ -329,19 +594,195 @@ impl CleanupStore for FaultyListVersionsStore {
             .await
     }
 
-    async fn has_in_progress_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
-        self.inner.has_in_progress_multipart_for_file(file_id).await
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_files_by_ids(&toolkit_security::AccessScope::allow_all(), ids)
+            .await
     }
 
-    async fn delete_file_with_event(
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        self.inner.has_active_multipart_for_file(file_id).await
+    }
+
+    async fn delete_file_with_event_collecting_versions(
         &self,
         scope: &toolkit_security::AccessScope,
+        file_id: Uuid,
+        expected_etag: Option<String>,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
+        if file_id == self.fault_file_id {
+            Err(DomainError::InternalError)
+        } else {
+            self.inner
+                .delete_file_with_event_collecting_versions(
+                    scope,
+                    file_id,
+                    expected_etag,
+                    audit,
+                    event,
+                )
+                .await
+        }
+    }
+
+    async fn delete_orphan_file_with_event(
+        &self,
         file_id: Uuid,
         audit: AuditEntry,
         event: Option<FileEvent>,
     ) -> Result<bool, DomainError> {
         self.inner
-            .delete_file_with_event(scope, file_id, audit, event)
+            .delete_orphan_file_with_event(file_id, audit, event)
+            .await
+    }
+
+    async fn delete_expired_idempotency_keys(
+        &self,
+        now: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<u64, DomainError> {
+        self.inner.delete_expired_idempotency_keys(now, limit).await
+    }
+}
+
+struct FaultyListFilesByIdsStore {
+    inner: Store,
+    fault_file_id: Uuid,
+}
+
+#[async_trait]
+impl CleanupStore for FaultyListFilesByIdsStore {
+    async fn list_abandoned_pending_versions(
+        &self,
+        older_than: time::OffsetDateTime,
+        now: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner
+            .list_abandoned_pending_versions(older_than, now, limit, after)
+            .await
+    }
+
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit, after)
+            .await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_version(file_id, version_id, audit).await
+    }
+
+    async fn delete_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_pending_version(file_id, version_id, audit)
+            .await
+    }
+
+    async fn list_expired_multipart_uploads(
+        &self,
+        now: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<MultipartUploadSession>, DomainError> {
+        self.inner
+            .list_expired_multipart_uploads(now, limit, after)
+            .await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.abort_multipart_upload(upload_id, audit).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        self.inner.get_version(file_id, version_id).await
+    }
+
+    async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        self.inner.list_all_retention_rules().await
+    }
+
+    async fn list_all_files_for_sweep(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner.list_all_files_for_sweep(after, limit).await
+    }
+
+    async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError> {
+        self.inner.list_metadata(file_id).await
+    }
+
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.inner.list_metadata_for_files(file_ids).await
+    }
+
+    async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner.list_versions(file_id).await
+    }
+
+    async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError> {
+        self.inner
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+    }
+
+    /// The one faulted method: errors whenever `ids` contains
+    /// `fault_file_id`, delegates otherwise.
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        if ids.contains(&self.fault_file_id) {
+            Err(DomainError::InternalError)
+        } else {
+            self.inner
+                .list_files_by_ids(&toolkit_security::AccessScope::allow_all(), ids)
+                .await
+        }
+    }
+
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        self.inner.has_active_multipart_for_file(file_id).await
+    }
+
+    async fn delete_file_with_event_collecting_versions(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        file_id: Uuid,
+        expected_etag: Option<String>,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
+        self.inner
+            .delete_file_with_event_collecting_versions(scope, file_id, expected_etag, audit, event)
             .await
     }
 
@@ -359,18 +800,236 @@ impl CleanupStore for FaultyListVersionsStore {
     async fn delete_expired_idempotency_keys(
         &self,
         now: time::OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
-        self.inner.delete_expired_idempotency_keys(now).await
+        self.inner.delete_expired_idempotency_keys(now, limit).await
     }
+}
+
+#[derive(Clone, Default)]
+struct CountingCleanupStore {
+    get_file_calls: Arc<std::sync::atomic::AtomicUsize>,
+    list_files_by_ids_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CountingCleanupStoreWrapper {
+    inner: Store,
+    counts: CountingCleanupStore,
+}
+
+#[async_trait]
+impl CleanupStore for CountingCleanupStoreWrapper {
+    async fn list_abandoned_pending_versions(
+        &self,
+        older_than: time::OffsetDateTime,
+        now: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner
+            .list_abandoned_pending_versions(older_than, now, limit, after)
+            .await
+    }
+
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner
+            .list_versionless_orphan_files(created_before, limit, after)
+            .await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_version(file_id, version_id, audit).await
+    }
+
+    async fn delete_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_pending_version(file_id, version_id, audit)
+            .await
+    }
+
+    async fn list_expired_multipart_uploads(
+        &self,
+        now: time::OffsetDateTime,
+        limit: u64,
+        after: Option<(time::OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<MultipartUploadSession>, DomainError> {
+        self.inner
+            .list_expired_multipart_uploads(now, limit, after)
+            .await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.abort_multipart_upload(upload_id, audit).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        self.inner.get_version(file_id, version_id).await
+    }
+
+    async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
+        self.inner.list_all_retention_rules().await
+    }
+
+    async fn list_all_files_for_sweep(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<File>, DomainError> {
+        self.inner.list_all_files_for_sweep(after, limit).await
+    }
+
+    async fn list_metadata(&self, file_id: Uuid) -> Result<Vec<CustomMetadataEntry>, DomainError> {
+        self.inner.list_metadata(file_id).await
+    }
+
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        self.inner.list_metadata_for_files(file_ids).await
+    }
+
+    async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
+        self.inner.list_versions(file_id).await
+    }
+
+    async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError> {
+        self.counts
+            .get_file_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+    }
+
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        self.counts
+            .list_files_by_ids_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .list_files_by_ids(&toolkit_security::AccessScope::allow_all(), ids)
+            .await
+    }
+
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        self.inner.has_active_multipart_for_file(file_id).await
+    }
+
+    async fn delete_file_with_event_collecting_versions(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        file_id: Uuid,
+        expected_etag: Option<String>,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<file_storage::domain::ports::DeletedFile, DomainError> {
+        self.inner
+            .delete_file_with_event_collecting_versions(scope, file_id, expected_etag, audit, event)
+            .await
+    }
+
+    async fn delete_orphan_file_with_event(
+        &self,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_orphan_file_with_event(file_id, audit, event)
+            .await
+    }
+
+    async fn delete_expired_idempotency_keys(
+        &self,
+        now: time::OffsetDateTime,
+        limit: u64,
+    ) -> Result<u64, DomainError> {
+        self.inner.delete_expired_idempotency_keys(now, limit).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingSubscriber {
+    messages: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl tracing::Subscriber for RecordingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct MessageVisitor(String);
+        impl tracing::field::Visit for MessageVisitor {
+            // The trait only ever hands back `&dyn Debug` (there is no
+            // `Display`-based visitor method), so `{value:?}` here is the
+            // API's own contract, not a debug-print left in by accident.
+            #[allow(clippy::use_debug)]
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                write!(self.0, " {}={value:?}", field.name()).ok();
+            }
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.messages
+            .lock()
+            .expect("recording subscriber mutex")
+            .push(format!("{}:{}", event.metadata().level(), visitor.0));
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 #[tokio::test]
 async fn abandoned_pending_version_is_deleted_by_sweep() {
-    let (svc, _psvc, _msvc, _dp, store, engine, _backend) = build_all(0).await;
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    backdate_version_created_at(
+        &db,
+        ticket.version_id,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+    )
+    .await;
 
     let before = store.list_versions(ticket.file_id).await.unwrap();
     assert_eq!(
@@ -411,7 +1070,10 @@ async fn recent_pending_version_is_not_swept_within_grace_window() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let result = engine.run_sweep().await;
     assert_eq!(
@@ -429,15 +1091,24 @@ async fn recent_pending_version_is_not_swept_within_grace_window() {
     );
 }
 
-/// Sweeping the file's only pending version also deletes the now-orphaned parent `files` row
-/// and enqueues `file.deleted`.
 #[tokio::test]
 async fn sweep_deletes_abandoned_zero_version_file() {
-    let (svc, _psvc, _msvc, _dp, store, engine, _backend) = build_all(0).await;
+    // Backdated 2h past a 1h grace: grace 0 on a fresh row would race the strict
+    // `created_at < cutoff` check against an equal-instant `now()`.
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    backdate_version_created_at(
+        &db,
+        ticket.version_id,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+    )
+    .await;
 
     let result = engine.run_sweep().await;
     assert_eq!(
@@ -474,14 +1145,24 @@ async fn sweep_deletes_abandoned_zero_version_file() {
     );
 }
 
-/// Negative control: a file that still has a bound `Available` version keeps its parent row.
 #[tokio::test]
 async fn sweep_keeps_file_with_other_versions() {
-    let (svc, _psvc, _msvc, dp, store, engine, _backend) = build_all(0).await;
+    // Backdated 2h past a 1h grace: grace 0 on a fresh row would race the strict
+    // `created_at < cutoff` check against an equal-instant `now()`.
+    let (svc, _psvc, _msvc, dp, store, engine, _backend, db) = build_all_full(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let v1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let v1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    backdate_version_created_at(
+        &db,
+        v1.version_id,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+    )
+    .await;
 
     let v2 = svc.presign_version(&ctx, v1.file_id).await.unwrap();
     dp.put_content(
@@ -526,21 +1207,234 @@ async fn sweep_keeps_file_with_other_versions() {
     assert_eq!(v2_after.status, VersionStatus::Available);
 }
 
-/// Expired sessions are inserted directly with a past `expires_at`; no public API can expire one.
+#[tokio::test]
+async fn sweep_deletes_versionless_file_past_grace() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    // grace = 1h so we can deterministically distinguish "old" (backdated
+    // 2h) from "fresh" (just created) without racing the clock.
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    let versions = store.list_versions(file_id).await.unwrap();
+    assert!(
+        versions.is_empty(),
+        "create_file_bare must leave no version"
+    );
+
+    // Backdate `files.created_at` past the grace cutoff (no public API sets it).
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "no pending version ever existed for this file"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "sweep_versionless_files should have deleted the permanently versionless file"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_none(),
+        "the versionless orphan file row must be deleted by the sweep"
+    );
+
+    let audit = store.list_audit(file_id).await.unwrap();
+    let reconcile_count = audit
+        .iter()
+        .filter(|r| r.operation == "orphan_reconcile")
+        .count();
+    assert!(
+        reconcile_count >= 1,
+        "expected at least 1 orphan_reconcile audit row"
+    );
+
+    let events = store.list_file_events(file_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.event_type == "file.deleted"),
+        "expected a file.deleted event for the reclaimed versionless file"
+    );
+}
+
+#[tokio::test]
+async fn sweep_keeps_recent_versionless_file_within_grace() {
+    let (svc, _msvc, store, engine, _db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a recently-created versionless file must not be swept within the grace window"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_some(),
+        "the recent versionless file must survive the sweep"
+    );
+}
+
+#[tokio::test]
+async fn sweep_versionless_file_blocked_by_in_progress_multipart_session() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    let now = time::OffsetDateTime::now_utc();
+    store
+        .create_multipart_upload(
+            Uuid::now_v7(),
+            file_id,
+            Uuid::now_v7(),
+            "backend-handle",
+            None,
+            None,
+            "text/plain",
+            1024,
+            1024,
+            false,
+            now + time::Duration::hours(1),
+            now,
+        )
+        .await
+        .expect("insert in_progress multipart session");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a versionless file with a live in_progress multipart session must not be reclaimed"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+        .await
+        .unwrap();
+    assert!(
+        file_after.is_some(),
+        "the file must survive while its multipart session is still in_progress"
+    );
+}
+
+#[tokio::test]
+async fn sweep_versionless_files_skips_file_with_a_version() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
+
+    // grace = 1h: the version created below stays fresh (not itself
+    // eligible for `sweep_abandoned_pending`), while the file row is
+    // deliberately backdated past the cutoff.
+    let (svc, _msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileEntity::update_many()
+        .col_expr(FileColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileColumn::FileId.eq(ticket.file_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate file created_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "the version itself is fresh, not past the grace cutoff"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "a file with an existing version row must never be treated as versionless, \
+         regardless of the file row's own age"
+    );
+
+    let file_after = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), ticket.file_id)
+        .await
+        .unwrap();
+    assert!(file_after.is_some(), "the file must survive the sweep");
+    let version_after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap();
+    assert!(
+        version_after.is_some(),
+        "the pending version must survive the sweep"
+    );
+}
+
 #[tokio::test]
 async fn expired_multipart_session_is_aborted_by_sweep() {
     let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
     let not_expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100, None)
         .await
         .unwrap();
     assert!(
@@ -572,9 +1466,12 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
             file_id2,
             version_id2,
             "fake-backend-handle",
+            Some("mem"),
+            Some(&format!("/{file_id2}/{version_id2}")),
             "text/plain",
             0u64,      // declared_size (not relevant for sweep test)
             0u64,      // part_size (not relevant for sweep test)
+            false,     // auto_bind (not relevant for sweep test)
             past_time, // expires in the past
             now_t,
         )
@@ -582,7 +1479,7 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
         .unwrap();
 
     let expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100, None)
         .await
         .unwrap();
     assert!(
@@ -619,8 +1516,416 @@ async fn expired_multipart_session_is_aborted_by_sweep() {
     );
 }
 
-/// A pending version backing a live `in_progress` session is never reclaimed, however old,
-/// or a long-running upload would lose its version before `complete`.
+#[tokio::test]
+async fn sweep_aborts_expired_completing_session() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::multipart_upload::{
+        Column as UploadColumn, Entity as UploadEntity,
+    };
+
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let session = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
+        .await
+        .unwrap();
+
+    let conn = db.conn().expect("conn");
+    let past = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let rows_updated = UploadEntity::update_many()
+        .col_expr(UploadColumn::State, Expr::value("completing"))
+        .col_expr(UploadColumn::LeaseUntil, Expr::value(Some(past)))
+        .col_expr(
+            UploadColumn::LeaseOwner,
+            Expr::value(Some("stale-completer".to_owned())),
+        )
+        .col_expr(UploadColumn::ExpiresAt, Expr::value(past))
+        .filter(UploadColumn::UploadId.eq(session.upload_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate session into expired completing state");
+    assert_eq!(
+        rows_updated.rows_affected, 1,
+        "the backdate must hit exactly the session row created above"
+    );
+
+    let expired = store
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc(), 100, None)
+        .await
+        .unwrap();
+    assert!(
+        expired.iter().any(|s| s.upload_id == session.upload_id),
+        "an expired-lease completing session must appear in the sweep's expired list"
+    );
+
+    let result = engine.run_sweep().await;
+    assert!(
+        result.expired_multipart_aborted >= 1,
+        "sweep must report the completing session as aborted"
+    );
+
+    let after = store
+        .get_multipart_upload(session.upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.state,
+        file_storage::domain::multipart::MultipartUploadState::Aborted,
+        "an expired-lease completing session must be aborted by the sweep, not left dangling"
+    );
+    assert!(
+        after.lease_until.is_none(),
+        "abort_expired_completing clears the lease alongside the state transition"
+    );
+}
+
+#[tokio::test]
+async fn delete_file_cascades_idempotency_keys() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let (svc, _psvc, _msvc, _dp, _store, _engine, _backend, dsn) = build_all_with_dsn(0).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(
+            &ctx,
+            new_file(),
+            Some("cascade-test-idem-key".to_owned()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let file_hex = ticket
+        .file_id
+        .as_bytes()
+        .iter()
+        .fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            write!(acc, "{b:02x}").expect("writing to a String cannot fail");
+            acc
+        });
+    let count_sql =
+        format!("SELECT COUNT(*) AS c FROM idempotency_keys WHERE file_id = X'{file_hex}'");
+
+    let conn = Database::connect(&dsn).await.expect("raw connect");
+    let before = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            count_sql.clone(),
+        ))
+        .await
+        .expect("count query")
+        .expect("one row")
+        .try_get::<i64>("", "c")
+        .expect("i64 column c");
+    assert_eq!(
+        before, 1,
+        "create_file with an idempotency_key must have inserted exactly one row"
+    );
+
+    svc.delete_file(&ctx, ticket.file_id, Some("*"))
+        .await
+        .expect("delete_file must succeed");
+
+    let after = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            count_sql,
+        ))
+        .await
+        .expect("count query")
+        .expect("one row")
+        .try_get::<i64>("", "c")
+        .expect("i64 column c");
+    assert_eq!(
+        after, 0,
+        "deleting the file must cascade-delete its idempotency_keys rows via \
+         idempotency_keys_file_idx's FK ON DELETE CASCADE"
+    );
+}
+
+#[tokio::test]
+async fn abort_expired_session_logs_warning_on_transient_file_batch_load_error() {
+    let (svc, msvc, store, _default_engine, _db, backend) = build_all_with_db(0).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let _live_session = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
+        .await
+        .unwrap();
+
+    let upload_id2 = Uuid::now_v7();
+    let file_id2 = ticket.file_id;
+    let version_id2 = Uuid::now_v7();
+    let past_time = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let now_t = time::OffsetDateTime::now_utc();
+
+    store
+        .insert_pending_version(
+            file_id2,
+            version_id2,
+            "text/plain",
+            "mem",
+            &format!("/{file_id2}/{version_id2}"),
+            now_t,
+        )
+        .await
+        .unwrap();
+    store
+        .create_multipart_upload(
+            upload_id2,
+            file_id2,
+            version_id2,
+            "fake-backend-handle",
+            Some("mem"),
+            Some(&format!("/{file_id2}/{version_id2}")),
+            "text/plain",
+            0u64,
+            0u64,
+            false,
+            past_time,
+            now_t,
+        )
+        .await
+        .unwrap();
+
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let faulty_store: Arc<dyn CleanupStore> = Arc::new(FaultyListFilesByIdsStore {
+        inner: store.clone(),
+        fault_file_id: file_id2,
+    });
+    let engine = CleanupEngine::new(
+        faulty_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 0,
+        },
+    );
+
+    let subscriber = RecordingSubscriber::default();
+    let messages = Arc::clone(&subscriber.messages);
+    // Thread-local default -- see `RecordingSubscriber`'s doc comment for why
+    // this is safe to hold across the `.await` below.
+    let tracing_guard = tracing::subscriber::set_default(subscriber);
+    let result = engine.run_sweep().await;
+    drop(tracing_guard);
+
+    assert!(
+        result.expired_multipart_aborted >= 1,
+        "sweep must still abort the backdated session despite the get_file failure"
+    );
+    let aborted_session = store
+        .get_multipart_upload(upload_id2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        aborted_session.state,
+        file_storage::domain::multipart::MultipartUploadState::Aborted,
+        "session must still be aborted even though the audit-tenant lookup failed"
+    );
+
+    let captured = messages.lock().expect("recording subscriber mutex");
+    assert!(
+        captured.iter().any(|m| m.contains("WARN")
+            && m.to_lowercase().contains("failed to load file")
+            && m.contains(&file_id2.to_string())),
+        "a transient batch-load failure during the audit-tenant lookup must be logged as a \
+         warning naming the file_id; captured events: {captured:?}"
+    );
+}
+
+#[tokio::test]
+async fn sweep_abandoned_pending_batch_loads_files_instead_of_per_candidate_get_file() {
+    const N: usize = 3;
+
+    let (svc, _msvc, store, _default_engine, _db, backend) = build_all_with_db(0).await;
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+
+    let mut file_ids_and_tenants = Vec::with_capacity(N);
+    for _ in 0..N {
+        let tenant = Uuid::now_v7();
+        let ctx = ctx(tenant);
+        let ticket = svc
+            .create_file(&ctx, new_file(), None, false)
+            .await
+            .unwrap();
+        file_ids_and_tenants.push((ticket.file_id, tenant));
+    }
+
+    let counts = CountingCleanupStore::default();
+    let counting_store: Arc<dyn CleanupStore> = Arc::new(CountingCleanupStoreWrapper {
+        inner: store.clone(),
+        counts: counts.clone(),
+    });
+    let engine = CleanupEngine::new(
+        counting_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 0,
+        },
+    );
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, N,
+        "all {N} candidates must be reclaimed"
+    );
+
+    assert_eq!(
+        counts
+            .list_files_by_ids_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "resolving {N} candidates' audit tenants must cost exactly ONE batch call"
+    );
+    assert_eq!(
+        counts
+            .get_file_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the batch prefetch must make the per-candidate get_file path entirely unused"
+    );
+
+    // Every candidate's own orphan_reconcile audit row must carry ITS OWN
+    // file's real tenant_id, not a nil fallback or another candidate's.
+    for (file_id, tenant) in file_ids_and_tenants {
+        let audit = store.list_audit(file_id).await.unwrap();
+        let reconcile = audit
+            .iter()
+            .find(|r| r.operation == "orphan_reconcile")
+            .unwrap_or_else(|| panic!("expected an orphan_reconcile audit row for {file_id}"));
+        assert_eq!(
+            reconcile.tenant_id, tenant,
+            "audit row for {file_id} must carry its own file's tenant_id, not nil or a \
+             different candidate's"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sweep_expired_multipart_batch_loads_files_instead_of_per_session_get_file() {
+    const N: usize = 3;
+
+    let (svc, _msvc, store, _default_engine, _db, backend) = build_all_with_db(86400).await;
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+
+    let past_time = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let now_t = time::OffsetDateTime::now_utc();
+    let mut file_ids_and_tenants = Vec::with_capacity(N);
+    for _ in 0..N {
+        let tenant = Uuid::now_v7();
+        let ctx = ctx(tenant);
+        let ticket = svc
+            .create_file(&ctx, new_file(), None, false)
+            .await
+            .unwrap();
+
+        let upload_id = Uuid::now_v7();
+        let version_id = Uuid::now_v7();
+        store
+            .insert_pending_version(
+                ticket.file_id,
+                version_id,
+                "text/plain",
+                "mem",
+                &format!("/{}/{}", ticket.file_id, version_id),
+                now_t,
+            )
+            .await
+            .unwrap();
+        store
+            .create_multipart_upload(
+                upload_id,
+                ticket.file_id,
+                version_id,
+                "fake-backend-handle",
+                Some("mem"),
+                Some(&format!("/{}/{}", ticket.file_id, version_id)),
+                "text/plain",
+                0u64,
+                0u64,
+                false,
+                past_time,
+                now_t,
+            )
+            .await
+            .unwrap();
+        file_ids_and_tenants.push((ticket.file_id, tenant));
+    }
+
+    let counts = CountingCleanupStore::default();
+    let counting_store: Arc<dyn CleanupStore> = Arc::new(CountingCleanupStoreWrapper {
+        inner: store.clone(),
+        counts: counts.clone(),
+    });
+    let engine = CleanupEngine::new(
+        counting_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 86400,
+        },
+    );
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.expired_multipart_aborted, N,
+        "all {N} expired sessions must be aborted"
+    );
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "step 1 must not have touched any of these files' pending versions \
+         (large orphan_grace_secs)"
+    );
+
+    assert_eq!(
+        counts
+            .list_files_by_ids_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "resolving {N} sessions' audit tenants must cost exactly ONE batch call"
+    );
+    assert_eq!(
+        counts
+            .get_file_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the batch prefetch must make the per-session get_file path entirely unused"
+    );
+
+    for (file_id, tenant) in file_ids_and_tenants {
+        let audit = store.list_audit(file_id).await.unwrap();
+        let abort_audit = audit
+            .iter()
+            .find(|r| r.operation == "multipart_abort")
+            .unwrap_or_else(|| panic!("expected a multipart_abort audit row for {file_id}"));
+        assert_eq!(
+            abort_audit.tenant_id, tenant,
+            "audit row for {file_id} must carry its own file's tenant_id, not nil or a \
+             different candidate's"
+        );
+    }
+}
+
 #[tokio::test]
 async fn sweep_skips_pending_version_of_active_multipart_session() {
     use sea_orm::sea_query::Expr;
@@ -631,18 +1936,21 @@ async fn sweep_skips_pending_version_of_active_multipart_session() {
         Column as FileVersionColumn, Entity as FileVersionEntity,
     };
 
-    // grace = 1 hour: only the backdated multipart-session version is a sweep candidate.
-    let (svc, msvc, store, engine, db) = build_all_with_db(3600).await;
+    // grace = 1h keeps the creation-time pending version fresh; only the backdated
+    // multipart-session version is a sweep candidate.
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None)
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
         .await
         .unwrap();
 
-    // Backdate the backing version past the grace cutoff; `expires_at` stays in the future.
     let conn = db.conn().expect("conn");
     let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
     FileVersionEntity::update_many()
@@ -681,9 +1989,92 @@ async fn sweep_skips_pending_version_of_active_multipart_session() {
     );
 }
 
-/// Companion: once `expires_at` has also passed, the sweep aborts the session and reclaims it.
 #[tokio::test]
-async fn sweep_reclaims_version_after_session_expires() {
+async fn sweep_skips_pending_version_of_completing_session() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file_version::{
+        Column as FileVersionColumn, Entity as FileVersionEntity,
+    };
+
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(3600).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let plan = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
+        .await
+        .unwrap();
+
+    let now = time::OffsetDateTime::now_utc();
+    let acquired = store
+        .acquire_multipart_complete_lease(
+            plan.upload_id,
+            "completer-a",
+            now + time::Duration::minutes(5),
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(acquired, "setup: must acquire the lease before completing");
+
+    let conn = db.conn().expect("conn");
+    let backdated = now - time::Duration::hours(2);
+    FileVersionEntity::update_many()
+        .col_expr(FileVersionColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileVersionColumn::VersionId.eq(plan.version_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate version created_at");
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_pending_deleted, 0,
+        "a pending version backing a live completing session must not be reclaimed"
+    );
+    assert_eq!(
+        result.abandoned_files_deleted, 0,
+        "the parent file must not be reclaimed while its only version is still \
+         backing a live completing session"
+    );
+
+    let version_after = store
+        .get_version(ticket.file_id, plan.version_id)
+        .await
+        .unwrap();
+    assert!(
+        version_after.is_some(),
+        "the completing session's backing version must survive the sweep"
+    );
+
+    let file_after = svc.get_file(&ctx, ticket.file_id).await;
+    assert!(
+        file_after.is_ok(),
+        "the parent file must survive the sweep untouched -- got: {file_after:?}"
+    );
+
+    let session_after = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must still exist");
+    assert_eq!(
+        session_after.state,
+        file_storage::domain::multipart::MultipartUploadState::Completing,
+        "the live completing session must survive the sweep untouched"
+    );
+}
+
+#[tokio::test]
+async fn sweep_reclaims_version_after_session_expires_still_aborts_backend_and_deletes_parts() {
     use sea_orm::sea_query::Expr;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
     use toolkit_db::secure::SecureUpdateExt;
@@ -695,34 +2086,83 @@ async fn sweep_reclaims_version_after_session_expires() {
         Column as MultipartUploadColumn, Entity as MultipartUploadEntity,
     };
 
-    let (svc, msvc, store, engine, db) = build_all_with_db(3600).await;
+    let (svc, msvc, store, engine, db, backend) = build_all_with_db(3600).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, None)
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
+    let plan = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
+        .await
+        .unwrap();
+
+    let session = store
+        .get_multipart_upload(plan.upload_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    let backend_path = format!("/{}/{}", ticket.file_id, plan.version_id);
+
+    let part = plan.parts.first().expect("declared_size fits in one part");
+    let part_bytes = Bytes::from_static(b"partial-part-data-before-expiry");
+    let part_size = i64::try_from(part_bytes.len()).unwrap();
+    let (stream, len) = one_shot_part_stream(part_bytes);
+    let (etag, part_hash) = backend
+        .upload_part_stream(
+            &backend_path,
+            &session.backend_upload_handle,
+            part.part_number,
+            part.offset,
+            stream,
+            len,
+        )
+        .await
+        .expect("simulated sidecar part upload");
+    store
+        .upsert_multipart_part(
+            plan.upload_id,
+            i32::try_from(part.part_number).unwrap(),
+            &etag,
+            part_hash,
+            part_size,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_multipart_parts(plan.upload_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "sanity: the part row must exist before the sweep"
+    );
 
     let conn = db.conn().expect("conn");
     let now = time::OffsetDateTime::now_utc();
 
-    let backdated_created = now - time::Duration::hours(2);
+    // Both the version's `created_at` and the session's `expires_at` are
+    // backdated, so step 1 reclaims the version in the SAME `run_sweep()`
+    // call, before step 2 ever fetches this session.
     FileVersionEntity::update_many()
-        .col_expr(FileVersionColumn::CreatedAt, Expr::value(backdated_created))
+        .col_expr(
+            FileVersionColumn::CreatedAt,
+            Expr::value(now - time::Duration::hours(2)),
+        )
         .filter(FileVersionColumn::VersionId.eq(plan.version_id))
         .secure()
         .scope_with(&toolkit_security::AccessScope::allow_all())
         .exec(&conn)
         .await
         .expect("backdate version created_at");
-
-    let backdated_expiry = now - time::Duration::seconds(10);
     MultipartUploadEntity::update_many()
         .col_expr(
             MultipartUploadColumn::ExpiresAt,
-            Expr::value(backdated_expiry),
+            Expr::value(now - time::Duration::seconds(10)),
         )
         .filter(MultipartUploadColumn::UploadId.eq(plan.upload_id))
         .secure()
@@ -733,21 +2173,48 @@ async fn sweep_reclaims_version_after_session_expires() {
 
     let result = engine.run_sweep().await;
     assert_eq!(
-        result.expired_multipart_aborted, 1,
-        "the now-expired session must be aborted"
+        result.abandoned_pending_deleted, 1,
+        "step 1 must reclaim the version before step 2 ever sees the session"
     );
     assert_eq!(
-        result.abandoned_pending_deleted, 1,
-        "the version must be reclaimed once its session is no longer live"
+        result.expired_multipart_aborted, 1,
+        "step 2 must still abort the session even though its version is already gone"
     );
 
-    let version_after = store
-        .get_version(ticket.file_id, plan.version_id)
-        .await
-        .unwrap();
     assert!(
-        version_after.is_none(),
-        "the pending version must be gone once the multipart session is no longer live"
+        store
+            .get_version(ticket.file_id, plan.version_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "version must be gone"
+    );
+
+    assert!(
+        store
+            .list_multipart_parts(plan.upload_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "multipart_upload_parts rows must be deleted even when the version was \
+         already reclaimed by step 1"
+    );
+
+    let (stream, len) = one_shot_part_stream(Bytes::from_static(b"x"));
+    let upload_after_abort = backend
+        .upload_part_stream(
+            &backend_path,
+            &session.backend_upload_handle,
+            2,
+            0,
+            stream,
+            len,
+        )
+        .await;
+    assert!(
+        upload_after_abort.is_err(),
+        "the backend multipart handle must have been aborted (a post-sweep upload_part \
+         against it must fail), but it succeeded: {upload_after_abort:?}"
     );
 
     let session_after = store
@@ -758,19 +2225,106 @@ async fn sweep_reclaims_version_after_session_expires() {
     assert_eq!(
         session_after.state,
         file_storage::domain::multipart::MultipartUploadState::Aborted,
-        "the session must be aborted once its expiry has passed"
+        "the session must be aborted"
     );
 }
 
-/// The zero-age rule is inserted through the store, bypassing `create_retention_rule`'s validation,
-/// so only the sweep matcher is exercised.
+#[tokio::test]
+async fn cleanup_aborts_on_the_sessions_own_backend_when_version_is_already_gone() {
+    let db = build_db().await;
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let store = Store::new(Arc::clone(&db));
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        ServiceConfig {
+            default_url_ttl_secs: 3600,
+            sidecar_base_url: "http://sidecar.test".to_owned(),
+            default_page_size: 50,
+            max_page_size: 1000,
+            idempotency_ttl_secs: 86400,
+        },
+        None,
+        None,
+    ));
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let engine = CleanupEngine::new(
+        sweep_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 3600,
+        },
+    );
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let file_id = svc.create_file_bare(&ctx, new_file()).await.unwrap();
+
+    // A real in-progress multipart upload against the NON-default "alt"
+    // backend -- the actual backend-side handle this test proves gets
+    // aborted (or leaked, on the old code).
+    let version_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let backend_handle = alt_backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate on the alt backend");
+
+    let now = time::OffsetDateTime::now_utc();
+    let session = MultipartUploadSession {
+        upload_id: Uuid::now_v7(),
+        file_id,
+        version_id,
+        backend_upload_handle: backend_handle.clone(),
+        state: file_storage::domain::multipart::MultipartUploadState::InProgress,
+        declared_mime: "application/octet-stream".to_owned(),
+        mime_validated: false,
+        declared_size: 0,
+        part_size: 0,
+        auto_bind: false,
+        lease_until: None,
+        complete_result: None,
+        backend_id: Some("alt".to_owned()),
+        backend_path: Some(backend_path.clone()),
+        created_at: now,
+        expires_at: now - time::Duration::hours(1),
+    };
+
+    engine.cleanup_expired_session_version(&session).await;
+
+    let (stream, len) = one_shot_part_stream(Bytes::from_static(b"x"));
+    let after_abort = alt_backend
+        .upload_part_stream(&backend_path, &backend_handle, 1, 0, stream, len)
+        .await;
+    assert!(
+        after_abort.is_err(),
+        "the multipart handle on the session's OWN backend (\"alt\") must have been \
+         aborted, but it is still live: {after_abort:?}"
+    );
+}
+
 #[tokio::test]
 async fn retention_expired_file_is_deleted_by_sweep() {
     let (svc, _psvc, _msvc, dp, store, engine, _backend) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -833,7 +2387,6 @@ async fn retention_expired_file_is_deleted_by_sweep() {
     assert_eq!(ret_del[0].outcome, "success");
 }
 
-/// `create_retention_rule` rejects `max_age_days = 0`, so such a rule can never reach the sweep.
 #[tokio::test]
 async fn sweep_does_not_run_zero_age_rule() {
     let (svc, psvc, _msvc, dp, store, engine, _backend) = build_all(86400).await;
@@ -869,7 +2422,10 @@ async fn sweep_does_not_run_zero_age_rule() {
         "no retention rule row should exist after a rejected create"
     );
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -899,15 +2455,16 @@ async fn sweep_does_not_run_zero_age_rule() {
     );
 }
 
-/// A `list_versions` failure aborts that file's expiry instead of being treated as zero versions;
-/// an unrelated matching file is still deleted in the same sweep.
 #[tokio::test]
 async fn expire_file_list_versions_error_does_not_delete_file() {
     let (svc, _psvc, _msvc, dp, store, _engine, backend) = build_all(86400).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let faulted = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let faulted = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         faulted.file_id,
@@ -921,7 +2478,10 @@ async fn expire_file_list_versions_error_does_not_delete_file() {
         .await
         .unwrap();
 
-    let healthy = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let healthy = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         healthy.file_id,
@@ -951,6 +2511,9 @@ async fn expire_file_list_versions_error_does_not_delete_file() {
         .await
         .unwrap();
 
+    // Run the sweep against a fault-injecting store wrapper so only
+    // `faulted.file_id`'s `list_versions` call errors; everything else
+    // (including `healthy`'s) goes through the real `Store`.
     let faulty_store: Arc<dyn CleanupStore> = Arc::new(FaultyListVersionsStore {
         inner: store.clone(),
         fault_file_id: faulted.file_id,
@@ -996,7 +2559,10 @@ async fn file_without_matching_retention_rule_is_not_deleted() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1026,7 +2592,10 @@ async fn migrate_backend_moves_content_and_updates_version_row() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1079,7 +2648,10 @@ async fn migrate_backend_to_same_backend_is_noop() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1108,7 +2680,6 @@ async fn migrate_backend_to_same_backend_is_noop() {
     );
 }
 
-/// Files with more than one version cannot be migrated.
 #[tokio::test]
 async fn migrate_backend_rejects_versioned_file() {
     use file_storage::domain::error::DomainError;
@@ -1117,7 +2688,10 @@ async fn migrate_backend_rejects_versioned_file() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1152,7 +2726,6 @@ async fn migrate_backend_rejects_versioned_file() {
     );
 }
 
-/// Grants everything except `ADMIN_POLICY`, which requires `set_admin(true)`.
 #[derive(Default)]
 struct ScopedTestAuthorizer {
     is_admin: std::sync::atomic::AtomicBool,
@@ -1189,7 +2762,7 @@ async fn build_all_dual_backend_scoped(
     grace_secs: u64,
 ) -> (
     Arc<FileService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
     Arc<ScopedTestAuthorizer>,
 ) {
@@ -1212,15 +2785,14 @@ async fn build_all_dual_backend_scoped(
 
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         Arc::clone(&authorizer) as Arc<dyn file_storage::domain::authz::Authorizer>,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
-    // `grace_secs` is unused here; kept for signature symmetry with the other `build_all*` helpers.
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     let _ = grace_secs;
     (svc, dp, store, authorizer)
 }
@@ -1232,7 +2804,10 @@ async fn migrate_backend_rejects_non_durable_target_for_non_admin() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file_owned_by(ctx.subject_id()), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1273,7 +2848,10 @@ async fn migrate_backend_allows_non_durable_target_for_admin_scope() {
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -1302,11 +2880,8 @@ async fn migrate_backend_allows_non_durable_target_for_admin_scope() {
     );
 }
 
-// Sweep-vs-complete races are tested as deterministic call orderings, never with sleeps or
-// real concurrency.
-/// Drives a single-part upload to a bound `Available` version; returns `(upload_id, version_id)`.
 async fn complete_one_part_multipart_upload(
-    msvc: &MultipartService,
+    msvc: &Arc<MultipartService>,
     svc: &FileService,
     store: &Store,
     backend: &Arc<dyn StorageBackend>,
@@ -1322,7 +2897,7 @@ async fn complete_one_part_multipart_upload(
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1334,16 +2909,18 @@ async fn complete_one_part_multipart_upload(
     let backend_path = format!("/{file_id}/{}", plan.version_id);
     let part = plan.parts.first().expect("single-part plan");
 
+    let (stream, len) = one_shot_part_stream(Bytes::from_static(data));
     let (backend_etag, part_hash) = backend
-        .upload_part(
+        .upload_part_stream(
             &backend_path,
             &session.backend_upload_handle,
             part.part_number,
             part.offset,
-            Bytes::from_static(data),
+            stream,
+            len,
         )
         .await
-        .expect("backend upload_part");
+        .expect("backend upload_part_stream");
     store
         .upsert_multipart_part(
             plan.upload_id,
@@ -1356,23 +2933,26 @@ async fn complete_one_part_multipart_upload(
         .await
         .unwrap();
 
-    msvc.complete_multipart_upload(ctx, file_id, plan.upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(ctx, file_id, plan.upload_id, None)
         .await
-        .unwrap();
+        .unwrap()
+        .unwrap_completed();
     svc.bind(ctx, file_id, plan.version_id, None).await.unwrap();
 
     (plan.upload_id, plan.version_id)
 }
 
-/// Completed first, then backdated: `complete_multipart_upload` rejects an expired `in_progress`
-/// session, so the sweep's session CAS must lose against an already-`completed` row.
 #[tokio::test]
 async fn sweep_after_complete_wins_does_not_delete_bound_version() {
     let (svc, _psvc, msvc, _dp, store, engine, backend) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let (upload_id, version_id) = complete_one_part_multipart_upload(
         &msvc,
         &svc,
@@ -1393,6 +2973,9 @@ async fn sweep_after_complete_wins_does_not_delete_bound_version() {
     let file_before = svc.get_file(&ctx, ticket.file_id).await.unwrap();
     assert_eq!(file_before.content_id, Some(version_id));
 
+    // Backdate the now-`completed` session's expires_at into the past,
+    // simulating the sweep tick finally catching up *after* complete already
+    // won the session CAS.
     store
         .set_multipart_expires_at_for_test(
             upload_id,
@@ -1418,15 +3001,22 @@ async fn sweep_after_complete_wins_does_not_delete_bound_version() {
     assert_eq!(file_after.content_id, Some(version_id));
 }
 
-/// Reverse order: the sweep aborts the expired session and deletes the version first;
-/// a later `complete` is rejected.
 #[tokio::test]
 async fn sweep_before_complete_wins_cleans_up_expired_session() {
-    let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
+    let (svc, msvc, store, engine, db, _backend) = build_all_with_db(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    backdate_version_created_at(
+        &db,
+        ticket.version_id,
+        time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+    )
+    .await;
     let plan = msvc
         .initiate_multipart_upload(
             &ctx,
@@ -1434,11 +3024,13 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
             "application/octet-stream",
             13,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
 
+    // Backdate the still-in_progress session's expires_at into the past
+    // *before* any complete attempt -- the sweep must win this race.
     store
         .set_multipart_expires_at_for_test(
             plan.upload_id,
@@ -1452,6 +3044,11 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
         result.expired_multipart_aborted, 1,
         "sweep must win the session CAS and abort the expired session"
     );
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "FS-05/F10 fix: the now-zero-version parent file must also be reclaimed in this same \
+         sweep pass, via step 2's own orphan-file check (cleanup_expired_session_version)"
+    );
 
     let version = store
         .get_version(ticket.file_id, plan.version_id)
@@ -1462,6 +3059,16 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
         "pending version must be deleted once the sweep wins the session CAS"
     );
 
+    let file_after = svc.get_file(&ctx, ticket.file_id).await;
+    assert!(
+        matches!(
+            file_after,
+            Err(file_storage::domain::error::DomainError::FileNotFound { .. })
+        ),
+        "FS-05/F10 fix: expected the now-orphaned parent file to be reclaimed by the same sweep \
+         pass, got: {file_after:?}"
+    );
+
     let err = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
@@ -1469,20 +3076,23 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
     assert!(
         matches!(
             err,
-            file_storage::domain::error::DomainError::MultipartUploadNotInProgress { .. }
+            file_storage::domain::error::DomainError::FileNotFound { .. }
         ),
-        "expected MultipartUploadNotInProgress after the sweep aborted the session, got {err:?}"
+        "expected FileNotFound after the sweep reclaimed both the session and its now-orphaned \
+         parent file, got {err:?}"
     );
 }
 
-/// Expired but still `in_progress` (no sweep ran): `complete_multipart_upload` itself must reject.
 #[tokio::test]
 async fn complete_after_session_expired_is_rejected() {
     let (svc, _psvc, msvc, _dp, store, _engine, _backend) = build_all(0).await;
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let plan = msvc
         .initiate_multipart_upload(
             &ctx,
@@ -1490,7 +3100,7 @@ async fn complete_after_session_expired_is_rejected() {
             "application/octet-stream",
             13,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1517,8 +3127,6 @@ async fn complete_after_session_expired_is_rejected() {
     );
 }
 
-/// Window where `finalize_version` already made the version `Available` but the session CAS has
-/// not run: the sweep's status-guarded delete must match zero rows.
 #[tokio::test]
 async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_available_version()
 {
@@ -1526,7 +3134,10 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let plan = msvc
         .initiate_multipart_upload(
             &ctx,
@@ -1534,7 +3145,7 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
             "application/octet-stream",
             5,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1549,6 +3160,9 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
         "session must still be in_progress at the moment cleanup is invoked"
     );
 
+    // Simulate the mid-flight window: `finalize_version` has already flipped
+    // the version pending -> available, but `complete_multipart_upload`
+    // hasn't reached its own session CAS yet.
     let finalize_audit = file_storage::domain::audit::AuditEntry {
         tenant_id: Uuid::nil(),
         actor_kind: "system".to_owned(),
@@ -1570,14 +3184,19 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
             None,
             None,
             finalize_audit,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .updated;
     assert!(
         finalized,
         "finalize_version must flip the pending version to available"
     );
 
+    // Invoke the sweep's version-cleanup helper directly -- as
+    // `abort_expired_multipart_session` would immediately after winning its
+    // own session CAS (`Ok(true)`).
     engine.cleanup_expired_session_version(&session).await;
 
     let after = store
@@ -1588,7 +3207,102 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
     assert_eq!(after.status, VersionStatus::Available);
 }
 
-/// Rows are seeded directly; `idempotency_keys.file_id` has an FK, so they point at real files.
+#[tokio::test]
+async fn sweep_step1_does_not_delete_version_finalized_between_list_and_delete() {
+    let (svc, _psvc, _msvc, _dp, store, engine, backend) = build_all(0).await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let candidate = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("pending version must exist");
+    assert_eq!(candidate.status, VersionStatus::Pending);
+
+    // Put real content at the version's backend path so a wrongful blob
+    // delete would be observable.
+    {
+        let content = Bytes::from_static(b"finalized content");
+        let len = content.len() as u64;
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(content) }));
+        backend
+            .put_stream(&candidate.backend_path, stream, Some(len))
+            .await
+            .unwrap();
+    }
+
+    // Simulate the race: a client's `finalize_upload` wins between the list
+    // query and step 1's per-row delete, flipping the version
+    // `pending -> available`.
+    let finalize_audit = AuditEntry {
+        tenant_id: tenant,
+        actor_kind: "system".to_owned(),
+        actor_id: Uuid::nil(),
+        file_id: Some(ticket.file_id),
+        operation: AuditOperation::FinalizeVersion,
+        outcome: file_storage::domain::audit::AuditOutcome::Success,
+        detail: serde_json::json!({ "test": "step1 mid-flight simulation" }),
+        occurred_at: time::OffsetDateTime::now_utc(),
+    };
+    let finalized = store
+        .finalize_version(
+            ticket.file_id,
+            ticket.version_id,
+            17,
+            vec![0u8; 32],
+            file_storage::infra::content::hash_mode::HashMode::WholeSha256,
+            None,
+            None,
+            None,
+            finalize_audit,
+            None,
+        )
+        .await
+        .unwrap()
+        .updated;
+    assert!(finalized, "finalize_version must flip pending -> available");
+
+    let (pending_deleted, files_deleted) = engine
+        .delete_abandoned_pending_version(
+            ticket.file_id,
+            ticket.version_id,
+            candidate.size,
+            &candidate.backend_id,
+            &candidate.backend_path,
+            None,
+        )
+        .await;
+    assert_eq!(
+        (pending_deleted, files_deleted),
+        (0, 0),
+        "the status-guarded delete must match zero rows once the version is no \
+         longer pending"
+    );
+
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version row must not be deleted by the mid-flight race");
+    assert_eq!(after.status, VersionStatus::Available);
+
+    // The backend blob must survive too -- proving `best_effort_delete` was
+    // never reached (it lives inside the `Ok(true)` branch of the guarded
+    // delete, which this race never takes).
+    let blob = backend.stat(&candidate.backend_path).await;
+    assert!(
+        matches!(blob, Ok(Some(_))),
+        "the just-finalized backend blob must not be deleted, got {blob:?}"
+    );
+}
+
 #[tokio::test]
 async fn run_sweep_deletes_expired_idempotency_rows() {
     use sea_orm::EntityTrait;
@@ -1604,7 +3318,6 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
     let store = Store::new(Arc::clone(&db));
     let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
-    // `orphan_grace_secs` 86400, not 0: zero would sweep these FK-only files, cascading the rows.
     let engine = CleanupEngine::new(
         sweep_store,
         backends.clone(),
@@ -1613,12 +3326,15 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
         },
     );
 
+    // `idempotency_keys.file_id` carries a `REFERENCES files (file_id)`
+    // foreign key, so the seeded rows must point at real file rows rather
+    // than arbitrary UUIDs.
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
     let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
         Arc::new(TenantOnlyAuthorizer);
     let svc = FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         ServiceConfig {
@@ -1633,8 +3349,14 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     );
     let tenant_id = Uuid::now_v7();
     let ctx = ctx(tenant_id);
-    let expired_ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    let live_ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let expired_ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let live_ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let conn = db.conn().expect("conn");
     let repo = IdempotencyRepo::new();
@@ -1706,8 +3428,395 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     assert_eq!(remaining.response_etag, "etag-live");
 }
 
-/// Unpublished outbox rows must survive regardless of age (`published_at` stays NULL until a relay
-/// exists). Seeded directly: there is no API to backdate `occurred_at`.
+#[tokio::test]
+async fn run_sweep_processes_multiple_batches_within_one_ticks_time_budget() {
+    use file_storage::infra::storage::repo::{FileRepo, IdempotencyRepo, VersionRepo};
+    use file_storage::infra::storage::store::IdempotencyInsert;
+
+    const PENDING_COUNT: usize = 1200;
+    const IDEMPOTENCY_COUNT: usize = 1200;
+
+    let (_svc, _psvc, _msvc, _dp, store, engine, _backend, db) = build_all_full(0).await;
+    let conn = db.conn().expect("conn");
+    let scope = toolkit_security::AccessScope::allow_all();
+    let files_repo = FileRepo::new();
+    let versions_repo = VersionRepo::new();
+
+    let tenant = Uuid::now_v7();
+    let now = time::OffsetDateTime::now_utc();
+    let old = now - time::Duration::hours(2);
+
+    for i in 0..PENDING_COUNT {
+        let file_id = Uuid::from_u128(1_000_000 + i as u128);
+        let version_id = Uuid::from_u128(2_000_000 + i as u128);
+        files_repo
+            .create(&conn, &scope, &raw_file(file_id, tenant, None, old))
+            .await
+            .expect("create pending-candidate file");
+        versions_repo
+            .insert(
+                &conn,
+                &scope,
+                &raw_pending_version(file_id, version_id, old),
+            )
+            .await
+            .expect("insert pending version");
+    }
+
+    let anchor_file_id = Uuid::from_u128(3_000_000);
+    files_repo
+        .create(
+            &conn,
+            &scope,
+            &raw_file(anchor_file_id, tenant, Some(Uuid::now_v7()), now),
+        )
+        .await
+        .expect("create anchor file");
+
+    let idempotency_repo = IdempotencyRepo::new();
+    for i in 0..IDEMPOTENCY_COUNT {
+        idempotency_repo
+            .insert(
+                &conn,
+                &IdempotencyInsert {
+                    tenant_id: tenant,
+                    owner_kind: "user".to_owned(),
+                    owner_id: Uuid::now_v7(),
+                    key: format!("batch-key-{i}"),
+                    subject_id: Uuid::now_v7(),
+                    response_status: 201,
+                    response_body: "{}".to_owned(),
+                    response_etag: format!("etag-{i}"),
+                    request_hash: format!("hash-{i}").into_bytes(),
+                    expires_at: now - time::Duration::hours(1),
+                },
+                anchor_file_id,
+                now - time::Duration::hours(2),
+            )
+            .await
+            .expect("insert expired idempotency row");
+    }
+
+    let result = engine.run_sweep().await;
+
+    assert_eq!(
+        result.abandoned_pending_deleted, PENDING_COUNT,
+        "one tick must clear the whole {PENDING_COUNT}-row pending backlog, not just one \
+         ABANDONED_PENDING_SWEEP_BATCH (500) batch"
+    );
+    assert_eq!(
+        result.idempotency_keys_deleted, IDEMPOTENCY_COUNT as u64,
+        "one tick must clear the whole {IDEMPOTENCY_COUNT}-row idempotency backlog, not \
+         just one EXPIRED_IDEMPOTENCY_SWEEP_BATCH (500) batch"
+    );
+    assert!(
+        !result.budget_exhausted,
+        "the default 900s tick budget must not be exhausted by this size of backlog"
+    );
+
+    let anchor = store
+        .get_file(&toolkit_security::AccessScope::allow_all(), anchor_file_id)
+        .await
+        .unwrap();
+    assert!(anchor.is_some(), "anchor file must survive the sweep");
+}
+
+#[tokio::test]
+async fn run_sweep_with_zero_budget_processes_exactly_one_pass_then_stops() {
+    use file_storage::infra::storage::repo::{FileRepo, VersionRepo};
+
+    const TOTAL: usize = 700; // > ABANDONED_PENDING_SWEEP_BATCH (500)
+    const FIRST_BATCH: usize = 500;
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let store = Store::new(Arc::clone(&db));
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let engine = CleanupEngine::new(
+        sweep_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 0,
+        },
+    )
+    .with_tick_budget(std::time::Duration::ZERO);
+
+    let conn = db.conn().expect("conn");
+    let scope = toolkit_security::AccessScope::allow_all();
+    let files_repo = FileRepo::new();
+    let versions_repo = VersionRepo::new();
+    let tenant = Uuid::now_v7();
+    let old = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+
+    for i in 0..TOTAL {
+        let file_id = Uuid::from_u128(10_000_000 + i as u128);
+        let version_id = Uuid::from_u128(20_000_000 + i as u128);
+        files_repo
+            .create(&conn, &scope, &raw_file(file_id, tenant, None, old))
+            .await
+            .expect("create file");
+        versions_repo
+            .insert(
+                &conn,
+                &scope,
+                &raw_pending_version(file_id, version_id, old),
+            )
+            .await
+            .expect("insert pending version");
+    }
+
+    let first = engine.run_sweep().await;
+    assert_eq!(
+        first.abandoned_pending_deleted, FIRST_BATCH,
+        "a zero-budget tick must process exactly one ABANDONED_PENDING_SWEEP_BATCH (500) \
+         batch on its unconditional first pass, no more"
+    );
+    assert!(
+        first.budget_exhausted,
+        "a zero-budget tick must report budget_exhausted once its first pass leaves work \
+         unfinished"
+    );
+
+    let second = engine.run_sweep().await;
+    assert_eq!(
+        second.abandoned_pending_deleted,
+        TOTAL - FIRST_BATCH,
+        "a second call must clear the remainder left behind by the first"
+    );
+    assert!(
+        !second.budget_exhausted,
+        "the second call's remaining {} candidates fit in one more batch, so it must run \
+         to exhaustion",
+        TOTAL - FIRST_BATCH
+    );
+}
+
+#[tokio::test]
+async fn sweep_versionless_files_head_of_line_block_does_not_starve_free_candidates() {
+    use file_storage::infra::storage::repo::{FileRepo, MultipartRepo};
+
+    const BLOCKED: usize = 500; // == VERSIONLESS_SWEEP_BATCH
+    const FREE: usize = 3;
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let store = Store::new(Arc::clone(&db));
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let engine = CleanupEngine::new(
+        sweep_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 0,
+        },
+    );
+
+    let conn = db.conn().expect("conn");
+    let scope = toolkit_security::AccessScope::allow_all();
+    let files_repo = FileRepo::new();
+    let multipart_repo = MultipartRepo::new();
+    let tenant = Uuid::now_v7();
+    let now = time::OffsetDateTime::now_utc();
+    let head_created_at = now - time::Duration::hours(10);
+    let tail_created_at = now - time::Duration::hours(9);
+
+    let mut blocked_ids = Vec::with_capacity(BLOCKED);
+    for i in 0..BLOCKED {
+        let file_id = Uuid::from_u128(40_000_000 + i as u128);
+        files_repo
+            .create(
+                &conn,
+                &scope,
+                &raw_file(file_id, tenant, None, head_created_at),
+            )
+            .await
+            .expect("create blocked versionless file");
+        multipart_repo
+            .create(
+                &conn,
+                Uuid::now_v7(),
+                file_id,
+                Uuid::now_v7(),
+                "backend-handle",
+                Some("mem"),
+                Some("/blocked"),
+                "application/octet-stream",
+                100,
+                50,
+                false,
+                now + time::Duration::hours(1), // still in the future: live session
+                now,
+            )
+            .await
+            .expect("create blocking in_progress multipart session");
+        blocked_ids.push(file_id);
+    }
+
+    let mut free_ids = Vec::with_capacity(FREE);
+    for i in 0..FREE {
+        let file_id = Uuid::from_u128(50_000_000 + i as u128);
+        files_repo
+            .create(
+                &conn,
+                &scope,
+                &raw_file(file_id, tenant, None, tail_created_at),
+            )
+            .await
+            .expect("create free versionless file");
+        free_ids.push(file_id);
+    }
+
+    let result = engine.run_sweep().await;
+    assert_eq!(
+        result.abandoned_files_deleted, FREE,
+        "the {FREE} free versionless files further along in created_at order must be \
+         reclaimed in the same tick, despite {BLOCKED} permanently-blocked candidates \
+         filling the whole first VERSIONLESS_SWEEP_BATCH page ahead of them"
+    );
+
+    for file_id in free_ids {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_none(),
+            "free versionless file {file_id} must be deleted"
+        );
+    }
+    for file_id in blocked_ids {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_some(),
+            "blocked versionless file {file_id} must survive (active multipart session)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retention_sweep_continues_from_persisted_cursor_across_ticks() {
+    use file_storage::infra::storage::repo::FileRepo;
+
+    const TOTAL: usize = 600;
+    const PAGE: usize = 500; // == RETENTION_SWEEP_BATCH
+
+    let db = build_db().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
+    let store = Store::new(Arc::clone(&db));
+    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let engine = CleanupEngine::new(
+        sweep_store,
+        backends,
+        CleanupConfig {
+            orphan_grace_secs: 86400,
+        },
+    )
+    .with_tick_budget(std::time::Duration::ZERO);
+
+    let conn = db.conn().expect("conn");
+    let scope = toolkit_security::AccessScope::allow_all();
+    let files_repo = FileRepo::new();
+    let tenant = Uuid::now_v7();
+    let now = time::OffsetDateTime::now_utc();
+    let old = now - time::Duration::days(40);
+
+    // Deterministic, strictly increasing file_ids so `file_id` ascending
+    // order matches creation order exactly -- lets the test assert WHICH
+    // half survives after the first call, not just how many.
+    let mut ids = Vec::with_capacity(TOTAL);
+    for i in 0..TOTAL {
+        let file_id = Uuid::from_u128(60_000_000 + i as u128);
+        files_repo
+            .create(
+                &conn,
+                &scope,
+                &raw_file(file_id, tenant, Some(Uuid::now_v7()), old),
+            )
+            .await
+            .expect("create retention candidate file");
+        ids.push(file_id);
+    }
+
+    store
+        .insert_retention_rule(
+            &toolkit_security::AccessScope::allow_all(),
+            tenant,
+            &RetentionScope::Tenant,
+            None,
+            &RetentionRuleBody {
+                age: Some(AgeRetention { max_age_days: 0 }),
+                inactivity: None,
+                metadata: None,
+            },
+            now,
+        )
+        .await
+        .expect("insert tenant retention rule");
+
+    let first = engine.run_sweep().await;
+    assert_eq!(
+        first.retention_expired_deleted, PAGE,
+        "a zero-budget tick must delete exactly one RETENTION_SWEEP_BATCH (500) page, not \
+         the whole {TOTAL}-file backlog in one call"
+    );
+    assert!(
+        first.budget_exhausted,
+        "the retention step alone had more pages left when the zero budget ran out"
+    );
+
+    for &file_id in &ids[..PAGE] {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_none(),
+            "file {file_id} in the first page must be deleted"
+        );
+    }
+    for &file_id in &ids[PAGE..] {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_some(),
+            "file {file_id} past the first page must survive the first tick"
+        );
+    }
+
+    let second = engine.run_sweep().await;
+    assert_eq!(
+        second.retention_expired_deleted,
+        TOTAL - PAGE,
+        "the second tick must continue from the persisted cursor and clear exactly the \
+         remaining {} files, proving it did not restart from the beginning",
+        TOTAL - PAGE
+    );
+    assert!(
+        !second.budget_exhausted,
+        "the remaining {} files fit in one more page, so the second tick must run to \
+         exhaustion",
+        TOTAL - PAGE
+    );
+
+    for &file_id in &ids {
+        let file = store
+            .get_file(&toolkit_security::AccessScope::allow_all(), file_id)
+            .await
+            .unwrap();
+        assert!(
+            file.is_none(),
+            "file {file_id} must be gone after the second tick"
+        );
+    }
+}
+
 #[tokio::test]
 async fn run_sweep_does_not_touch_unpublished_outbox_rows() {
     use sea_orm::{EntityTrait, Set};
@@ -1730,6 +3839,8 @@ async fn run_sweep_does_not_touch_unpublished_outbox_rows() {
     );
 
     let conn = db.conn().expect("conn");
+    // Deliberately ancient -- decades old -- so any plausible age-based purge
+    // threshold would have caught it.
     let ancient = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
     let tenant_id = Uuid::now_v7();
     let file_id = Uuid::now_v7();
@@ -1791,7 +3902,6 @@ async fn run_sweep_does_not_touch_unpublished_outbox_rows() {
     );
 }
 
-/// Two racers share the same starting `(backend_id, backend_path)`; the CAS lets only one win.
 #[tokio::test]
 async fn concurrent_migrate_backend_second_racer_is_rejected() {
     use toolkit_security::AccessScope;
@@ -1815,7 +3925,10 @@ async fn concurrent_migrate_backend_second_racer_is_rejected() {
     let svc = FileService::new(store.clone(), backends, issuer, authorizer, cfg, None, None);
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let before = store
         .get_version(ticket.file_id, ticket.version_id)
@@ -1827,10 +3940,27 @@ async fn concurrent_migrate_backend_second_racer_is_rejected() {
     let conn = db.conn().expect("conn");
     let scope = AccessScope::allow_all();
     let repo = VersionRepo::new();
+    let db_backend = db.db().backend();
 
+    // Both racers read the SAME pre-migration state before either commits.
     let expected_backend_id = before.backend_id.clone();
     let expected_backend_path = before.backend_path.clone();
 
+    let owner_a = Uuid::now_v7();
+    assert!(
+        repo.acquire_migration_lease(
+            &conn,
+            &scope,
+            db_backend,
+            ticket.file_id,
+            ticket.version_id,
+            owner_a,
+            3600,
+        )
+        .await
+        .expect("racer A's lease acquire"),
+        "racer A must acquire the free lease"
+    );
     let first = repo
         .rebind_backend(
             &conn,
@@ -1841,11 +3971,35 @@ async fn concurrent_migrate_backend_second_racer_is_rejected() {
             &expected_backend_path,
             "alt",
             "/alt/racer-a",
+            owner_a,
         )
         .await
         .expect("first racer's CAS call");
     assert!(first, "first racer's CAS must win");
 
+    // `rebind_backend` keeps the lease; `migrate_backend` releases it after the source delete.
+    assert!(
+        repo.release_migration_lease(&conn, &scope, ticket.file_id, ticket.version_id, owner_a)
+            .await
+            .expect("racer A's lease release"),
+        "racer A must release its lease"
+    );
+
+    let owner_b = Uuid::now_v7();
+    assert!(
+        repo.acquire_migration_lease(
+            &conn,
+            &scope,
+            db_backend,
+            ticket.file_id,
+            ticket.version_id,
+            owner_b,
+            3600,
+        )
+        .await
+        .expect("racer B's lease acquire"),
+        "racer B must acquire the lease racer A released"
+    );
     let second = repo
         .rebind_backend(
             &conn,
@@ -1856,6 +4010,7 @@ async fn concurrent_migrate_backend_second_racer_is_rejected() {
             &expected_backend_path,
             "other",
             "/other/racer-b",
+            owner_b,
         )
         .await
         .expect("second racer's CAS call");
@@ -1878,12 +4033,10 @@ async fn concurrent_migrate_backend_second_racer_is_rejected() {
 
 type RaceIds = Arc<std::sync::Mutex<Option<(Uuid, Uuid, String, String)>>>;
 
-/// Runs a one-shot hook before `put`, modelling a racing `migrate_backend` that commits between
-/// this call's destination `put` and its CAS, deterministically and in-process.
 struct RacingBackend {
     inner: Arc<dyn StorageBackend>,
     #[allow(clippy::type_complexity)]
-    on_put: std::sync::Mutex<
+    on_publish: std::sync::Mutex<
         Option<Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>>,
     >,
 }
@@ -1898,24 +4051,47 @@ impl StorageBackend for RacingBackend {
         self.inner.capabilities()
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        let hook = self.on_put.lock().expect("on_put mutex").take();
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        let hook = self.on_publish.lock().expect("on_publish mutex").take();
         if let Some(hook) = hook {
             hook().await;
         }
-        self.inner.put(path, bytes).await
+        self.inner.publish_exclusive(path, stream, max_size).await
     }
 
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.inner.get(path).await
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_stream(path, expected_len).await
     }
 
-    async fn get_range(
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+
+    async fn get_range_stream(
         &self,
         path: &str,
         range: file_storage_sdk::ByteRange,
-    ) -> Result<Bytes, DomainError> {
-        self.inner.get_range(path, range).await
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
     }
 
     async fn size(&self, path: &str) -> Result<u64, DomainError> {
@@ -1929,10 +4105,12 @@ impl StorageBackend for RacingBackend {
     async fn exists(&self, path: &str) -> Result<bool, DomainError> {
         self.inner.exists(path).await
     }
+
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
 }
 
-/// Racer migrates to a different target mid-flight: our CAS loses and our destination blob is
-/// cleaned up, since it is never the live pointer.
 #[tokio::test]
 async fn migrate_backend_loser_target_blob_cleaned_up() {
     let db = build_db().await;
@@ -1945,6 +4123,8 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
     let tenant = Uuid::now_v7();
     let content = Bytes::from_static(b"loser cleanup content");
 
+    // Populated once the file/version exist, read by the injected racer hook
+    // when `migrate_backend`'s own `dest.put()` fires.
     let ids_cell: RaceIds = Arc::new(std::sync::Mutex::new(None));
 
     let hook_ids_cell = Arc::clone(&ids_cell);
@@ -1960,10 +4140,7 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
                     .clone()
                     .expect("ids must be set before migrate_backend runs");
                 let dest_path = format!("/{file_id}/{version_id}");
-                hook_alt2
-                    .put(&dest_path, hook_bytes.clone())
-                    .await
-                    .expect("racer's own blob write");
+                write_all(&hook_alt2, &dest_path, hook_bytes.clone()).await;
                 let audit = AuditEntry::success(
                     tenant,
                     "system",
@@ -1972,6 +4149,16 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
                     AuditOperation::BackendMigrate,
                     serde_json::json!({ "racer": "concurrent-winner-different-target" }),
                 );
+                let racer_owner = Uuid::now_v7();
+                hook_store
+                    .set_migration_lease_for_test(
+                        file_id,
+                        version_id,
+                        Some(racer_owner),
+                        Some(time::OffsetDateTime::now_utc() + time::Duration::HOUR),
+                    )
+                    .await
+                    .expect("test setup: force-stamp the racer as lease holder");
                 let won = hook_store
                     .rebind_version_backend(
                         file_id,
@@ -1980,6 +4167,7 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
                         &orig_backend_path,
                         "alt2",
                         &dest_path,
+                        racer_owner,
                         audit,
                     )
                     .await
@@ -1993,7 +4181,7 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
 
     let racing_alt1: Arc<dyn StorageBackend> = Arc::new(RacingBackend {
         inner: alt1_inner.clone(),
-        on_put: std::sync::Mutex::new(Some(hook)),
+        on_publish: std::sync::Mutex::new(Some(hook)),
     });
 
     let backends = BackendRegistry::new(
@@ -2018,17 +4206,20 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
     };
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
 
     let ctx = ctx(tenant);
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -2078,12 +4269,10 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
         .expect("version must still exist");
     assert_eq!(after.backend_id, "alt2");
     assert_eq!(after.backend_path, expected_dest_path);
-    let winner_bytes = alt2_backend.get(&expected_dest_path).await.unwrap();
+    let winner_bytes = read_all(&alt2_backend, &expected_dest_path, content.len() as u64).await;
     assert_eq!(winner_bytes, content, "winner's blob must be untouched");
 }
 
-/// Racer migrates to the SAME target: the path is deterministic, so our destination blob is the
-/// winner's live data. The loser must return `Ok` without deleting it.
 #[tokio::test]
 async fn migrate_backend_same_target_race_preserves_winner_blob() {
     let db = build_db().await;
@@ -2110,10 +4299,7 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
                     .clone()
                     .expect("ids must be set before migrate_backend runs");
                 let dest_path = format!("/{file_id}/{version_id}");
-                hook_alt1
-                    .put(&dest_path, hook_bytes.clone())
-                    .await
-                    .expect("racer's own blob write");
+                write_all(&hook_alt1, &dest_path, hook_bytes.clone()).await;
                 let audit = AuditEntry::success(
                     tenant,
                     "system",
@@ -2122,6 +4308,16 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
                     AuditOperation::BackendMigrate,
                     serde_json::json!({ "racer": "concurrent-winner-same-target" }),
                 );
+                let racer_owner = Uuid::now_v7();
+                hook_store
+                    .set_migration_lease_for_test(
+                        file_id,
+                        version_id,
+                        Some(racer_owner),
+                        Some(time::OffsetDateTime::now_utc() + time::Duration::HOUR),
+                    )
+                    .await
+                    .expect("test setup: force-stamp the racer as lease holder");
                 let won = hook_store
                     .rebind_version_backend(
                         file_id,
@@ -2130,6 +4326,7 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
                         &orig_backend_path,
                         "alt1",
                         &dest_path,
+                        racer_owner,
                         audit,
                     )
                     .await
@@ -2143,7 +4340,7 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
 
     let racing_alt1: Arc<dyn StorageBackend> = Arc::new(RacingBackend {
         inner: alt1_inner.clone(),
-        on_put: std::sync::Mutex::new(Some(hook)),
+        on_publish: std::sync::Mutex::new(Some(hook)),
     });
 
     let backends = BackendRegistry::new(
@@ -2164,17 +4361,20 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
     };
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
 
     let ctx = ctx(tenant);
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -2203,9 +4403,14 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
 
     let expected_dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
 
-    svc.migrate_backend(&ctx, ticket.file_id, "alt1")
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt1")
         .await
-        .expect("same-target race must be a no-op, not an error");
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Conflict { .. }),
+        "a destination already claimed by a concurrent winner must surface as Conflict, got {err:?}"
+    );
 
     let after = store
         .get_version(ticket.file_id, ticket.version_id)
@@ -2215,13 +4420,769 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
     assert_eq!(after.backend_id, "alt1");
     assert_eq!(after.backend_path, expected_dest_path);
 
+    // Critically: the destination blob must still exist and hold the
+    // winner's content -- a naive unconditional cleanup would have deleted
+    // it here, destroying the winner's live data.
     assert!(
         alt1_inner.exists(&expected_dest_path).await.unwrap(),
         "winner's destination blob must NOT be deleted by the loser's cleanup"
     );
-    let stored_bytes = alt1_inner.get(&expected_dest_path).await.unwrap();
+    let stored_bytes = read_all(&alt1_inner, &expected_dest_path, content.len() as u64).await;
     assert_eq!(
         stored_bytes, content,
         "surviving blob must match the winner's bytes"
+    );
+}
+
+struct DeleteAfterPublishBackend {
+    inner: Arc<dyn StorageBackend>,
+}
+
+#[async_trait]
+impl StorageBackend for DeleteAfterPublishBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        let outcome = self.inner.publish_exclusive(path, stream, max_size).await?;
+        if outcome.created {
+            self.inner
+                .delete(path)
+                .await
+                .expect("test setup: delete-after-publish must succeed");
+        }
+        Ok(outcome)
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_stream(path, expected_len).await
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
+}
+
+#[tokio::test]
+async fn migrate_backend_dest_object_vanishes_before_cas_fails_without_committing() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+
+    let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let alt_vanishing: Arc<dyn StorageBackend> = Arc::new(DeleteAfterPublishBackend {
+        inner: Arc::clone(&alt_inner),
+    });
+
+    let backends = BackendRegistry::new(
+        vec![Arc::clone(&mem_backend), Arc::clone(&alt_vanishing)],
+        "mem",
+    )
+    .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"vanishing destination object content");
+
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let before = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must exist before migration");
+
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::BackendUnavailable { .. }),
+        "a destination object vanishing before the CAS is a concurrent-change \
+         race, not a permanent fault -- it must surface as a retryable \
+         BackendUnavailable (503), got {err:?}"
+    );
+
+    assert!(
+        !alt_inner.exists(&dest_path).await.unwrap(),
+        "test setup sanity check: the object must indeed be gone"
+    );
+
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after.backend_id, before.backend_id,
+        "version must stay on the source backend when the destination \
+         object vanishes before the CAS"
+    );
+    assert_eq!(after.backend_path, before.backend_path);
+}
+
+#[tokio::test]
+async fn migrate_backend_second_attempt_rejected_while_lease_is_live() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends =
+        BackendRegistry::new(vec![Arc::clone(&mem), Arc::clone(&alt)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"lease contention content");
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let before = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must exist");
+
+    let other_owner = Uuid::now_v7();
+    assert!(
+        store
+            .acquire_migration_lease(
+                ticket.file_id,
+                ticket.version_id,
+                other_owner,
+                std::time::Duration::from_hours(1),
+            )
+            .await
+            .expect("test setup: acquire the lease"),
+        "test setup sanity check: the lease must be free to acquire on a fresh version"
+    );
+
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Conflict { .. }),
+        "expected Conflict while another attempt holds the migration lease, got {err:?}"
+    );
+
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(after.backend_id, before.backend_id);
+    assert_eq!(after.backend_path, before.backend_path);
+    assert!(
+        !alt.exists(&dest_path).await.unwrap(),
+        "a rejected attempt must never touch the destination backend at all"
+    );
+}
+
+#[tokio::test]
+async fn migrate_backend_takes_over_expired_lease_and_succeeds() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends =
+        BackendRegistry::new(vec![Arc::clone(&mem), Arc::clone(&alt)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"expired lease takeover content");
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let stale_owner = Uuid::now_v7();
+    store
+        .set_migration_lease_for_test(
+            ticket.file_id,
+            ticket.version_id,
+            Some(stale_owner),
+            Some(time::OffsetDateTime::now_utc() - time::Duration::HOUR),
+        )
+        .await
+        .expect("test setup: force an expired lease");
+
+    svc.migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .expect("must take over the database-clock-expired lease and succeed");
+
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(after.backend_id, "alt");
+    assert_eq!(after.backend_path, dest_path);
+    let bytes = read_all(&alt, &dest_path, content.len() as u64).await;
+    assert_eq!(bytes, content);
+}
+
+#[tokio::test]
+async fn migrate_backend_deletes_stale_tail_and_succeeds() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let backends =
+        BackendRegistry::new(vec![Arc::clone(&mem), Arc::clone(&alt)], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends.clone(),
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"correct migrated content");
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    // A tail an earlier, interrupted attempt at this exact deterministic path
+    // left behind: some garbage bytes, no lease held, version still on the
+    // source ("mem").
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    write_all(
+        &alt,
+        &dest_path,
+        Bytes::from_static(b"garbage left behind by a crashed earlier attempt"),
+    )
+    .await;
+
+    svc.migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .expect("must delete the stale tail, retry the publish, and succeed");
+
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(after.backend_id, "alt");
+    assert_eq!(after.backend_path, dest_path);
+    let bytes = read_all(&alt, &dest_path, content.len() as u64).await;
+    assert_eq!(
+        bytes, content,
+        "the tail garbage must be replaced with the correctly migrated content"
+    );
+}
+
+/// A `StorageBackend` wrapper whose `stat` steals the migration lease --
+/// force-stamping a different owner directly, bypassing the normal CAS --
+/// the FIRST time it is called, then delegates to the inner backend.
+struct LeaseStealingBackend {
+    inner: Arc<dyn StorageBackend>,
+    store: Store,
+    file_id: Uuid,
+    version_id: Uuid,
+    stolen: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl StorageBackend for LeaseStealingBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_stream(path, expected_len).await
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        if !self.stolen.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let thief = Uuid::now_v7();
+            self.store
+                .set_migration_lease_for_test(
+                    self.file_id,
+                    self.version_id,
+                    Some(thief),
+                    Some(time::OffsetDateTime::now_utc() + time::Duration::HOUR),
+                )
+                .await
+                .expect("test setup: steal the migration lease");
+        }
+        self.inner.stat(path).await
+    }
+}
+
+#[tokio::test]
+async fn migrate_backend_cas_loses_to_stolen_lease() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"stolen lease content");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+
+    let backends_setup =
+        BackendRegistry::new(vec![Arc::clone(&mem), Arc::clone(&alt_inner)], "mem")
+            .expect("registry");
+    let svc_setup = Arc::new(FileService::new(
+        store.clone(),
+        backends_setup.clone(),
+        Arc::clone(&issuer),
+        Arc::clone(&authorizer),
+        cfg.clone(),
+        None,
+        None,
+    ));
+    let dp = TestDataPlane::new(Arc::clone(&svc_setup), store.clone(), backends_setup);
+    let ticket = svc_setup
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc_setup
+        .bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let before = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must exist");
+
+    let alt_stealing: Arc<dyn StorageBackend> = Arc::new(LeaseStealingBackend {
+        inner: Arc::clone(&alt_inner),
+        store: store.clone(),
+        file_id: ticket.file_id,
+        version_id: ticket.version_id,
+        stolen: std::sync::atomic::AtomicBool::new(false),
+    });
+    let backends = BackendRegistry::new(vec![Arc::clone(&mem), Arc::clone(&alt_stealing)], "mem")
+        .expect("registry");
+    let svc = Arc::new(FileService::new(
+        store.clone(),
+        backends,
+        issuer,
+        authorizer,
+        cfg,
+        None,
+        None,
+    ));
+
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DomainError::Conflict { .. } | DomainError::VersionNotFound { .. }
+        ),
+        "a CAS lost to a stolen lease must surface as a recognized lost-CAS outcome, got {err:?}"
+    );
+
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after.backend_id, before.backend_id,
+        "the version must stay on the source backend when the CAS loses to a stolen lease"
+    );
+    assert_eq!(after.backend_path, before.backend_path);
+}
+
+/// A `StorageBackend` wrapper whose `publish_exclusive` sleeps for `delay`
+/// before delegating to the inner backend -- models a backend call that
+/// outlives `migrate_backend`'s own `migrate_timeout_secs` budget.
+struct SlowPublishBackend {
+    inner: Arc<dyn StorageBackend>,
+    delay: std::time::Duration,
+}
+
+#[async_trait]
+impl StorageBackend for SlowPublishBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> file_storage::infra::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn put_stream(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<(u64, [u8; 32]), DomainError> {
+        self.inner.put_stream(path, stream, max_size).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_stream(path, expected_len).await
+    }
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        self.inner.read_prefix(path, max_bytes).await
+    }
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: file_storage_sdk::ByteRange,
+        expected_len: u64,
+    ) -> Result<futures::stream::BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        self.inner.get_range_stream(path, range, expected_len).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        self.inner.stat(path).await
+    }
+}
+
+#[tokio::test]
+async fn migrate_backend_times_out_and_releases_lease() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let alt_inner: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
+    let alt_slow: Arc<dyn StorageBackend> = Arc::new(SlowPublishBackend {
+        inner: Arc::clone(&alt_inner),
+        delay: std::time::Duration::from_secs(5),
+    });
+    let backends = BackendRegistry::new(vec![Arc::clone(&mem), Arc::clone(&alt_slow)], "mem")
+        .expect("registry");
+
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
+        Arc::new(TenantOnlyAuthorizer);
+    let cfg = ServiceConfig {
+        default_url_ttl_secs: 3600,
+        sidecar_base_url: "http://sidecar.test".to_owned(),
+        default_page_size: 50,
+        max_page_size: 1000,
+        idempotency_ttl_secs: 86400,
+    };
+    let svc = Arc::new(
+        FileService::new(
+            store.clone(),
+            backends.clone(),
+            issuer,
+            authorizer,
+            cfg,
+            None,
+            None,
+        )
+        // Deliberately tiny budget -- the destination write above sleeps 5s.
+        .with_migrate_lease_config(1, 1),
+    );
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
+
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let content = Bytes::from_static(b"timeout content");
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        content.clone(),
+    )
+    .await
+    .unwrap();
+    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+
+    let dest_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    let err = svc
+        .migrate_backend(&ctx, ticket.file_id, "alt")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::BackendUnavailable { .. }),
+        "a migration exceeding migrate_timeout_secs must surface as a retryable \
+         BackendUnavailable (503), got {err:?}"
+    );
+
+    let after = store
+        .get_version(ticket.file_id, ticket.version_id)
+        .await
+        .unwrap()
+        .expect("version must still exist");
+    assert_eq!(
+        after.backend_id, "mem",
+        "the version must stay on the source backend after a timeout"
+    );
+    assert!(
+        !alt_inner.exists(&dest_path).await.unwrap(),
+        "the cancelled write must never have created anything at the destination"
+    );
+
+    let fresh_owner = Uuid::now_v7();
+    assert!(
+        store
+            .acquire_migration_lease(
+                ticket.file_id,
+                ticket.version_id,
+                fresh_owner,
+                std::time::Duration::from_mins(1),
+            )
+            .await
+            .expect("acquire after timeout"),
+        "the migration lease must have been released after the timeout, not left held"
     );
 }

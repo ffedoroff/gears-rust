@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::policy::{RetentionRuleBody, RetentionScope, StoredRetentionRule};
+use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::file::{Column as FileColumn, Entity as FileEntity};
 use crate::infra::storage::entity::retention_rule::{ActiveModel, Column, Entity, Model};
 
@@ -36,7 +37,7 @@ impl RetentionRuleRepo {
             .scope_with(scope)
             .all(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
 
         rows.into_iter().map(map_model).collect()
     }
@@ -113,7 +114,7 @@ impl RetentionRuleRepo {
             .scope_with(scope)
             .all(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
 
         rows.into_iter().map(map_model).collect()
     }
@@ -131,7 +132,7 @@ impl RetentionRuleRepo {
             .scope_with(scope)
             .one(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
 
         model.map(map_model).transpose()
     }
@@ -157,7 +158,7 @@ impl RetentionRuleRepo {
         };
         secure_insert::<Entity>(am, scope, conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
         Ok(rule_id)
     }
 
@@ -178,7 +179,7 @@ impl RetentionRuleRepo {
             .scope_with(scope)
             .all(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
 
         rows.into_iter().map(map_model).collect()
     }
@@ -194,9 +195,32 @@ impl RetentionRuleRepo {
             .scope_with(scope)
             .all(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
 
         rows.into_iter().map(map_model).collect()
+    }
+
+    /// Delete every `File`-scope rule targeting a file, in the same transaction that removes
+    /// the `files` row (`scope_target_id` is polymorphic, so there is no FK to cascade).
+    /// Returns the number of rows removed.
+    pub async fn delete_file_scope_rules<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        file_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        let res = Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(Column::Scope.eq("file"))
+                    .add(Column::ScopeTargetId.eq(file_id)),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected)
     }
 
     /// Delete a retention rule by `rule_id`. Returns `true` if a row was removed.
@@ -212,7 +236,7 @@ impl RetentionRuleRepo {
             .scope_with(scope)
             .exec(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
         Ok(res.rows_affected > 0)
     }
 }

@@ -431,7 +431,7 @@ impl PolicyResolver {
         mime_type: &str,
     ) -> Result<(), crate::domain::error::DomainError> {
         let Some(allowed) = &policy.allowed_mime_types else {
-            return Ok(());
+            return Ok(()); // no restriction
         };
         if Self::mime_allowed(mime_type, allowed) {
             Ok(())

@@ -17,6 +17,19 @@ fn default_url_ttl_is_short_and_within_ceiling() {
 }
 
 #[test]
+fn default_finalize_token_grace_is_one_hour() {
+    let cfg = FileStorageConfig::default();
+    assert_eq!(cfg.finalize_token_grace_secs, 3600);
+}
+
+#[test]
+fn finalize_token_grace_can_be_overridden() {
+    let cfg: FileStorageConfig =
+        serde_json::from_str(r#"{"finalize_token_grace_secs": 0}"#).unwrap();
+    assert_eq!(cfg.finalize_token_grace_secs, 0);
+}
+
+#[test]
 fn default_url_ttl_can_be_overridden() {
     let cfg: FileStorageConfig = serde_json::from_str(r#"{"default_url_ttl_secs": 300}"#).unwrap();
     assert_eq!(cfg.default_url_ttl_secs, 300);
@@ -47,7 +60,6 @@ fn rejects_unknown_fields() {
     );
 }
 
-/// Config with the mandatory internal secret set, so a test isolates the check it targets.
 fn cfg_with_secret() -> FileStorageConfig {
     FileStorageConfig {
         finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
@@ -57,11 +69,11 @@ fn cfg_with_secret() -> FileStorageConfig {
 
 #[test]
 fn removed_background_sweep_keys_are_rejected() {
-    // The background sweep keys were removed; deny_unknown_fields rejects them.
     for key in [
         "enable_background_sweep",
         "sweep_interval_secs",
         "orphan_grace_secs",
+        "sweep_time_budget_secs",
         "require_finalize_internal_secret",
     ] {
         let json = format!(r#"{{"{key}": 1}}"#);
@@ -111,6 +123,7 @@ fn validate_allows_present_signing_key_seed_when_required_flag_set() {
         "a present signing_key_seed must pass validation even when required"
     );
 
+    // Redaction proof: the raw seed must not appear in Debug output.
     let cfg_debug = format!("{cfg:?}");
     assert!(
         !cfg_debug.contains(SEED),
@@ -128,12 +141,10 @@ fn default_require_signing_key_seed_is_true() {
 
 #[test]
 fn missing_finalize_internal_secret_fails_validate() {
-    // The s2s finalize/report-part callbacks require the internal credential;
-    // finalize trusts the size/hash the sidecar reports on them.
     let cfg = FileStorageConfig {
         require_signing_key_seed: false,
         finalize_internal_secret: None,
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     let err = cfg.validate().unwrap_err().to_string();
     assert!(err.contains("finalize_internal_secret"), "{err}");
@@ -155,10 +166,11 @@ fn present_finalize_internal_secret_passes_validate_and_is_redacted() {
     let cfg = FileStorageConfig {
         require_signing_key_seed: false,
         finalize_internal_secret: Some(SecretString::new(SECRET)),
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     assert!(cfg.validate().is_ok());
 
+    // Redaction proof: the raw secret must not appear in Debug output.
     let cfg_debug = format!("{cfg:?}");
     assert!(
         !cfg_debug.contains(SECRET),
@@ -170,7 +182,7 @@ fn present_finalize_internal_secret_passes_validate_and_is_redacted() {
 fn serde_round_trip_preserves_value() {
     let original = FileStorageConfig {
         max_url_ttl_secs: 12_345,
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     let json = serde_json::to_string(&original).unwrap();
     let back: FileStorageConfig = serde_json::from_str(&json).unwrap();
@@ -179,7 +191,6 @@ fn serde_round_trip_preserves_value() {
 
 #[test]
 fn config_s3_backends_serde_round_trip() {
-    // `s3_backends` round-trips through serde; `secret_access_key` never leaks via `Debug`.
     const SECRET: &str = "super-secret-value-do-not-print-me";
 
     let original = FileStorageConfig {
@@ -192,7 +203,7 @@ fn config_s3_backends_serde_round_trip() {
             secret_access_key: Some(SecretString::new(SECRET)),
             path_style: true,
         }],
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
 
     let json = serde_json::to_string(&original).unwrap();
@@ -214,6 +225,8 @@ fn config_s3_backends_serde_round_trip() {
     );
     assert!(entry.path_style);
 
+    // Redaction proof: the raw secret must not appear anywhere in either
+    // struct's `Debug` output.
     let cfg_debug = format!("{back:?}");
     assert!(
         !cfg_debug.contains(SECRET),
@@ -238,7 +251,6 @@ fn config_s3_backends_defaults_to_empty() {
 
 #[test]
 fn config_default_backend_id_defaults_to_none() {
-    // A config without `default_backend_id` keeps `local-fs` as the implicit default.
     let cfg: FileStorageConfig = serde_json::from_str("{}").unwrap();
     assert_eq!(cfg.default_backend_id, None);
 }
@@ -247,7 +259,7 @@ fn config_default_backend_id_defaults_to_none() {
 fn config_default_backend_id_serde_round_trip() {
     let original = FileStorageConfig {
         default_backend_id: Some("s3-primary".to_owned()),
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     let json = serde_json::to_string(&original).unwrap();
     let back: FileStorageConfig = serde_json::from_str(&json).unwrap();
@@ -255,13 +267,156 @@ fn config_default_backend_id_serde_round_trip() {
 }
 
 #[test]
-fn default_page_sizes_are_valid_and_within_ceiling() {
+fn default_multipart_session_ttl_is_24_hours() {
     let cfg = FileStorageConfig::default();
-    assert_eq!(cfg.default_page_size, 25);
-    assert_eq!(cfg.max_page_size, 200);
+    assert_eq!(cfg.multipart_session_ttl_secs, 86400);
+}
+
+#[test]
+fn multipart_session_ttl_can_be_overridden() {
+    let cfg: FileStorageConfig =
+        serde_json::from_str(r#"{"multipart_session_ttl_secs": 3600}"#).unwrap();
+    assert_eq!(cfg.multipart_session_ttl_secs, 3600);
+}
+
+#[test]
+fn validate_rejects_multipart_session_ttl_shorter_than_default_url_ttl() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 900,
+        multipart_session_ttl_secs: 300,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_session_ttl_secs shorter than default_url_ttl_secs is a direct \
+         self-contradiction and must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_multipart_session_ttl_equal_to_default_url_ttl() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 900,
+        multipart_session_ttl_secs: 900,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_session_ttl_secs == default_url_ttl_secs must be accepted"
+    );
+}
+
+#[test]
+fn default_config_passes_validation() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+
+    assert!(
+        cfg.multipart_session_ttl_secs > cfg.default_url_ttl_secs,
+        "sanity: the stock defaults are 24h session vs 15min url ttl"
+    );
+    assert!(
+        cfg.default_url_ttl_secs <= cfg.max_url_ttl_secs,
+        "sanity: the stock defaults must not exhibit the condition this test guards against"
+    );
+    assert!(
+        cfg.default_page_size <= cfg.max_page_size,
+        "sanity: the stock defaults must not exhibit the condition this test guards against"
+    );
     assert!(
         cfg.max_page_size <= MAX_PAGE_SIZE_CEILING,
-        "the shipped default_max_page_size must not itself exceed the ceiling"
+        "sanity: the shipped default_max_page_size must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.max_url_ttl_secs <= MAX_URL_TTL_CEILING,
+        "sanity: the shipped default_max_url_ttl_secs must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.multipart_session_ttl_secs <= MAX_MULTIPART_SESSION_TTL_SECS,
+        "sanity: the shipped default_multipart_session_ttl_secs must not itself exceed the \
+         ceiling"
+    );
+    assert!(
+        cfg.multipart_complete_lease_secs <= MAX_MULTIPART_COMPLETE_LEASE_SECS,
+        "sanity: the shipped default_multipart_complete_lease_secs must not itself exceed the \
+         ceiling"
+    );
+    assert!(
+        cfg.migrate_timeout_secs <= MAX_MIGRATE_TIMEOUT_SECS,
+        "sanity: the shipped default_migrate_timeout_secs must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.migrate_lease_margin_secs <= MAX_MIGRATE_LEASE_MARGIN_SECS,
+        "sanity: the shipped default_migrate_lease_margin_secs must not itself exceed the ceiling"
+    );
+    assert!(
+        cfg.idempotency_ttl_secs <= MAX_IDEMPOTENCY_TTL_SECS,
+        "sanity: the shipped default_idempotency_ttl_secs must not itself exceed the ceiling"
+    );
+
+    assert!(
+        cfg.validate().is_ok(),
+        "the stock default config (module-config knobs only) must pass validation"
+    );
+}
+
+#[test]
+fn validate_rejects_default_url_ttl_exceeding_max_url_ttl() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 200,
+        max_url_ttl_secs: 100,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "default_url_ttl_secs exceeding max_url_ttl_secs is a direct self-contradiction \
+         and must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_url_ttl_equal_to_max_url_ttl() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 100,
+        max_url_ttl_secs: 100,
+        multipart_session_ttl_secs: 100,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "default_url_ttl_secs == max_url_ttl_secs must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_default_url_ttl() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 0,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "default_url_ttl_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_default_url_ttl_of_one() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "default_url_ttl_secs == 1 must be accepted"
     );
 }
 
@@ -271,7 +426,7 @@ fn validate_rejects_default_page_size_exceeding_max_page_size() {
         default_page_size: 150,
         max_page_size: 100,
         require_signing_key_seed: false,
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_err(),
@@ -286,8 +441,7 @@ fn validate_accepts_default_page_size_equal_to_max_page_size() {
         default_page_size: 100,
         max_page_size: 100,
         require_signing_key_seed: false,
-        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_ok(),
@@ -301,8 +455,7 @@ fn validate_accepts_max_page_size_at_ceiling() {
         default_page_size: MAX_PAGE_SIZE_CEILING,
         max_page_size: MAX_PAGE_SIZE_CEILING,
         require_signing_key_seed: false,
-        finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_ok(),
@@ -316,11 +469,429 @@ fn validate_rejects_max_page_size_above_ceiling() {
         default_page_size: MAX_PAGE_SIZE_CEILING,
         max_page_size: MAX_PAGE_SIZE_CEILING + 1,
         require_signing_key_seed: false,
-        ..FileStorageConfig::default()
+        ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_err(),
         "max_page_size exceeding MAX_PAGE_SIZE_CEILING must be rejected regardless of what an \
          operator configures"
+    );
+}
+
+// Guards the saturating `i64` conversion: an unbounded grace would become `i64::MAX` seconds.
+#[test]
+fn validate_accepts_finalize_token_grace_at_max() {
+    let cfg = FileStorageConfig {
+        finalize_token_grace_secs: MAX_FINALIZE_TOKEN_GRACE_SECS,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "finalize_token_grace_secs == MAX_FINALIZE_TOKEN_GRACE_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_finalize_token_grace_above_max() {
+    let cfg = FileStorageConfig {
+        finalize_token_grace_secs: MAX_FINALIZE_TOKEN_GRACE_SECS + 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "finalize_token_grace_secs exceeding MAX_FINALIZE_TOKEN_GRACE_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_zero_finalize_token_grace() {
+    let cfg = FileStorageConfig {
+        finalize_token_grace_secs: 0,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "finalize_token_grace_secs == 0 (grace disabled) must be accepted"
+    );
+}
+
+#[test]
+fn validate_accepts_max_url_ttl_at_ceiling() {
+    let cfg = FileStorageConfig {
+        max_url_ttl_secs: MAX_URL_TTL_CEILING,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "max_url_ttl_secs == MAX_URL_TTL_CEILING must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_max_url_ttl_above_ceiling() {
+    let cfg = FileStorageConfig {
+        max_url_ttl_secs: MAX_URL_TTL_CEILING + 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "max_url_ttl_secs exceeding MAX_URL_TTL_CEILING must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_multipart_session_ttl_at_ceiling() {
+    let cfg = FileStorageConfig {
+        multipart_session_ttl_secs: MAX_MULTIPART_SESSION_TTL_SECS,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_session_ttl_secs == MAX_MULTIPART_SESSION_TTL_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_multipart_session_ttl_above_ceiling() {
+    let cfg = FileStorageConfig {
+        multipart_session_ttl_secs: MAX_MULTIPART_SESSION_TTL_SECS + 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_session_ttl_secs exceeding MAX_MULTIPART_SESSION_TTL_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_multipart_session_ttl() {
+    let cfg = FileStorageConfig {
+        multipart_session_ttl_secs: 0,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_session_ttl_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_multipart_session_ttl_of_one() {
+    let cfg = FileStorageConfig {
+        default_url_ttl_secs: 1,
+        multipart_session_ttl_secs: 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_session_ttl_secs == 1 must be accepted"
+    );
+}
+
+#[test]
+fn validate_accepts_multipart_complete_lease_at_ceiling() {
+    let cfg = FileStorageConfig {
+        multipart_complete_lease_secs: MAX_MULTIPART_COMPLETE_LEASE_SECS,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_complete_lease_secs == MAX_MULTIPART_COMPLETE_LEASE_SECS must be accepted"
+    );
+}
+
+// The lease must be bounded: an oversized value would delay another caller taking over.
+#[test]
+fn validate_rejects_multipart_complete_lease_above_ceiling() {
+    let cfg = FileStorageConfig {
+        multipart_complete_lease_secs: MAX_MULTIPART_COMPLETE_LEASE_SECS + 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_complete_lease_secs exceeding MAX_MULTIPART_COMPLETE_LEASE_SECS must be \
+         rejected"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_multipart_complete_lease() {
+    let cfg = FileStorageConfig {
+        multipart_complete_lease_secs: 0,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "multipart_complete_lease_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_multipart_complete_lease_of_one() {
+    let cfg = FileStorageConfig {
+        multipart_complete_lease_secs: 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "multipart_complete_lease_secs == 1 must be accepted"
+    );
+}
+
+#[test]
+fn validate_accepts_migrate_timeout_at_ceiling() {
+    let cfg = FileStorageConfig {
+        migrate_timeout_secs: MAX_MIGRATE_TIMEOUT_SECS,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "migrate_timeout_secs == MAX_MIGRATE_TIMEOUT_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_migrate_timeout_above_ceiling() {
+    let cfg = FileStorageConfig {
+        migrate_timeout_secs: MAX_MIGRATE_TIMEOUT_SECS + 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "migrate_timeout_secs exceeding MAX_MIGRATE_TIMEOUT_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_migrate_timeout() {
+    let cfg = FileStorageConfig {
+        migrate_timeout_secs: 0,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "migrate_timeout_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_migrate_timeout_of_one() {
+    let cfg = FileStorageConfig {
+        migrate_timeout_secs: 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "migrate_timeout_secs == 1 must be accepted"
+    );
+}
+
+#[test]
+fn validate_accepts_migrate_lease_margin_at_ceiling() {
+    let cfg = FileStorageConfig {
+        migrate_lease_margin_secs: MAX_MIGRATE_LEASE_MARGIN_SECS,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "migrate_lease_margin_secs == MAX_MIGRATE_LEASE_MARGIN_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_migrate_lease_margin_above_ceiling() {
+    let cfg = FileStorageConfig {
+        migrate_lease_margin_secs: MAX_MIGRATE_LEASE_MARGIN_SECS + 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "migrate_lease_margin_secs exceeding MAX_MIGRATE_LEASE_MARGIN_SECS must be rejected"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_migrate_lease_margin() {
+    let cfg = FileStorageConfig {
+        migrate_lease_margin_secs: 0,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "migrate_lease_margin_secs == 0 must be rejected"
+    );
+}
+
+#[test]
+fn validate_accepts_migrate_lease_margin_of_one() {
+    let cfg = FileStorageConfig {
+        migrate_lease_margin_secs: 1,
+        require_signing_key_seed: false,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "migrate_lease_margin_secs == 1 must be accepted"
+    );
+}
+
+#[test]
+fn validate_accepts_idempotency_ttl_at_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        idempotency_ttl_secs: MAX_IDEMPOTENCY_TTL_SECS,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "idempotency_ttl_secs == MAX_IDEMPOTENCY_TTL_SECS must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_idempotency_ttl_above_ceiling() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        idempotency_ttl_secs: MAX_IDEMPOTENCY_TTL_SECS + 1,
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "idempotency_ttl_secs exceeding MAX_IDEMPOTENCY_TTL_SECS must be rejected"
+    );
+}
+
+#[test]
+fn default_previous_signing_public_keys_is_empty() {
+    assert!(
+        FileStorageConfig::default()
+            .previous_signing_public_keys
+            .is_empty()
+    );
+}
+
+#[test]
+fn validate_accepts_empty_previous_signing_public_keys() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: Vec::new(),
+        ..cfg_with_secret()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn validate_accepts_well_formed_previous_signing_public_keys() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let key = crate::infra::signed_url::Issuer::generate(60)
+        .expect("issuer")
+        .public_key();
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: vec![URL_SAFE_NO_PAD.encode(key)],
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "a validly-formed (base64url, 32-byte) previous key must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_non_base64_previous_signing_public_key() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: vec!["not-valid-base64!!!".to_owned()],
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_err(),
+        "a non-base64url entry must fail gear init, not surface lazily at the first callback"
+    );
+}
+
+#[test]
+fn validate_rejects_wrong_length_previous_signing_public_key() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: vec![URL_SAFE_NO_PAD.encode([1, 2, 3, 4, 5, 6, 7, 8])],
+        ..cfg_with_secret()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("a wrong-length previous key must fail gear init");
+    assert!(
+        err.to_string().contains("length"),
+        "error should name the length mismatch: {err}"
+    );
+}
+
+fn synthetic_previous_keys(n: usize) -> Vec<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    (0..n)
+        .map(|i| {
+            let b = u8::try_from(i).expect("test count stays well within u8 range");
+            URL_SAFE_NO_PAD.encode([b; 32])
+        })
+        .collect()
+}
+
+#[test]
+fn validate_accepts_previous_signing_public_keys_at_max() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: synthetic_previous_keys(
+            crate::infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS,
+        ),
+        ..cfg_with_secret()
+    };
+    assert!(
+        cfg.validate().is_ok(),
+        "exactly MAX_PREVIOUS_SIGNING_PUBLIC_KEYS entries must be accepted"
+    );
+}
+
+#[test]
+fn validate_rejects_previous_signing_public_keys_above_max() {
+    let cfg = FileStorageConfig {
+        require_signing_key_seed: false,
+        previous_signing_public_keys: synthetic_previous_keys(
+            crate::infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS + 1,
+        ),
+        ..cfg_with_secret()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("one entry over MAX_PREVIOUS_SIGNING_PUBLIC_KEYS must fail gear init");
+    assert!(
+        err.to_string().contains("MAX_PREVIOUS_SIGNING_PUBLIC_KEYS"),
+        "error should name the exceeded ceiling: {err}"
     );
 }

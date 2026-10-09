@@ -37,7 +37,9 @@ fn clamp_limit_within_range_passes_through() {
 
 #[test]
 fn clamp_limit_default_above_max_is_also_clamped() {
-    // A misconfigured default above max must still not escape the ceiling.
+    // Defensive: a misconfigured default above max should still not escape
+    // the ceiling (mirrors `FileStorageConfig::validate()`'s own invariant,
+    // which should make this unreachable in practice).
     assert_eq!(clamp_limit(None, 500, 200).unwrap(), 200);
 }
 
@@ -143,7 +145,6 @@ fn an_unrecognized_direction_is_rejected() {
     };
     let token = cursor.encode().expect("encode");
     let err = decode(&token, ID, None).expect_err("an unrecognized direction must be rejected");
-    // Rejected by `CursorV1::decode` itself.
     assert!(
         matches!(err, ODataError::CursorInvalidDirection),
         "got {err:?}"
@@ -166,7 +167,8 @@ fn a_cursor_naming_the_wrong_number_of_keys_is_rejected() {
 
 #[test]
 fn files_and_versions_bindings_differ_for_the_same_uuid() {
-    // An owner id and a file id may share a UUID; the bindings must not collide.
+    // An owner's `owner_id` and some file's `file_id` can coincidentally
+    // share the same UUID; the two bindings must not collide.
     let shared_id = Uuid::now_v7();
     let o = owner(file_storage_sdk::OwnerKind::User, shared_id);
     assert_ne!(files_binding(&o), versions_binding(shared_id));
@@ -178,7 +180,6 @@ struct Row {
     id: Uuid,
 }
 
-/// Builds rows from `(offset_seconds, id)` pairs, in exactly the order passed.
 fn rows(specs: &[(i64, u128)]) -> Vec<Row> {
     specs
         .iter()
@@ -243,7 +244,6 @@ fn finish_page_backward_query_restores_canonical_order() {
         id: Uuid::from_u128(2),
         direction: Direction::Backward,
     };
-    // Backward repo query order: ascending, closest to the cursor first.
     let fetched = rows(&[(30, 3), (40, 4), (50, 5), (60, 6)]);
     let page = finish_page(fetched, 3, Some(after), ID, None, row_key).expect("finish_page");
     assert_eq!(page.items.len(), 3);

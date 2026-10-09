@@ -13,6 +13,7 @@ use crate::domain::error::DomainError;
 use crate::domain::idempotency::IdempotencyRecord;
 use crate::domain::multipart::MultipartUploadSession;
 use crate::domain::policy::StoredRetentionRule;
+use crate::infra::storage::db::db_err;
 use crate::infra::storage::repo::AuditRow;
 use crate::infra::storage::store::Store;
 
@@ -26,7 +27,7 @@ impl Store {
         key: &str,
         now: OffsetDateTime,
     ) -> Result<Option<IdempotencyRecord>, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
+        let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .idempotency_keys
             .get(&conn, tenant_id, owner_kind, owner_id, key, now)
@@ -35,7 +36,7 @@ impl Store {
 
     /// List audit rows for a file, ordered by occurrence time (tests only).
     pub async fn list_audit(&self, file_id: Uuid) -> Result<Vec<AuditRow>, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
+        let conn = self.db.conn().map_err(db_err)?;
         self.repos.audit.list_for_file(&conn, file_id).await
     }
 
@@ -45,11 +46,41 @@ impl Store {
         &self,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
+        limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
+        let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .versions
-            .list_pending_older_than(&conn, &AccessScope::allow_all(), older_than, now)
+            .list_pending_older_than(
+                &conn,
+                &AccessScope::allow_all(),
+                older_than,
+                now,
+                limit,
+                after,
+            )
+            .await
+    }
+
+    /// List `files` rows that never received any version; see
+    /// [`crate::domain::ports::CleanupStore::list_versionless_orphan_files`].
+    pub async fn list_versionless_orphan_files(
+        &self,
+        created_before: OffsetDateTime,
+        limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<File>, DomainError> {
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .files
+            .list_versionless_orphan_files(
+                &conn,
+                &AccessScope::allow_all(),
+                created_before,
+                limit,
+                after,
+            )
             .await
     }
 
@@ -57,9 +88,14 @@ impl Store {
     pub async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
+        limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<MultipartUploadSession>, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        self.repos.multipart.list_expired(&conn, now).await
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .multipart
+            .list_expired(&conn, now, limit, after)
+            .await
     }
 
     /// List files across all tenants for the sweep, keyset-paginated by `file_id`;
@@ -69,7 +105,7 @@ impl Store {
         after: Option<Uuid>,
         limit: u64,
     ) -> Result<Vec<File>, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
+        let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .files
             .list_all_for_sweep(&conn, &AccessScope::allow_all(), after, limit)
@@ -81,7 +117,7 @@ impl Store {
         &self,
         file_id: Uuid,
     ) -> Result<Vec<StoredRetentionRule>, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
+        let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .retention_rules
             .list_by_file_scope(&conn, &AccessScope::allow_all(), file_id)
@@ -90,7 +126,7 @@ impl Store {
 
     /// List all retention rules across all tenants and scopes.
     pub async fn list_all_retention_rules(&self) -> Result<Vec<StoredRetentionRule>, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
+        let conn = self.db.conn().map_err(db_err)?;
         self.repos
             .retention_rules
             .list_all(&conn, &AccessScope::allow_all())
@@ -101,8 +137,12 @@ impl Store {
     pub async fn delete_expired_idempotency_keys(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
-        let conn = self.db.conn().map_err(DomainError::from)?;
-        self.repos.idempotency_keys.delete_expired(&conn, now).await
+        let conn = self.db.conn().map_err(db_err)?;
+        self.repos
+            .idempotency_keys
+            .delete_expired(&conn, now, limit)
+            .await
     }
 }

@@ -16,15 +16,15 @@ use uuid::Uuid;
 
 use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
-use file_storage::domain::data_plane::DataPlaneService;
+use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
 use file_storage::domain::multipart::MultipartPlan;
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
-use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore};
+use file_storage::domain::ports::{CleanupStore, MultipartStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
-use file_storage::infra::content::hash;
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::external_clients::{UsageDelta, UsageReporter};
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 use file_storage::infra::storage::Store;
@@ -32,6 +32,57 @@ use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{NewFile, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.usage_test.file.type.v1~");
+
+/// Direct byte-path test double: writes content through `put_stream`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+}
 
 /// Capturing fake `UsageReporter`; records deltas in call order.
 #[derive(Default)]
@@ -80,14 +131,13 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
-/// Wires `FileService`, `MultipartService`, `DataPlaneService`, `Store` and `CleanupEngine`
-/// to one fake reporter.
+/// Wires `FileService`, `MultipartService`, `Store` and `CleanupEngine` to one fake reporter.
 async fn build_all(
     fake: Arc<FakeUsageReporter>,
 ) -> (
     Arc<FileService>,
     Arc<MultipartService>,
-    DataPlaneService,
+    TestDataPlane,
     Store,
     CleanupEngine,
     Arc<dyn StorageBackend>,
@@ -132,7 +182,7 @@ async fn build_all(
         )
         .with_usage_reporter(Some(Arc::clone(&reporter))),
     );
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends.clone());
     let engine = CleanupEngine::new(
         sweep_store,
         backends,
@@ -167,7 +217,7 @@ fn new_file(owner: Uuid) -> NewFile {
 /// Drive initiate -> one part -> complete, writing the part via the native backend API and
 /// persisting it with `upsert_multipart_part`. Returns `(upload_id, version_id, size)`.
 async fn drive_multipart_upload(
-    msvc: &MultipartService,
+    msvc: &Arc<MultipartService>,
     multipart_store: &Arc<dyn MultipartStore>,
     backend: &Arc<dyn StorageBackend>,
     ctx: &SecurityContext,
@@ -182,7 +232,7 @@ async fn drive_multipart_upload(
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -195,10 +245,20 @@ async fn drive_multipart_upload(
         .expect("session must exist");
     let backend_path = format!("/{file_id}/{}", plan.version_id);
 
+    let data_len = data.len() as u64;
+    let data_stream: futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>> =
+        Box::pin(futures::stream::once(async move { Ok(data) }));
     let (backend_etag, part_hash) = backend
-        .upload_part(&backend_path, &session.backend_upload_handle, 1, 0, data)
+        .upload_part_stream(
+            &backend_path,
+            &session.backend_upload_handle,
+            1,
+            0,
+            data_stream,
+            data_len,
+        )
         .await
-        .expect("backend upload_part");
+        .expect("backend upload_part_stream");
 
     multipart_store
         .upsert_multipart_part(
@@ -212,9 +272,11 @@ async fn drive_multipart_upload(
         .await
         .unwrap();
 
-    msvc.complete_multipart_upload(ctx, file_id, plan.upload_id, None)
+    let _completed = msvc
+        .complete_multipart_upload(ctx, file_id, plan.upload_id, None)
         .await
-        .unwrap();
+        .unwrap()
+        .unwrap_completed();
 
     (
         plan.upload_id,
@@ -231,7 +293,10 @@ async fn finalize_reports_positive_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
 
     // `create_file` reports `+1 file / 0 bytes`, so finalize is the only byte credit.
     let after_create = wait_for_reports(&fake, 1).await;
@@ -275,15 +340,24 @@ async fn finalize_by_token_reports_positive_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     wait_for_reports(&fake, 1).await;
 
     let payload = Bytes::from_static(b"token-path payload bytes");
     let backend_path = format!("/{}/{}", ticket.file_id, ticket.version_id);
+    let payload_len = payload.len() as u64;
+    let payload_stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+        Box::pin(futures::stream::once({
+            let payload = payload.clone();
+            async move { Ok(payload) }
+        }));
     backend
-        .put(&backend_path, payload.clone())
+        .put_stream(&backend_path, payload_stream, Some(payload_len))
         .await
-        .expect("backend put");
+        .expect("backend put_stream");
     let size = i64::try_from(payload.len()).unwrap();
     let digest = hash::sha256(&payload);
 
@@ -299,6 +373,8 @@ async fn finalize_by_token_reports_positive_byte_delta() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
+        content_sha256: String::new(),
     };
     svc.finalize_upload_by_token(&claims, size, digest)
         .await
@@ -321,7 +397,10 @@ async fn multipart_complete_reports_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     wait_for_reports(&fake, 1).await;
 
     let data = Bytes::from_static(b"multipart assembled payload bytes for usage credit");
@@ -359,7 +438,10 @@ async fn delete_version_reports_negative_byte_delta() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     let v1_payload = Bytes::from_static(b"version one payload");
     dp.put_content(
         &ctx,
@@ -418,7 +500,10 @@ async fn sweep_reports_deltas_for_deleted_files() {
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
-    let ticket = svc.create_file(&ctx, new_file(owner), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(owner), None, false)
+        .await
+        .unwrap();
     let payload = Bytes::from_static(b"retention-swept payload");
     dp.put_content(
         &ctx,
@@ -478,7 +563,7 @@ async fn usage_deltas_sum_to_zero_over_create_upload_delete() {
     let ctx = ctx(Uuid::now_v7());
 
     let ticket = svc
-        .create_file(&ctx, new_file(Uuid::now_v7()), None)
+        .create_file(&ctx, new_file(Uuid::now_v7()), None, false)
         .await
         .unwrap();
     dp.put_content(

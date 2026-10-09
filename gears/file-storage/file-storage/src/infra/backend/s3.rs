@@ -22,8 +22,42 @@ use crate::infra::content::hash;
 use crate::infra::content::hash_mode::Manifest;
 
 use super::{
-    BackendCapabilities, MultipartCompletionPart, StorageBackend, build_manifest_and_root,
+    BackendCapabilities, MultipartCompletionPart, PublishOutcome, StorageBackend,
+    build_manifest_and_root, check_read_prefix_budget,
 };
+
+/// Maps a mid-stream `reqwest::Error` to an `io::Error` whose kind lets
+/// `super::is_transient_io_error` tell transient from permanent. Timeout is checked first,
+/// since a timed-out request may also report connect/body.
+fn reqwest_to_io(e: reqwest::Error) -> std::io::Error {
+    let kind = if e.is_timeout() {
+        std::io::ErrorKind::TimedOut
+    } else if e.is_connect() || e.is_body() || e.is_request() || e.is_decode() {
+        std::io::ErrorKind::ConnectionReset
+    } else {
+        std::io::ErrorKind::Other
+    };
+    std::io::Error::new(kind, e)
+}
+
+/// Whether the terminal write of a streamed upload may overwrite an existing object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// Plain `PutObject` / `CompleteMultipartUpload`: last write wins.
+    Overwrite,
+    /// `If-None-Match: *` conditional write. A `412` is not an error: the object already
+    /// existed and is reported as `created: false` (closes the PUT-token-replay overwrite
+    /// race). Requires an endpoint that honours conditional writes (AWS S3 since 2024-08).
+    CreateExclusive,
+}
+
+/// Result of `S3Backend::stream_upload`.
+struct StreamUploadOutcome {
+    bytes_written: u64,
+    digest: [u8; 32],
+    /// `false` only in `WriteMode::CreateExclusive` when the object already existed.
+    created: bool,
+}
 
 /// Expiry of signed URLs; requests execute immediately, so it only covers clock skew and latency.
 const SIGN_DURATION: Duration = Duration::from_mins(1);
@@ -150,18 +184,60 @@ impl S3Backend {
         format!("/{key}")
     }
 
+    /// Builds the HTTP `Range` header value, failing locally for shapes that are unsatisfiable
+    /// without asking the server (`start > end`, zero-length suffix). Shared by `get_range`
+    /// and `get_range_stream` so both serve the same bytes for the same range.
+    fn range_header_value(range: ByteRange) -> Result<String, DomainError> {
+        match range {
+            ByteRange::Inclusive { start, end } => {
+                if start > end {
+                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
+                }
+                Ok(format!("bytes={start}-{end}"))
+            }
+            ByteRange::OpenEnded { start } => Ok(format!("bytes={start}-")),
+            ByteRange::Suffix { length } => {
+                if length == 0 {
+                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
+                }
+                Ok(format!("bytes=-{length}"))
+            }
+        }
+    }
+
+    /// Parses the `Content-Length` response header, if present and well-formed.
+    fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+        headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    }
+
+    /// `is_builder()` means a malformed request/URL (configuration bug; retrying won't help);
+    /// every other cause happened on the wire and is treated as transient.
     fn transport_err(&self, e: &reqwest::Error) -> DomainError {
-        DomainError::backend(&self.id, e.to_string())
+        if e.is_builder() {
+            DomainError::backend(&self.id, e.to_string())
+        } else {
+            DomainError::backend_unavailable(&self.id, e.to_string())
+        }
     }
 
     /// Maps a non-2xx response to a `DomainError`, using the S3 XML error body if present
-    /// (HEAD responses have none).
+    /// (HEAD responses have none). Transience is decided by `is_transient_s3`.
     fn s3_error(&self, status: StatusCode, body: &[u8]) -> DomainError {
-        match parse_error_body(body) {
-            Some((code, message)) => {
-                DomainError::backend(&self.id, format!("S3 error {status} ({code}): {message}"))
-            }
-            None => DomainError::backend(&self.id, format!("S3 error {status}")),
+        let (msg, transient) = if let Some((code, message)) = parse_error_body(body) {
+            (
+                format!("S3 error {status} ({code}): {message}"),
+                is_transient_s3(status, Some(&code)),
+            )
+        } else {
+            (format!("S3 error {status}"), is_transient_s3(status, None))
+        };
+        if transient {
+            DomainError::backend_unavailable(&self.id, msg)
+        } else {
+            DomainError::backend(&self.id, msg)
         }
     }
 
@@ -177,34 +253,245 @@ impl S3Backend {
         }
     }
 
+    /// Like `send_and_check` for a create-exclusive (`If-None-Match: *`) write: `Ok(true)`
+    /// if created, `Ok(false)` on `412` (object already existed, left untouched).
+    async fn send_and_check_created(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<bool, DomainError> {
+        let resp = req.send().await.map_err(|e| self.transport_err(&e))?;
+        let status = resp.status();
+        let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
+        if status.is_success() {
+            Ok(true)
+        } else if status == StatusCode::PRECONDITION_FAILED {
+            Ok(false)
+        } else {
+            Err(self.s3_error(status, &body))
+        }
+    }
+
+    /// `PutObject` with `If-None-Match: *`: `Ok(true)` = created, `Ok(false)` = already
+    /// existed (`412`).
+    async fn put_create_exclusive(&self, path: &str, bytes: Bytes) -> Result<bool, DomainError> {
+        let key = Self::path_to_key(path);
+        let mut action = self.bucket.put_object(Some(&self.credentials), key);
+        // The header must be in the signed set and also sent on the wire with the same value,
+        // or S3 rejects the request with a signature mismatch.
+        action.headers_mut().insert("if-none-match", "*");
+        let url = action.sign(SIGN_DURATION);
+        self.send_and_check_created(self.http.put(url).header("if-none-match", "*").body(bytes))
+            .await
+    }
+
+    /// HEAD responses carry no XML error body, so classification uses the status only.
     fn head_error(&self, path: &str, status: StatusCode) -> DomainError {
-        DomainError::backend(&self.id, format!("HEAD {path} failed: {status}"))
+        let msg = format!("HEAD {path} failed: {status}");
+        if is_transient_s3(status, None) {
+            DomainError::backend_unavailable(&self.id, msg)
+        } else {
+            DomainError::backend(&self.id, msg)
+        }
+    }
+
+    /// Plain (overwrite-allowed) `PutObject` of already-buffered `bytes`; the terminal write of
+    /// `stream_upload` below the multipart threshold.
+    async fn put_whole(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .put_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        self.send_and_check(self.http.put(url).body(bytes)).await?;
+        Ok(())
     }
 
     /// POSTs `CompleteMultipartUpload` for `parts` (sorted by part number). Never re-reads the
     /// assembled object: callers already hold the digest (`put_stream` hashes incrementally,
     /// `complete_multipart` builds the ADR-0006 manifest root from per-part digests).
+    ///
+    /// In `WriteMode::CreateExclusive` the request carries `If-None-Match: *` and `Ok(false)`
+    /// means the object already existed (`412`).
     async fn finalize_multipart(
         &self,
         path: &str,
         upload_handle: &str,
         parts: &[(u32, String)],
-    ) -> Result<(), DomainError> {
+        mode: WriteMode,
+    ) -> Result<bool, DomainError> {
         let mut sorted_parts = parts.to_vec();
         sorted_parts.sort_by_key(|(part_number, _)| *part_number);
         let etags: Vec<&str> = sorted_parts.iter().map(|(_, etag)| etag.as_str()).collect();
 
         let key = Self::path_to_key(path);
-        let action = self.bucket.complete_multipart_upload(
+        let mut action = self.bucket.complete_multipart_upload(
             Some(&self.credentials),
             key,
             upload_handle,
             etags.iter().copied(),
         );
+        let exclusive = mode == WriteMode::CreateExclusive;
+        if exclusive {
+            // Signed and sent, see `put_create_exclusive`.
+            action.headers_mut().insert("if-none-match", "*");
+        }
         let url = action.sign(SIGN_DURATION);
         let body = action.body();
-        self.send_and_check(self.http.post(url).body(body)).await?;
-        Ok(())
+        let mut req = self.http.post(url).body(body);
+        if exclusive {
+            req = req.header("if-none-match", "*");
+        }
+        self.send_and_check_created(req).await
+    }
+
+    /// Streaming-upload core of `put_stream` (overwrite) and `publish_exclusive`
+    /// (create-exclusive). Below `multipart_threshold_bytes` the object is buffered and
+    /// written with one `PutObject`; above it a native multipart upload runs, holding at most
+    /// one part plus the current chunk in memory. SHA-256 is computed incrementally and
+    /// `max_size` is enforced mid-stream. Any failure after the multipart upload was initiated
+    /// aborts it, leaving no orphaned session or partial object; the same happens in
+    /// `CreateExclusive` when a `412` makes the terminal write a no-op.
+    async fn stream_upload(
+        &self,
+        path: &str,
+        mut stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+        mode: WriteMode,
+    ) -> Result<StreamUploadOutcome, DomainError> {
+        let mut hasher = hash::Hasher::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut upload_handle: Option<String> = None;
+        let mut parts: Vec<(u32, String)> = Vec::new();
+        let mut next_part_number: u32 = 1;
+        // Only satisfies `upload_part`'s ADR-0006 signature: this path hashes the whole
+        // stream and never builds an offset manifest.
+        let mut next_part_offset: u64 = 0;
+
+        let collect_result: Result<(), DomainError> = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| DomainError::backend(&self.id, e.to_string()))?;
+                buf.extend_from_slice(&chunk);
+                hasher.update(&chunk);
+                if max_size.is_some_and(|m| hasher.len() > m) {
+                    return Err(DomainError::validation("size", "exceeds max_size"));
+                }
+
+                // Flush full parts as they accumulate to bound memory.
+                while buf.len() as u64 >= self.multipart_threshold_bytes {
+                    if upload_handle.is_none() {
+                        upload_handle = Some(self.initiate_multipart(path).await?);
+                    }
+                    let part_size =
+                        usize::try_from(self.multipart_threshold_bytes).unwrap_or(buf.len());
+                    let part_bytes: Vec<u8> = buf.drain(..part_size).collect();
+                    let part_len = part_bytes.len() as u64;
+                    let part_offset = next_part_offset;
+                    next_part_offset += part_len;
+                    let part_number = next_part_number;
+                    next_part_number += 1;
+                    let Some(handle) = upload_handle.as_deref() else {
+                        // Unreachable (set just above); handled without `expect`/`unwrap`.
+                        return Err(DomainError::backend(
+                            &self.id,
+                            "multipart handle missing right after initiation",
+                        ));
+                    };
+                    // Already in memory; `once` only satisfies `upload_part_stream`'s signature.
+                    let part_stream: BoxStream<'static, std::io::Result<Bytes>> = Box::pin(
+                        futures::stream::once(async move { Ok(Bytes::from(part_bytes)) }),
+                    );
+                    let (etag, _part_hash) = self
+                        .upload_part_stream(
+                            path,
+                            handle,
+                            part_number,
+                            part_offset,
+                            part_stream,
+                            part_len,
+                        )
+                        .await?;
+                    parts.push((part_number, etag));
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = collect_result {
+            if let Some(handle) = &upload_handle {
+                // Best-effort cleanup of the multipart session.
+                drop(self.abort_multipart(path, handle).await);
+            }
+            return Err(e);
+        }
+
+        let bytes_written = hasher.len();
+        let digest = hash::digest_to_array(hasher.finalize());
+
+        match upload_handle {
+            None => {
+                // Never crossed the threshold: one `PutObject`.
+                let created = match mode {
+                    WriteMode::Overwrite => {
+                        self.put_whole(path, Bytes::from(buf)).await?;
+                        true
+                    }
+                    WriteMode::CreateExclusive => {
+                        self.put_create_exclusive(path, Bytes::from(buf)).await?
+                    }
+                };
+                Ok(StreamUploadOutcome {
+                    bytes_written,
+                    digest,
+                    created,
+                })
+            }
+            Some(handle) => {
+                if !buf.is_empty() {
+                    let part_number = next_part_number;
+                    let part_offset = next_part_offset;
+                    let part_len = buf.len() as u64;
+                    let part_stream: BoxStream<'static, std::io::Result<Bytes>> =
+                        Box::pin(futures::stream::once(async move { Ok(Bytes::from(buf)) }));
+                    match self
+                        .upload_part_stream(
+                            path,
+                            &handle,
+                            part_number,
+                            part_offset,
+                            part_stream,
+                            part_len,
+                        )
+                        .await
+                    {
+                        Ok((etag, _part_hash)) => parts.push((part_number, etag)),
+                        Err(e) => {
+                            drop(self.abort_multipart(path, &handle).await);
+                            return Err(e);
+                        }
+                    }
+                }
+                // `finalize_multipart`, not `complete_multipart`: the digest was computed
+                // while uploading, so the object is not re-downloaded to hash it.
+                match self.finalize_multipart(path, &handle, &parts, mode).await {
+                    Ok(created) => {
+                        // `CreateExclusive` + `412`: the session is still open, abort it.
+                        if !created {
+                            drop(self.abort_multipart(path, &handle).await);
+                        }
+                        Ok(StreamUploadOutcome {
+                            bytes_written,
+                            digest,
+                            created,
+                        })
+                    }
+                    Err(e) => {
+                        drop(self.abort_multipart(path, &handle).await);
+                        Err(e)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -237,140 +524,87 @@ impl StorageBackend for S3Backend {
         }
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        let key = Self::path_to_key(path);
-        let url = self
-            .bucket
-            .put_object(Some(&self.credentials), key)
-            .sign(SIGN_DURATION);
-        self.send_and_check(self.http.put(url).body(bytes)).await?;
-        Ok(())
-    }
-
-    /// Streams into `path`: below `multipart_threshold_bytes` the object is buffered and
-    /// written with one `PutObject`; above it a native multipart upload runs, holding at most
-    /// one part plus the current chunk in memory. SHA-256 is computed incrementally and
-    /// `max_size` is enforced mid-stream. Any failure after the multipart upload was initiated
-    /// aborts it, leaving no orphaned session or partial object.
+    /// Streams into `path`, last write wins; see `stream_upload`.
     async fn put_stream(
         &self,
         path: &str,
-        mut stream: BoxStream<'_, std::io::Result<Bytes>>,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
         max_size: Option<u64>,
     ) -> Result<(u64, [u8; 32]), DomainError> {
-        let mut hasher = hash::Hasher::new();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut upload_handle: Option<String> = None;
-        let mut parts: Vec<(u32, String)> = Vec::new();
-        let mut next_part_number: u32 = 1;
-        // Only satisfies `upload_part`'s ADR-0006 signature: this path hashes the whole
-        // stream and never builds an offset manifest.
-        let mut next_part_offset: u64 = 0;
-
-        let collect_result: Result<(), DomainError> = async {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| DomainError::backend(&self.id, e.to_string()))?;
-                buf.extend_from_slice(&chunk);
-                hasher.update(&chunk);
-                if max_size.is_some_and(|m| hasher.len() > m) {
-                    return Err(DomainError::validation("size", "exceeds max_size"));
-                }
-
-                // Flush full parts as they accumulate to bound memory.
-                while buf.len() as u64 >= self.multipart_threshold_bytes {
-                    if upload_handle.is_none() {
-                        upload_handle = Some(self.initiate_multipart(path).await?);
-                    }
-                    let part_size =
-                        usize::try_from(self.multipart_threshold_bytes).unwrap_or(buf.len());
-                    let part_bytes: Vec<u8> = buf.drain(..part_size).collect();
-                    let part_offset = next_part_offset;
-                    next_part_offset += part_bytes.len() as u64;
-                    let part_number = next_part_number;
-                    next_part_number += 1;
-                    let Some(handle) = upload_handle.as_deref() else {
-                        // Unreachable (set just above); handled without `expect`/`unwrap`.
-                        return Err(DomainError::backend(
-                            &self.id,
-                            "multipart handle missing right after initiation",
-                        ));
-                    };
-                    let (etag, _part_hash) = self
-                        .upload_part(
-                            path,
-                            handle,
-                            part_number,
-                            part_offset,
-                            Bytes::from(part_bytes),
-                        )
-                        .await?;
-                    parts.push((part_number, etag));
-                }
-            }
-            Ok(())
-        }
-        .await;
-
-        if let Err(e) = collect_result {
-            if let Some(handle) = &upload_handle {
-                // Best-effort cleanup of the multipart session.
-                drop(self.abort_multipart(path, handle).await);
-            }
-            return Err(e);
-        }
-
-        let bytes_written = hasher.len();
-        let digest = hash::digest_to_array(hasher.finalize());
-
-        match upload_handle {
-            None => {
-                // Never crossed the threshold: one `PutObject`.
-                self.put(path, Bytes::from(buf)).await?;
-                Ok((bytes_written, digest))
-            }
-            Some(handle) => {
-                if !buf.is_empty() {
-                    let part_number = next_part_number;
-                    let part_offset = next_part_offset;
-                    match self
-                        .upload_part(path, &handle, part_number, part_offset, Bytes::from(buf))
-                        .await
-                    {
-                        Ok((etag, _part_hash)) => parts.push((part_number, etag)),
-                        Err(e) => {
-                            drop(self.abort_multipart(path, &handle).await);
-                            return Err(e);
-                        }
-                    }
-                }
-                // `finalize_multipart`, not `complete_multipart`: the digest was computed
-                // while uploading, so the object is not re-downloaded to hash it.
-                match self.finalize_multipart(path, &handle, &parts).await {
-                    Ok(()) => Ok((bytes_written, digest)),
-                    Err(e) => {
-                        drop(self.abort_multipart(path, &handle).await);
-                        Err(e)
-                    }
-                }
-            }
-        }
+        let o = self
+            .stream_upload(path, stream, max_size, WriteMode::Overwrite)
+            .await?;
+        Ok((o.bytes_written, o.digest))
     }
 
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
+    /// Create-exclusive publish via S3 conditional writes (`If-None-Match: *` on the terminal
+    /// `PutObject`/`CompleteMultipartUpload`); a `412` maps to `created: false`.
+    /// `bytes_written`/`digest` always describe this attempt's bytes.
+    ///
+    /// **Provider requirement:** the endpoint MUST honour conditional writes (AWS S3 since
+    /// 2024-08-20, `s3s-fs`); one that ignores the header degrades to last-write-wins.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        let o = self
+            .stream_upload(path, stream, max_size, WriteMode::CreateExclusive)
+            .await?;
+        Ok(PublishOutcome {
+            bytes_written: o.bytes_written,
+            digest: o.digest,
+            created: o.created,
+        })
+    }
+
+    /// Reads up to `max_bytes` from the start via one ranged `GetObject`; never falls back to
+    /// a whole-object read. `404` maps to `Ok(None)`; `416` (a `0-` range on an empty object)
+    /// means present with zero bytes.
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        check_read_prefix_budget(max_bytes)?;
         let key = Self::path_to_key(path);
         let url = self
             .bucket
             .get_object(Some(&self.credentials), key)
             .sign(SIGN_DURATION);
-        self.send_and_check(self.http.get(url)).await
+        let end = max_bytes.saturating_sub(1);
+        let resp = self
+            .http
+            .get(url)
+            .header(RANGE, format!("bytes=0-{end}"))
+            .send()
+            .await
+            .map_err(|e| self.transport_err(&e))?;
+
+        let status = resp.status();
+        match status {
+            StatusCode::NOT_FOUND => Ok(None),
+            StatusCode::RANGE_NOT_SATISFIABLE => Ok(Some(Bytes::new())),
+            _ if status.is_success() => {
+                let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
+                Ok(Some(body))
+            }
+            other => {
+                let body = resp.bytes().await.unwrap_or_default();
+                Err(self.s3_error(other, &body))
+            }
+        }
     }
 
     /// `GetObject` returned as a chunk stream (at most one chunk in memory). The status is
     /// checked before returning, so a missing object or S3 error surfaces from this call.
+    ///
+    /// `expected_len` is the length the caller already committed to. A present
+    /// `Content-Length` is checked up front; the stream is always wrapped in
+    /// `super::length_guard`, which enforces it against the actual byte count (covers chunked
+    /// responses without `Content-Length`).
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+        expected_len: u64,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
         let key = Self::path_to_key(path);
         let url = self
             .bucket
@@ -389,30 +623,29 @@ impl StorageBackend for S3Backend {
             return Err(self.s3_error(status, &body));
         }
 
-        let stream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(std::io::Error::other));
-        Ok(Box::pin(stream))
+        if let Some(content_len) = Self::parse_content_length(resp.headers())
+            && content_len != expected_len
+        {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' changed size before it could be read: expected {expected_len} byte(s), found {content_len}"
+            )));
+        }
+
+        let stream = resp.bytes_stream().map(|r| r.map_err(reqwest_to_io));
+        Ok(super::length_guard(Box::pin(stream), expected_len))
     }
 
-    /// Native range read: a signed `GetObject` plus an unsigned `Range` header (allowed, as
-    /// `Range` is not in `SigV4`'s signed canonical request). One round trip, no prior `HEAD`.
-    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        let header_value = match range {
-            ByteRange::Inclusive { start, end } => {
-                if start > end {
-                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
-                }
-                format!("bytes={start}-{end}")
-            }
-            ByteRange::OpenEnded { start } => format!("bytes={start}-"),
-            ByteRange::Suffix { length } => {
-                if length == 0 {
-                    return Err(DomainError::validation("range", "unsatisfiable byte range"));
-                }
-                format!("bytes=-{length}")
-            }
-        };
+    /// Streaming range read: a signed `GetObject` plus an unsigned `Range` header (allowed, as
+    /// `Range` is not in `SigV4`'s signed canonical request). `bytes=0-` would otherwise
+    /// buffer the whole object. Status and `expected_len` are checked as in `get_stream`,
+    /// including the `length_guard` wrapper.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+        expected_len: u64,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let header_value = Self::range_header_value(range)?;
 
         let key = Self::path_to_key(path);
         let url = self
@@ -431,12 +664,31 @@ impl StorageBackend for S3Backend {
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
             return Err(DomainError::validation("range", "unsatisfiable byte range"));
         }
-        let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
-        if status.is_success() {
-            Ok(body)
-        } else {
-            Err(self.s3_error(status, &body))
+        if !status.is_success() {
+            let body = resp.bytes().await.map_err(|e| self.transport_err(&e))?;
+            return Err(self.s3_error(status, &body));
         }
+        // The caller builds a `206` response from the requested range, so a backend that
+        // ignored `Range` and answered `200` with the whole object must be refused.
+        if status != StatusCode::PARTIAL_CONTENT {
+            return Err(DomainError::backend(
+                &self.id,
+                format!("backend ignored the Range header (answered {status}, expected 206)"),
+            ));
+        }
+
+        // Same `expected_len` check as `get_stream`: a mismatch means the object changed
+        // since the caller resolved the range.
+        if let Some(content_len) = Self::parse_content_length(resp.headers())
+            && content_len != expected_len
+        {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' range changed before it could be read: expected {expected_len} byte(s), found {content_len}"
+            )));
+        }
+
+        let stream = resp.bytes_stream().map(|r| r.map_err(reqwest_to_io));
+        Ok(super::length_guard(Box::pin(stream), expected_len))
     }
 
     /// Size from the `HeadObject` `Content-Length` header.
@@ -507,6 +759,37 @@ impl StorageBackend for S3Backend {
         }
     }
 
+    /// Single `HeadObject`: 404 is `Ok(None)`, 200 plus `Content-Length` is `Ok(Some(len))`,
+    /// anything else is an `Err`.
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        let key = Self::path_to_key(path);
+        let url = self
+            .bucket
+            .head_object(Some(&self.credentials), key)
+            .sign(SIGN_DURATION);
+        let resp = self
+            .http
+            .head(url)
+            .send()
+            .await
+            .map_err(|e| self.transport_err(&e))?;
+        match resp.status() {
+            StatusCode::OK => {
+                let len = resp
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        DomainError::backend(&self.id, "HEAD response missing Content-Length")
+                    })?;
+                Ok(Some(len))
+            }
+            StatusCode::NOT_FOUND => Ok(None),
+            other => Err(self.head_error(path, other)),
+        }
+    }
+
     /// `CreateMultipartUpload`; the returned `<UploadId>` is the opaque handle for
     /// `upload_part`/`complete_multipart`/`abort_multipart`.
     async fn initiate_multipart(&self, path: &str) -> Result<String, DomainError> {
@@ -524,19 +807,23 @@ impl StorageBackend for S3Backend {
         })
     }
 
-    /// `UploadPart`. Returns `(backend_etag, part_hash_bytes)`: S3's `ETag` header with quotes
-    /// stripped (fed back into `complete_multipart`) and the locally computed SHA-256 of
-    /// `data` (S3's `ETag` is MD5-based).
-    async fn upload_part(
+    /// `UploadPart` streaming `stream` as the body without buffering the part. An explicit
+    /// `Content-Length` is set (S3 rejects chunked `UploadPart`); it is not in the presigned
+    /// signed-header set.
+    ///
+    /// Returns `(backend_etag, part_hash_bytes)`: S3's `ETag` header with quotes stripped
+    /// (fed back into `complete_multipart`) and this gear's own SHA-256 of the bytes (S3's
+    /// `ETag` is MD5-based). The digest is only produced if the stream yielded exactly
+    /// `len` bytes, so a part is never reported uploaded on an unverified digest.
+    async fn upload_part_stream(
         &self,
         path: &str,
         upload_handle: &str,
         part_number: u32,
         _part_offset: u64,
-        data: Bytes,
+        stream: BoxStream<'static, std::io::Result<Bytes>>,
+        len: u64,
     ) -> Result<(String, Vec<u8>), DomainError> {
-        let part_hash = hash::sha256(&data);
-
         // S3 allows parts 1..=10_000, narrower than `u16`, so check explicitly.
         if !(1..=10_000).contains(&part_number) {
             return Err(DomainError::validation(
@@ -554,10 +841,12 @@ impl StorageBackend for S3Backend {
             .upload_part(Some(&self.credentials), key, part_number_u16, upload_handle)
             .sign(SIGN_DURATION);
 
+        let (guarded, digest_slot) = super::hashing_length_guard(stream, len);
         let resp = self
             .http
             .put(url)
-            .body(data)
+            .header(CONTENT_LENGTH, len.to_string())
+            .body(reqwest::Body::wrap_stream(guarded))
             .send()
             .await
             .map_err(|e| self.transport_err(&e))?;
@@ -574,7 +863,19 @@ impl StorageBackend for S3Backend {
         let etag = etag_header.ok_or_else(|| {
             DomainError::backend(&self.id, "UploadPart response missing ETag header")
         })?;
-        Ok((etag, part_hash))
+        let part_hash = digest_slot
+            .lock()
+            .map_err(|_| DomainError::backend(&self.id, "poisoned part-hash lock"))?
+            .take()
+            .ok_or_else(|| {
+                DomainError::backend(
+                    &self.id,
+                    "UploadPart reported success but the part body stream was never fully \
+                     verified against its declared length \u{2014} refusing to treat the part \
+                     as uploaded",
+                )
+            })?;
+        Ok((etag, part_hash.to_vec()))
     }
 
     /// `CompleteMultipartUpload` via `finalize_multipart`, then the ADR-0006 offset manifest
@@ -591,7 +892,7 @@ impl StorageBackend for S3Backend {
             .iter()
             .map(|(part_number, _, _, etag)| (*part_number, etag.clone()))
             .collect();
-        self.finalize_multipart(path, upload_handle, &etag_parts)
+        self.finalize_multipart(path, upload_handle, &etag_parts, WriteMode::Overwrite)
             .await?;
 
         build_manifest_and_root(parts)
@@ -814,6 +1115,29 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether a non-2xx S3 response is transient (overload, throttling, server hiccup) and worth
+/// retrying. `RequestTimeTooSkewed` is deliberately excluded: retries re-sign with the same
+/// skewed clock.
+fn is_transient_s3(status: StatusCode, code: Option<&str>) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    ) || matches!(
+        code,
+        Some(
+            "SlowDown"
+                | "RequestTimeout"
+                | "ServiceUnavailable"
+                | "InternalError"
+                | "ThrottlingException"
+        )
+    )
 }
 
 #[cfg(test)]

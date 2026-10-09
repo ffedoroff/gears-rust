@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::policy::{PolicyBody, PolicyScope, StoredPolicy};
+use crate::infra::storage::db::{conflict_on_unique_violation, db_err};
 use crate::infra::storage::entity::policy::{ActiveModel, Column, Entity, Model};
 
 /// Repository over the `policies` table.
@@ -46,7 +47,7 @@ impl PolicyRepo {
             .scope_with(scope)
             .one(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
 
         model.map(map_model).transpose()
     }
@@ -79,7 +80,7 @@ impl PolicyRepo {
             .scope_with(scope)
             .exec(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
 
         let policy_id = Uuid::now_v7();
         let body_json = serde_json::to_value(body)
@@ -94,9 +95,16 @@ impl PolicyRepo {
             created_at: Set(now),
             updated_at: Set(now),
         };
+        // The loser of two concurrent first-time upserts hits the unique index here;
+        // map it to a conflict (409) rather than an opaque 500.
         secure_insert::<Entity>(am, scope, conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(|e| {
+                conflict_on_unique_violation(
+                    e,
+                    "a policy for this scope was just created by a concurrent request",
+                )
+            })?;
         Ok(policy_id)
     }
 }

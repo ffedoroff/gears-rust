@@ -3,7 +3,7 @@
 //! Insert-or-fetch: the first call stores the record, a retry gets it back unchanged.
 //! Queries are keyed by `(tenant_id, owner_kind, owner_id, key)`.
 
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::idempotency::IdempotencyRecord;
+use crate::infra::storage::db::{conflict_on_unique_violation, db_err};
 use crate::infra::storage::entity::idempotency_key::{ActiveModel, Column, Entity, Model};
 use crate::infra::storage::store::IdempotencyInsert;
 
@@ -47,7 +48,7 @@ impl IdempotencyRepo {
             .scope_with(&AccessScope::allow_all())
             .one(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
         Ok(found.map(record_from_model))
     }
 
@@ -79,7 +80,7 @@ impl IdempotencyRepo {
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
 
         let am = ActiveModel {
             tenant_id: Set(idem.tenant_id),
@@ -95,27 +96,87 @@ impl IdempotencyRepo {
             created_at: Set(now),
             expires_at: Set(idem.expires_at),
         };
+        // Losing the PK race to a concurrent identical request is the expected dedup
+        // path: report a 409 (client re-fetches via `get`), not an opaque 500.
         secure_insert::<Entity>(am, &AccessScope::allow_all(), conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(|e| {
+                conflict_on_unique_violation(
+                    e,
+                    "a request with this idempotency key is already being processed or has \
+                     already completed",
+                )
+            })?;
         Ok(())
     }
 
-    /// Bulk-delete all rows whose `expires_at` is at or before `now`.
+    /// Delete at most `limit` rows whose `expires_at` is at or before `now`, oldest first.
     ///
-    /// Used by the cleanup sweep; returns the number of rows removed.
+    /// Batched so a large backlog never holds one long transaction; fewer than `limit`
+    /// removed means the backlog is cleared. Called by the cleanup sweep, because
+    /// [`Self::insert`] only removes a lapsed row for its own key.
+    ///
+    /// The composite PK has no surrogate column and the delete builder lacks
+    /// `RETURNING`/tuple-`IN`, so this selects the batch's keys, then deletes by an OR
+    /// of exact 4-column matches. Safe because `expires_at` never un-expires, so a
+    /// selected candidate stays expired.
     pub async fn delete_expired<C: DBRunner>(
         &self,
         conn: &C,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
-        let res = Entity::delete_many()
+        #[derive(sea_orm::FromQueryResult)]
+        struct ExpiredKey {
+            tenant_id: Uuid,
+            owner_kind: String,
+            owner_id: Uuid,
+            idempotency_key: String,
+        }
+
+        let candidates = Entity::find()
             .filter(Column::ExpiresAt.lte(now))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(Column::TenantId)
+                    .column(Column::OwnerKind)
+                    .column(Column::OwnerId)
+                    .column(Column::IdempotencyKey)
+                    .order_by_asc(Column::ExpiresAt)
+                    .order_by_asc(Column::TenantId)
+                    .order_by_asc(Column::OwnerKind)
+                    .order_by_asc(Column::OwnerId)
+                    .order_by_asc(Column::IdempotencyKey)
+                    .limit(limit)
+                    .into_model::<ExpiredKey>()
+            })
+            .await
+            .map_err(db_err)?;
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut matches = Condition::any();
+        for c in &candidates {
+            matches = matches.add(
+                Condition::all()
+                    .add(Column::TenantId.eq(c.tenant_id))
+                    .add(Column::OwnerKind.eq(c.owner_kind.clone()))
+                    .add(Column::OwnerId.eq(c.owner_id))
+                    .add(Column::IdempotencyKey.eq(c.idempotency_key.clone())),
+            );
+        }
+
+        let res = Entity::delete_many()
+            .filter(matches)
             .secure()
             .scope_with(&AccessScope::allow_all())
             .exec(conn)
             .await
-            .map_err(DomainError::from)?;
+            .map_err(db_err)?;
         Ok(res.rows_affected)
     }
 }

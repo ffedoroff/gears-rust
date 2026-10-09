@@ -228,6 +228,13 @@ returned.
 - Policy size limit exceeded by the assembled total -- policy-size-exceeded error
 - Session `aborted` or expired, or `upload_id` foreign to this `file_id` -- `404`-shaped "not found"
 - `If-Match` supplied and it does not match the file's current content ETag -- `400` (`FailedPrecondition`)
+- The abandoned-session/expiry sweep aborts the session **after** this call already passed the step-4 non-terminal
+  check and won the lease, but **before** its finalize transaction (step 14) runs -- a race window the sweep's own
+  TTL reclaim can land in while this call's backend assembly (step 12) is still in flight. The finalize transaction's
+  first statement re-checks session state and rejects with `409 Conflict` instead of finalizing a version for a
+  session no longer there to own it. Because the backend assembly already succeeded by this point, this call
+  best-effort deletes the object it just assembled (it's an orphan no DB row will ever point at again -- the sweep
+  that aborted the session already removed its part rows) before returning the `409`
 
 **Steps**:
 1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/multipart/{upload_id}/complete (no request body; optional `If-Match` header). Control plane: authorize `write` - `inst-complete-request`
@@ -468,7 +475,12 @@ session `completing -> completed`, and persists the `complete_result` JSON -- pl
 path, the audit row too (a takeover or converge path instead writes the audit row via a separate step). A crash
 between winning the lease and this transaction committing leaves the session at `completing` for the next `complete`
 call to take over (§4's state machine), never a half-finalized version. A failed assembly/verification instead
-releases the lease (`completing -> in_progress`) so the next `complete` retries immediately. Returns **`200`** with
+releases the lease (`completing -> in_progress`) so the next `complete` retries immediately. If instead the
+abandoned-session/expiry sweep aborts the session out from under this call between its lease win and this
+transaction (a race the sweep's own TTL reclaim can land in while assembly is still running), the transaction's own
+first statement detects the session is no longer there to own and rejects with `409` instead of finalizing a version
+for it -- this call then best-effort deletes the object it already assembled on the backend, since the aborted
+session leaves no DB row left to ever reference it. Returns **`200`** with
 `{version_id, size, hash_algorithm, content_hash, hash_mode, part_count, manifest, bind_state, etag?,
 current_etag?}`. A retry against an already-`completed` session **converges**: it replays the persisted
 `complete_result` verbatim -- or, only for a session that predates the `complete_result`/`auto_bind` migration

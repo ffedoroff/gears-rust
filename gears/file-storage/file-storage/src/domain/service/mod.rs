@@ -1,6 +1,8 @@
-//! `FileService` — control-plane business logic (create/presign, finalize/bind with
-//! optimistic CAS, downloads, metadata, listing, versioning, delete). Content bytes never
-//! flow through it; they move via `crate::domain::data_plane::DataPlaneService`.
+//! `FileService` — control-plane business logic.
+//!
+//! Owns create/presign, finalize/bind (optimistic CAS), download-URL issuance, metadata,
+//! listing, versioning and delete. Content bytes never flow through it; they move via
+//! `crate::domain::data_plane::DataPlaneService`.
 //!
 //! The impl is split across `create.rs`, `write.rs`, `read_ops.rs` and `backend.rs`;
 //! shared types and the struct live here.
@@ -53,6 +55,23 @@ pub struct UploadTicket {
     pub upload_url: String,
 }
 
+/// Outcome of the token-authenticated finalize callback; the sidecar surfaces it to the
+/// client as `PUT`-response headers (`X-FS-Bound: true` + `ETag`, or `X-FS-Bound: conflict` +
+/// `X-FS-Current-ETag`).
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+#[derive(Debug, Clone)]
+pub struct FinalizeByTokenOutcome {
+    /// `None`: the token did not request a bind (manual mode), first non-retried call.
+    /// `Some(Bound)`/`Some(Conflict)`: auto-bind token that won/lost the `content_id IS NULL`
+    /// CAS. `Some(Manual)`: idempotent retry of a manual-mode finalize on an already-`Available`,
+    /// still-unbound version; handled like `None`.
+    pub bind_state: Option<crate::domain::multipart::BindState>,
+    /// Content ETag after a successful bind (`Bound` only).
+    pub etag: Option<String>,
+    /// The file's current content ETag on a lost CAS (`Conflict` only), for a manual rebind.
+    pub current_etag: Option<String>,
+}
+
 /// Result of `download-url`: the signed URL plus the content ETag.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Debug, Clone)]
@@ -80,6 +99,15 @@ pub struct FileService {
     pub(super) usage_reporter: Option<Arc<dyn UsageReporter>>,
     /// Defaults to a no-op; `with_metrics` installs the real meter.
     pub(super) metrics: Arc<dyn FileStorageMetricsPort>,
+    /// Verifier for the finalize/report-part callbacks: the issuer's current key plus any
+    /// retained previous keys, so a `signing_key_seed` rotation does not reject in-flight uploads.
+    pub(super) callback_verifier: crate::infra::signed_url::Verifier,
+    /// Time budget (seconds) of one `migrate_backend` attempt; default mirrors
+    /// `FileStorageConfig::migrate_timeout_secs`.
+    pub(super) migrate_timeout_secs: u64,
+    /// Margin (seconds) added to `migrate_timeout_secs` when sizing the migration lease;
+    /// default mirrors `FileStorageConfig::migrate_lease_margin_secs`.
+    pub(super) migrate_lease_margin_secs: u64,
 }
 
 impl FileService {
@@ -92,6 +120,7 @@ impl FileService {
         quota_client: Option<Arc<dyn QuotaClient>>,
         usage_reporter: Option<Arc<dyn UsageReporter>>,
     ) -> Self {
+        let callback_verifier = issuer.verifier();
         Self {
             store,
             backends,
@@ -101,7 +130,19 @@ impl FileService {
             quota_client,
             usage_reporter,
             metrics: Arc::new(NoopMetrics),
+            callback_verifier,
+            // Same defaults as the config fields of the same names.
+            migrate_timeout_secs: 3600,
+            migrate_lease_margin_secs: 300,
         }
+    }
+
+    /// Install the migration lease's timeout and margin (builder step, like `with_metrics`).
+    #[must_use]
+    pub fn with_migrate_lease_config(mut self, timeout_secs: u64, margin_secs: u64) -> Self {
+        self.migrate_timeout_secs = timeout_secs;
+        self.migrate_lease_margin_secs = margin_secs;
+        self
     }
 
     /// Install a real metrics port (a builder step so `new()` keeps its signature).
@@ -111,12 +152,37 @@ impl FileService {
         self
     }
 
-    pub(super) fn tenant_scope(ctx: &SecurityContext) -> AccessScope {
-        AccessScope::for_tenant(ctx.subject_tenant_id())
+    /// Extend the callback verifier to also accept `previous_keys` (raw public keys of earlier
+    /// `signing_key_seed`s). A no-op when empty. Only widens what the callback routes accept;
+    /// minting always uses the current key.
+    ///
+    /// Duplicates of the current key (or within `previous_keys`) are deduped with a warning.
+    ///
+    /// # Errors
+    /// Returns an error if any key is not a valid 32-byte Ed25519 public key.
+    pub fn with_previous_signing_public_keys(
+        mut self,
+        previous_keys: Vec<Vec<u8>>,
+    ) -> Result<Self, DomainError> {
+        if previous_keys.is_empty() {
+            return Ok(self);
+        }
+        let (keys, dropped) =
+            crate::infra::signed_url::dedupe_public_keys(self.issuer.public_key(), previous_keys);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped_duplicates = dropped,
+                "file-storage: previous_signing_public_keys contains keys already accepted by \
+                 the current signing key; dropped \u{2014} a completed signing_key_seed rotation \
+                 usually means the list should be cleared"
+            );
+        }
+        self.callback_verifier = crate::infra::signed_url::Verifier::from_public_keys(keys)?;
+        Ok(self)
     }
 
-    pub(super) fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
-        crate::domain::storage_layout::backend_path(file_id, version_id)
+    pub(super) fn tenant_scope(ctx: &SecurityContext) -> AccessScope {
+        AccessScope::for_tenant(ctx.subject_tenant_id())
     }
 
     pub(super) fn validate_gts_type(t: &str) -> Result<(), DomainError> {
@@ -127,43 +193,66 @@ impl FileService {
         }
     }
 
-    /// Token verifier backed by the control plane's signing key (used by the finalize
-    /// handler to validate the sidecar's upload token).
+    /// Token verifier for the finalize/report-part callbacks (see `callback_verifier`).
     #[must_use]
     pub fn verifier(&self) -> crate::infra::signed_url::Verifier {
-        self.issuer.verifier()
+        self.callback_verifier.clone()
     }
 
     /// Mint a signed URL for `op` against `v`.
     ///
-    /// `download_meta` is `Some((content_type, etag))` for `Op::Get` only, so the sidecar can
-    /// emit `Content-Type`/`ETag` without a DB lookup; it is ignored for other ops.
+    /// `download_meta` is `Some((content_type, etag, content_sha256))` for `Op::Get` only (the
+    /// version's MIME, content ETag and, in whole-object mode, hex SHA-256), so the sidecar can
+    /// emit `Content-Type`/`ETag` and verify the stream without a DB lookup; ignored for other
+    /// ops.
     pub(super) fn sign_url(
         &self,
         op: Op,
         v: &VersionRef,
         constraints: UploadConstraints,
-        download_meta: Option<(String, String)>,
+        download_meta: Option<(String, String, String)>,
     ) -> Result<String, DomainError> {
+        self.sign_url_with_bind(op, v, constraints, download_meta, false)
+    }
+
+    /// `sign_url` with an explicit `bind_on_finalize` claim (only `create_file` with auto-bind).
+    pub(super) fn sign_url_with_bind(
+        &self,
+        op: Op,
+        v: &VersionRef,
+        constraints: UploadConstraints,
+        download_meta: Option<(String, String, String)>,
+        bind_on_finalize: bool,
+    ) -> Result<String, DomainError> {
+        // Validate `op` before any signing work.
         let verb = content_verb(op)?;
         let now = OffsetDateTime::now_utc();
-        let (content_type, etag) = match op {
+        // Only a GET (download) token carries content_type/etag/content_sha256.
+        let (content_type, etag, content_sha256) = match op {
             Op::Get => download_meta.unwrap_or_default(),
-            Op::Put | Op::MultipartPart => (String::new(), String::new()),
+            Op::Put | Op::MultipartPart => (String::new(), String::new(), String::new()),
         };
-        // Fresh correlation id per URL; the sidecar echoes it as `x-request-id` on finalize.
+        // `checked_add` is defense in depth: `FileStorageConfig::validate()` bounds the TTL.
+        let exp = now
+            .unix_timestamp()
+            .checked_add(self.cfg.default_url_ttl_secs)
+            .ok_or_else(|| {
+                DomainError::database("default_url_ttl_secs overflowed computing the token expiry")
+            })?;
         let claims = Claims {
             op,
             file_id: v.file_id,
             version_id: v.version_id,
             backend_id: v.backend_id.clone(),
             backend_path: v.backend_path.clone(),
-            exp: now.unix_timestamp() + self.cfg.default_url_ttl_secs,
+            exp,
             upload: constraints,
             multipart: MultipartClaims::default(),
             request_id: Uuid::now_v7().to_string(),
             content_type,
             etag,
+            bind_on_finalize,
+            content_sha256,
         };
         let token = self.issuer.issue(claims, now)?;
         Ok(format!(
@@ -176,7 +265,7 @@ impl FileService {
         ))
     }
 
-    /// Stable actor kind string for the audit log.
+    /// Stable actor kind (`app` or `user`) of the caller.
     pub(super) fn actor_kind(ctx: &SecurityContext) -> &'static str {
         match ctx.subject_type() {
             Some("app") => "app",
@@ -184,7 +273,6 @@ impl FileService {
         }
     }
 
-    /// Build a success audit entry for a file-scoped write operation.
     pub(super) fn audit_ok(
         ctx: &SecurityContext,
         file_id: Option<Uuid>,
@@ -201,7 +289,7 @@ impl FileService {
         )
     }
 
-    /// Fire-and-forget usage delta; a failing reporter must not block file operations.
+    /// Fire-and-forget: a failing usage reporter must not block file operations.
     pub(super) fn report_usage(&self, delta: UsageDelta) {
         if let Some(reporter) = self.usage_reporter.clone() {
             tokio::spawn(async move {
@@ -227,10 +315,10 @@ impl FileService {
     }
 }
 
-/// Map an `Op` to its sidecar path segment.
+/// Map an [`Op`] to its sidecar path segment (`/api/file-storage-data/v1/{verb}/{file}/{version}`).
 ///
-/// `Op::MultipartPart` is rejected: part uploads use a distinct route with part-specific
-/// claims, and `MultipartService::initiate` is the single place that mints those URLs.
+/// `Op::MultipartPart` is rejected: part uploads use a distinct sidecar route with part-specific
+/// claims, and `MultipartService::initiate` is the single source of truth for those URLs.
 fn content_verb(op: Op) -> Result<&'static str, DomainError> {
     match op {
         Op::Get => Ok("download"),
@@ -248,13 +336,18 @@ pub(super) struct VersionRef {
     pub(super) backend_path: String,
 }
 
-/// Serializable `UploadTicket` stored in the idempotency record.
+/// Serializable form of `UploadTicket` stored in the idempotency record.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct IdempotencyTicket {
     pub(super) file_id: Uuid,
     pub(super) version_id: Uuid,
     pub(super) upload_url: String,
+    /// The `bind` mode minted into `upload_url`'s token at the original `create_file` call; a
+    /// replay re-mints with this value, not the retry's. Defaults to `false` for tickets
+    /// stored before auto-bind existed.
+    #[serde(default)]
+    pub(super) auto_bind: bool,
 }
 
 impl From<IdempotencyTicket> for UploadTicket {

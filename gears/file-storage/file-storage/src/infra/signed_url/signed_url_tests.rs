@@ -18,6 +18,8 @@ fn sample_claims(op: Op, exp: i64) -> Claims {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
+        content_sha256: String::new(),
     }
 }
 
@@ -64,6 +66,7 @@ fn expired_token_is_rejected() {
 
 #[test]
 fn expiry_is_exclusive_at_the_boundary() {
+    // A token must stop being usable exactly at `exp`, not one second later.
     let issuer = Issuer::generate(3600).unwrap();
     let verifier = issuer.verifier();
     let exp = now().unix_timestamp() + 60;
@@ -78,6 +81,100 @@ fn expiry_is_exclusive_at_the_boundary() {
     assert!(
         verifier.verify(&token, just_before).is_ok(),
         "token must still be valid one second before exp"
+    );
+}
+
+#[test]
+fn verify_with_grace_accepts_a_token_expired_within_the_grace_window() {
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = issuer.verifier();
+    let exp = now().unix_timestamp() + 60;
+    let token = issuer.issue(sample_claims(Op::Put, exp), now()).unwrap();
+
+    let past_exp = OffsetDateTime::from_unix_timestamp(exp + 30).unwrap();
+    assert!(
+        verifier
+            .verify_with_grace(&token, past_exp, time::Duration::seconds(60))
+            .is_ok(),
+        "a token expired within the grace window must be accepted"
+    );
+}
+
+#[test]
+fn verify_with_grace_rejects_a_token_expired_beyond_the_grace_window() {
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = issuer.verifier();
+    let exp = now().unix_timestamp() + 60;
+    let token = issuer.issue(sample_claims(Op::Put, exp), now()).unwrap();
+
+    // 90s past exp with a 60s grace: rejected with the same message `verify` uses.
+    let past_exp = OffsetDateTime::from_unix_timestamp(exp + 90).unwrap();
+    let err = verifier
+        .verify_with_grace(&token, past_exp, time::Duration::seconds(60))
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::TokenInvalid { .. }),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("token expired"),
+        "grace expiry must surface the same message as strict `verify`, got {err}"
+    );
+}
+
+#[test]
+fn verify_with_grace_zero_behaves_exactly_like_verify() {
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = issuer.verifier();
+    let exp = now().unix_timestamp() + 60;
+    let token = issuer.issue(sample_claims(Op::Put, exp), now()).unwrap();
+
+    let before = OffsetDateTime::from_unix_timestamp(exp - 1).unwrap();
+    assert_eq!(
+        verifier
+            .verify_with_grace(&token, before, time::Duration::ZERO)
+            .unwrap(),
+        verifier.verify(&token, before).unwrap()
+    );
+
+    let at_exp = OffsetDateTime::from_unix_timestamp(exp).unwrap();
+    assert!(
+        verifier
+            .verify_with_grace(&token, at_exp, time::Duration::ZERO)
+            .is_err()
+    );
+    assert!(verifier.verify(&token, at_exp).is_err());
+
+    let after = OffsetDateTime::from_unix_timestamp(exp + 30).unwrap();
+    assert!(
+        verifier
+            .verify_with_grace(&token, after, time::Duration::ZERO)
+            .is_err()
+    );
+    assert!(verifier.verify(&token, after).is_err());
+}
+
+#[test]
+fn verify_with_grace_does_not_weaken_signature_verification() {
+    // Grace only loosens the `exp` deadline, never the signature check.
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = issuer.verifier();
+    let token = issuer
+        .issue(sample_claims(Op::Put, now().unix_timestamp() + 60), now())
+        .unwrap();
+
+    let (payload, sig) = token.split_once('.').unwrap();
+    let mut p = payload.to_owned();
+    let last = p.pop().unwrap();
+    p.push(if last == 'A' { 'B' } else { 'A' });
+    let tampered = format!("{p}.{sig}");
+
+    let err = verifier
+        .verify_with_grace(&tampered, now(), time::Duration::seconds(3600))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("signature"),
+        "a huge grace must not accept a tampered payload, got {err}"
     );
 }
 
@@ -122,15 +219,58 @@ fn malformed_token_is_rejected() {
 }
 
 #[test]
-fn issuer_over_explicit_provider_round_trips() {
-    // The codec goes through the `SignatureProvider` seam, so an explicitly supplied provider
-    // behaves identically.
-    let provider = Arc::new(Ed25519Provider::generate().unwrap());
-    let issuer = Issuer::with_provider(provider, 3600);
+fn from_public_key_still_works_as_a_single_key_verifier() {
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = Verifier::from_public_key(issuer.public_key()).unwrap();
     let claims = sample_claims(Op::Get, now().unix_timestamp() + 60);
-
     let token = issuer.issue(claims.clone(), now()).unwrap();
-    assert_eq!(issuer.verifier().verify(&token, now()).unwrap(), claims);
+    assert_eq!(verifier.verify(&token, now()).unwrap(), claims);
+}
+
+#[test]
+fn from_public_keys_accepts_a_token_signed_by_any_configured_key() {
+    let provider_a = Arc::new(Ed25519Provider::generate().unwrap());
+    let provider_b = Arc::new(Ed25519Provider::generate().unwrap());
+    let issuer_a =
+        Issuer::with_provider(Arc::clone(&provider_a) as Arc<dyn SignatureProvider>, 3600);
+    let claims = sample_claims(Op::Get, now().unix_timestamp() + 60);
+    let token = issuer_a.issue(claims.clone(), now()).unwrap();
+
+    // Token signed by A (index 1) must verify via the previous key: rotation without outage.
+    let verifier =
+        Verifier::from_public_keys(vec![provider_b.public_key(), provider_a.public_key()]).unwrap();
+    assert_eq!(verifier.verify(&token, now()).unwrap(), claims);
+}
+
+#[test]
+fn from_public_keys_rejects_a_token_from_an_unlisted_key_with_the_same_error_as_a_single_wrong_key()
+{
+    let provider_a = Arc::new(Ed25519Provider::generate().unwrap());
+    let provider_b = Arc::new(Ed25519Provider::generate().unwrap());
+    let provider_c = Arc::new(Ed25519Provider::generate().unwrap());
+    let issuer_c =
+        Issuer::with_provider(Arc::clone(&provider_c) as Arc<dyn SignatureProvider>, 3600);
+    let token = issuer_c
+        .issue(sample_claims(Op::Get, now().unix_timestamp() + 60), now())
+        .unwrap();
+
+    let multi_key_err =
+        Verifier::from_public_keys(vec![provider_b.public_key(), provider_a.public_key()])
+            .unwrap()
+            .verify(&token, now())
+            .unwrap_err();
+    let single_key_err = Verifier::from_public_key(provider_b.public_key())
+        .unwrap()
+        .verify(&token, now())
+        .unwrap_err();
+
+    // The error must not reveal how many keys were configured or tried.
+    assert_eq!(multi_key_err.to_string(), single_key_err.to_string());
+}
+
+#[test]
+fn from_public_keys_rejects_an_empty_list() {
+    assert!(Verifier::from_public_keys(vec![]).is_err());
 }
 
 #[test]

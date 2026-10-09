@@ -177,6 +177,13 @@ This single algorithm is shared by three call sites: the client-side flow above,
 `Store::verify_content_hash` (used by single-part finalize), and `migrate_backend`'s destination-write verification —
 none of them re-derive the split/rebuild/compare sequence independently.
 
+A fourth, deliberately **separate** check exists on the sidecar's full (non-`Range`) download path: it compares a
+streamed whole-object SHA-256 against the version's `hash_value` to catch the backend path being reoccupied after
+the token for it was issued (see api.md's "Signed URLs" §claims table and
+[concurrency-and-failure-model.md](../concurrency-and-failure-model.md) race #13). It is **not** an instance of this
+algorithm — it never parses or rebuilds a manifest, and is skipped entirely for `multipart-composite-sha256`
+versions, whose `hash_value` is a manifest root the sidecar has no way to recompute from a straight-through stream.
+
 ## 4. States (CDSL)
 
 **Not applicable.** `hash_mode` is a per-version attribute set exactly once, at finalize time, from which code path

@@ -810,7 +810,12 @@ avoid leaving this unswept sibling behind.
   a `400`, "If-Match is required to rebind already-bound content"). Mismatch → `400 Bad Request` on the
   control plane (`FailedPrecondition` collapses to `400` on this platform — see "Status code summary" below). The
   sidecar's data-plane `PUT` does not check `If-Match` at all — it only streams bytes and calls finalize; conditional
-  concurrency on content is enforced solely by the control-plane `bind` handler.
+  concurrency on content is enforced solely by the control-plane `bind` handler. On `DELETE`, a concrete `If-Match`
+  value is re-verified a second time, *inside* the delete transaction against the row it locks there — not only
+  against a `file` read taken before the transaction opened — so a `bind`/version-restore that lands in the narrow
+  gap between that earlier read and the transaction's own lock cannot slip an unapproved delete through; `*` skips
+  the check entirely, at both points (see race #12 in
+  [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)).
 - `If-Match-Metadata: <u64>`: **optional** on metadata-only `PATCH`; matched against the current `meta_version`.
   Mismatch → `400` (same `FailedPrecondition` → `400` mapping). `meta_version` is returned in the JSON body
   (`FileDto.meta_version`) on every file read/mutation response; there is **no** `X-FS-Metadata-Revision` response

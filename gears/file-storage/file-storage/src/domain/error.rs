@@ -4,6 +4,16 @@ use thiserror::Error;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+/// `Retry-After` (seconds) advertised for every `BackendUnavailable` emission; short because
+/// these are transient blips or a lost concurrent-change race, so a prompt retry is expected.
+pub const BACKEND_RETRY_AFTER_SECS: u64 = 5;
+
+/// `DomainError::Conflict` message raised when `Store::finalize_multipart_version` finds the
+/// session already aborted by cleanup. `Conflict` has no sub-kind, so the raise site and
+/// `MultipartService` both match on this constant.
+pub const MULTIPART_SESSION_RECLAIMED_BY_CLEANUP_MESSAGE: &str =
+    "multipart session is no longer completing (aborted by cleanup)";
+
 /// Domain-specific errors. Mapped to RFC-9457 Problem at the REST boundary
 /// (`api/rest/error.rs`).
 #[domain_model]
@@ -44,6 +54,11 @@ pub enum DomainError {
 
     #[error("Storage backend '{backend_id}' error: {message}")]
     Backend { backend_id: String, message: String },
+
+    /// Transient backend failure (network, timeout, overload, a concurrent change
+    /// of the object): retrying the same request later is expected to succeed.
+    #[error("Storage backend '{backend_id}' temporarily unavailable: {message}")]
+    BackendUnavailable { backend_id: String, message: String },
 
     #[error("Unknown storage backend: '{backend_id}'")]
     UnknownBackend { backend_id: String },
@@ -88,8 +103,7 @@ pub enum DomainError {
     #[error("Multipart upload session {upload_id} is not in progress (state: {state})")]
     MultipartUploadNotInProgress { upload_id: Uuid, state: String },
 
-    /// 409 — `complete` was called while one or more planned parts have not
-    /// been reported yet.
+    /// 409 — `complete` was called while planned parts are still unreported.
     #[error("Multipart upload {upload_id}: parts missing: {missing:?}")]
     MultipartPartsMissing { upload_id: Uuid, missing: Vec<u32> },
 
@@ -169,6 +183,13 @@ impl DomainError {
 
     pub fn backend(backend_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Backend {
+            backend_id: backend_id.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn backend_unavailable(backend_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::BackendUnavailable {
             backend_id: backend_id.into(),
             message: message.into(),
         }

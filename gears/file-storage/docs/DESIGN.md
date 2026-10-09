@@ -1283,6 +1283,13 @@ find it by). `DELETE /files/{id}/versions/{vid}` (§3.3) applies the same lock-t
 orphan-reclaim sweep (`cleanup-engine`, above) applies it to its own zero-version check before reclaiming a
 versionless `files` row.
 
+The same transaction also re-verifies a concrete `If-Match` against the locked row, immediately after that lock
+and before any version is listed or deleted — this diagram's earlier "ETag mismatch" branch is only the cheap,
+pre-transaction fast reject; the in-transaction re-check is the actual guarantee, since a `bind`/version-restore
+that commits strictly between the fast reject and the lock would otherwise go undetected and let the delete
+remove content the caller's `If-Match` never approved (`*` skips the check at both points). See
+[concurrency-and-failure-model.md](./concurrency-and-failure-model.md) race #12.
+
 #### List files (P1)
 
 **ID**: `cpt-cf-file-storage-seq-list-files`
@@ -1392,7 +1399,7 @@ The file row holds **no bytes and no per-content fields** (mime, size, hash, bac
 - `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)` — covers `GET /files` listing
   (sorted `ORDER BY created_at DESC, file_id DESC`; the `file_id` tie-breaker keeps two
   keyset-paginated pages from skipping or repeating a row when they share a `created_at` instant).
-  `files_owner_listing_v2_idx`, shipped in `m20260924_000001_upload_flow_redesign`,
+  `files_owner_listing_v2_idx`, shipped in `m20261008_000001_listing_indexes`,
   superseding the released `files_owner_listing_idx (tenant_id, owner_kind, owner_id, created_at DESC)`
   (`m20260624_000001_p1_initial`), dropped in the same migration
 - `(tenant_id, gts_file_type)` — supports per-type queries
@@ -1434,7 +1441,7 @@ and is immutable.
   pre-registered versions (P2); matches `file_versions_pending_idx` (created in `m20260624_000001_p1_initial`)
 - `(file_id, created_at, version_id)` — covers `GET /files/{id}/versions`'s `file_id = ?` filter plus its
   `created_at DESC` sort (the composite PK alone serves the filter but not the sort, and versions are never
-  pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx`, shipped in `m20260924_000001_upload_flow_redesign`
+  pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx`, shipped in `m20261008_000001_listing_indexes`
 
 **Constraints**: `backend_id`/`backend_path` immutable per version (a content write makes a **new** version; the P2
 `backend-migrator` may relocate a version's bytes after a verified copy). The ETag is derived from

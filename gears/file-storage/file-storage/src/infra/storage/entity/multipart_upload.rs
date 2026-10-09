@@ -27,6 +27,28 @@ pub struct Model {
     /// Server-chosen part size (bytes); with `declared_size` it reconstitutes the
     /// parts plan without persisting per-part rows.
     pub part_size: i64,
+    /// Whether `complete` binds the finalized version as the file's current content
+    /// itself (set by `POST /files` with `bind: "auto"`); `false` = client binds.
+    #[sea_orm(default_value = false)]
+    pub auto_bind: bool,
+    /// Completion-lease expiry (`state = 'completing'` only); a later `complete`
+    /// takes over once it passes.
+    #[sea_orm(nullable)]
+    pub lease_until: Option<OffsetDateTime>,
+    /// Opaque id of the completer holding the lease (diagnostics + scoped release).
+    #[sea_orm(nullable)]
+    pub lease_owner: Option<String>,
+    /// Persisted JSON of the successful complete response
+    /// (`domain::multipart::StoredCompleteResult`) once `state = 'completed'`.
+    #[sea_orm(nullable)]
+    pub complete_result: Option<String>,
+    /// The backend this session's upload targets, set once at initiate time.
+    /// `NULL` only for legacy sessions whose `file_versions` row was gone at backfill.
+    #[sea_orm(nullable)]
+    pub backend_id: Option<String>,
+    /// The backend object path this session's upload targets, same provenance as `backend_id`.
+    #[sea_orm(nullable)]
+    pub backend_path: Option<String>,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
 }

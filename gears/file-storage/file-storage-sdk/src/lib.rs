@@ -1,6 +1,8 @@
 //! File Storage SDK
 //!
-//! Public API surface of the `file-storage` gear (control plane):
+//! Public API surface of the `file-storage` gear (control plane). Operations run
+//! in-process through [`FileStorageClientV1`] and return models / signed URLs; the
+//! SDK never transfers file bytes itself.
 //!
 //! - [`FileStorageClientV1`] — the inter-gear client trait (resolved from `ClientHub`)
 //! - model types ([`models`])
@@ -25,9 +27,19 @@ pub mod models;
 pub use api::FileStorageClientV1;
 pub use gts::FILE_TYPE_RESOURCE;
 pub use models::{
-    ByteRange, CustomMetadataEntry, CustomMetadataPatch, File, FileId, FileVersion, NewFile,
-    OwnerFilter, OwnerKind, VersionId, VersionStatus,
+    AgeRetention, BindState, ByteRange, CompletedMultipartUpload, CreateFileOutcome,
+    CustomMetadataEntry, CustomMetadataPatch, DownloadTicket, EffectivePolicy, File, FileFetch,
+    FileId, FileRecord, FileVersion, InactivityRetention, MetadataLimits, MetadataRetention,
+    MimeSizeOverride, MissingPart, MultipartCompleteOutcome, MultipartIntent, MultipartPartPlan,
+    MultipartPlan, MultipartStatus, MultipartUploadState, NewFile, OwnerFilter, OwnerKind, Policy,
+    PolicyBody, PolicyScope, ReceivedPart, RetentionRule, RetentionRuleBody, RetentionScope,
+    SizeLimits, Storage, StorageCapabilities, UploadTicket, VersionId, VersionRecord,
+    VersionStatus,
 };
+
+// Cursor-pagination envelope for the `list_*` methods, re-exported so callers need
+// no direct `toolkit-odata` dependency.
+pub use toolkit_odata::Page;
 
 pub use toolkit_canonical_errors::CanonicalError as FileStorageError;
 pub use toolkit_canonical_errors::{self, CanonicalError, Problem};

@@ -29,6 +29,16 @@ pub struct Model {
     pub backend_id: String,
     pub backend_path: String,
     pub created_at: OffsetDateTime,
+    /// See [`file_storage_sdk::FileVersion::bound_on_finalize`]'s doc comment.
+    pub bound_on_finalize: bool,
+    /// Migration lease owner: a random `Uuid` stamped by `migrate_backend` before it writes
+    /// to the destination, so a concurrent migration of the same version (same destination
+    /// path) is rejected. `None` means no lease. Internal; not part of `FileVersion`.
+    pub migration_lease_owner: Option<Uuid>,
+    /// Migration lease expiry, set from the **database clock**
+    /// (`VersionRepo::acquire_migration_lease`) so instance clock skew cannot make a live
+    /// lease look expired or vice versa. `None` iff [`Self::migration_lease_owner`] is `None`.
+    pub migration_lease_until: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

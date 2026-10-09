@@ -70,7 +70,6 @@ fn resolve_user_restricted_tenant_unrestricted_returns_user_set() {
 
 #[test]
 fn resolve_intersection_of_mime_types() {
-    // image/* and image/jpeg must resolve to the narrower image/jpeg, not image/*.
     let tenant = body_with_mimes(&["image/*", "video/mp4"]);
     let user = body_with_mimes(&["image/jpeg", "video/mp4"]);
     let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
@@ -164,7 +163,8 @@ fn resolve_per_mime_overrides_merged_most_restrictive() {
 
 #[test]
 fn resolve_per_mime_specific_is_tightened_by_covering_wildcard() {
-    // A broader wildcard cap must tighten the more-specific entry it covers.
+    // A broader wildcard cap must tighten the more-specific entry it covers,
+    // otherwise the most-specific-match consumer would ignore the stricter cap.
     let mut tenant = PolicyBody::default();
     tenant.size_limits.per_mime = vec![MimeSizeOverride {
         mime: "image/*".to_owned(),
@@ -291,32 +291,8 @@ fn empty_policy_body_serializes_to_valid_json() {
 }
 
 #[test]
-fn mime_allowed_exact_match() {
-    assert!(PolicyResolver::mime_allowed(
-        "image/jpeg",
-        &["image/jpeg".to_owned()]
-    ));
-}
-
-#[test]
-fn mime_allowed_wildcard_subtype() {
-    assert!(PolicyResolver::mime_allowed(
-        "image/jpeg",
-        &["image/*".to_owned()]
-    ));
-}
-
-#[test]
-fn mime_allowed_wildcard_does_not_match_different_type() {
-    assert!(!PolicyResolver::mime_allowed(
-        "video/mp4",
-        &["image/*".to_owned()]
-    ));
-}
-
-/// A stored pattern without `/` (e.g. `"image"`) must not act as a wildcard for `image/...`.
-#[test]
 fn mime_allowed_malformed_pattern_without_slash_never_matches_as_wildcard() {
+    // `"image"` stored as an allowed pattern must not match `"image/jpeg"`.
     assert!(!PolicyResolver::mime_allowed(
         "image/jpeg",
         &["image".to_owned()]

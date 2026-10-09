@@ -20,13 +20,11 @@ fn validate_accepts_matching_declared_type() {
 
 #[test]
 fn validate_accepts_declared_with_charset_param() {
-    // essence comparison ignores `; charset=...`
     assert!(validate("image/png; charset=binary", PNG_MAGIC).is_ok());
 }
 
 #[test]
 fn validate_rejects_mismatch() {
-    // declared png but bytes are pdf → mismatch
     let err = validate("image/png", PDF_MAGIC).unwrap_err();
     assert!(
         matches!(err, DomainError::MimeMismatch { .. }),

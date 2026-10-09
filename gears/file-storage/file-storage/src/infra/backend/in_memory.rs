@@ -6,18 +6,18 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use file_storage_sdk::ByteRange;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use uuid::Uuid;
-
-use file_storage_sdk::ByteRange;
 
 use crate::domain::error::DomainError;
 use crate::infra::content::hash;
 use crate::infra::content::hash_mode::Manifest;
 
 use super::{
-    BackendCapabilities, MultipartCompletionPart, StorageBackend, build_manifest_and_root,
+    BackendCapabilities, MultipartCompletionPart, PublishOutcome, StorageBackend,
+    build_manifest_and_root, check_read_prefix_budget,
 };
 
 /// In-progress multipart state per handle: (blob path, ordered parts).
@@ -52,6 +52,28 @@ impl InMemoryBackend {
             .lock()
             .map_err(|_| DomainError::backend("in-memory", "poisoned lock (multipart)"))
     }
+
+    /// Whole-object read helper; fine here because the object is already in memory.
+    fn get_whole(&self, path: &str) -> Result<Bytes, DomainError> {
+        self.lock_blobs()?
+            .get(path)
+            .cloned()
+            .ok_or_else(|| DomainError::backend(&self.id, format!("blob not found: {path}")))
+    }
+
+    /// Range-slice helper built on [`Self::get_whole`].
+    fn get_range_whole(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
+        let full = self.get_whole(path)?;
+        let total = full.len() as u64;
+        match range.resolve(total) {
+            Some((start, end)) => {
+                let s = usize::try_from(start).unwrap_or(usize::MAX);
+                let e = usize::try_from(end).unwrap_or(usize::MAX);
+                Ok(full.slice(s..=e.min(full.len().saturating_sub(1))))
+            }
+            None => Err(DomainError::validation("range", "unsatisfiable byte range")),
+        }
+    }
 }
 
 #[async_trait]
@@ -67,11 +89,6 @@ impl StorageBackend for InMemoryBackend {
             // `durable` stays `false`: content is lost on restart.
             ..BackendCapabilities::default()
         }
-    }
-
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
-        self.lock_blobs()?.insert(path.to_owned(), bytes);
-        Ok(())
     }
 
     /// Buffers the stream: acceptable for non-durable test/dev storage.
@@ -95,37 +112,85 @@ impl StorageBackend for InMemoryBackend {
         Ok((bytes_written, digest))
     }
 
-    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
-        self.lock_blobs()?
-            .get(path)
-            .cloned()
-            .ok_or_else(|| DomainError::backend(&self.id, format!("blob not found: {path}")))
+    /// Create-exclusive publish: the existence check and insert share one `blobs` lock,
+    /// so unlike the trait's default fallback there is no TOCTOU window.
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        mut stream: BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<PublishOutcome, DomainError> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(&self.id, e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+            if max_size.is_some_and(|m| buf.len() as u64 > m) {
+                return Err(DomainError::validation("size", "exceeds max_size"));
+            }
+        }
+        let bytes_written = buf.len() as u64;
+        let digest = hash::digest_to_array(hash::sha256(&buf));
+
+        let mut blobs = self.lock_blobs()?;
+        if blobs.contains_key(path) {
+            return Ok(PublishOutcome {
+                bytes_written,
+                digest,
+                created: false,
+            });
+        }
+        blobs.insert(path.to_owned(), Bytes::from(buf));
+        Ok(PublishOutcome {
+            bytes_written,
+            digest,
+            created: true,
+        })
+    }
+
+    /// Reads up to `max_bytes` from the start of the stored blob, if any.
+    async fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<Option<Bytes>, DomainError> {
+        check_read_prefix_budget(max_bytes)?;
+        let blobs = self.lock_blobs()?;
+        Ok(blobs.get(path).map(|b| {
+            let n = usize::try_from(max_bytes)
+                .unwrap_or(usize::MAX)
+                .min(b.len());
+            b.slice(0..n)
+        }))
     }
 
     /// Yields the stored `Bytes` as a single chunk.
+    /// Still checks `expected_len` against the blob read under the lock.
     async fn get_stream(
         &self,
         path: &str,
-    ) -> Result<BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
-        let bytes = self.get(path).await?;
+        expected_len: u64,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let bytes = self.get_whole(path)?;
+        let actual_len = bytes.len() as u64;
+        if actual_len != expected_len {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' changed size before it could be read: expected {expected_len} byte(s), found {actual_len}"
+            )));
+        }
         Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
     }
 
-    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        let full = self.get(path).await?;
-        let total = full.len() as u64;
-        match range.resolve(total) {
-            Some((start, end)) => {
-                let s = usize::try_from(start).unwrap_or(usize::MAX);
-                let e = usize::try_from(end).unwrap_or(usize::MAX);
-                Ok(full.slice(s..=e.min(full.len().saturating_sub(1))))
-            }
-            None => Err(DomainError::validation("range", "unsatisfiable byte range")),
+    /// Yields the resolved range as a single chunk, checking `expected_len` like `get_stream`.
+    async fn get_range_stream(
+        &self,
+        path: &str,
+        range: ByteRange,
+        expected_len: u64,
+    ) -> Result<BoxStream<'static, std::io::Result<Bytes>>, DomainError> {
+        let bytes = self.get_range_whole(path, range)?;
+        let actual_len = bytes.len() as u64;
+        if actual_len != expected_len {
+            return Err(DomainError::conflict(format!(
+                "object at '{path}' range changed before it could be read: expected {expected_len} byte(s), resolved {actual_len}"
+            )));
         }
-    }
-
-    async fn size(&self, path: &str) -> Result<u64, DomainError> {
-        Ok(self.get(path).await?.len() as u64)
+        Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
     }
 
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
@@ -137,6 +202,18 @@ impl StorageBackend for InMemoryBackend {
         Ok(self.lock_blobs()?.contains_key(path))
     }
 
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.lock_blobs()?
+            .get(path)
+            .map(|b| b.len() as u64)
+            .ok_or_else(|| DomainError::backend(&self.id, format!("blob not found: {path}")))
+    }
+
+    /// Combined stat under one lock, without cloning the blob to measure it.
+    async fn stat(&self, path: &str) -> Result<Option<u64>, DomainError> {
+        Ok(self.lock_blobs()?.get(path).map(|b| b.len() as u64))
+    }
+
     async fn initiate_multipart(&self, path: &str) -> Result<String, DomainError> {
         let handle = format!("{}-{}", path, Uuid::now_v7());
         self.lock_multipart()?
@@ -144,14 +221,38 @@ impl StorageBackend for InMemoryBackend {
         Ok(handle)
     }
 
-    async fn upload_part(
+    /// Buffers the stream, but still enforces the trait's exact-length contract on `len`
+    /// so tests see the same rejection a real backend gives.
+    async fn upload_part_stream(
         &self,
         _path: &str,
         upload_handle: &str,
         part_number: u32,
         _part_offset: u64,
-        data: Bytes,
+        mut stream: BoxStream<'static, std::io::Result<Bytes>>,
+        len: u64,
     ) -> Result<(String, Vec<u8>), DomainError> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(&self.id, e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+            if buf.len() as u64 > len {
+                return Err(DomainError::validation(
+                    "size",
+                    format!("part stream exceeded the declared length {len}"),
+                ));
+            }
+        }
+        if buf.len() as u64 != len {
+            return Err(DomainError::validation(
+                "size",
+                format!(
+                    "part stream yielded {} byte(s), expected exactly {len}",
+                    buf.len()
+                ),
+            ));
+        }
+        let data = Bytes::from(buf);
         let hash_bytes = hash::sha256(&data);
         let etag = hex::encode(&hash_bytes);
 
@@ -198,6 +299,7 @@ impl StorageBackend for InMemoryBackend {
         Ok(())
     }
 
+    /// Returns all blob paths currently in the store.
     async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
         let paths = self.lock_blobs()?.keys().cloned().collect();
         Ok(paths)

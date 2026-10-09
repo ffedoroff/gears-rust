@@ -415,9 +415,17 @@ concurrent winner's blob, best-effort cleaning up a destination object only
 when doing so cannot destroy a concurrent winner's already-live content
 (this call created it and its own verification failed, or the destination
 tail rule above found it safe to reclaim), and best-effort clean up the
-source blob only after the CAS has won. The system **MUST** best-effort
-release the migration lease on every exit path, whether or not the release
-itself succeeds.
+source blob only after the CAS has won. The CAS itself **MUST NOT** release
+the migration lease on a win -- the lease **MUST** stay held by this call's
+own owner through that best-effort source cleanup, so that a second
+migration of the same version can never re-acquire it and move the version
+back onto the backend this call is still in the middle of deleting from (the
+destination path is deterministic, so both migrations would target the
+identical path, and the delayed delete would otherwise risk destroying the
+second migration's live object instead of the stale one it was meant to
+remove). The system **MUST** best-effort release the migration lease on
+every exit path, whether or not the release itself succeeds, and only after
+that exit path's own source-cleanup attempt (if any) has already run.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-backend-migration`

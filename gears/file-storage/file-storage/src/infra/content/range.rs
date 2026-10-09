@@ -18,8 +18,11 @@ pub fn parse(header: &str) -> Option<ByteRange> {
     let (start, end) = spec.split_once('-')?;
 
     match (start.is_empty(), end.is_empty()) {
+        // "-N" → suffix
         (true, false) => parse_digits(end).map(|length| ByteRange::Suffix { length }),
+        // "N-" → open-ended
         (false, true) => parse_digits(start).map(|start| ByteRange::OpenEnded { start }),
+        // "N-M" → inclusive.
         (false, false) => {
             let s = parse_digits(start)?;
             let e = parse_digits(end)?;
@@ -30,6 +33,7 @@ pub fn parse(header: &str) -> Option<ByteRange> {
             }
             Some(ByteRange::Inclusive { start: s, end: e })
         }
+        // "-" → malformed
         (true, true) => None,
     }
 }

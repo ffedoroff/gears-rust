@@ -1,6 +1,5 @@
-//! Cursor-pagination contract for `/files`, `/files/{id}/versions` and `/retention-rules`:
-//! full walks in both directions (including `created_at` ties), cursor errors, and SQL-side
-//! non-admin visibility on `/retention-rules`.
+//! Cursor-pagination coverage for the three SQL-backed listings: `GET /files`, `GET
+//! /files/{id}/versions`, `GET /retention-rules`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -59,7 +58,8 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
-/// Real default page sizes, so `?limit` clamping tests observe the real ceiling.
+/// Matches the platform's real defaults (`FileStorageConfig::default_page_size`/ `max_page_size`),
+/// so `?limit` clamping tests observe the real ceiling.
 fn base_config() -> ServiceConfig {
     ServiceConfig {
         default_url_ttl_secs: 3600,
@@ -112,7 +112,6 @@ fn get_req(uri: String) -> Request<Body> {
         .expect("build request")
 }
 
-/// Grants `READ`/`WRITE`/`DELETE`; gates `ADMIN_POLICY` on `is_admin`.
 #[derive(Default)]
 struct ScopedTestAuthorizer {
     is_admin: AtomicBool,
@@ -148,8 +147,6 @@ impl Authorizer for ScopedTestAuthorizer {
     }
 }
 
-/// Seeds `n` files for one owner via `FileRepo` with pinned `created_at` (`instants[i]`) to
-/// exercise the tie-break at page boundaries.
 async fn seed_files(
     db: &Arc<DBProvider<DbError>>,
     tenant: Uuid,
@@ -180,7 +177,8 @@ async fn seed_files(
     ids
 }
 
-/// Canonical order for every listing: `created_at DESC`, id column `DESC`.
+/// Canonical order for `/files`/`/files/{id}/versions`/`/retention-rules`: `created_at DESC`, id
+/// column `DESC`.
 fn expected_order(mut items: Vec<(OffsetDateTime, Uuid)>) -> Vec<Uuid> {
     items.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     items.into_iter().map(|(_, id)| id).collect()
@@ -207,7 +205,6 @@ async fn files_cursor_walk_covers_all_items_exactly_once_including_created_at_ti
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
     let base = OffsetDateTime::now_utc();
-    // 7 files over 3 instants, so a small `limit` walk crosses a `created_at` tie.
     let instants = [
         base,
         base,
@@ -256,7 +253,9 @@ async fn files_cursor_walk_covers_all_items_exactly_once_including_created_at_ti
     );
     assert!(pages.len() > 1, "test must exercise more than one page");
 
-    // Walking back from the last page's `prev_cursor` reproduces the same pages.
+    // Walk backward from the last page's own prev_cursor and confirm the exact same pages come
+    // back, in the same canonical order, ending with prev_cursor = null on what is again the first
+    // page.
     let mut back_pages: Vec<Vec<Uuid>> = Vec::new();
     let mut back_cursor = prev_cursors
         .last()
@@ -275,6 +274,8 @@ async fn files_cursor_walk_covers_all_items_exactly_once_including_created_at_ti
         }
     }
     back_pages.reverse();
+    // The backward walk starts from the last page's predecessor and ends at the first page, so it
+    // reproduces every page except the last one, still in forward order.
     let expected_back = &pages[..pages.len() - 1];
     assert_eq!(
         back_pages, expected_back,
@@ -418,7 +419,7 @@ async fn build_files_harness() -> (Arc<FileService>, SecurityContext, Uuid) {
     ));
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
-    svc.create_file(&ctx(tenant, owner), new_file(owner), None)
+    svc.create_file(&ctx(tenant, owner), new_file(owner), None, false)
         .await
         .expect("seed one file");
     (svc, ctx(tenant, owner), owner)
@@ -505,6 +506,7 @@ fn new_version(file_id: Uuid, version_id: Uuid, created_at: OffsetDateTime) -> F
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at,
+        bound_on_finalize: false,
     }
 }
 
@@ -800,6 +802,130 @@ async fn versions_limit_zero_is_rejected_as_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn versions_manifest_budget_truncation_forces_next_cursor_with_no_gap_or_duplicate() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let svc = FileService::new(
+        store.clone(),
+        backends,
+        issuer,
+        authorizer,
+        base_config(),
+        None,
+        None,
+    );
+
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let base = OffsetDateTime::now_utc();
+    let conn = db.conn().expect("conn");
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+    let scope = AccessScope::allow_all();
+    let file_id = Uuid::now_v7();
+    files
+        .create(
+            &conn,
+            &scope,
+            &File {
+                file_id,
+                tenant_id: tenant,
+                owner_kind: OwnerKind::User,
+                owner_id: owner,
+                name: "doc.bin".to_owned(),
+                gts_file_type: GTS.to_owned(),
+                content_id: None,
+                meta_version: 0,
+                created_at: base,
+                last_modified_at: base,
+            },
+        )
+        .await
+        .expect("create file");
+
+    let manifest_text = "x".repeat(3 * 1024 * 1024);
+    let mut version_ids = Vec::new();
+    for i in 0..3u8 {
+        let version_id = Uuid::now_v7();
+        let created_at = base + time::Duration::seconds(i64::from(i));
+        let mut v = new_version(file_id, version_id, created_at);
+        v.hash_mode = "multipart-composite-sha256".to_owned();
+        v.part_count = Some(2);
+        versions
+            .insert(&conn, &scope, &v)
+            .await
+            .expect("insert composite version");
+        versions
+            .insert_manifest(&conn, &scope, version_id, &manifest_text, created_at)
+            .await
+            .expect("insert manifest");
+        version_ids.push(version_id);
+    }
+    // Newest-first order: v2 (base+2), v1 (base+1), v0 (base).
+    let v2 = version_ids[2];
+    let v1 = version_ids[1];
+    let v0 = version_ids[0];
+
+    let ctx = ctx(tenant, owner);
+    let page1 = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), None)
+        .await
+        .expect("page 1");
+    assert_eq!(
+        page1.items.len(),
+        1,
+        "the manifest budget must cut the page short after the first (largest-budget) version"
+    );
+    assert_eq!(page1.items[0].0.version_id, v2);
+    let cursor = page1
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("a budget-truncated page must still carry a next_cursor");
+
+    let page2 = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), Some(&cursor))
+        .await
+        .expect("page 2");
+    assert_eq!(
+        page2
+            .items
+            .iter()
+            .map(|(v, _)| v.version_id)
+            .collect::<Vec<_>>(),
+        vec![v1],
+        "page 2 must resume exactly at v1 -- no gap, no repeat of v2"
+    );
+    let cursor2 = page2
+        .page_info
+        .next_cursor
+        .clone()
+        .expect("page 2 is budget-truncated too, so it must also carry a next_cursor");
+
+    let page3 = svc
+        .list_versions_with_manifests(&ctx, file_id, Some(10), Some(&cursor2))
+        .await
+        .expect("page 3");
+    assert_eq!(
+        page3
+            .items
+            .iter()
+            .map(|(v, _)| v.version_id)
+            .collect::<Vec<_>>(),
+        vec![v0],
+        "page 3 must resume exactly at v0 -- no gap, no repeat of v1"
+    );
+    assert!(
+        page3.page_info.next_cursor.is_none(),
+        "must be the last page"
+    );
+}
+
 async fn build_retention_harness() -> (
     Arc<FileService>,
     Arc<PolicyService>,
@@ -835,8 +961,6 @@ async fn build_retention_harness() -> (
     (svc, policy_svc, authz, tenant, subject)
 }
 
-/// A non-admin cursor walk matches the full visibility set and every page but the last is
-/// `limit`-sized (the filter runs in SQL).
 #[tokio::test]
 async fn retention_rules_non_admin_cursor_walk_matches_full_visibility_set_and_pages_are_full() {
     let (svc, policy_svc, authz, tenant, subject) = build_retention_harness().await;
@@ -845,7 +969,8 @@ async fn retention_rules_non_admin_cursor_walk_matches_full_visibility_set_and_p
     let ctx_other = ctx(tenant, other_user);
 
     authz.set_admin(true);
-    // Visible: tenant-scope, own user-scope, own file's file-scope rule.
+    // Visible to `subject`: tenant-scope rule, subject's own user-scope rule, subject's own file's
+    // file-scope rule.
     let tenant_rule = policy_svc
         .create_retention_rule(
             &ctx_subject,
@@ -865,10 +990,9 @@ async fn retention_rules_non_admin_cursor_walk_matches_full_visibility_set_and_p
         .await
         .expect("create subject's user rule");
     let own_file = svc
-        .create_file(&ctx_subject, new_file(subject), None)
+        .create_file_bare(&ctx_subject, new_file(subject))
         .await
-        .expect("create own file")
-        .file_id;
+        .expect("create own file");
     let subject_file_rule = policy_svc
         .create_retention_rule(
             &ctx_subject,
@@ -878,7 +1002,7 @@ async fn retention_rules_non_admin_cursor_walk_matches_full_visibility_set_and_p
         )
         .await
         .expect("create subject's file rule");
-    // Not visible: another user's user-scope rule, another owner's file-scope rule.
+    // Not visible to `subject`: another user's user-scope rule, another owner's file-scope rule.
     policy_svc
         .create_retention_rule(
             &ctx_subject,
@@ -889,10 +1013,9 @@ async fn retention_rules_non_admin_cursor_walk_matches_full_visibility_set_and_p
         .await
         .expect("create other user's rule");
     let other_file = svc
-        .create_file(&ctx_other, new_file(other_user), None)
+        .create_file_bare(&ctx_other, new_file(other_user))
         .await
-        .expect("create other's file")
-        .file_id;
+        .expect("create other's file");
     policy_svc
         .create_retention_rule(
             &ctx_subject,
@@ -1069,7 +1192,6 @@ async fn retention_rules_garbage_cursor_is_rejected_as_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// A cursor built under a different order must be rejected (`ORDER_MISMATCH`).
 #[tokio::test]
 async fn retention_rules_cursor_with_wrong_order_field_is_rejected() {
     let (_svc, policy_svc, authz, tenant, subject) = build_retention_harness().await;
@@ -1089,7 +1211,6 @@ async fn retention_rules_cursor_with_wrong_order_field_is_rejected() {
     assert!(matches!(err, DomainError::Cursor(_)));
 }
 
-/// Same as above for a backward cursor.
 #[tokio::test]
 async fn retention_rules_backward_cursor_with_wrong_order_field_is_rejected() {
     let (_svc, policy_svc, authz, tenant, subject) = build_retention_harness().await;

@@ -2,6 +2,7 @@
 //! repositories (`SecureORM`), the migration registry, and the persistence
 //! facade ([`Store`]) that owns the `DBProvider` and all transaction logic.
 
+pub mod db;
 pub mod entity;
 pub mod mapper;
 pub mod migrations;

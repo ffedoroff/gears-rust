@@ -5,21 +5,22 @@ use super::*;
 
 #[test]
 fn gear_provides_p1_and_p2_migrations() {
-    // The database wiring must hand the runtime every migration, in order.
+    // The DatabaseCapability wiring must hand the runtime all current migrations:
     let gear = FileStorageGear::default();
     assert_eq!(
         gear.migrations().len(),
-        8,
+        9,
         "gear must provide the P1, P2 initial, P2 multipart plan columns, P2 \
          remediation 0.10 idempotency subject_id, P2 remediation 2.1 \
          idempotency request_hash, P2 remediation 2.4 policies unique \
-         scope, ADR-0006 content-hash-modes, and listing-indexes migrations"
+         scope, ADR-0006 content-hash-modes, upload-flow-redesign \
+         (auto_bind + completion lease + backend_id/backend_path + index \
+         hardening), and listing-indexes migrations"
     );
 }
 
 #[test]
 fn gear_default_config_excludes_in_memory_backend() {
-    // The non-durable `memory` backend is registered only on explicit opt-in.
     let cfg = FileStorageConfig::default();
     assert!(!cfg.enable_in_memory_backend);
 
@@ -33,6 +34,8 @@ fn gear_default_config_excludes_in_memory_backend() {
 
 #[test]
 fn gear_dev_flag_enables_in_memory_backend() {
+    // Opting in via `enable_in_memory_backend: true` registers the `memory`
+    // backend alongside the always-present `local-fs` default.
     let cfg = FileStorageConfig {
         enable_in_memory_backend: true,
         ..FileStorageConfig::default()
@@ -47,7 +50,6 @@ fn gear_dev_flag_enables_in_memory_backend() {
 
 #[test]
 fn gear_registry_includes_configured_s3_backends() {
-    // Construction performs no I/O, so an unreachable endpoint is fine here.
     let cfg = crate::config::FileStorageConfig {
         s3_backends: vec![crate::config::S3BackendConfig {
             id: "s3-primary".to_owned(),
@@ -76,7 +78,6 @@ fn gear_registry_includes_configured_s3_backends() {
 
 #[test]
 fn gear_default_backend_id_falls_back_to_local_fs_when_unset() {
-    // Without `default_backend_id`, new uploads keep routing to `local-fs`.
     let cfg = crate::config::FileStorageConfig {
         s3_backends: vec![crate::config::S3BackendConfig {
             id: "s3-primary".to_owned(),
@@ -96,7 +97,6 @@ fn gear_default_backend_id_falls_back_to_local_fs_when_unset() {
 
 #[test]
 fn gear_default_backend_id_override_selects_configured_backend() {
-    // `default_backend_id` naming a configured S3 backend makes it the registry default.
     let cfg = crate::config::FileStorageConfig {
         s3_backends: vec![crate::config::S3BackendConfig {
             id: "s3-primary".to_owned(),
@@ -118,7 +118,8 @@ fn gear_default_backend_id_override_selects_configured_backend() {
 
 #[test]
 fn gear_default_backend_id_unknown_id_fails_fast() {
-    // An unknown `default_backend_id` is an init-time `Err`, not a panic.
+    // An override naming a backend id that isn't among the configured
+    // backends must be a clean init-time `Err`, never a panic.
     let cfg = crate::config::FileStorageConfig {
         default_backend_id: Some("does-not-exist".to_owned()),
         ..FileStorageConfig::default()

@@ -16,20 +16,110 @@ use uuid::Uuid;
 
 use file_storage::domain::audit::{AuditEntry, AuditOperation};
 use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
-use file_storage::domain::ports::DataPlanePort;
 use file_storage::domain::service::{FileService, ServiceConfig};
 use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::content::{hash, mime};
 use file_storage::infra::signed_url::{Claims, Issuer};
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
+use file_storage_sdk::{
+    ByteRange, CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind,
+};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-async fn build_service() -> (Arc<FileService>, DataPlaneService) {
+/// Direct byte-path test double: writes and reads content through `put_stream`/`get_stream`.
+struct TestDataPlane {
+    svc: Arc<FileService>,
+    store: Store,
+    backends: BackendRegistry,
+}
+
+impl TestDataPlane {
+    fn new(svc: Arc<FileService>, store: Store, backends: BackendRegistry) -> Self {
+        Self {
+            svc,
+            store,
+            backends,
+        }
+    }
+
+    async fn put_content(
+        &self,
+        ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        declared_mime: &str,
+        bytes: Bytes,
+    ) -> Result<(), DomainError> {
+        mime::validate(declared_mime, &bytes)?;
+        self.svc.authorize_write(ctx, file_id).await?;
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let len = bytes.len() as u64;
+        let digest = hash::sha256(&bytes);
+        let stream: futures::stream::BoxStream<'static, std::io::Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        backend
+            .put_stream(&version.backend_path, stream, Some(len))
+            .await?;
+        self.svc
+            .finalize_upload(
+                ctx,
+                file_id,
+                version_id,
+                i64::try_from(len).unwrap_or(i64::MAX),
+                digest,
+            )
+            .await
+    }
+
+    async fn read_content(
+        &self,
+        _ctx: &SecurityContext,
+        file_id: Uuid,
+        version_id: Uuid,
+        range: Option<ByteRange>,
+    ) -> Result<Bytes, DomainError> {
+        use futures::StreamExt;
+
+        let version = self
+            .store
+            .get_version(file_id, version_id)
+            .await?
+            .ok_or_else(|| DomainError::version_not_found(file_id, version_id))?;
+        let backend = self.backends.get(&version.backend_id)?;
+        let total = u64::try_from(version.size).unwrap_or(0);
+
+        let mut stream = match range {
+            Some(r) => {
+                let (start, end) = r
+                    .resolve(total)
+                    .ok_or_else(|| DomainError::validation("range", "unsatisfiable byte range"))?;
+                let len = end - start + 1;
+                backend
+                    .get_range_stream(&version.backend_path, r, len)
+                    .await?
+            }
+            None => backend.get_stream(&version.backend_path, total).await?,
+        };
+
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DomainError::backend(backend.id(), e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf.freeze())
+    }
+}
+
+async fn build_service() -> (Arc<FileService>, TestDataPlane) {
     let (svc, dp, _store) = build_service_with_page_sizes(50, 1000).await;
     (svc, dp)
 }
@@ -39,7 +129,7 @@ async fn build_service() -> (Arc<FileService>, DataPlaneService) {
 async fn build_service_with_page_sizes(
     default_page_size: u64,
     max_page_size: u64,
-) -> (Arc<FileService>, DataPlaneService, Store) {
+) -> (Arc<FileService>, TestDataPlane, Store) {
     // Temp-file DB: the service opens a connection per call, and `sqlite::memory:` gives each
     // connection its own DB.
     let mut path = std::env::temp_dir();
@@ -70,14 +160,14 @@ async fn build_service_with_page_sizes(
     let store = Store::new(Arc::clone(&db));
     let svc = Arc::new(FileService::new(
         store.clone(),
-        backends,
+        backends.clone(),
         issuer,
         authorizer,
         cfg,
         None,
         None,
     ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let dp = TestDataPlane::new(Arc::clone(&svc), store.clone(), backends);
     (svc, dp, store)
 }
 
@@ -108,7 +198,10 @@ async fn full_upload_bind_download_lifecycle() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     assert!(ticket.upload_url.contains("fs-token="), "signed upload URL");
     assert!(ticket.upload_url.starts_with("http://sidecar.test"));
 
@@ -166,7 +259,10 @@ async fn full_upload_bind_download_lifecycle() {
 async fn bind_with_wrong_if_match_returns_precondition_failed() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -214,7 +310,10 @@ async fn tenant_isolation_hides_other_tenants_files() {
     let ctx_a = ctx(Uuid::now_v7());
     let ctx_b = ctx(Uuid::now_v7());
 
-    let t = svc.create_file(&ctx_a, new_file(), None).await.unwrap();
+    let t = svc
+        .create_file(&ctx_a, new_file(), None, false)
+        .await
+        .unwrap();
     let err = svc.get_file(&ctx_b, t.file_id).await.unwrap_err();
     assert!(
         matches!(err, DomainError::FileNotFound { .. }),
@@ -229,7 +328,7 @@ async fn content_type_mismatch_is_rejected() {
     let ctx = ctx(Uuid::now_v7());
     let mut nf = new_file();
     nf.mime_type = "image/png".to_owned();
-    let t = svc.create_file(&ctx, nf, None).await.unwrap();
+    let t = svc.create_file(&ctx, nf, None, false).await.unwrap();
 
     // Declared png, but the bytes are a PDF signature.
     let err = dp
@@ -252,7 +351,10 @@ async fn content_type_mismatch_is_rejected() {
 async fn update_metadata_merges_and_bumps_meta_version() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let patch = CustomMetadataPatch {
         entries: vec![
@@ -282,11 +384,52 @@ async fn update_metadata_merges_and_bumps_meta_version() {
     assert!(meta2.iter().all(|e| e.key != "color"), "color removed");
 }
 
+/// A key repeated in one patch resolves to "last occurrence wins" (set or delete).
+#[tokio::test]
+async fn update_metadata_with_duplicate_keys_last_occurrence_wins() {
+    let (svc, _dp) = build_service().await;
+    let ctx = ctx(Uuid::now_v7());
+    let t = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+
+    let patch = CustomMetadataPatch {
+        entries: vec![
+            ("tag".to_owned(), Some("first".to_owned())),
+            ("tag".to_owned(), Some("second".to_owned())),
+            ("color".to_owned(), Some("blue".to_owned())),
+            ("color".to_owned(), None), // last occurrence: delete
+            ("tag".to_owned(), Some("third".to_owned())), // last occurrence: set
+        ],
+    };
+    svc.update_metadata(&ctx, t.file_id, patch, None)
+        .await
+        .unwrap();
+
+    let (_f, meta) = svc.get_file_with_metadata(&ctx, t.file_id).await.unwrap();
+    let map: std::collections::BTreeMap<_, _> =
+        meta.into_iter().map(|e| (e.key, e.value)).collect();
+    assert_eq!(
+        map.get("tag"),
+        Some(&"third".to_owned()),
+        "the last occurrence of a repeated key in one patch must win"
+    );
+    assert!(
+        !map.contains_key("color"),
+        "a key whose last occurrence in the patch is a delete must end up deleted, \
+         not left over from an earlier occurrence in the same patch"
+    );
+}
+
 #[tokio::test]
 async fn restore_prior_version_rebinds_pointer() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -331,7 +474,10 @@ async fn restore_prior_version_rebinds_pointer() {
 async fn delete_file_then_get_returns_not_found() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     svc.delete_file(&ctx, t.file_id, Some("*")).await.unwrap();
     let err = svc.get_file(&ctx, t.file_id).await.unwrap_err();
     assert!(
@@ -345,7 +491,10 @@ async fn download_url_pending_version_is_rejected() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let err = svc
         .download_url(&ctx, ticket.file_id, Some(ticket.version_id))
@@ -362,7 +511,10 @@ async fn delete_file_if_match_required_and_enforced() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -414,7 +566,7 @@ async fn list_files_filters_by_owner() {
     let owner = Uuid::now_v7();
     let mut nf = new_file();
     nf.owner_id = owner;
-    let t = svc.create_file(&ctx, nf, None).await.unwrap();
+    let t = svc.create_file(&ctx, nf, None, false).await.unwrap();
 
     let found = svc
         .list_files(
@@ -457,7 +609,10 @@ async fn list_versions_caps_at_max_page_size() {
     let total = max_page_size + 5;
     let mut created = Vec::with_capacity(usize::try_from(total).expect("total fits usize"));
 
-    let t0 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t0 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t0.file_id,
@@ -491,9 +646,12 @@ async fn list_versions_caps_at_max_page_size() {
     let page = svc
         .list_versions(&ctx, t0.file_id, None, None)
         .await
-        .unwrap()
-        .items;
-    assert_eq!(page.len() as u64, max_page_size);
+        .unwrap();
+    assert_eq!(page.items.len() as u64, max_page_size);
+    assert!(
+        page.page_info.next_cursor.is_some(),
+        "more versions remain beyond the clamped page"
+    );
 
     let expected: Vec<Uuid> = created
         .iter()
@@ -501,7 +659,7 @@ async fn list_versions_caps_at_max_page_size() {
         .take(usize::try_from(max_page_size).expect("max_page_size fits usize"))
         .copied()
         .collect();
-    let actual: Vec<Uuid> = page.iter().map(|v| v.version_id).collect();
+    let actual: Vec<Uuid> = page.items.iter().map(|v| v.version_id).collect();
     assert_eq!(actual, expected, "must be the newest-first page");
 
     let clamped = svc
@@ -511,12 +669,16 @@ async fn list_versions_caps_at_max_page_size() {
     assert_eq!(clamped.items.len() as u64, max_page_size);
 }
 
+/// Deleting the version `content_id` points at is rejected (`Conflict`/`version_not_found`).
 #[tokio::test]
 async fn delete_current_version_is_rejected() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -573,7 +735,10 @@ async fn delete_version_then_bind_cannot_dangle() {
     let (svc, dp, store) = build_service_with_page_sizes(50, 1000).await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let t1 = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         t1.file_id,
@@ -645,7 +810,10 @@ async fn download_url_token_carries_version_mime_and_etag() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     dp.put_content(
         &ctx,
         ticket.file_id,

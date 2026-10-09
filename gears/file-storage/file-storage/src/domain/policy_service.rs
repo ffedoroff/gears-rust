@@ -20,6 +20,9 @@ use crate::domain::policy::{
 use crate::domain::ports::PolicyStore;
 
 /// The policy and retention-rule administration service.
+///
+/// Wired alongside `FileService` in `gear.rs`; holds its own copies of the shared
+/// dependencies rather than referencing `FileService`.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct PolicyService {
     store: Arc<dyn PolicyStore>,
@@ -55,6 +58,8 @@ impl PolicyService {
         let scope = self
             .authorize_scope_owner(ctx, actions::READ, scope_owner_id)
             .await?;
+        // Malformed scope/owner shape is a `400`, not an always-empty `204`.
+        Self::validate_scope_owner_shape(&policy_scope, scope_owner_id)?;
         self.store
             .get_policy(
                 &scope,
@@ -74,11 +79,21 @@ impl PolicyService {
         scope_owner_id: Option<Uuid>,
         body: PolicyBody,
     ) -> Result<StoredPolicy, DomainError> {
-        // Tenant scope (`scope_owner_id == None`) has no owner to compare; plain `WRITE` gates it.
-        let scope = self
-            .authorize_scope_owner(ctx, actions::WRITE, scope_owner_id)
-            .await?;
+        // Validate before authorizing: a `User`-scope request without an owner is a malformed
+        // body (`400`), not a `403` just because a missing owner also spells tenant scope.
+        // The check inspects only the request and discloses no stored state.
         Self::validate_policy_body(&policy_scope, scope_owner_id, &body)?;
+        let scope = match scope_owner_id {
+            None => {
+                self.authorizer
+                    .authorize(ctx, actions::ADMIN_POLICY, "", None)
+                    .await?
+            }
+            Some(owner) => {
+                self.authorize_admin_or_owner(ctx, actions::WRITE, Some(owner), false)
+                    .await?
+            }
+        };
         let now = OffsetDateTime::now_utc();
         let tenant_id = ctx.subject_tenant_id();
         let policy_id = self
@@ -97,7 +112,8 @@ impl PolicyService {
         })
     }
 
-    /// Effective policy for the caller: tenant and user levels, most-restrictive-wins.
+    /// Compute the effective policy for the current caller context, combining
+    /// the tenant-level and user-level policies with most-restrictive-wins.
     pub async fn get_effective_policy(
         &self,
         ctx: &SecurityContext,
@@ -107,6 +123,15 @@ impl PolicyService {
             .authorizer
             .authorize(ctx, actions::READ, "", None)
             .await?;
+        // `user_owner_id` is caller-supplied: without this gate any tenant member could read
+        // another user's policy. Cross-owner access requires `ADMIN_POLICY`.
+        if let Some(uid) = user_owner_id
+            && uid != ctx.subject_id()
+        {
+            self.authorizer
+                .authorize(ctx, actions::ADMIN_POLICY, "", None)
+                .await?;
+        }
         let tenant_id = ctx.subject_tenant_id();
 
         let tenant_policy = self
@@ -153,6 +178,7 @@ impl PolicyService {
             self.default_page_size,
             self.max_page_size,
         )?;
+
         let admin = match self
             .authorizer
             .authorize(ctx, actions::ADMIN_POLICY, "", None)
@@ -188,10 +214,12 @@ impl PolicyService {
         scope_target_id: Option<Uuid>,
         body: RetentionRuleBody,
     ) -> Result<StoredRetentionRule, DomainError> {
+        // Validate before authorizing (as in `set_policy`) so one malformed body does not
+        // answer `403` for non-admins but `400` for admins.
+        Self::validate_retention_rule(&retention_scope, scope_target_id, &body)?;
         let scope = self
             .authorize_retention_scope(ctx, &retention_scope, scope_target_id)
             .await?;
-        Self::validate_retention_rule(&retention_scope, scope_target_id, &body)?;
         let now = OffsetDateTime::now_utc();
         let tenant_id = ctx.subject_tenant_id();
         let rule_id = self
@@ -221,16 +249,30 @@ impl PolicyService {
         ctx: &SecurityContext,
         rule_id: Uuid,
     ) -> Result<bool, DomainError> {
-        // A bare `rule_id` carries no ownership, so fetch the rule (via `allow_all`, only to
-        // decide authorization) and re-run the scope check `create_retention_rule` uses.
+        // A bare `rule_id` carries no ownership: fetch the rule under the caller's own tenant
+        // (not `allow_all`, which would give a 403-vs-404 cross-tenant oracle) and re-run the
+        // scope check `create_retention_rule` uses. A foreign-tenant id 404s like a missing one.
         let rule = self
             .store
-            .get_retention_rule(&AccessScope::allow_all(), rule_id)
+            .get_retention_rule(&Self::tenant_scope(ctx), rule_id)
             .await?
             .ok_or_else(|| DomainError::retention_rule_not_found(rule_id))?;
-        let scope = self
+        let scope = match self
             .authorize_retention_scope(ctx, &rule.scope, rule.scope_target_id)
-            .await?;
+            .await
+        {
+            // The target file was deleted between the fetch above and this check (file delete
+            // removes its `File`-scope rules in the same transaction; there is no FK). No file
+            // is left to check, so fall back to plain `WRITE`. Not `ADMIN_POLICY`: the rule
+            // governs nothing (pure garbage collection), and `403` vs `404` would be an
+            // existence oracle. The delete still runs under the caller's tenant scope.
+            Err(DomainError::FileNotFound { .. }) if rule.scope == RetentionScope::File => {
+                self.authorizer
+                    .authorize(ctx, actions::WRITE, "", None)
+                    .await?
+            }
+            other => other?,
+        };
         self.store.delete_retention_rule(&scope, rule_id).await
     }
 
@@ -275,10 +317,32 @@ impl PolicyService {
         Ok(())
     }
 
-    /// Reject a policy body that is dead or dangerous on write.
+    /// Reject a `(scope, scope_owner_id)` pair whose shape is impossible or dead (shared by
+    /// the read and write paths).
     ///
     /// - `User` scope without `scope_owner_id`: the reader always queries with
     ///   `Some(owner_id)`, so such a row could never be read back.
+    /// - `Tenant` scope with an owner: tenant rows are keyed on `(tenant_id, scope)` alone.
+    fn validate_scope_owner_shape(
+        scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<(), DomainError> {
+        match (scope, scope_owner_id) {
+            (PolicyScope::User, None) => Err(DomainError::validation(
+                "scope_owner_id",
+                "user-scope policy requires a scope_owner_id",
+            )),
+            (PolicyScope::Tenant, Some(_)) => Err(DomainError::validation(
+                "scope_owner_id",
+                "tenant-scope policy must not carry a scope_owner_id",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Reject a policy body that is dead or dangerous on write.
+    ///
+    /// - the `(scope, scope_owner_id)` shape checks from `validate_scope_owner_shape`.
     /// - `*/*` in `allowed_mime_types` or `size_limits.per_mime`: the matcher only
     ///   handles `type/*`, so `*/*` silently matches nothing (an accidental deny-all).
     ///   Callers wanting no restriction should omit the entry.
@@ -287,12 +351,7 @@ impl PolicyService {
         scope_owner_id: Option<Uuid>,
         body: &PolicyBody,
     ) -> Result<(), DomainError> {
-        if matches!(scope, PolicyScope::User) && scope_owner_id.is_none() {
-            return Err(DomainError::validation(
-                "scope_owner_id",
-                "user-scope policy requires a scope_owner_id",
-            ));
-        }
+        Self::validate_scope_owner_shape(scope, scope_owner_id)?;
         if body.allowed_mime_types.iter().any(|m| m == "*/*") {
             return Err(DomainError::validation(
                 "allowed_mime_types",
@@ -312,9 +371,9 @@ impl PolicyService {
 
     /// Try `ADMIN_POLICY` (cross-owner / tenant-wide); on `Forbidden`, fall back to
     /// `fallback_action` (`READ`/`WRITE`) and require `required_owner_id`, when present, to
-    /// equal the caller's subject id. A missing owner is "tenant scope" for the policy
-    /// endpoints (authorized by the fallback alone) but a mismatch for `User`-scope retention
-    /// rules; `treat_missing_owner_as_authorized` picks between the two.
+    /// equal the caller's subject id. A missing owner is "tenant scope" for policy reads
+    /// (authorized by the fallback alone) but a mismatch for `User`-scope retention rules;
+    /// `treat_missing_owner_as_authorized` picks between the two.
     async fn authorize_admin_or_owner(
         &self,
         ctx: &SecurityContext,
@@ -360,11 +419,12 @@ impl PolicyService {
 
     /// Authorize a retention-rule mutation for `(retention_scope, scope_target_id)`.
     ///
-    /// - `Tenant`: `WRITE`.
+    /// - `Tenant`: `ADMIN_POLICY` outright (a standing tenant-wide delete instruction must
+    ///   not be reachable with ordinary file `WRITE`).
     /// - `User`: target must be the caller unless they hold `ADMIN_POLICY`; a missing target
     ///   is a mismatch.
-    /// - `File`: the target file must resolve (missing/foreign yields `FileNotFound`) and
-    ///   the caller needs per-file `WRITE`.
+    /// - `File`: the target file is resolved under the caller's tenant (missing or foreign
+    ///   yields `FileNotFound`, no cross-tenant existence oracle) and needs per-file `WRITE`.
     async fn authorize_retention_scope(
         &self,
         ctx: &SecurityContext,
@@ -373,8 +433,9 @@ impl PolicyService {
     ) -> Result<AccessScope, DomainError> {
         match retention_scope {
             RetentionScope::Tenant => {
+                // `ADMIN_POLICY` outright, no fallback (see the method doc).
                 self.authorizer
-                    .authorize(ctx, actions::WRITE, "", None)
+                    .authorize(ctx, actions::ADMIN_POLICY, "", None)
                     .await
             }
             RetentionScope::User => {
@@ -388,12 +449,17 @@ impl PolicyService {
                 })?;
                 let file = self
                     .store
-                    .require_file(&AccessScope::allow_all(), target_id)
+                    .require_file(&Self::tenant_scope(ctx), target_id)
                     .await?;
                 self.authorizer
                     .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(target_id))
                     .await
             }
         }
+    }
+
+    /// The caller's own-tenant `AccessScope`, used for prefetch before authorization.
+    fn tenant_scope(ctx: &SecurityContext) -> AccessScope {
+        AccessScope::for_tenant(ctx.subject_tenant_id())
     }
 }

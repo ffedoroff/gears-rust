@@ -1,6 +1,3 @@
-//! `Store::upsert_policy` upsert-race tests on a temp-file `SQLite` DB (`sqlite::memory:` would
-//! give each pooled connection its own DB).
-
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
@@ -20,7 +17,6 @@ use file_storage::infra::storage::migrations::Migrator;
 const TENANT: &str = "00000000-0000-0000-0000-0000000000a1";
 const OWNER: &str = "00000000-0000-0000-0000-0000000000b1";
 
-/// `Store` over a fresh temp-file DB with migrations, plus the raw DSN for a second connection.
 async fn build_store() -> (Store, String) {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-policy-{}.db", Uuid::now_v7().simple()));
@@ -48,7 +44,6 @@ fn body_with_max_bytes(max_bytes: u64) -> PolicyBody {
     }
 }
 
-/// Two sequential upserts for one tenant scope leave exactly one row carrying the second body.
 #[tokio::test]
 async fn policy_upsert_on_conflict_updates_existing_row_not_duplicates() {
     let (store, dsn) = build_store().await;
@@ -82,7 +77,6 @@ async fn policy_upsert_on_conflict_updates_existing_row_not_duplicates() {
         .await
         .expect("second upsert must succeed");
 
-    // Independent raw connection, purely for the row count.
     let raw = sea_orm::Database::connect(&dsn)
         .await
         .expect("second raw connection");
@@ -106,7 +100,6 @@ async fn policy_upsert_on_conflict_updates_existing_row_not_duplicates() {
     );
 }
 
-/// Same for a user-scope row (`scope_owner_id = Some(..)`).
 #[tokio::test]
 async fn policy_upsert_on_conflict_updates_existing_user_scope_row() {
     let (store, dsn) = build_store().await;

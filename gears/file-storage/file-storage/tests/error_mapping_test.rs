@@ -1,17 +1,12 @@
-//! Table-driven pin of every `DomainError` variant's HTTP status via the real conversion.
-//! `expected_status` has no wildcard arm, so a new variant fails to compile until covered.
-
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
+use axum::http::header;
 use file_storage::domain::error::DomainError;
-use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::api::canonical_prelude::{CanonicalError, IntoResponse, Problem};
 use uuid::Uuid;
 
-/// Guards `expected_status` and `all_variant_instances` against a new variant being forgotten.
-const EXPECTED_VARIANT_COUNT: usize = 25;
+const EXPECTED_VARIANT_COUNT: usize = 26;
 
-/// Expected HTTP status per variant, per the canonical-error taxonomy (`status_code()`).
-/// No wildcard arm on purpose.
 fn expected_status(err: &DomainError) -> u16 {
     match err {
         DomainError::Validation { .. }
@@ -24,7 +19,6 @@ fn expected_status(err: &DomainError) -> u16 {
         | DomainError::PolicySizeExceeded { .. }
         | DomainError::PolicyMetadataExceeded { .. }
         | DomainError::MultipartNotSupported { .. }
-        // Delegated to `toolkit_odata`: every cursor failure is `InvalidArgument` -> 400.
         | DomainError::Cursor(_) => 400,
         DomainError::TokenInvalid { .. } | DomainError::Forbidden => 403,
         DomainError::FileNotFound { .. }
@@ -39,6 +33,7 @@ fn expected_status(err: &DomainError) -> u16 {
         DomainError::Database { .. } | DomainError::Backend { .. } | DomainError::InternalError => {
             500
         }
+        DomainError::BackendUnavailable { .. } => 503,
     }
 }
 
@@ -79,6 +74,10 @@ fn all_variant_instances() -> Vec<DomainError> {
         DomainError::Backend {
             backend_id: "s3".into(),
             message: "put failed".into(),
+        },
+        DomainError::BackendUnavailable {
+            backend_id: "s3".into(),
+            message: "connection timed out".into(),
         },
         DomainError::UnknownBackend {
             backend_id: "nope".into(),
@@ -125,8 +124,6 @@ fn all_variant_instances() -> Vec<DomainError> {
 #[test]
 fn error_domain_error_maps_to_expected_http_status() {
     let cases = all_variant_instances();
-    // Best-effort backstop: a variant added to `expected_status` but not to
-    // `all_variant_instances` trips this.
     assert_eq!(
         cases.len(),
         EXPECTED_VARIANT_COUNT,
@@ -147,7 +144,6 @@ fn error_domain_error_maps_to_expected_http_status() {
     }
 }
 
-/// Route declarations in `routes.rs` checked against the same status constants (hand-synced).
 #[test]
 fn declared_routes_match_the_pinned_status_table() {
     let precondition_failed_expected = expected_status(&DomainError::PreconditionFailed {
@@ -158,11 +154,8 @@ fn declared_routes_match_the_pinned_status_table() {
     });
 
     let declared_routes: Vec<(&str, u16)> = vec![
-        // POST /files/{id}/bind: If-Match/CAS precondition failure.
         ("file_storage.bind", precondition_failed_expected),
-        // DELETE /files/{id}: If-Match required, mismatch/absent.
         ("file_storage.delete_file", precondition_failed_expected),
-        // POST /files/{id}/multipart: MultipartNotSupported (no variant maps to 422).
         (
             "file_storage.initiate_multipart",
             multipart_not_supported_expected,
@@ -175,4 +168,39 @@ fn declared_routes_match_the_pinned_status_table() {
             "{operation_id}'s declared route status must be 400 per the 2.5 fix"
         );
     }
+}
+
+#[test]
+fn backend_unavailable_maps_to_503_with_retry_after_5() {
+    let err = DomainError::backend_unavailable("s3-primary", "connect timed out");
+    let canonical: CanonicalError = err.into();
+    assert_eq!(canonical.status_code(), 503);
+
+    let problem = Problem::from(canonical);
+    assert_eq!(
+        problem
+            .context
+            .get("retry_after_seconds")
+            .and_then(serde_json::Value::as_u64),
+        Some(5)
+    );
+
+    let response = problem.into_response();
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After header present on 503")
+            .to_str()
+            .expect("valid header value"),
+        "5"
+    );
+}
+
+#[test]
+fn backend_still_maps_to_500() {
+    let err = DomainError::backend("s3-primary", "invalid bucket config");
+    let canonical: CanonicalError = err.into();
+    assert_eq!(canonical.status_code(), 500);
 }

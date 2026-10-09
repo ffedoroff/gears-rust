@@ -1,6 +1,3 @@
-//! Cross-user file-enumeration authorization tests.
-//! Duplicates `ScopedTestAuthorizer` (each `tests/*.rs` is its own crate).
-
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
@@ -26,7 +23,6 @@ use file_storage_sdk::{NewFile, OwnerFilter, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-/// Grants `ADMIN_POLICY` only while `is_admin` is set; other actions are allowed.
 #[derive(Default)]
 struct ScopedTestAuthorizer {
     is_admin: AtomicBool,
@@ -124,6 +120,18 @@ fn ctx(tenant: Uuid, subject: Uuid) -> SecurityContext {
         .expect("ctx")
 }
 
+/// Like `ctx`, but with an explicit `subject_type` (e.g. `"app"`), so
+/// `FileService::actor_kind` resolves to something other than the default
+/// `"user"` fallback.
+fn ctx_with_type(tenant: Uuid, subject: Uuid, subject_type: &str) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(subject)
+        .subject_tenant_id(tenant)
+        .subject_type(subject_type)
+        .build()
+        .expect("ctx")
+}
+
 fn new_file(owner_id: Uuid) -> NewFile {
     NewFile {
         owner_kind: OwnerKind::User,
@@ -142,7 +150,6 @@ fn owner_filter(owner_id: Uuid) -> OwnerFilter {
     }
 }
 
-/// A non-owner, non-admin listing another user's files must be denied without leaking them.
 #[tokio::test]
 async fn list_files_foreign_owner_without_admin_is_denied() {
     let h = build_harness().await;
@@ -153,7 +160,7 @@ async fn list_files_foreign_owner_without_admin_is_denied() {
     let ctx_b = ctx(tenant, user_b);
 
     h.file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
 
@@ -176,7 +183,7 @@ async fn list_files_self_owner_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
 
@@ -186,6 +193,72 @@ async fn list_files_self_owner_is_allowed() {
         .await
         .expect("self-owner list should succeed");
     assert!(found.items.iter().any(|f| f.file_id == ticket.file_id));
+}
+
+/// `owner_id` alone matching the caller is not enough: `owner_kind` picks
+/// between two disjoint owner spaces (`OwnerKind::User` / `OwnerKind::App`).
+#[tokio::test]
+async fn list_files_owner_kind_mismatch_without_admin_is_denied() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let user_a = Uuid::now_v7();
+    let ctx_a = ctx(tenant, user_a);
+
+    let result = h
+        .file_svc
+        .list_files(
+            &ctx_a,
+            OwnerFilter {
+                owner_kind: OwnerKind::App,
+                owner_id: user_a,
+            },
+            Some(10),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DomainError::Forbidden)),
+        "expected Forbidden, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_files_owner_kind_match_without_admin_is_allowed() {
+    let h = build_harness().await;
+    let tenant = Uuid::now_v7();
+    let app_id = Uuid::now_v7();
+    let ctx_app = ctx_with_type(tenant, app_id, "app");
+
+    let ticket = h
+        .file_svc
+        .create_file_bare(
+            &ctx_app,
+            NewFile {
+                owner_kind: OwnerKind::App,
+                owner_id: app_id,
+                name: "app-owned.bin".to_owned(),
+                gts_file_type: GTS.to_owned(),
+                mime_type: "application/octet-stream".to_owned(),
+                custom_metadata: vec![],
+            },
+        )
+        .await
+        .expect("app creates its own file");
+
+    let found = h
+        .file_svc
+        .list_files(
+            &ctx_app,
+            OwnerFilter {
+                owner_kind: OwnerKind::App,
+                owner_id: app_id,
+            },
+            Some(10),
+            None,
+        )
+        .await
+        .expect("self-service app listing should succeed without ADMIN_POLICY");
+    assert!(found.items.iter().any(|f| f.file_id == ticket));
 }
 
 #[tokio::test]
@@ -199,7 +272,7 @@ async fn list_files_foreign_owner_with_admin_scope_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
     h.authz.set_admin(true);

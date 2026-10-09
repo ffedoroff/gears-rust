@@ -24,7 +24,7 @@ use crate::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, S3Backend, StorageBackend,
 };
 use crate::infra::metrics::FileStorageMetricsMeter;
-use crate::infra::signed_url::Issuer;
+use crate::infra::signed_url::{Issuer, decode_public_key_entry};
 use crate::infra::storage::Store;
 
 /// Ids of the always-present `local-fs` backend and the optional `memory` backend.
@@ -71,12 +71,21 @@ impl Gear for FileStorageGear {
         );
 
         // `cfg.validate()` already rejected an absent/empty secret.
+        // Grace for a slow upload that outlasts the token TTL (`finalize_token_grace_secs`).
+        // `validate()` caps every `*_secs` below so `unwrap_or` is only a defensive
+        // fallback (`expect` is denied by clippy).
+        let finalize_token_grace = time::Duration::seconds(
+            i64::try_from(cfg.finalize_token_grace_secs).unwrap_or(i64::MAX),
+        );
         let secret = cfg
             .finalize_internal_secret
             .as_ref()
             .map(|s| s.expose().to_owned())
             .ok_or_else(|| anyhow::anyhow!("finalize_internal_secret is required"))?;
-        let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(secret));
+        let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(
+            secret,
+            finalize_token_grace,
+        ));
         self.finalize_auth
             .set(Arc::clone(&finalize_auth))
             .map_err(|_| {
@@ -110,6 +119,16 @@ impl Gear for FileStorageGear {
             "file-storage URL-signing public key (configure FS_SIDECAR_PUBLIC_KEY with this)"
         );
 
+        // Lets the control plane's own callback verification accept tokens signed under
+        // a previous seed (key rotation); the sidecar widens its own set separately.
+        let previous_signing_public_keys: Vec<Vec<u8>> = cfg
+            .previous_signing_public_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| decode_public_key_entry(k, i))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("previous_signing_public_keys: {e}"))?;
+
         // Per-type access decisions via the platform Authorization Service. Tenant
         // isolation is independent of the PDP (point ops prefetch within the tenant;
         // listing applies the tenant scope).
@@ -136,12 +155,15 @@ impl Gear for FileStorageGear {
 
         let store = Store::new(Arc::clone(&db));
 
+        // Upcast to the narrow capability traits; `Store` is `Clone`.
         let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
         let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
 
         // Needed by both services before `svc_cfg` is moved.
         let sidecar_base_url = svc_cfg.sidecar_base_url.clone();
         let url_ttl_secs = svc_cfg.default_url_ttl_secs;
+        // Multipart sessions use their own, longer TTL (see `MultipartService::session_ttl_secs`).
+        let session_ttl_secs = i64::try_from(cfg.multipart_session_ttl_secs).unwrap_or(i64::MAX);
 
         // TODO: wire the quota-enforcement client once the Quota Enforcement gear
         // exposes an SDK crate; until then no quota checks are performed.
@@ -161,7 +183,10 @@ impl Gear for FileStorageGear {
                 None, // quota_client
                 None, // usage_reporter -- see TODO above
             )
-            .with_metrics(Arc::clone(&metrics)),
+            .with_metrics(Arc::clone(&metrics))
+            .with_previous_signing_public_keys(previous_signing_public_keys)
+            .map_err(|e| anyhow::anyhow!("file-storage previous_signing_public_keys: {e}"))?
+            .with_migrate_lease_config(cfg.migrate_timeout_secs, cfg.migrate_lease_margin_secs),
         );
         self.service
             .set(Arc::clone(&service))
@@ -178,14 +203,20 @@ impl Gear for FileStorageGear {
                 url_ttl_secs,
             )
             .with_metrics(Arc::clone(&metrics))
-            .with_usage_reporter(None), // see TODO above
+            .with_usage_reporter(None) // see TODO above `service`
+            .with_session_ttl_secs(session_ttl_secs)
+            .with_complete_lease_secs(
+                i64::try_from(cfg.multipart_complete_lease_secs).unwrap_or(120),
+            ),
         );
-        self.multipart_service.set(multipart_svc).map_err(|_| {
-            anyhow::anyhow!(
-                "{} multipart service already initialized",
-                Self::MODULE_NAME
-            )
-        })?;
+        self.multipart_service
+            .set(Arc::clone(&multipart_svc))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{} multipart service already initialized",
+                    Self::MODULE_NAME
+                )
+            })?;
 
         let policy_svc = Arc::new(PolicyService::new(
             policy_store,
@@ -193,13 +224,19 @@ impl Gear for FileStorageGear {
             cfg.default_page_size,
             cfg.max_page_size,
         ));
-        self.policy_service.set(policy_svc).map_err(|_| {
-            anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
-        })?;
+        self.policy_service
+            .set(Arc::clone(&policy_svc))
+            .map_err(|_| {
+                anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
+            })?;
 
         ctx.client_hub()
             .register::<dyn file_storage_sdk::FileStorageClientV1>(Arc::new(
-                FileStorageLocalClient::new(),
+                FileStorageLocalClient::new(
+                    Arc::clone(&service),
+                    Arc::clone(&multipart_svc),
+                    Arc::clone(&policy_svc),
+                ),
             ));
 
         info!("{} gear initialized", Self::MODULE_NAME);

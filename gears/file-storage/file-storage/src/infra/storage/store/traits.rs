@@ -17,8 +17,19 @@ impl CleanupStore for Store {
         &self,
         older_than: OffsetDateTime,
         now: OffsetDateTime,
+        limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<FileVersion>, DomainError> {
-        Store::list_abandoned_pending_versions(self, older_than, now).await
+        Store::list_abandoned_pending_versions(self, older_than, now, limit, after).await
+    }
+
+    async fn list_versionless_orphan_files(
+        &self,
+        created_before: OffsetDateTime,
+        limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
+    ) -> Result<Vec<File>, DomainError> {
+        Store::list_versionless_orphan_files(self, created_before, limit, after).await
     }
 
     async fn delete_version(
@@ -42,8 +53,10 @@ impl CleanupStore for Store {
     async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
+        limit: u64,
+        after: Option<(OffsetDateTime, Uuid)>,
     ) -> Result<Vec<crate::domain::multipart::MultipartUploadSession>, DomainError> {
-        Store::list_expired_multipart_uploads(self, now).await
+        Store::list_expired_multipart_uploads(self, now, limit, after).await
     }
 
     async fn abort_multipart_upload(
@@ -80,6 +93,13 @@ impl CleanupStore for Store {
         Store::list_metadata(self, file_id).await
     }
 
+    async fn list_metadata_for_files(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<CustomMetadataEntry>>, DomainError> {
+        Store::list_metadata_for_files(self, file_ids).await
+    }
+
     async fn list_versions(&self, file_id: Uuid) -> Result<Vec<FileVersion>, DomainError> {
         Store::list_versions(self, file_id).await
     }
@@ -88,18 +108,24 @@ impl CleanupStore for Store {
         Store::get_file(self, &toolkit_security::AccessScope::allow_all(), file_id).await
     }
 
-    async fn has_in_progress_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
-        Store::has_in_progress_multipart_for_file(self, file_id).await
+    async fn list_files_by_ids(&self, ids: &[Uuid]) -> Result<Vec<File>, DomainError> {
+        Store::list_files_by_ids(self, &toolkit_security::AccessScope::allow_all(), ids).await
     }
 
-    async fn delete_file_with_event(
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
+        Store::has_active_multipart_for_file(self, file_id).await
+    }
+
+    async fn delete_file_with_event_collecting_versions(
         &self,
         scope: &toolkit_security::AccessScope,
         file_id: Uuid,
+        expected_etag: Option<String>,
         audit: crate::domain::audit::AuditEntry,
         event: Option<crate::domain::audit::FileEvent>,
-    ) -> Result<bool, DomainError> {
-        Store::delete_file_with_event(self, scope, file_id, audit, event).await
+    ) -> Result<crate::domain::ports::DeletedFile, DomainError> {
+        Store::delete_file_collecting_versions(self, scope, file_id, expected_etag, audit, event)
+            .await
     }
 
     async fn delete_orphan_file_with_event(
@@ -114,8 +140,9 @@ impl CleanupStore for Store {
     async fn delete_expired_idempotency_keys(
         &self,
         now: OffsetDateTime,
+        limit: u64,
     ) -> Result<u64, DomainError> {
-        Store::delete_expired_idempotency_keys(self, now).await
+        Store::delete_expired_idempotency_keys(self, now, limit).await
     }
 }
 
@@ -166,9 +193,12 @@ impl MultipartStore for Store {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: Option<&str>,
+        backend_path: Option<&str>,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
+        auto_bind: bool,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
@@ -178,9 +208,12 @@ impl MultipartStore for Store {
             file_id,
             version_id,
             backend_upload_handle,
+            backend_id,
+            backend_path,
             declared_mime,
             declared_size,
             part_size,
+            auto_bind,
             expires_at,
             now,
         )
@@ -200,6 +233,10 @@ impl MultipartStore for Store {
         version_id: Uuid,
     ) -> Result<Option<FileVersion>, DomainError> {
         Store::get_version(self, file_id, version_id).await
+    }
+
+    async fn get_version_manifest(&self, version_id: Uuid) -> Result<Option<String>, DomainError> {
+        Store::get_version_manifest(self, version_id).await
     }
 
     async fn upsert_multipart_part(
@@ -242,7 +279,8 @@ impl MultipartStore for Store {
         manifest: Option<String>,
         validated_mime: Option<String>,
         audit: crate::domain::audit::AuditEntry,
-    ) -> Result<bool, DomainError> {
+        auto_bind: Option<crate::domain::ports::AutoBindOnFinalize>,
+    ) -> Result<crate::domain::ports::FinalizeVersionOutcome, DomainError> {
         // Persist the sniffed `validated_mime` in place of the declared type.
         Store::finalize_version(
             self,
@@ -255,6 +293,29 @@ impl MultipartStore for Store {
             manifest,
             validated_mime,
             audit,
+            auto_bind,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        finalize_audit: crate::domain::audit::AuditEntry,
+        auto_bind: Option<crate::domain::ports::AutoBindOnFinalize>,
+        finish: crate::domain::ports::MultipartFinishSnapshot,
+    ) -> Result<crate::domain::ports::FinalizeMultipartOutcome, DomainError> {
+        Store::finalize_multipart_version(
+            self,
+            file_id,
+            manifest,
+            validated_mime,
+            finalize_audit,
+            auto_bind,
+            finish,
         )
         .await
     }
@@ -262,9 +323,29 @@ impl MultipartStore for Store {
     async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        lease_owner: &str,
+        result_json: &str,
         audit: crate::domain::audit::AuditEntry,
     ) -> Result<bool, DomainError> {
-        Store::complete_multipart_upload(self, upload_id, audit).await
+        Store::complete_multipart_upload(self, upload_id, lease_owner, result_json, audit).await
+    }
+
+    async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        Store::acquire_multipart_complete_lease(self, upload_id, owner, lease_until, now).await
+    }
+
+    async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        Store::release_multipart_complete_lease(self, upload_id, owner).await
     }
 
     async fn abort_multipart_upload(
@@ -293,6 +374,14 @@ impl crate::domain::ports::PolicyStore for Store {
         file_id: Uuid,
     ) -> Result<File, DomainError> {
         Store::require_file(self, scope, file_id).await
+    }
+
+    async fn list_files_by_ids(
+        &self,
+        scope: &toolkit_security::AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<File>, DomainError> {
+        Store::list_files_by_ids(self, scope, ids).await
     }
 
     async fn get_policy(

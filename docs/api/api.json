@@ -2883,6 +2883,13 @@
       "CreateFileReq": {
         "description": "Request to create a file (`POST /files`).",
         "properties": {
+          "bind": {
+            "description": "Bind mode for the first content: `\"auto\"` (default; the upload itself binds under a\n`content_id IS NULL` CAS) or `\"manual\"` (an explicit `POST /files/{id}/bind`\nafterwards).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "custom_metadata": {
             "items": {
               "$ref": "#/components/schemas/MetadataEntryDto"
@@ -2893,7 +2900,7 @@
             "type": "string"
           },
           "idempotency_key": {
-            "description": "Optional idempotency key: within the same `(owner_kind, owner_id)`, a retry with\nthe same key returns the original response without creating a new file.",
+            "description": "Optional idempotency key: within the same `(owner_kind, owner_id)`, a retry with\nthe same key returns the original response without creating a new file.\nNot supported together with `multipart` (rejected with 400).",
             "type": [
               "string",
               "null"
@@ -2901,6 +2908,17 @@
           },
           "mime_type": {
             "type": "string"
+          },
+          "multipart": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CreateMultipartIntentDto",
+                "description": "Optional multipart intent. When the server-computed plan has **two or more parts**,\nthe response carries the parts plan (`UploadTicketDto::multipart`) instead of a\nsingle-part `upload_url`; a one-part plan falls back to `upload_url`."
+              }
+            ]
           },
           "name": {
             "type": "string"
@@ -2965,6 +2983,30 @@
         "required": [
           "type",
           "name"
+        ],
+        "type": "object"
+      },
+      "CreateMultipartIntentDto": {
+        "description": "Multipart intent on `POST /files`: opens the multipart session and returns the parts plan\nin the same response, saving the separate `POST /files/{id}/multipart` round-trip.",
+        "properties": {
+          "declared_size": {
+            "description": "Declared total file size in bytes (validated against policy/quota at create time).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "preferred_part_size": {
+            "description": "Preferred part size in bytes (hint); the server-computed plan is authoritative.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "declared_size"
         ],
         "type": "object"
       },
@@ -6769,15 +6811,6 @@
       "InitiateMultipartReq": {
         "description": "Request to initiate a multipart upload (`POST /files/{id}/multipart`).\n\nThe server answers with a parts plan containing one signed upload URL per part.",
         "properties": {
-          "concurrency": {
-            "description": "Advisory upload concurrency; does not change the parts plan.",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "declared_mime": {
             "description": "Declared MIME type for the file content.",
             "type": "string"
@@ -8333,23 +8366,44 @@
         "type": "string"
       },
       "MultipartCompleteDto": {
-        "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete`: the bound version,\nits size, and the composite content hash. `manifest` lets a client re-verify the hash.",
+        "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete`: the version, its size,\nthe content hash and the bind outcome. `manifest` lets a client re-verify the hash.",
         "properties": {
-          "content_hash": {
-            "description": "Hex-encoded composite hash (`sha256` of the manifest).",
+          "bind_state": {
+            "description": "Bind outcome, same model as the single-part `X-FS-Bound` header: `\"bound\"` (`etag`\nis the new content `ETag`), `\"conflict\"` (auto-bind lost its CAS; the upload\nsucceeded and `current_etag` is the `If-Match` for a manual rebind), or `\"manual\"`\n(the client binds explicitly).",
             "type": "string"
+          },
+          "content_hash": {
+            "description": "Hex-encoded content hash: `sha256` of the manifest for two or more parts, or of\nthe object bytes for a one-part plan.",
+            "type": "string"
+          },
+          "current_etag": {
+            "description": "Current content `ETag` when the bind CAS was lost (`bind_state == \"conflict\"` only).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "etag": {
+            "description": "Content `ETag` after a successful bind (`bind_state == \"bound\"` only).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "hash_algorithm": {
             "description": "Always `\"SHA-256\"`.",
             "type": "string"
           },
           "hash_mode": {
-            "description": "Always `\"multipart-composite-sha256\"` for this endpoint.",
+            "description": "`\"multipart-composite-sha256\"` for two or more parts, `\"whole-sha256\"` for one part.",
             "type": "string"
           },
           "manifest": {
-            "description": "Part manifest text the composite hash is computed over.",
-            "type": "string"
+            "description": "Part manifest text the composite hash is computed over. Omitted for a one-part\nplan (`whole-sha256` has no manifest).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "part_count": {
             "format": "int32",
@@ -8371,7 +8425,26 @@
           "content_hash",
           "hash_mode",
           "part_count",
-          "manifest"
+          "bind_state"
+        ],
+        "type": "object"
+      },
+      "MultipartCompletingDto": {
+        "description": "`202 Accepted` body of `POST .../complete` while another caller holds the completion\nlease; the client re-issues the idempotent `complete` after `retry_after_secs`.",
+        "properties": {
+          "retry_after_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "description": "Always `\"completing\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "retry_after_secs"
         ],
         "type": "object"
       },
@@ -21679,14 +21752,29 @@
         "type": "object"
       },
       "UploadTicketDto": {
-        "description": "Result of create / presign: identity + the signed upload URL.",
+        "description": "Result of create / presign: identity plus exactly one of a single-part signed upload\nURL or a multipart parts plan (`multipart` only when requested and the plan has ≥2 parts).",
         "properties": {
           "file_id": {
             "format": "uuid",
             "type": "string"
           },
+          "multipart": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MultipartPlanDto",
+                "description": "Multipart plan (absent on the single-part path); same shape as the\n`POST /files/{id}/multipart` response."
+              }
+            ]
+          },
           "upload_url": {
-            "type": "string"
+            "description": "Single-part signed sidecar URL (absent when `multipart` is present).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "version_id": {
             "format": "uuid",
@@ -21695,8 +21783,7 @@
         },
         "required": [
           "file_id",
-          "version_id",
-          "upload_url"
+          "version_id"
         ],
         "type": "object"
       },
@@ -22293,6 +22380,13 @@
           },
           "is_current": {
             "type": "boolean"
+          },
+          "manifest": {
+            "description": "Part manifest text of a `multipart-composite-sha256` version (as returned by\n`complete`), so a client can re-verify `hash`. Omitted for `whole-sha256`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mime_type": {
             "type": "string"
@@ -26906,7 +27000,7 @@
     },
     "/api/file-storage/v1/files": {
       "get": {
-        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, file_id desc` -- see docs/api.md.",
+        "description": "Forward-only keyset pagination: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical order is `created_at desc, file_id desc` -- see docs/api.md.",
         "operationId": "file_storage.list_files",
         "parameters": [
           {
@@ -27062,6 +27156,16 @@
             },
             "description": "Forbidden"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -27071,6 +27175,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -27078,7 +27192,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Create a file and presign its first content upload",
+        "summary": "Create a file and presign its first content upload (single-part URL, or the multipart parts plan with the `multipart` block)",
         "tags": [
           "File Storage"
         ]
@@ -27119,6 +27233,16 @@
             },
             "description": "Version finalized"
           },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
           "403": {
             "content": {
               "application/problem+json": {
@@ -27139,6 +27263,16 @@
             },
             "description": "Not Found"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -27148,6 +27282,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "summary": "Finalize a pending version (token-authenticated, sidecar s2s callback)",
@@ -27209,6 +27353,16 @@
             },
             "description": "Part reported"
           },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
           "403": {
             "content": {
               "application/problem+json": {
@@ -27228,6 +27382,16 @@
               }
             },
             "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "500": {
             "content": {
@@ -27806,6 +27970,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -27905,6 +28079,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -28101,7 +28285,7 @@
     },
     "/api/file-storage/v1/files/{id}/multipart/{upload_id}/complete": {
       "post": {
-        "description": "Returns the bound version id, size, and ADR-0006 composite hash/manifest (item 3.3). Optional If-Match carries the current content ETag; `*`/absent is unconditional, a mismatch is a 400.",
+        "description": "Returns the version id, size, ADR-0006 hash (composite root + manifest for plans of two or more parts; plain whole-sha256 with no manifest for a one-part plan), and the bind outcome (`bind_state`: bound/conflict/manual — auto-bind sessions bind here, in the same transaction as the finalize). Optional If-Match carries the current content ETag; `*`/absent is unconditional, a mismatch is a 400. Idempotent: a retry of an already-completed session replays the stored result; while another caller holds the completion lease the response is `202 completing` (poll by re-issuing the same call).",
         "operationId": "file_storage.complete_multipart",
         "parameters": [
           {
@@ -28132,7 +28316,17 @@
                 }
               }
             },
-            "description": "Completed — version id, size, composite hash, manifest"
+            "description": "Completed — version id, size, composite hash, manifest, bind outcome"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MultipartCompletingDto"
+                }
+              }
+            },
+            "description": "Another caller is completing — poll by re-issuing the same complete"
           },
           "400": {
             "content": {
@@ -28193,6 +28387,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -28200,7 +28404,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Finalize a multipart upload (assemble all parts)",
+        "summary": "Finalize a multipart upload (assemble all parts; idempotent)",
         "tags": [
           "File Storage"
         ]
@@ -28307,7 +28511,7 @@
     },
     "/api/file-storage/v1/files/{id}/versions": {
       "get": {
-        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, version_id desc` -- see docs/api.md.",
+        "description": "Forward-only keyset pagination: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical order is `created_at desc, version_id desc`; a page may return fewer than `limit` items (with `next_cursor` still set) when the ADR-0006 manifest-byte budget truncates it -- see docs/api.md.",
         "operationId": "file_storage.list_versions",
         "parameters": [
           {
@@ -28433,6 +28637,16 @@
               }
             },
             "description": "Presigned"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -28822,7 +29036,7 @@
     },
     "/api/file-storage/v1/retention-rules": {
       "get": {
-        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, rule_id desc`. An admin caller sees every rule in the tenant; a non-admin caller sees only tenant-scope rules, their own user-scope rules, and file-scope rules on files they own -- filtered in SQL, so every page but the last is full -- see docs/api.md.",
+        "description": "Forward-only keyset pagination: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor`. Canonical order is `created_at desc, rule_id desc`. An admin caller sees every rule in the tenant; a non-admin caller sees only tenant-scope rules, their own user-scope rules, and file-scope rules on files they own -- filtered in SQL, so every page but the last is full -- see docs/api.md.",
         "operationId": "file_storage.list_retention_rules",
         "parameters": [
           {

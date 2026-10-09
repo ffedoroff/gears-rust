@@ -1,4 +1,4 @@
-//! Wire-format tests for `Manifest` (ADR-0006): the grammar must be byte-for-byte unambiguous.
+//! Wire-format tests for [`Manifest`] (ADR-0006 §3).
 
 use sha2::{Digest, Sha256};
 
@@ -27,8 +27,6 @@ fn sample_entries() -> Vec<ManifestEntry> {
     ]
 }
 
-/// Hand-written expected wire string for `sample_entries`, independent of `Manifest`,
-/// so the test cannot pass by tautology.
 fn expected_wire_string(entries: &[ManifestEntry]) -> String {
     let mut s = String::from("v1");
     for e in entries {
@@ -47,6 +45,8 @@ fn to_wire_string_matches_hand_written_expected_string_exactly() {
     let expected = expected_wire_string(&entries);
     assert_eq!(manifest.to_wire_string(), expected);
 
+    // Spot-check the exact literal shape too, not just self-consistency against the
+    // `expected_wire_string` helper.
     let d0 = hex::encode(entries[0].digest);
     let d1 = hex::encode(entries[1].digest);
     let d2 = hex::encode(entries[2].digest);
@@ -72,7 +72,8 @@ fn root_matches_independently_computed_reference_sha256() {
     let manifest = Manifest::new(entries.clone()).unwrap();
     let wire = expected_wire_string(&entries);
 
-    // Reference hash computed with a fresh `Sha256`, not through `Manifest::root()`.
+    // Independent reference: hash the hand-written string directly with a fresh `Sha256` instance,
+    // not through `Manifest::root()`.
     let reference_root: [u8; 32] = {
         let mut hasher = Sha256::new();
         hasher.update(wire.as_bytes());

@@ -40,6 +40,52 @@ fn rejects_bare_dash() {
 }
 
 #[test]
+fn accepts_single_byte_range() {
+    assert_eq!(
+        parse("bytes=0-0"),
+        Some(ByteRange::Inclusive { start: 0, end: 0 })
+    );
+}
+
+#[test]
+fn rejects_start_greater_than_end() {
+    // RFC 9110 §14.1.1: last-byte-pos < first-byte-pos is invalid syntax and
+    // MUST be ignored by the recipient, not treated as unsatisfiable.
+    assert_eq!(parse("bytes=5-2"), None);
+}
+
+#[test]
+fn rejects_leading_plus_sign() {
+    assert_eq!(parse("bytes=+0-+5"), None);
+    assert_eq!(parse("bytes=+0-5"), None);
+    assert_eq!(parse("bytes=0-+5"), None);
+    assert_eq!(parse("bytes=-+5"), None);
+    assert_eq!(parse("bytes=+5-"), None);
+}
+
+#[test]
+fn rejects_interior_whitespace() {
+    assert_eq!(parse("bytes= 0-1023"), None);
+    assert_eq!(parse("bytes=0 -1023"), None);
+    assert_eq!(parse("bytes=0- 1023"), None);
+    assert_eq!(parse("bytes=0 -"), None);
+    assert_eq!(parse("bytes=- 256"), None);
+    assert_eq!(parse("bytes=512 -"), None);
+}
+
+#[test]
+fn rejects_non_digit_garbage() {
+    assert_eq!(parse("bytes=0x10-0x20"), None);
+    assert_eq!(parse("bytes=1e3-2e3"), None);
+}
+
+#[test]
+fn multi_range_ignores_whitespace_around_comma() {
+    assert_eq!(parse("bytes=0-1, 2-3"), None);
+    assert_eq!(parse("bytes=0-1 , 2-3"), None);
+}
+
+#[test]
 fn resolve_inclusive_clamps_end_to_total() {
     let r = ByteRange::Inclusive { start: 2, end: 100 };
     assert_eq!(r.resolve(10), Some((2, 9)));
