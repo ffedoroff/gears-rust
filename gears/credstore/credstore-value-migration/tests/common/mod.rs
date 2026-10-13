@@ -22,8 +22,12 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use credstore::CredStoreGear;
 use credstore::infra::storage::migrations::m0001_initial_schema;
+use credstore::infra::storage::migrations::m0002_value_versions::{
+    VALUE_MIGRATION_DISCARD_VALUES_COLUMN, VALUE_MIGRATION_PHASE_COLUMN,
+};
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, ValueVersion,
+    CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError, DestroySelector,
+    SecretValue, StoreKey, ValueVersion,
 };
 use credstore_value_migration::fence::{FENCE_KEY_REF, compute_fp};
 use credstore_value_migration::{Exit, LegacyError, LegacyStore, Tuning, run_with};
@@ -71,11 +75,11 @@ pub struct FakeOld {
     values: Mutex<HashMap<OldKey, Vec<u8>>>,
     pub gets: AtomicUsize,
     pub deletes: AtomicUsize,
-    /// `get` calls with an index at or above this fail with `ServiceUnavailable`.
+    /// `get` calls with an index at or above this fail with `Unavailable`.
     fail_get_from: Mutex<Option<usize>>,
     /// Same for `delete`.
     fail_delete_from: Mutex<Option<usize>>,
-    /// The next this-many `get`s fail with `ServiceUnavailable`, then it recovers.
+    /// The next this-many `get`s fail with `Unavailable`, then it recovers.
     pub transient_gets: AtomicUsize,
     gate: Mutex<Option<Arc<Gate>>>,
 }
@@ -303,10 +307,10 @@ impl CredStorePluginClientV2 for FakeNew {
         _ctx: &toolkit_security::SecurityContext,
         key: &StoreKey,
         value: SecretValue,
-    ) -> Result<ValueVersion, CredStoreError> {
+    ) -> Result<ValueVersion, CredStorePluginError> {
         let call = self.puts.fetch_add(1, Ordering::SeqCst);
         if tripped(&self.fail_put_from, call) {
-            return Err(CredStoreError::service_unavailable("injected"));
+            return Err(CredStorePluginError::unavailable("injected", None));
         }
         let mut inner = self.inner.lock().unwrap();
         let counter = inner
@@ -327,10 +331,10 @@ impl CredStorePluginClientV2 for FakeNew {
         _ctx: &toolkit_security::SecurityContext,
         key: &StoreKey,
         version: &ValueVersion,
-    ) -> Result<Option<SecretValue>, CredStoreError> {
+    ) -> Result<Option<SecretValue>, CredStorePluginError> {
         let call = self.gets.fetch_add(1, Ordering::SeqCst);
         if tripped(&self.fail_get_from, call) {
-            return Err(CredStoreError::service_unavailable("injected"));
+            return Err(CredStorePluginError::unavailable("injected", None));
         }
         if self
             .none_gets_left
@@ -351,7 +355,7 @@ impl CredStorePluginClientV2 for FakeNew {
         &self,
         _ctx: &toolkit_security::SecurityContext,
         key: &StoreKey,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         self.inner
             .lock()
             .unwrap()
@@ -360,19 +364,24 @@ impl CredStorePluginClientV2 for FakeNew {
         Ok(())
     }
 
-    fn supports_destroy(&self) -> bool {
-        self.destroy_supported.load(Ordering::SeqCst)
+    fn destroyer(&self) -> Option<&dyn CredStorePluginDestroyerV2> {
+        self.destroy_supported
+            .load(Ordering::SeqCst)
+            .then_some(self as &dyn CredStorePluginDestroyerV2)
     }
+}
 
+#[async_trait]
+impl CredStorePluginDestroyerV2 for FakeNew {
     async fn destroy(
         &self,
         _ctx: &toolkit_security::SecurityContext,
         key: &StoreKey,
         selector: DestroySelector,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         let call = self.destroys.fetch_add(1, Ordering::SeqCst);
         if tripped(&self.fail_destroy_from, call) {
-            return Err(CredStoreError::service_unavailable("injected"));
+            return Err(CredStorePluginError::unavailable("injected", None));
         }
         let (below, exactly) = match &selector {
             DestroySelector::Below(v) => (v.as_str().parse::<u64>().ok(), None),
@@ -889,15 +898,19 @@ impl Fixture {
         }
         let rows = self
             .query(
-                "SELECT phase, accept_losses, discard_values FROM credstore_value_migration",
+                &format!(
+                    "SELECT {VALUE_MIGRATION_PHASE_COLUMN}, accept_losses, \
+                     {VALUE_MIGRATION_DISCARD_VALUES_COLUMN} FROM credstore_value_migration"
+                ),
                 vec![],
             )
             .await;
         rows.first().map(|r| {
             (
-                r.try_get("", "phase").unwrap(),
+                r.try_get("", VALUE_MIGRATION_PHASE_COLUMN).unwrap(),
                 r.try_get("", "accept_losses").unwrap(),
-                r.try_get("", "discard_values").unwrap(),
+                r.try_get("", VALUE_MIGRATION_DISCARD_VALUES_COLUMN)
+                    .unwrap(),
             )
         })
     }

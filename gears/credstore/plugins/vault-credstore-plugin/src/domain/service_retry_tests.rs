@@ -8,13 +8,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use credstore_sdk::{
-    CredStoreError, DestroySelector, SecretValue, StoreKey, TenantId, ValueVersion,
-};
+use credstore_sdk::{DestroySelector, SecretValue, StoreKey, TenantId, ValueVersion};
 use uuid::Uuid;
 
 use super::*;
 use crate::config::{RetryConfig, VaultCredStorePluginConfig, VaultToken};
+use crate::domain::test_ext::PluginErrorExt as _;
 use crate::domain::transport::{HttpMethod, TransportError, VaultRequest, VaultResponse};
 
 type Reply = Result<VaultResponse, TransportError>;
@@ -194,18 +193,17 @@ async fn final_transient_status_keeps_the_retry_after_hint() {
         .get_value(&key(), &vv("1"))
         .await
         .unwrap_err();
-    assert_eq!(err.retry_after_seconds(), Some(12));
+    assert_eq!(err.retry_after().map(|d| d.as_secs()), Some(12));
 }
 
 #[tokio::test]
-async fn forbidden_is_not_retried_and_is_not_access_denied() {
+async fn forbidden_is_not_retried_and_is_credentials_rejected() {
     let fake = FakeTransport::new(vec![reply(403, r#"{"errors":["permission denied"]}"#)]);
     let err = service(&fake, 3)
         .get_value(&key(), &vv("1"))
         .await
         .unwrap_err();
-    assert!(err.is_unavailable());
-    assert!(!matches!(err, CredStoreError::AccessDenied));
+    assert!(err.is_credentials_rejected());
     assert_eq!(fake.calls(), 1);
 }
 
