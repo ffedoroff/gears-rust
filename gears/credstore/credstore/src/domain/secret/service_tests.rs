@@ -1964,13 +1964,13 @@ async fn read_gate_denied_when_tenant_out_of_scope() {
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
     repo.seed(seeded_row(tenant, Uuid::new_v4(), "k", SharingMode::Tenant));
-    let got = svc.get_secret(&ctx, &key("k")).await.expect("get_secret");
-    assert!(got.is_none());
+    let got = svc.get_secret(&ctx, &key("k")).await;
+    assert_denied(&got, "get_secret out of scope");
     assert_eq!(metrics.cross_tenant_denied_count(), 1);
 }
 
 #[tokio::test]
-async fn get_secret_returns_not_found_when_pdp_denies() {
+async fn get_secret_is_access_denied_when_pdp_denies() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -1984,12 +1984,7 @@ async fn get_secret_returns_not_found_when_pdp_denies() {
     );
     let ctx = make_ctx(Uuid::new_v4(), tenant);
     repo.seed(seeded_row(tenant, Uuid::new_v4(), "k", SharingMode::Tenant));
-    assert!(
-        svc.get_secret(&ctx, &key("k"))
-            .await
-            .expect("get_secret")
-            .is_none()
-    );
+    assert_denied(&svc.get_secret(&ctx, &key("k")).await, "get_secret denied");
 }
 
 #[tokio::test]
@@ -5119,4 +5114,370 @@ async fn a_type_restricted_scope_hides_rows_of_other_types_and_leaves_them_untou
     svc.delete(&ctx, &key("visible"), exists())
         .await
         .expect("delete visible");
+}
+
+// ── a value only under a record of its own type; reads authorize first ──────
+//
+// ADR-0010, Inheritance: a `private` record is exempt from the create-time
+// type checks, so a caller's own value-less private row of one type can sit
+// over a decisive row of another type. The value of that row must never be
+// served under the caller's record.
+
+#[derive(Clone, Copy)]
+enum GapVariant {
+    /// The decisive row is an ancestor's `shared` row of type B.
+    Ancestor,
+    /// The decisive row is the own tenant's `tenant` row of type B.
+    SameTenant,
+}
+
+struct GapWorld {
+    svc: Service,
+    repo: Arc<FakeSecretRepo>,
+    plugin: Arc<FakePlugin>,
+    audit: Arc<RecordingAudit>,
+    ctx: toolkit_security::SecurityContext,
+    /// Id of the decisive row of type B.
+    b_id: Uuid,
+}
+
+fn b_gts() -> String {
+    SecretType::from_name("api-key")
+        .expect("type")
+        .gts_id()
+        .to_owned()
+}
+
+/// The caller (type A = generic) holds an own private, value-less `declared`
+/// / `inherit` row `r`; behind it sits a row of type B (api-key) with a value.
+/// `scoped_to_a` makes the PDP exclude type B.
+fn gap_world(variant: GapVariant, scoped_to_a: bool) -> GapWorld {
+    let child = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let subject = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let mut own = seeded_row(child, subject, "r", SharingMode::Private);
+    own.status = SecretStatus::Declared;
+    own.value_version = None;
+    own.fallback = Fallback::Inherit;
+    repo.seed(own);
+    let mut b = match variant {
+        GapVariant::Ancestor => seeded_row(parent, Uuid::new_v4(), "r", SharingMode::Shared),
+        GapVariant::SameTenant => seeded_row(child, Uuid::new_v4(), "r", SharingMode::Tenant),
+    };
+    b.secret_type_uuid = SecretType::from_name("api-key").expect("type").uuid();
+    b.value_version = Some(plugin.seed(&b.store_key(), b"type-b-secret"));
+    let b_id = b.id;
+    repo.seed(b);
+    let enforcer = if scoped_to_a {
+        type_deny_enforcer(vec![b_gts()]).0
+    } else {
+        mock_enforcer()
+    };
+    let audit = RecordingAudit::new();
+    let metrics = FakeMetrics::new();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        Arc::new(FakeDir::new(vec![child, parent])),
+        enforcer,
+        metrics,
+    )
+    .with_audit(audit.clone());
+    GapWorld {
+        svc,
+        repo,
+        plugin,
+        audit,
+        ctx: make_ctx(subject, child),
+        b_id,
+    }
+}
+
+fn secret_list_query() -> toolkit_odata::ODataQuery {
+    toolkit_odata::ODataQuery::new().with_select(vec!["reference".to_owned(), "secret".to_owned()])
+}
+
+async fn assert_no_value_under_the_callers_record(w: &GapWorld) {
+    let ctx = &w.ctx;
+    // A pure value request is the canonical miss.
+    assert!(
+        w.svc
+            .get_secret(ctx, &key("r"))
+            .await
+            .expect("get_secret")
+            .is_none()
+    );
+    // A mixed projection returns the record without `secret`.
+    let fields = ["status".to_owned(), "secret".to_owned()];
+    let item = w
+        .svc
+        .get_item(ctx, &key("r"), Some(&fields))
+        .await
+        .expect("get_item")
+        .expect("the record itself is visible");
+    assert!(item.value.is_none());
+    assert_eq!(item.credential.secret_type, SecretType::generic().gts_id());
+    // The metadata projection reports `own`, as if the winner did not exist.
+    let meta = w
+        .svc
+        .get_item(ctx, &key("r"), None)
+        .await
+        .expect("get_item")
+        .expect("some");
+    assert_eq!(meta.credential.inheritance, InheritanceStatus::Own);
+    assert_eq!(meta.credential.status, CredentialStatus::Declared);
+    // The collection in secret mode omits the item.
+    let page = w.svc.list(ctx, &secret_list_query()).await.expect("list");
+    assert!(page.items.is_empty(), "{:?}", page.items.len());
+    // Nothing was read from the store or audited.
+    assert_eq!(w.plugin.get_calls(), 0);
+    assert!(w.audit.events().is_empty(), "{:?}", w.audit.events());
+}
+
+#[tokio::test]
+async fn private_declared_a_over_an_ancestors_shared_b_never_serves_the_value() {
+    let w = gap_world(GapVariant::Ancestor, true);
+    assert_no_value_under_the_callers_record(&w).await;
+}
+
+#[tokio::test]
+async fn private_declared_a_over_the_own_tenants_b_row_never_serves_the_value() {
+    let w = gap_world(GapVariant::SameTenant, true);
+    assert_no_value_under_the_callers_record(&w).await;
+}
+
+#[tokio::test]
+async fn differing_types_serve_no_value_even_when_both_types_are_admitted() {
+    for variant in [GapVariant::Ancestor, GapVariant::SameTenant] {
+        let w = gap_world(variant, false);
+        assert_no_value_under_the_callers_record(&w).await;
+    }
+}
+
+#[tokio::test]
+async fn an_expired_winner_of_another_type_is_a_miss_not_secret_expired() {
+    for variant in [GapVariant::Ancestor, GapVariant::SameTenant] {
+        let w = gap_world(variant, false);
+        w.repo.force_expire(w.b_id);
+        let got = w.svc.get_secret(&w.ctx, &key("r")).await;
+        assert!(matches!(got, Ok(None)), "{got:?}");
+        let page = w
+            .svc
+            .list(&w.ctx, &secret_list_query())
+            .await
+            .expect("list");
+        assert!(page.items.is_empty());
+        assert!(w.audit.events().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_re_resolution_landing_on_another_row_is_a_miss() {
+    let child = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let mut x = seeded_row(parent, Uuid::new_v4(), "r", SharingMode::Shared);
+    x.value_version = Some(plugin.seed(&x.store_key(), b"x"));
+    repo.seed(x);
+    let mut z = seeded_row(parent, Uuid::new_v4(), "other", SharingMode::Shared);
+    z.value_version = Some(plugin.seed(&z.store_key(), b"z"));
+    let z_id = z.id;
+    repo.seed(z);
+    let audit = RecordingAudit::new();
+    let metrics = FakeMetrics::new();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        Arc::new(FakeDir::new(vec![child, parent])),
+        mock_enforcer(),
+        metrics.clone(),
+    )
+    .with_audit(audit.clone());
+    let ctx = make_ctx(Uuid::new_v4(), child);
+
+    repo.redirect_next_resolve_for_get(z_id);
+    let got = svc.get_secret(&ctx, &key("r")).await;
+    assert!(matches!(got, Ok(None)), "{got:?}");
+    assert_eq!(metrics.last_read_outcome(), Some(ReadOutcome::Miss));
+    assert!(audit.events().is_empty());
+    assert_eq!(plugin.get_calls(), 0);
+
+    // Without the race the value is served.
+    let got = svc
+        .get_secret(&ctx, &key("r"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"x");
+}
+
+#[tokio::test]
+async fn private_declared_a_over_an_ancestors_shared_a_still_inherits_the_value() {
+    let child = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let subject = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let mut own = seeded_row(child, subject, "r", SharingMode::Private);
+    own.status = SecretStatus::Declared;
+    own.value_version = None;
+    repo.seed(own);
+    let mut shared = seeded_row(parent, Uuid::new_v4(), "r", SharingMode::Shared);
+    shared.value_version = Some(plugin.seed(&shared.store_key(), b"inherited"));
+    repo.seed(shared);
+    let svc = make_service(
+        repo,
+        plugin,
+        Arc::new(FakeDir::new(vec![child, parent])),
+        type_deny_enforcer(vec![b_gts()]).0,
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(subject, child);
+    let got = svc
+        .get_secret(&ctx, &key("r"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"inherited");
+    let meta = svc
+        .get_item(&ctx, &key("r"), None)
+        .await
+        .expect("get_item")
+        .expect("some");
+    assert_eq!(meta.credential.inheritance, InheritanceStatus::Inherited);
+    let page = svc.list(&ctx, &secret_list_query()).await.expect("list");
+    assert_eq!(page.items.len(), 1);
+}
+
+// R1: reads authorize first.
+
+#[tokio::test]
+async fn a_denied_read_is_access_denied_for_every_projection_and_the_collection() {
+    let (svc, _repo, (ctx, ..)) = denied_world();
+    let metrics = FakeMetrics::new();
+    let svc = {
+        // Same world, but with metrics and an audit sink attached.
+        let _ = svc;
+        let tenant = ctx.subject_tenant_id();
+        let repo = Arc::new(FakeSecretRepo::new());
+        repo.seed(seeded_row(tenant, Uuid::new_v4(), "k", SharingMode::Tenant));
+        make_service(
+            repo,
+            FakePlugin::new(),
+            Arc::new(FakeDir::single(tenant)),
+            deny_enforcer(),
+            metrics.clone(),
+        )
+    };
+    for reference in ["k", "gone"] {
+        let k = key(reference);
+        assert_denied(&svc.get_item(&ctx, &k, None).await, "metadata");
+        let secret_only = ["secret".to_owned()];
+        assert_denied(
+            &svc.get_item(&ctx, &k, Some(&secret_only)).await,
+            "secret only",
+        );
+        let mixed = ["status".to_owned(), "secret".to_owned()];
+        assert_denied(&svc.get_item(&ctx, &k, Some(&mixed)).await, "mixed");
+        assert_denied(&svc.get_secret(&ctx, &k).await, "get_secret");
+        assert_denied(&svc.get_record(&ctx, &k).await, "get_record");
+    }
+    assert_denied(
+        &svc.list(&ctx, &toolkit_odata::ODataQuery::new()).await,
+        "list",
+    );
+    assert_denied(&svc.list(&ctx, &secret_list_query()).await, "list secret");
+    assert_eq!(
+        metrics.last_read_outcome(),
+        None,
+        "a denied read is not a read miss"
+    );
+}
+
+#[tokio::test]
+async fn the_pdp_is_evaluated_even_when_nothing_resolves() {
+    let tenant = Uuid::new_v4();
+    let (enforcer, resolver) = counting_enforcer();
+    let svc = make_service(
+        Arc::new(FakeSecretRepo::new()),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        enforcer,
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    assert!(
+        svc.get_secret(&ctx, &key("gone"))
+            .await
+            .expect("get_secret")
+            .is_none()
+    );
+    assert_eq!(resolver.calls(), 1);
+    assert!(
+        svc.get_record(&ctx, &key("gone"))
+            .await
+            .expect("get")
+            .is_none()
+    );
+    assert_eq!(resolver.calls(), 2);
+}
+
+#[tokio::test]
+async fn a_pdp_outage_on_a_missing_reference_is_service_unavailable() {
+    let tenant = Uuid::new_v4();
+    let svc = make_service(
+        Arc::new(FakeSecretRepo::new()),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        failing_enforcer(),
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let r = svc.get_secret(&ctx, &key("gone")).await;
+    assert!(
+        matches!(r, Err(DomainError::ServiceUnavailable { .. })),
+        "{r:?}"
+    );
+    let r = svc.get_item(&ctx, &key("gone"), None).await;
+    assert!(
+        matches!(r, Err(DomainError::ServiceUnavailable { .. })),
+        "{r:?}"
+    );
+    let r = svc.list(&ctx, &toolkit_odata::ODataQuery::new()).await;
+    assert!(
+        matches!(r, Err(DomainError::ServiceUnavailable { .. })),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn constraints_excluding_the_record_answer_a_miss_and_omit_it_from_the_collection() {
+    let (svc, _repo, (ctx, ..)) = partial_world();
+    // `k` is of the excluded type: answered exactly as missing.
+    assert!(
+        svc.get_item(&ctx, &key("k"), None)
+            .await
+            .expect("ok")
+            .is_none()
+    );
+    assert!(svc.get_secret(&ctx, &key("k")).await.expect("ok").is_none());
+    assert!(
+        svc.get_item(&ctx, &key("a"), None)
+            .await
+            .expect("ok")
+            .is_some()
+    );
+    let page = svc
+        .list(&ctx, &toolkit_odata::ODataQuery::new())
+        .await
+        .expect("list");
+    let refs: Vec<_> = page
+        .items
+        .iter()
+        .map(|i| i.credential.reference.as_ref().to_owned())
+        .collect();
+    assert_eq!(refs, vec!["a".to_owned()]);
 }

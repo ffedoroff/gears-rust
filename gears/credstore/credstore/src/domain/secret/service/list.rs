@@ -235,10 +235,10 @@ impl Service {
                 required_action,
             )
             .await?;
-        // A caller the gate refuses gets an empty page, never a refusal
-        // (ADR-0005 §"How authorization applies to a collection", step 4):
-        // there is no permitted type left to build a step 1 query from, so
-        // step 1 never runs.
+        // A denial never reaches here (`permitted_rows` returned 403). The
+        // constraints may still leave no permitted type: an empty page, and
+        // there is nothing to build a step 1 query from, so step 1 never
+        // runs.
         if allowed.is_empty() {
             return Ok(Page {
                 items: Vec::new(),
@@ -342,8 +342,11 @@ impl Service {
     /// and/or reference, reduced to the row predicates admitted for the
     /// caller's tenant, then narrowed by the caller's own `$filter type in
     /// (…)`. `AccessDenied` and a scope that excludes the caller's tenant
-    /// (counted via `cross_tenant_denied`) both yield an empty clamp; any
-    /// other PDP error propagates.
+    /// (counted via `cross_tenant_denied`) both are
+    /// `AccessDenied` (403, before any lookup — reads authorize first, like
+    /// writes), never an empty clamp; any other PDP error propagates. A clamp
+    /// that is empty because the constraints (or the caller's `$filter type
+    /// in`) leave no type still yields an empty page.
     async fn permitted_rows(
         &self,
         ctx: &SecurityContext,
@@ -353,7 +356,6 @@ impl Service {
     ) -> Result<RowClamp, DomainError> {
         let scope = match self.authorize_actions(ctx, req, &[required_action]).await {
             Ok(scope) => scope,
-            Err(DomainError::AccessDenied { .. }) => return Ok(RowClamp::Constraints(Vec::new())),
             Err(e) => return Err(e),
         };
         Ok(authz::row_clamp(&scope, req.0).restrict_to(caller_type_in))
@@ -385,13 +387,13 @@ impl Service {
         }
 
         // Step 2: every visible row of `references`, whole and unclamped by
-        // type. The override-type-consistency invariant is enforced only
-        // upward on write (`TYPE_MISMATCH_WITH_INHERITED` checks the
-        // inherited row an ancestor can see; an ancestor writing after a
-        // descendant cannot see the descendant's row to check against), so
-        // reduction here must see every row a point read would see — a type
-        // clamp at this step could make the list show, or serve the value
-        // of, a reference the point read never resolves to.
+        // type. Type consistency is checked on write in both directions but
+        // only at creation (and `private` records are exempt), so rows of one
+        // reference can differ in type (a race between creates, a private
+        // record). Reduction here must see every row a point read would see —
+        // a type clamp at this step could make the list show, or serve the
+        // value of, a reference the point read never resolves to; the value
+        // is served only from a decisive row of the effective record's type.
         let rows = self
             .repo
             .list_candidates_for_references(req, subject, chain, references)
@@ -464,7 +466,10 @@ impl Service {
                 continue;
             }
 
-            let Some(winner) = reduced.winner else {
+            // A value only from a decisive row of the effective record's
+            // type, checked before expiry: another-type winner omits the
+            // item and never yields an expired-metadata item.
+            let Some(winner) = reduced.value_row else {
                 continue;
             };
             if winner.is_expired(now) {
