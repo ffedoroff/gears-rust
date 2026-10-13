@@ -63,16 +63,20 @@ async fn each_put_is_a_new_immutable_version() {
 #[tokio::test]
 async fn declares_and_implements_destroy() {
     let svc = empty_service();
-    assert!(svc.supports_destroy());
+    assert!(svc.destroyer().is_some());
     let k = key();
     let v1 = svc.put(&ctx(), &k, SecretValue::from("v1")).await.unwrap();
     let v2 = svc.put(&ctx(), &k, SecretValue::from("v2")).await.unwrap();
-    svc.destroy(&ctx(), &k, DestroySelector::Below(v2.clone()))
+    svc.destroyer()
+        .unwrap()
+        .destroy(&ctx(), &k, DestroySelector::Below(v2.clone()))
         .await
         .unwrap();
     assert!(svc.get(&ctx(), &k, &v1).await.unwrap().is_none());
     assert!(svc.get(&ctx(), &k, &v2).await.unwrap().is_some());
-    svc.destroy(&ctx(), &k, DestroySelector::Exactly(v2.clone()))
+    svc.destroyer()
+        .unwrap()
+        .destroy(&ctx(), &k, DestroySelector::Exactly(v2.clone()))
         .await
         .unwrap();
     assert!(svc.get(&ctx(), &k, &v2).await.unwrap().is_none());

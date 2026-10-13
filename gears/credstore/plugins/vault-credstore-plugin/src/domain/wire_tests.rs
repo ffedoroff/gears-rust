@@ -1,6 +1,7 @@
 // Created: 2026-09-23 by Constructor Tech
 // Updated: 2026-10-06 by Constructor Tech
 use super::*;
+use crate::domain::test_ext::PluginErrorExt as _;
 
 /// What Vault answers (dev server) for a soft-deleted version: `404`, no
 /// `errors`, `data.data = null`, `deletion_time` set.
@@ -77,7 +78,7 @@ fn encode_decode_value_round_trips() {
 #[test]
 fn decode_value_rejects_invalid_base64_as_internal() {
     let err = decode_value("not-valid-base64!!").unwrap_err();
-    assert!(matches!(err, CredStoreError::Internal(_)));
+    assert!(matches!(err, CredStorePluginError::Internal { .. }));
 }
 
 #[test]
@@ -165,7 +166,10 @@ fn parse_get_body_entry_without_a_value_is_internal() {
         r#"{"data":{"data":{"value":"not base64!!"}}}"#,
     ] {
         assert!(
-            matches!(parse_get_body(body), Err(CredStoreError::Internal(_))),
+            matches!(
+                parse_get_body(body),
+                Err(CredStorePluginError::Internal { .. })
+            ),
             "{body}"
         );
     }
@@ -179,7 +183,10 @@ fn parse_get_body_rejects_unexpected_shape_as_internal() {
         "<html>bad gateway</html>",
     ] {
         let err = parse_get_body(body).unwrap_err();
-        assert!(matches!(err, CredStoreError::Internal(_)), "{body}");
+        assert!(
+            matches!(err, CredStorePluginError::Internal { .. }),
+            "{body}"
+        );
     }
 }
 
@@ -226,7 +233,7 @@ fn parse_live_versions_of_a_real_metadata_body() {
 fn parse_live_versions_rejects_unexpected_shape() {
     assert!(matches!(
         parse_live_versions("{}").unwrap_err(),
-        CredStoreError::Internal(_)
+        CredStorePluginError::Internal { .. }
     ));
 }
 
@@ -284,22 +291,22 @@ fn is_transient_status_covers_5xx_408_429_only() {
 // -- error mapping table ---------------------------------------------------------
 
 #[test]
-fn transient_statuses_map_to_service_unavailable() {
+fn transient_statuses_map_to_unavailable() {
     for status in [408, 429, 500, 502, 503, 599] {
         let err = map_error_status(status, "", None, &[]);
         assert!(err.is_unavailable(), "{status}");
-        assert_eq!(err.retry_after_seconds(), None);
+        assert_eq!(err.retry_after().map(|d| d.as_secs()), None);
     }
 }
 
 #[test]
 fn retry_after_is_passed_on() {
     let err = map_error_status(503, "", Some(Duration::from_secs(7)), &[]);
-    assert_eq!(err.retry_after_seconds(), Some(7));
+    assert_eq!(err.retry_after().map(|d| d.as_secs()), Some(7));
 }
 
 #[test]
-fn service_unavailable_detail_carries_status_and_vault_text() {
+fn unavailable_detail_carries_status_and_vault_text() {
     let err = map_error_status(503, r#"{"errors":["Vault is sealed"]}"#, None, &[]);
     let msg = err.to_string();
     assert!(msg.contains("503"), "{msg}");
@@ -307,10 +314,10 @@ fn service_unavailable_detail_carries_status_and_vault_text() {
 }
 
 #[test]
-fn forbidden_maps_to_service_unavailable_without_leaking_anything() {
+fn forbidden_maps_to_credentials_rejected_without_leaking_anything() {
     let err = map_error_status(403, FORBIDDEN_403, None, &[]);
-    assert!(err.is_unavailable());
-    assert!(!matches!(err, CredStoreError::AccessDenied));
+    assert!(err.is_credentials_rejected());
+    assert_eq!(err.retry_after(), None);
     let msg = err.to_string();
     assert!(msg.contains("403"), "{msg}");
     assert!(!msg.contains("invalid token"), "{msg}");
@@ -319,14 +326,19 @@ fn forbidden_maps_to_service_unavailable_without_leaking_anything() {
 #[test]
 fn bad_request_maps_to_internal_with_vault_text() {
     let err = map_error_status(400, r#"{"errors":["no data provided"]}"#, None, &[]);
-    assert!(matches!(&err, CredStoreError::Internal(m) if m.contains("no data provided")));
+    assert!(
+        matches!(&err, CredStorePluginError::Internal { detail: m, .. } if m.contains("no data provided"))
+    );
 }
 
 #[test]
 fn other_statuses_map_to_internal() {
     for status in [300, 301, 401, 404, 405, 409, 412, 499, 600] {
         let err = map_error_status(status, "", None, &[]);
-        assert!(matches!(err, CredStoreError::Internal(_)), "{status}");
+        assert!(
+            matches!(err, CredStorePluginError::Internal { .. }),
+            "{status}"
+        );
         assert!(!err.is_unavailable(), "{status}");
     }
 }
@@ -360,7 +372,9 @@ fn classify_get_response_soft_deleted_and_destroyed_are_none() {
 #[test]
 fn classify_get_response_missing_mount_is_an_error_not_a_miss() {
     let err = classify_get_response(404, NO_MOUNT_404).unwrap_err();
-    assert!(matches!(&err, CredStoreError::Internal(m) if m.contains("no handler for route")));
+    assert!(
+        matches!(&err, CredStorePluginError::Internal { detail: m, .. } if m.contains("no handler for route"))
+    );
 }
 
 #[test]
@@ -377,11 +391,11 @@ fn classify_get_response_failures() {
     assert!(
         classify_get_response(403, FORBIDDEN_403)
             .unwrap_err()
-            .is_unavailable()
+            .is_credentials_rejected()
     );
     assert!(matches!(
         classify_get_response(400, r#"{"errors":["x"]}"#).unwrap_err(),
-        CredStoreError::Internal(_)
+        CredStorePluginError::Internal { .. }
     ));
 }
 
@@ -391,17 +405,17 @@ fn classify_get_response_status_boundaries() {
     assert!(classify_get_response(299, r#"{"data":{"data":null}}"#).is_ok());
     assert!(matches!(
         classify_get_response(300, "").unwrap_err(),
-        CredStoreError::Internal(_)
+        CredStorePluginError::Internal { .. }
     ));
     assert!(matches!(
         classify_get_response(499, "").unwrap_err(),
-        CredStoreError::Internal(_)
+        CredStorePluginError::Internal { .. }
     ));
     assert!(classify_get_response(500, "").unwrap_err().is_unavailable());
     assert!(classify_get_response(599, "").unwrap_err().is_unavailable());
     assert!(matches!(
         classify_get_response(600, "").unwrap_err(),
-        CredStoreError::Internal(_)
+        CredStorePluginError::Internal { .. }
     ));
 }
 
@@ -421,16 +435,16 @@ fn classify_put_response_failures() {
     assert!(
         classify_put_response(403, FORBIDDEN_403, "aGk=")
             .unwrap_err()
-            .is_unavailable()
+            .is_credentials_rejected()
     );
     assert!(matches!(
         classify_put_response(400, "{}", "aGk=").unwrap_err(),
-        CredStoreError::Internal(_)
+        CredStorePluginError::Internal { .. }
     ));
     // A `404` on a write means the mount is missing: an error, never success.
     assert!(matches!(
         classify_put_response(404, NO_MOUNT_404, "aGk=").unwrap_err(),
-        CredStoreError::Internal(_)
+        CredStorePluginError::Internal { .. }
     ));
 }
 
@@ -454,7 +468,7 @@ fn classify_metadata_response_404_is_empty() {
     assert!(classify_metadata_response(404, "").expect("ok").is_empty());
     assert!(matches!(
         classify_metadata_response(404, NO_MOUNT_404).unwrap_err(),
-        CredStoreError::Internal(_)
+        CredStorePluginError::Internal { .. }
     ));
 }
 
@@ -477,14 +491,18 @@ fn classify_delete_and_destroy_responses() {
         classify(404, ABSENT_404).expect("a missing key is ok, idempotent");
         classify(404, "").expect("a bare 404 is ok, idempotent");
         assert!(classify(502, "").unwrap_err().is_unavailable());
-        assert!(classify(403, FORBIDDEN_403).unwrap_err().is_unavailable());
+        assert!(
+            classify(403, FORBIDDEN_403)
+                .unwrap_err()
+                .is_credentials_rejected()
+        );
         assert!(matches!(
             classify(404, NO_MOUNT_404).unwrap_err(),
-            CredStoreError::Internal(_)
+            CredStorePluginError::Internal { .. }
         ));
         assert!(matches!(
             classify(400, r#"{"errors":["no version number provided"]}"#).unwrap_err(),
-            CredStoreError::Internal(_)
+            CredStorePluginError::Internal { .. }
         ));
     }
 }

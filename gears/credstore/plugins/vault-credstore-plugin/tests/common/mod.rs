@@ -286,3 +286,18 @@ pub fn key_path(fixture: &VaultFixture, kind: &str, key: &credstore_sdk::StoreKe
 pub fn fresh_key() -> credstore_sdk::StoreKey {
     credstore_sdk::StoreKey::new(credstore_sdk::TenantId(Uuid::new_v4()), Uuid::new_v4())
 }
+
+/// Test-only predicates on the plugin error.
+pub trait PluginErrorExt {
+    fn is_unavailable(&self) -> bool;
+    fn is_credentials_rejected(&self) -> bool;
+}
+
+impl PluginErrorExt for credstore_sdk::CredStorePluginError {
+    fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+    fn is_credentials_rejected(&self) -> bool {
+        matches!(self, Self::CredentialsRejected { .. })
+    }
+}

@@ -6,7 +6,7 @@
 //!   `(tenant, reference, owner)` the way the shipped gear addressed it;
 //! * the NEW store, through the current `CredStorePluginClientV2`.
 //!
-//! A transient answer (`LegacyError::Unavailable`, `ServiceUnavailable`) is
+//! A transient answer (`LegacyError::Unavailable`, `CredStorePluginError::Unavailable`) is
 //! retried with a bounded backoff; any other error is final for the run. After
 //! the last attempt the error aborts the run (exit code `1`); what was
 //! persisted so far stays.
@@ -15,8 +15,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, TenantId,
-    ValueVersion,
+    CredStorePluginClientV2, CredStorePluginError, DestroySelector, SecretValue, StoreKey,
+    TenantId, ValueVersion,
 };
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -109,8 +109,8 @@ fn old_transient(e: &LegacyError) -> bool {
     matches!(e, LegacyError::Unavailable(_))
 }
 
-fn new_transient(e: &CredStoreError) -> bool {
-    matches!(e, CredStoreError::ServiceUnavailable { .. })
+fn new_transient(e: &CredStorePluginError) -> bool {
+    matches!(e, CredStorePluginError::Unavailable { .. })
 }
 
 /// The address of an entry in the old store.
@@ -209,8 +209,8 @@ impl<'a> NewStore<'a> {
 
     /// Whether the store can destroy versions (and so has ordered versions).
     #[must_use]
-    pub fn supports_destroy(&self) -> bool {
-        self.inner.supports_destroy()
+    pub fn can_destroy(&self) -> bool {
+        self.inner.destroyer().is_some()
     }
 
     /// Stores a new version of `key`. A `put` whose answer was lost leaves a
@@ -255,9 +255,13 @@ impl<'a> NewStore<'a> {
         key: &StoreKey,
         version: &ValueVersion,
     ) -> Result<(), MigrationError> {
+        let Some(destroyer) = self.inner.destroyer() else {
+            return Err(MigrationError::Target(CredStorePluginError::internal(
+                "the new store does not support destroy",
+            )));
+        };
         retry(&self.tuning, "new store destroy", new_transient, || {
-            self.inner
-                .destroy(&self.ctx, key, DestroySelector::Below(version.clone()))
+            destroyer.destroy(&self.ctx, key, DestroySelector::Below(version.clone()))
         })
         .await
         .map_err(MigrationError::Target)
@@ -352,11 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn only_service_unavailable_is_transient() {
+    fn only_unavailable_is_transient() {
         assert!(old_transient(&LegacyError::Unavailable("x".to_owned())));
         assert!(!old_transient(&LegacyError::Failed("x".to_owned())));
-        assert!(new_transient(&CredStoreError::service_unavailable("x")));
-        assert!(!new_transient(&CredStoreError::internal("x")));
+        assert!(new_transient(&CredStorePluginError::unavailable("x", None)));
+        assert!(!new_transient(&CredStorePluginError::internal("x")));
     }
 
     fn row(sharing: i16, reference: &str) -> ProgressRow {

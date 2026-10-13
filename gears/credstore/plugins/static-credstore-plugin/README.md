@@ -18,7 +18,7 @@ The `cf-gears-static-credstore-plugin` module provides:
   through its `value_version` (ADR-0006).
 - **Ordered versions** - a per-key monotonic counter: the n-th `put` under a
   key returns `"n"` (destroyed numbers are never reissued).
-- **`destroy` supported** - `supports_destroy` is `true`; `Below(v)` removes
+- **`destroy` supported** - `destroyer()` returns `Some`; `Below(v)` removes
   every version older than `v`, `Exactly(v)` removes that one. `destroy` and
   `delete_key` of anything not held are successes (idempotent).
 - **Writable at runtime** - the gear's write protocol mutates the in-memory
@@ -63,7 +63,7 @@ validation (`deny_unknown_fields`).
 | `put(ctx, key, value)` | Stores a new immutable version under `key`; returns its version (`"1"`, `"2"`, ...). |
 | `get(ctx, key, version)` | Returns the bytes of that version, or `None` when it is gone. |
 | `delete_key(ctx, key)` | Removes the key with all versions; a missing key is `Ok(())`. |
-| `supports_destroy()` | `true`. |
+| `destroyer()` | `Some(self)`; the destroy capability is `CredStorePluginDestroyerV2`. |
 | `destroy(ctx, key, selector)` | `Below(v)` / `Exactly(v)`; idempotent. |
 
 ## Architecture

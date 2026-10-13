@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use common::{FENCE_KEY, Fixture, Row, expect_exit, tenant};
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, TenantId,
-    ValueVersion,
+    CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError, DestroySelector,
+    SecretValue, StoreKey, TenantId, ValueVersion,
 };
 use credstore_sdk_v02::{
     CredStorePluginClientV1, OwnerId, SecretRef, SecretValue as OldValue, TenantId as OldTenantId,
@@ -213,7 +213,7 @@ impl CredStorePluginClientV2 for FlakyReadBack {
         ctx: &SecurityContext,
         key: &StoreKey,
         value: SecretValue,
-    ) -> Result<ValueVersion, CredStoreError> {
+    ) -> Result<ValueVersion, CredStorePluginError> {
         self.inner.put(ctx, key, value).await
     }
 
@@ -222,13 +222,13 @@ impl CredStorePluginClientV2 for FlakyReadBack {
         ctx: &SecurityContext,
         key: &StoreKey,
         version: &ValueVersion,
-    ) -> Result<Option<SecretValue>, CredStoreError> {
+    ) -> Result<Option<SecretValue>, CredStorePluginError> {
         if self
             .fail_gets
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(CredStoreError::service_unavailable("injected"));
+            return Err(CredStorePluginError::unavailable("injected", None));
         }
         self.inner.get(ctx, key, version).await
     }
@@ -237,21 +237,30 @@ impl CredStorePluginClientV2 for FlakyReadBack {
         &self,
         ctx: &SecurityContext,
         key: &StoreKey,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         self.inner.delete_key(ctx, key).await
     }
 
-    fn supports_destroy(&self) -> bool {
-        self.inner.supports_destroy()
+    fn destroyer(&self) -> Option<&dyn CredStorePluginDestroyerV2> {
+        self.inner
+            .destroyer()
+            .map(|_| self as &dyn CredStorePluginDestroyerV2)
     }
+}
 
+#[async_trait]
+impl CredStorePluginDestroyerV2 for FlakyReadBack {
     async fn destroy(
         &self,
         ctx: &SecurityContext,
         key: &StoreKey,
         selector: DestroySelector,
-    ) -> Result<(), CredStoreError> {
-        self.inner.destroy(ctx, key, selector).await
+    ) -> Result<(), CredStorePluginError> {
+        self.inner
+            .destroyer()
+            .expect("the inner plugin supports destroy")
+            .destroy(ctx, key, selector)
+            .await
     }
 }
 
