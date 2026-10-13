@@ -8,7 +8,8 @@
 //! keys purely on `(tenant_id, record_id)`.
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, ValueVersion,
+    CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError, DestroySelector,
+    SecretValue, StoreKey, ValueVersion,
 };
 use toolkit_security::SecurityContext;
 
@@ -21,7 +22,7 @@ impl CredStorePluginClientV2 for Service {
         _ctx: &SecurityContext,
         key: &StoreKey,
         value: SecretValue,
-    ) -> Result<ValueVersion, CredStoreError> {
+    ) -> Result<ValueVersion, CredStorePluginError> {
         self.put_value(key, value).await
     }
 
@@ -30,7 +31,7 @@ impl CredStorePluginClientV2 for Service {
         _ctx: &SecurityContext,
         key: &StoreKey,
         version: &ValueVersion,
-    ) -> Result<Option<SecretValue>, CredStoreError> {
+    ) -> Result<Option<SecretValue>, CredStorePluginError> {
         self.get_value(key, version).await
     }
 
@@ -38,20 +39,23 @@ impl CredStorePluginClientV2 for Service {
         &self,
         _ctx: &SecurityContext,
         key: &StoreKey,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         self.delete_key_value(key).await
     }
 
-    fn supports_destroy(&self) -> bool {
-        true
+    fn destroyer(&self) -> Option<&dyn CredStorePluginDestroyerV2> {
+        Some(self)
     }
+}
 
+#[async_trait]
+impl CredStorePluginDestroyerV2 for Service {
     async fn destroy(
         &self,
         _ctx: &SecurityContext,
         key: &StoreKey,
         selector: DestroySelector,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         self.destroy_value(key, &selector).await
     }
 }
