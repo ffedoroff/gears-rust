@@ -28,14 +28,13 @@ use crate::domain::error::DomainError;
 use crate::domain::secret::model::Fallback;
 
 /// Stable machine-readable reason codes this module's validation failures
-/// carry. `INVALID_FILTER`/`INVALID_ORDERBY_FIELD`/`INVALID_SELECT` mirror
+/// carry (re-exported from the SDK's `field` vocabulary). `INVALID_FILTER`/`INVALID_ORDERBY_FIELD`/`INVALID_SELECT` mirror
 /// the platform's standard `OData` reason codes (`guidelines/DNA/REST/
 /// PAGINATION.md`, DESIGN §10).
 pub(crate) mod reasons {
-    pub const INVALID_FILTER: &str = "INVALID_FILTER";
-    pub const INVALID_ORDERBY_FIELD: &str = "INVALID_ORDERBY_FIELD";
-    pub const INVALID_SELECT: &str = "INVALID_SELECT";
-    pub const SECRET_SELECT_FIELDS: &str = "SECRET_SELECT_FIELDS";
+    pub use credstore_sdk::field::{
+        INVALID_FILTER, INVALID_ORDERBY_FIELD, INVALID_SELECT, SECRET_SELECT_FIELDS,
+    };
 }
 
 fn invalid_filter(detail: impl Into<String>) -> DomainError {
@@ -113,7 +112,7 @@ const SELECT_ALLOWLIST: &[&str] = &[
     "secret",
 ];
 
-/// The administrative record fields (ADR-0004 Amendment A): naming any of
+/// The administrative record fields (ADR-0004, "Read actions follow the projection"): naming any of
 /// these in the point read's `$select` requires `read` — in addition to, or
 /// instead of, `read_secret` — because disclosing them is that action's
 /// privilege, not `read_secret`'s. Distinct from the envelope fields (`reference`,
@@ -175,7 +174,7 @@ pub(crate) fn secret_selected(fields: Option<&[String]>) -> bool {
 
 /// `true` iff `fields` names one of [`ADMIN_FIELDS`] — the point read's
 /// trigger for requiring `read` on top of (or instead of) `read_secret`
-/// (ADR-0004 Amendment A).
+/// (ADR-0004, "Read actions follow the projection").
 pub(crate) fn admin_field_selected(fields: Option<&[String]>) -> bool {
     fields.is_some_and(|fields| fields.iter().any(|f| ADMIN_FIELDS.contains(&f.as_str())))
 }

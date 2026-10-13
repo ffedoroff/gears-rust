@@ -13,8 +13,8 @@ use authz_resolver_sdk::models::{
 };
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV2, DestroySelector, OwnerId, SecretRef, SecretValue,
-    SharingMode, StoreKey, TenantId, ValueVersion,
+    CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError, DestroySelector,
+    OwnerId, SecretRef, SecretValue, SharingMode, StoreKey, TenantId, ValueVersion,
 };
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_security::{AccessScope, PlatformSecurityContext, SecurityContext, pep_properties};
@@ -29,6 +29,7 @@ use crate::domain::ports::metrics::{
 };
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
+use crate::domain::secret::cleanup::{DeadContent, cleanup_tasks};
 use crate::domain::secret::model::{
     CleanupDebt, CleanupTask, DeleteVerification, HealFlags, HealedCreates, IntentCommit,
     NewDeclaredSecret, NewSecret, SecretRow, SecretStatus, WriteAttempt, WriteVerification,
@@ -603,20 +604,19 @@ fn plugin_key(key: &StoreKey) -> PluginKey {
     (key.tenant_id.0, key.record_id)
 }
 
-/// Injected `get` fault for one key - see [`FakePlugin::deny_get_for`] /
+/// Injected `get` fault for one key - see [`FakePlugin::reject_get_for`] /
 /// [`FakePlugin::fail_get_for`]. Used by the secret-selecting list concurrency
 /// tests, which need a *specific* winner's read (not just "the next `get`
 /// call", nondeterministic once reads run concurrently) to fail.
 #[derive(Clone, Copy)]
 enum FakeGetFault {
-    /// Backend ACL refusal (`CredStoreError::AccessDenied`) - a legitimate
-    /// per-item miss (`fetch_with_retry` maps it to `Ok(None)`), not a
-    /// request failure.
-    Denied,
-    /// A generic backend outage (`CredStoreError::ServiceUnavailable`) - a
+    /// The store refused the plugin's own credentials
+    /// (`CredStorePluginError::CredentialsRejected`): 503 without a hint.
+    Rejected,
+    /// A generic backend outage (`CredStorePluginError::Unavailable`) - a
     /// non-`NotFound` error that fails the whole request.
     Error,
-    /// A permanent plugin failure (`CredStoreError::Internal`): a version
+    /// A permanent plugin failure (`CredStorePluginError::Internal`): a version
     /// that exists but can never be read.
     Internal,
 }
@@ -652,10 +652,10 @@ pub struct FakePlugin {
     /// the store's actual contents - models a read racing a concurrent
     /// pointer switch (ADR-0006's re-read-once case).
     not_found_gets: Mutex<usize>,
-    /// When set, every `get` returns [`CredStoreError::AccessDenied`],
-    /// modelling a backend whose own ACLs reject a read the gear's PDP has
-    /// already allowed.
-    get_denied: bool,
+    /// When set, every `get` returns
+    /// [`CredStorePluginError::CredentialsRejected`], modelling a store that
+    /// refuses the plugin's own credentials.
+    get_rejected: bool,
     /// Per-key injected `get` faults (secret-selecting list concurrency tests).
     get_faults: Mutex<HashMap<PluginKey, FakeGetFault>>,
     /// Per-key injected read latency in milliseconds (secret-selecting list
@@ -676,7 +676,7 @@ pub struct FakePlugin {
 }
 
 impl FakePlugin {
-    fn build(destroy_supported: bool, get_denied: bool) -> Self {
+    fn build(destroy_supported: bool, get_rejected: bool) -> Self {
         Self {
             store: Mutex::new(HashMap::new()),
             destroy_supported,
@@ -685,7 +685,7 @@ impl FakePlugin {
             destroy_failures: Mutex::new(0),
             delete_key_failures: Mutex::new(0),
             not_found_gets: Mutex::new(0),
-            get_denied,
+            get_rejected,
             get_faults: Mutex::new(HashMap::new()),
             delays: Mutex::new(HashMap::new()),
             in_flight: AtomicUsize::new(0),
@@ -702,8 +702,8 @@ impl FakePlugin {
         Arc::new(Self::build(true, false))
     }
 
-    /// A plugin that does not declare `destroy`: `supports_destroy()` is
-    /// `false`, and any `destroy` call it still receives is recorded as a
+    /// A plugin that does not declare `destroy`: `destroyer()` is
+    /// `None`, and any `destroy` call it still receives is recorded as a
     /// contract violation (see [`Self::destroy_calls`]).
     #[must_use]
     pub fn without_destroy() -> Arc<Self> {
@@ -722,10 +722,10 @@ impl FakePlugin {
         p
     }
 
-    /// Plugin whose every `get` denies - models a backend ACL rejecting a read
-    /// the gear's PDP already allowed.
+    /// Plugin whose every `get` fails with `CredentialsRejected` - models a
+    /// store refusing the plugin's own credentials.
     #[must_use]
-    pub fn with_get_denied() -> Arc<Self> {
+    pub fn with_get_rejected() -> Arc<Self> {
         Arc::new(Self::build(true, true))
     }
 
@@ -877,28 +877,26 @@ impl FakePlugin {
         self.get_calls.load(Ordering::SeqCst)
     }
 
-    /// Always fail `get` for `key` with `CredStoreError::AccessDenied` - a
-    /// backend ACL refusing a read the gear's PDP already allowed, which
-    /// `fetch_with_retry` treats as a legitimate per-item miss (`Ok(None)`),
-    /// not a request failure. For the secret-selecting list "refused item omitted"
-    /// test: unlike [`Self::fail_next_gets_with_not_found`] (a global counter
+    /// Always fail `get` for `key` with `CredentialsRejected` - the store
+    /// refusing the plugin's own credentials, a request failure (503 without
+    /// a hint). Unlike [`Self::fail_next_gets_with_not_found`] (a global counter
     /// over the *next* call, nondeterministic once reads run concurrently),
     /// this targets one specific winner.
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn deny_get_for(&self, key: &StoreKey) {
+    pub fn reject_get_for(&self, key: &StoreKey) {
         self.get_faults
             .lock()
             .expect("lock")
-            .insert(plugin_key(key), FakeGetFault::Denied);
+            .insert(plugin_key(key), FakeGetFault::Rejected);
     }
 
     /// Always fail `get` for `key` with a simulated backend outage
-    /// (`CredStoreError::ServiceUnavailable`) - a non-`NotFound` error that
+    /// (`CredStorePluginError::Unavailable`) - a non-`NotFound` error that
     /// fails the whole request, targeted at one specific winner (see
-    /// [`Self::deny_get_for`]).
+    /// [`Self::reject_get_for`]).
     ///
     /// # Panics
     ///
@@ -911,8 +909,8 @@ impl FakePlugin {
     }
 
     /// Always fail `get` for `key` with the permanent
-    /// `CredStoreError::Internal` (a lost key or an entry the plugin did not
-    /// write), targeted at one specific winner (see [`Self::deny_get_for`]).
+    /// `CredStorePluginError::Internal` (a lost key or an entry the plugin did not
+    /// write), targeted at one specific winner (see [`Self::reject_get_for`]).
     ///
     /// # Panics
     ///
@@ -969,10 +967,10 @@ impl CredStorePluginClientV2 for FakePlugin {
         _ctx: &SecurityContext,
         key: &StoreKey,
         value: SecretValue,
-    ) -> Result<ValueVersion, CredStoreError> {
+    ) -> Result<ValueVersion, CredStorePluginError> {
         if Self::take_one(&self.put_failures) {
-            return Err(CredStoreError::Internal(
-                "simulated backend put failure".to_owned(),
+            return Err(CredStorePluginError::internal(
+                "simulated backend put failure",
             ));
         }
         let version = {
@@ -983,10 +981,10 @@ impl CredStorePluginClientV2 for FakePlugin {
             ValueVersion::new(state.last.to_string())
         };
         if Self::take_one(&self.put_persist_then_fail) {
-            return Err(CredStoreError::ServiceUnavailable {
-                detail: "simulated lost put ack".to_owned(),
-                retry_after: None,
-            });
+            return Err(CredStorePluginError::unavailable(
+                "simulated lost put ack",
+                None,
+            ));
         }
         Ok(version)
     }
@@ -996,22 +994,26 @@ impl CredStorePluginClientV2 for FakePlugin {
         _ctx: &SecurityContext,
         key: &StoreKey,
         version: &ValueVersion,
-    ) -> Result<Option<SecretValue>, CredStoreError> {
+    ) -> Result<Option<SecretValue>, CredStorePluginError> {
         self.get_calls.fetch_add(1, Ordering::SeqCst);
-        if self.get_denied {
-            return Err(CredStoreError::AccessDenied);
+        if self.get_rejected {
+            return Err(CredStorePluginError::credentials_rejected(
+                "simulated rejected credentials",
+            ));
         }
         let k = plugin_key(key);
         if let Some(fault) = self.get_faults.lock().expect("lock").get(&k).copied() {
             return match fault {
-                FakeGetFault::Denied => Err(CredStoreError::AccessDenied),
-                FakeGetFault::Error => Err(CredStoreError::ServiceUnavailable {
-                    detail: "simulated backend get failure".to_owned(),
-                    retry_after: None,
-                }),
-                FakeGetFault::Internal => {
-                    Err(CredStoreError::internal("simulated permanent get failure"))
-                }
+                FakeGetFault::Rejected => Err(CredStorePluginError::credentials_rejected(
+                    "simulated rejected credentials",
+                )),
+                FakeGetFault::Error => Err(CredStorePluginError::unavailable(
+                    "simulated backend get failure",
+                    None,
+                )),
+                FakeGetFault::Internal => Err(CredStorePluginError::internal(
+                    "simulated permanent get failure",
+                )),
             };
         }
         if Self::take_one(&self.not_found_gets) {
@@ -1044,41 +1046,44 @@ impl CredStorePluginClientV2 for FakePlugin {
         &self,
         _ctx: &SecurityContext,
         key: &StoreKey,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         self.delete_key_log.lock().expect("lock").push(key.clone());
         if Self::take_one(&self.delete_key_failures) {
-            return Err(CredStoreError::Internal(
-                "simulated backend delete_key failure".to_owned(),
+            return Err(CredStorePluginError::internal(
+                "simulated backend delete_key failure",
             ));
         }
         self.store.lock().expect("lock").remove(&plugin_key(key));
         Ok(())
     }
 
-    fn supports_destroy(&self) -> bool {
-        self.destroy_supported
+    fn destroyer(&self) -> Option<&dyn CredStorePluginDestroyerV2> {
+        self.destroy_supported.then_some(self)
     }
+}
 
+#[async_trait]
+impl CredStorePluginDestroyerV2 for FakePlugin {
     async fn destroy(
         &self,
         _ctx: &SecurityContext,
         key: &StoreKey,
         selector: DestroySelector,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         self.destroy_log
             .lock()
             .expect("lock")
             .push((key.clone(), selector.clone()));
         if !self.destroy_supported {
-            return Err(CredStoreError::Internal(
-                "destroy called on a plugin that does not support it".to_owned(),
+            return Err(CredStorePluginError::internal(
+                "destroy called on a plugin that does not support it",
             ));
         }
         if Self::take_one(&self.destroy_failures) {
-            return Err(CredStoreError::ServiceUnavailable {
-                detail: "simulated backend destroy failure".to_owned(),
-                retry_after: None,
-            });
+            return Err(CredStorePluginError::unavailable(
+                "simulated backend destroy failure",
+                None,
+            ));
         }
         let mut store = self.store.lock().expect("lock");
         let Some(state) = store.get_mut(&plugin_key(key)) else {
@@ -1693,24 +1698,23 @@ impl FakeSecretRepo {
             .any(|r| r.id == record_id)
     }
 
-    /// What a write that lost (or lost its intent) leaves as debts, by the
-    /// same rule as the SQL repo.
+    /// What a write that lost (or lost its intent) leaves as debts: the
+    /// row-existence fact, fed to the one cleanup rule
+    /// ([`cleanup_tasks`], `DeadContent::LostWrite`) like the SQL repo.
     fn lost_write_tasks(
         &self,
         key: &StoreKey,
         version: &ValueVersion,
         destroy_supported: bool,
     ) -> Vec<CleanupTask> {
-        if !self.row_exists(key.record_id) {
-            return vec![CleanupTask::Purge(key.clone())];
-        }
-        if destroy_supported {
-            return vec![CleanupTask::Destroy {
-                key: key.clone(),
-                selector: DestroySelector::Exactly(version.clone()),
-            }];
-        }
-        Vec::new()
+        cleanup_tasks(
+            DeadContent::LostWrite {
+                key,
+                version,
+                row_exists: self.row_exists(key.record_id),
+            },
+            destroy_supported,
+        )
     }
 
     /// Deletes the attempt's intent; `true` iff it existed.
@@ -1743,7 +1747,15 @@ impl FakeSecretRepo {
             })
         };
         if conflict {
-            let debts = self.record(vec![CleanupTask::Purge(attempt.key.clone())]);
+            let tasks = cleanup_tasks(
+                DeadContent::LostWrite {
+                    key: &attempt.key,
+                    version: &new.value_version,
+                    row_exists: false,
+                },
+                attempt.destroy_supported,
+            );
+            let debts = self.record(tasks);
             return IntentCommit::Lost { debts };
         }
         self.rows.lock().expect("lock").push(SecretRow {
@@ -1781,7 +1793,7 @@ impl FakeSecretRepo {
         sharing: SharingMode,
         fallback: crate::domain::secret::model::Fallback,
         expires_at: Option<OffsetDateTime>,
-        new_value_version: ValueVersion,
+        new_value_version: &ValueVersion,
         attempt: &WriteAttempt,
     ) -> IntentCommit<SecretRow> {
         if !self.retire_intent(attempt.attempt_id) {
@@ -1813,18 +1825,17 @@ impl FakeSecretRepo {
             // A definite loss: the intent deletion committed, with the debt
             // for this attempt's version in the same transaction.
             let tasks =
-                self.lost_write_tasks(&attempt.key, &new_value_version, attempt.destroy_supported);
+                self.lost_write_tasks(&attempt.key, new_value_version, attempt.destroy_supported);
             let debts = self.record(tasks);
             return IntentCommit::Lost { debts };
         };
-        let tasks = if attempt.destroy_supported {
-            vec![CleanupTask::Destroy {
-                key: attempt.key.clone(),
-                selector: DestroySelector::Below(new_value_version),
-            }]
-        } else {
-            Vec::new()
-        };
+        let tasks = cleanup_tasks(
+            DeadContent::Superseded {
+                key: &attempt.key,
+                new: new_value_version,
+            },
+            attempt.destroy_supported,
+        );
         let debts = self.record(tasks);
         // Heal the record's expired intents, when the row read reported some.
         let healed = if attempt.heal_expired_intents {
@@ -1858,7 +1869,7 @@ impl FakeSecretRepo {
         rows.remove(idx);
         drop(rows);
         // The row delete and the purge debt are one transaction.
-        Ok(self.record(vec![CleanupTask::Purge(key.clone())]))
+        Ok(self.record(cleanup_tasks(DeadContent::DeadKey { key }, false)))
     }
 
     /// Concurrent activity scheduled to land just before a commit.
@@ -1951,7 +1962,7 @@ impl FakeSecretRepo {
         })
     }
 
-    /// Resolution-eligible (ADR-0004, Suppression): `active` (expired or not —
+    /// Resolution-eligible (ADR-0008, Resolution): `active` (expired or not —
     /// expiry applies to the secret, not to the record), or `declared` with `fallback: none` (a suppressing row that competes
     /// and blocks). Mirrors the production predicate in
     /// `infra::storage::repo_impl::reads::resolution_eligible_condition`.
@@ -2351,7 +2362,7 @@ impl SecretRepo for FakeSecretRepo {
             sharing,
             fallback,
             expires_at,
-            new_value_version,
+            &new_value_version,
             attempt,
         );
         if Self::take_failure(&self.switch_value_fail_after_commit) {
@@ -2397,7 +2408,11 @@ impl SecretRepo for FakeSecretRepo {
                 keys.push(intent.key.clone());
             }
         }
-        let debts = self.record(keys.into_iter().map(CleanupTask::Purge).collect());
+        let debts = self.record(
+            keys.iter()
+                .flat_map(|key| cleanup_tasks(DeadContent::DeadKey { key }, false))
+                .collect(),
+        );
         Ok(HealedCreates {
             intents: healed.len() as u64,
             debts,
@@ -2476,18 +2491,9 @@ impl SecretRepo for FakeSecretRepo {
         drop(rows);
         // The destroy debts are recorded by the same transaction as the CAS.
         let key = row.store_key();
-        let tasks = match old_value_version {
-            Some(old) if destroy_supported => vec![
-                CleanupTask::Destroy {
-                    key: key.clone(),
-                    selector: DestroySelector::Below(old.clone()),
-                },
-                CleanupTask::Destroy {
-                    key,
-                    selector: DestroySelector::Exactly(old),
-                },
-            ],
-            _ => Vec::new(),
+        let tasks = match &old_value_version {
+            Some(old) => cleanup_tasks(DeadContent::Removed { key: &key, old }, destroy_supported),
+            None => Vec::new(),
         };
         let debts = self.record(tasks);
         Ok(Some((row, debts)))
@@ -2586,7 +2592,7 @@ impl SecretRepo for FakeSecretRepo {
                 sharing,
                 fallback,
                 expires_at,
-                new_value_version,
+                &new_value_version,
                 attempt,
             )));
         }

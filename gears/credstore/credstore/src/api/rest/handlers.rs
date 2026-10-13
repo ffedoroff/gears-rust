@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use credstore_sdk::{
     CredentialPatch, CredentialWrite, Fallback, GtsId, PatchField, SecretRef, SecretValue,
-    SharingMode,
+    SecretWrite, SharingMode,
 };
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::page_to_projected_json;
@@ -91,7 +91,7 @@ fn parse_if_match(headers: &axum::http::HeaderMap) -> Result<DomainWritePrecondi
     }
 }
 
-/// Parse `PUT`'s precondition (ADR-0004, "Two write verbs on one resource"):
+/// Parse `PUT`'s precondition (ADR-0007):
 /// exactly one of `If-None-Match: *` (create-only) or `If-Match` (guarded or
 /// unconditional replace, parsed like [`parse_if_match`]). Neither, or both,
 /// is a typed 400 (`PRECONDITION_REQUIRED`); an `If-None-Match` naming
@@ -145,7 +145,7 @@ fn parse_rfc3339(field: &'static str, raw: &str) -> Result<time::OffsetDateTime,
     time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).map_err(|_| {
         DomainError::InvalidRequest {
             field,
-            reason: "INVALID_EXPIRES_AT",
+            reason: credstore_sdk::field::INVALID_EXPIRES_AT,
             detail: format!("{field} must be an RFC 3339 timestamp"),
         }
     })
@@ -201,7 +201,7 @@ pub async fn list_credentials(
         .into_response())
 }
 
-/// `GET /credstore/v1/credentials/{ref}` (ADR-0004 Amendment A): the point
+/// `GET /credstore/v1/credentials/{ref}` (ADR-0004, "Read actions follow the projection"): the point
 /// read, sharing its item shape and `$select` mechanism with the collection.
 /// Without `$select`, the full record (never `secret`); selecting `secret`
 /// includes it, for a caller the projection's action(s) admit — the same
@@ -228,7 +228,10 @@ pub async fn get_credential(
     match svc.get_item(&ctx, &key, query.selected_fields()).await? {
         Some(item) => {
             let dto = CredentialDto::try_from_parts(&item.credential, item.value.as_ref())?;
-            let etag = match (&item.credential.validator, item.weak_validator_source) {
+            let etag = match (
+                item.credential.own.as_ref().map(|o| &o.validator),
+                item.weak_validator_source,
+            ) {
                 (Some(v), _) => format!("\"{}.{}\"", v.id, v.version),
                 (None, Some((winner_id, winner_version))) => weak_etag(
                     ctx.subject_tenant_id(),
@@ -283,7 +286,7 @@ pub async fn put_credential(
             detail: e.to_string(),
         })
     })?;
-    // Tri-state (ADR-0004 Amendment B): absent (`None`) is 400
+    // Tri-state (ADR-0007, "PUT: whole replace, secret tri-state"): absent (`None`) is 400
     // `SECRET_REQUIRED`; `Some(None)` (explicit JSON `null`) writes no value;
     // `Some(Some(s))` writes `s`.
     let Some(raw_value) = body.secret else {
@@ -309,7 +312,10 @@ pub async fn put_credential(
         sharing: body.sharing.into(),
         fallback: Fallback::from(body.fallback),
         expires_at,
-        secret: raw_value.map(SecretValue::from),
+        secret: match raw_value {
+            Some(v) => SecretWrite::Set(SecretValue::from(v)),
+            None => SecretWrite::Null,
+        },
     };
     let outcome = svc.put(&ctx, &key, write, precondition).await?;
     let etag = format!("\"{}.{}\"", outcome.validator.id, outcome.validator.version);
@@ -372,7 +378,7 @@ pub async fn patch_credential(
                         "PATCH requires Content-Type: {MERGE_PATCH_CONTENT_TYPE}; got {}",
                         content_type.as_deref().unwrap_or("<none>")
                     ),
-                    "UNSUPPORTED_MEDIA_TYPE",
+                    credstore_sdk::field::UNSUPPORTED_MEDIA_TYPE,
                 )
                 .with_override(toolkit_canonical_errors::transport::Http::status_code(415))
                 .create(),
@@ -394,7 +400,7 @@ pub async fn patch_credential(
     let invalid_body = |detail: String| {
         CanonicalError::from(DomainError::InvalidRequest {
             field: "body",
-            reason: "INVALID_MERGE_PATCH_BODY",
+            reason: credstore_sdk::field::INVALID_MERGE_PATCH_BODY,
             detail,
         })
     };

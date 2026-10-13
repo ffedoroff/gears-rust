@@ -71,8 +71,8 @@ impl From<FallbackDto> for Fallback {
     }
 }
 
-/// The caller's own-row status for the REST transport layer (ADR-0004, "Two
-/// representations").
+/// The caller's own-row status for the REST transport layer (ADR-0004, "Read
+/// actions follow the projection").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
 pub enum CredentialStatusDto {
@@ -87,19 +87,22 @@ pub enum CredentialStatusDto {
     Expired,
 }
 
-impl From<CredentialStatus> for CredentialStatusDto {
-    fn from(value: CredentialStatus) -> Self {
+/// The SDK reports "no own row" as the absence of
+/// [`Credential::own`](credstore_sdk::Credential::own); on the wire it is the
+/// status `none`.
+impl From<Option<CredentialStatus>> for CredentialStatusDto {
+    fn from(value: Option<CredentialStatus>) -> Self {
         match value {
-            CredentialStatus::None => Self::None,
-            CredentialStatus::Declared => Self::Declared,
-            CredentialStatus::Active => Self::Active,
-            CredentialStatus::Expired => Self::Expired,
+            None => Self::None,
+            Some(CredentialStatus::Declared) => Self::Declared,
+            Some(CredentialStatus::Active) => Self::Active,
+            Some(CredentialStatus::Expired) => Self::Expired,
         }
     }
 }
 
 /// The effective-row inheritance status for the REST transport layer
-/// (ADR-0004, "Two representations").
+/// (ADR-0004, "Read actions follow the projection").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
 pub enum InheritanceStatusDto {
@@ -133,8 +136,8 @@ where
     serde::Deserialize::deserialize(de).map(Some)
 }
 
-/// Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004; tri-state
-/// `secret` per Amendment B): a whole-credential replace. `secret` is
+/// Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0007; tri-state
+/// `secret`): a whole-credential replace. `secret` is
 /// tri-state (`Option<Option<String>>`, like [`CredentialPatchDto::secret`])
 /// so its *absence* — rejected with the typed `SECRET_REQUIRED` reason rather
 /// than a generic deserialization error — can be told apart from an explicit
@@ -163,7 +166,7 @@ pub struct PutCredentialRequestDto {
     pub expires_at: Option<String>,
     /// The secret to write. Required at the wire — absent is `400
     /// SECRET_REQUIRED` — but once present it is tri-state: a string writes a
-    /// value, an explicit `null` writes none (ADR-0004 Amendment B).
+    /// value, an explicit `null` writes none (ADR-0007, "PUT: whole replace, secret tri-state").
     #[serde(default, deserialize_with = "deserialize_double_option")]
     #[schema(value_type = Option<String>)]
     pub secret: Option<Option<String>>,
@@ -242,8 +245,8 @@ impl std::fmt::Debug for CredentialPatchDto {
 }
 
 /// Response body for both `GET /credstore/v1/credentials/{ref}` and each item
-/// of `GET /credstore/v1/credentials` (ADR-0004 Amendment A, "Why one item
-/// shape, and why writes do not follow `$select`"): one shape for both
+/// of `GET /credstore/v1/credentials` (ADR-0004, "Read actions follow the
+/// projection": why one item shape, and why writes do not follow `$select`): one shape for both
 /// addresses. `secret` is populated only when `$select` names it (point
 /// read or collection read), and only for an item the caller may
 /// read; absent from the wire entirely otherwise — including when the item's
@@ -335,7 +338,7 @@ impl CredentialDto {
     }
 
     /// Convert a resolved [`Credential`] plus an optional decrypted value
-    /// (the point read's projection-aware shape, ADR-0004 Amendment A) into
+    /// (the point read's projection-aware shape, ADR-0004, "Read actions follow the projection") into
     /// the REST DTO.
     ///
     /// # Errors
@@ -350,8 +353,9 @@ impl CredentialDto {
     }
 
     fn build(c: &Credential, value: Option<&SecretValue>) -> Result<Self, DomainError> {
-        let updated_at = c
-            .updated_at
+        let own = c.own.as_ref();
+        let updated_at = own
+            .map(|o| o.updated_at)
             .map(|at| {
                 at.format(&time::format_description::well_known::Rfc3339)
                     .map_err(|e| DomainError::internal(format!("updated_at failed to format: {e}")))
@@ -378,12 +382,12 @@ impl CredentialDto {
             reference: c.reference.as_ref().to_owned(),
             secret_type: c.secret_type.clone(),
             sharing: c.sharing.into(),
-            fallback: c.fallback.map(Into::into),
-            status: c.status.into(),
+            fallback: own.map(|o| o.fallback.into()),
+            status: own.map(|o| o.status).into(),
             inheritance: c.inheritance.into(),
-            version: c.version,
+            version: own.map(|o| o.validator.version),
             updated_at,
-            owner_id: c.owner_id.map(|o| o.0.to_string()),
+            owner_id: own.map(|o| o.owner_id.0.to_string()),
             expires_at,
             secret,
         })

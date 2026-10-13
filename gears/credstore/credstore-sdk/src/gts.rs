@@ -4,7 +4,8 @@
 //! Credstore type/resource ids follow the platform convention
 //! `gts.cf.core.credstore.<resource>.v1~`: the trailing `~` terminates the type
 //! URI and `.v1` is the schema version. Plugin specs nest under the toolkit base,
-//! `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.<spec>.v1~`.
+//! `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.<spec>.v2~` (the platform
+//! plugin base stays `v1`; the credstore plugin contract is `v2`).
 //!
 //! Each `#[gts_type_schema(...)]`-annotated struct submits its schema to the
 //! link-time inventory the types-registry loads at boot. Registration is what
@@ -15,11 +16,11 @@
 //! [`CREDENTIAL_RESOURCE_TYPE`], pinned to the impl crate's `#[resource_error(...)]`
 //! marker by a unit test.
 //!
-//! **Renamed by ADR-0004.** The base type shipped as
+//! **Renamed by ADR-0004 ("Naming").** The base type shipped as
 //! `gts.cf.core.credstore.secret.v1~`; it is now
 //! `gts.cf.core.credstore.credential.v1~`, so the type, the `credentials`
 //! collection, the `Credential`/`Secret` schemas, the PDP actions and the SDK's
-//! `get`/`get_secret` all share one noun for the entity (`credential`) and one
+//! `get_record`/`get_secret` all share one noun for the entity (`credential`) and one
 //! for the payload (`secret`).
 
 use toolkit::gts::PluginV1;
@@ -41,11 +42,11 @@ pub const CREDENTIAL_RESOURCE_TYPE: &str = gts_id!("cf.core.credstore.credential
 #[gts_type_schema(
     dir_path = "schemas",
     base = PluginV1,
-    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~"),
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v2~"),
     description = "CredStore plugin specification",
     properties = "",
 )]
-pub struct CredStorePluginSpecV1;
+pub struct CredStorePluginSpecV2;
 
 /// GTS type-schema for the credstore **credential** resource.
 ///
@@ -78,20 +79,10 @@ pub struct CredStorePluginSpecV1;
     description = "CredStore credential resource — tenant-scoped, RBAC/PEP protected",
     properties = "gts_type",
     traits_schema = inline(SecretTypeTraits),
-    // `x-gts-traits` defaults for the base type itself: generic semantics (all
-    // sharing modes, opaque value). Kept although the type is abstract — a
-    // value-less abstract base would validate (gts defers required-trait
-    // completeness to descendants) — because these values are the chain-merge
-    // *inherited defaults* (leaf wins, base fills the rest): a derived type
-    // that declares only some traits inherits the generic values for the
-    // holes. Dropping them would flip such sparse (customer-registered) types
-    // to the trait-schema defaults (`allow_sharing: []`) — silently
-    // unwritable, while still registering fine. Supplied as the typed
-    // `SecretTypeTraits` carrier (via the catalog's `generic` entry) rather
-    // than an untyped `json!`, so the base default is compile-checked and
-    // can't drift from the catalog — the idiom from gts-rust's
-    // `traits_struct_literal`.
-    traits = builtin_traits("generic"),
+    // The base declares the trait schema and supplies no trait values.
+    // `allow_sharing` and `max_size_bytes` are required with no default, so
+    // every non-abstract type must declare them and the registry refuses one
+    // that does not; the optional traits fall back to their schema defaults.
     // The base is a pure trait/schema carrier: credentials are always typed
     // by a derived id (`generic`, `api_key`, …, or a customer type), never by
     // the bare base.
@@ -127,7 +118,7 @@ pub use crate::types::SecretTypeTraits;
 // descriptor (single source of truth), so a registered schema cannot drift.
 // The Rust struct names below keep their shipped spelling
 // (`GenericSecretV1`, …) — only the base type and the resource-type
-// constant are renamed by ADR-0004 (§5.4).
+// constant are renamed by ADR-0004, Naming.
 
 #[allow(
     clippy::expect_used,

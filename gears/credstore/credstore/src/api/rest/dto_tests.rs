@@ -2,7 +2,7 @@
 //! Unit tests for the credstore REST DTOs.
 
 use credstore_sdk::{
-    Credential, CredentialListItem, CredentialStatus, Fallback, InheritanceStatus, OwnerId,
+    Credential, CredentialListItem, CredentialStatus, Fallback, InheritanceStatus, OwnRow, OwnerId,
     SecretRef, SecretType, SecretValue, SharingMode, Validator,
 };
 use uuid::Uuid;
@@ -39,17 +39,19 @@ fn fallback_roundtrip() {
 #[test]
 fn credential_status_and_inheritance_status_convert() {
     assert_eq!(
-        CredentialStatusDto::from(CredentialStatus::Active),
+        CredentialStatusDto::from(Some(CredentialStatus::Active)),
         CredentialStatusDto::Active
     );
     assert_eq!(
-        CredentialStatusDto::from(CredentialStatus::Declared),
+        CredentialStatusDto::from(Some(CredentialStatus::Declared)),
         CredentialStatusDto::Declared
     );
     assert_eq!(
-        CredentialStatusDto::from(CredentialStatus::None),
-        CredentialStatusDto::None
+        CredentialStatusDto::from(Some(CredentialStatus::Expired)),
+        CredentialStatusDto::Expired
     );
+    // No own row (`Credential::own` is `None`) is the wire status `none`.
+    assert_eq!(CredentialStatusDto::from(None), CredentialStatusDto::None);
     assert_eq!(
         InheritanceStatusDto::from(InheritanceStatus::Overridden),
         InheritanceStatusDto::Overridden
@@ -58,6 +60,54 @@ fn credential_status_and_inheritance_status_convert() {
         InheritanceStatusDto::from(InheritanceStatus::Suppressed),
         InheritanceStatusDto::Suppressed
     );
+}
+
+/// The DTO -> SDK direction exists only here, as exhaustive matches: a
+/// variant added to a DTO enum or to its SDK counterpart makes this fail to
+/// compile (the REST DTOs mirror the closed SDK enums one-to-one; the
+/// production conversions are exhaustive in the SDK -> DTO direction).
+fn credential_status_to_sdk(dto: CredentialStatusDto) -> Option<CredentialStatus> {
+    match dto {
+        CredentialStatusDto::None => None,
+        CredentialStatusDto::Declared => Some(CredentialStatus::Declared),
+        CredentialStatusDto::Active => Some(CredentialStatus::Active),
+        CredentialStatusDto::Expired => Some(CredentialStatus::Expired),
+    }
+}
+
+fn inheritance_status_to_sdk(dto: InheritanceStatusDto) -> InheritanceStatus {
+    match dto {
+        InheritanceStatusDto::Own => InheritanceStatus::Own,
+        InheritanceStatusDto::Inherited => InheritanceStatus::Inherited,
+        InheritanceStatusDto::Overridden => InheritanceStatus::Overridden,
+        InheritanceStatusDto::Suppressed => InheritanceStatus::Suppressed,
+    }
+}
+
+#[test]
+fn status_dtos_mirror_the_sdk_enums_one_to_one() {
+    for dto in [
+        CredentialStatusDto::None,
+        CredentialStatusDto::Declared,
+        CredentialStatusDto::Active,
+        CredentialStatusDto::Expired,
+    ] {
+        assert_eq!(
+            CredentialStatusDto::from(credential_status_to_sdk(dto)),
+            dto
+        );
+    }
+    for dto in [
+        InheritanceStatusDto::Own,
+        InheritanceStatusDto::Inherited,
+        InheritanceStatusDto::Overridden,
+        InheritanceStatusDto::Suppressed,
+    ] {
+        assert_eq!(
+            InheritanceStatusDto::from(inheritance_status_to_sdk(dto)),
+            dto
+        );
+    }
 }
 
 #[test]
@@ -155,16 +205,17 @@ fn credential_dto_from_credential_own_row() {
         reference: sref("k"),
         secret_type: SecretType::generic().gts_id().to_owned(),
         sharing: SharingMode::Shared,
-        fallback: Some(Fallback::Inherit),
-        status: CredentialStatus::Active,
         inheritance: InheritanceStatus::Own,
-        version: Some(3),
-        updated_at: Some(time::OffsetDateTime::now_utc()),
-        owner_id: Some(OwnerId(owner)),
         expires_at: None,
-        validator: Some(Validator {
-            id: Uuid::new_v4(),
-            version: 3,
+        own: Some(OwnRow {
+            status: CredentialStatus::Active,
+            fallback: Fallback::Inherit,
+            updated_at: time::OffsetDateTime::now_utc(),
+            owner_id: OwnerId(owner),
+            validator: Validator {
+                id: Uuid::new_v4(),
+                version: 3,
+            },
         }),
     };
     let dto = CredentialDto::try_from_credential(&cred).expect("no formatting error");
@@ -188,14 +239,9 @@ fn credential_dto_from_credential_no_own_row() {
         reference: sref("k"),
         secret_type: SecretType::generic().gts_id().to_owned(),
         sharing: SharingMode::Shared,
-        fallback: None,
-        status: CredentialStatus::None,
         inheritance: InheritanceStatus::Inherited,
-        version: None,
-        updated_at: None,
-        owner_id: None,
         expires_at: None,
-        validator: None,
+        own: None,
     };
     let dto = CredentialDto::try_from_credential(&cred).expect("no formatting error");
     assert_eq!(dto.fallback, None);
@@ -223,16 +269,17 @@ fn cred_with_secret_fields(owner: Uuid) -> Credential {
         reference: sref("k"),
         secret_type: SecretType::generic().gts_id().to_owned(),
         sharing: SharingMode::Tenant,
-        fallback: Some(Fallback::Inherit),
-        status: CredentialStatus::Active,
         inheritance: InheritanceStatus::Own,
-        version: Some(1),
-        updated_at: None,
-        owner_id: Some(OwnerId(owner)),
         expires_at: None,
-        validator: Some(Validator {
-            id: Uuid::new_v4(),
-            version: 1,
+        own: Some(OwnRow {
+            status: CredentialStatus::Active,
+            fallback: Fallback::Inherit,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            owner_id: OwnerId(owner),
+            validator: Validator {
+                id: Uuid::new_v4(),
+                version: 1,
+            },
         }),
     }
 }

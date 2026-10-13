@@ -34,6 +34,13 @@ fn global_meter_records_all_instruments() {
     m.walkup_depth(2);
     m.dependency(Dep::Plugin, DepOp::PluginGet, Outcome::Success, 0.01);
     m.dependency(Dep::Pdp, DepOp::Evaluate, Outcome::Error, 0.02);
+    // The store refusing the plugin's credentials is labelled `credentials_rejected`.
+    m.dependency(
+        Dep::Plugin,
+        DepOp::PluginPut,
+        Outcome::CredentialsRejected,
+        0.03,
+    );
     m.cross_tenant_denied();
     m.write_intents_healed(3);
     m.store_cleanup_recorded(CleanupOp::Purge);

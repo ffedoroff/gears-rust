@@ -23,11 +23,12 @@ use uuid::Uuid;
 
 use crate::domain::authz::scope_admits_tenant;
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{Fallback, HealFlags, SecretRow, SecretStatus};
+use crate::domain::secret::model::{HealFlags, SecretRow};
 use crate::infra::canonical_mapping::classify_db_err_to_domain;
 use crate::infra::storage::entity;
+use crate::infra::storage::entity::enums::{DbFallback, DbSharing, DbStatus};
 use crate::infra::storage::repo_impl::helpers::{
-    SecretRepoImpl, db_now_sql, entity_to_model, map_scope_err, sharing_to_i16,
+    SecretRepoImpl, db_now_sql, entity_to_model, map_scope_err,
 };
 
 fn scope_err_to_domain(e: ScopeError) -> DomainError {
@@ -43,22 +44,22 @@ struct RowWithFlags {
     id: Uuid,
     tenant_id: Uuid,
     reference: String,
-    sharing: i16,
+    sharing: DbSharing,
     owner_id: Uuid,
-    status: i16,
+    status: DbStatus,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     version: i64,
     secret_type_uuid: Uuid,
     expires_at: Option<OffsetDateTime>,
     value_version: Option<String>,
-    fallback: i16,
+    fallback: DbFallback,
     has_debts: bool,
     has_expired_intents: bool,
 }
 
 impl RowWithFlags {
-    fn into_row(self) -> Result<SecretRow, DomainError> {
+    fn into_row(self) -> SecretRow {
         let heal = HealFlags {
             debts: self.has_debts,
             expired_intents: self.has_expired_intents,
@@ -77,8 +78,8 @@ impl RowWithFlags {
             expires_at: self.expires_at,
             value_version: self.value_version,
             fallback: self.fallback,
-        })?;
-        Ok(SecretRow { heal, ..row })
+        });
+        SecretRow { heal, ..row }
     }
 }
 
@@ -115,7 +116,7 @@ async fn rows_with_flags(
         .map_err(scope_err_to_domain)
 }
 
-/// Resolution-eligible statuses (ADR-0004, Suppression): `active` (expired
+/// Resolution-eligible statuses (ADR-0008, Resolution): `active` (expired
 /// or not — expiry applies to the secret, not to the record, so an expired
 /// record stays the decisive one and the service refuses to serve its
 /// secret), or `declared` with `fallback = none` (a suppressing row that
@@ -125,14 +126,11 @@ async fn rows_with_flags(
 /// fallback)` shapes.
 fn resolution_eligible_condition() -> Condition {
     Condition::any()
+        .add(Condition::all().add(entity::secrets::Column::Status.eq(DbStatus::Active)))
         .add(
             Condition::all()
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint())),
-        )
-        .add(
-            Condition::all()
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Declared.as_smallint()))
-                .add(entity::secrets::Column::Fallback.eq(Fallback::None.as_smallint())),
+                .add(entity::secrets::Column::Status.eq(DbStatus::Declared))
+                .add(entity::secrets::Column::Fallback.eq(DbFallback::None)),
         )
 }
 
@@ -143,16 +141,13 @@ fn own_tenant_visibility_condition(tenant: Uuid, subject: Uuid) -> Condition {
     Condition::any()
         .add(
             Condition::all()
-                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Private)))
+                .add(entity::secrets::Column::Sharing.eq(DbSharing::Private))
                 .add(entity::secrets::Column::TenantId.eq(tenant))
                 .add(entity::secrets::Column::OwnerId.eq(subject)),
         )
         .add(
             Condition::all()
-                .add(entity::secrets::Column::Sharing.is_in([
-                    sharing_to_i16(SharingMode::Tenant),
-                    sharing_to_i16(SharingMode::Shared),
-                ]))
+                .add(entity::secrets::Column::Sharing.is_in([DbSharing::Tenant, DbSharing::Shared]))
                 .add(entity::secrets::Column::TenantId.eq(tenant)),
         )
 }
@@ -169,7 +164,7 @@ pub(super) async fn resolve_for_get(
     // resolve_for_get applies its own chain + sharing predicates;
     // PDP authorization runs upstream. allow_all skips the scope WHERE clamp.
     // The predicate is `status = active OR (status = declared AND fallback =
-    // none)` (ADR-0004, Suppression): a suppressing row competes and, when
+    // none)` (ADR-0008, Resolution): a suppressing row competes and, when
     // nearest, wins — the walk stops there rather than falling through.
     let select = entity::secrets::Entity::find()
         .secure()
@@ -195,20 +190,14 @@ pub(super) async fn resolve_for_get(
             Condition::any()
                 .add(
                     Condition::all()
-                        .add(
-                            entity::secrets::Column::Sharing
-                                .eq(sharing_to_i16(SharingMode::Private)),
-                        )
+                        .add(entity::secrets::Column::Sharing.eq(DbSharing::Private))
                         .add(entity::secrets::Column::TenantId.eq(req))
                         .add(entity::secrets::Column::OwnerId.eq(subject.0)),
                 )
-                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Shared)))
+                .add(entity::secrets::Column::Sharing.eq(DbSharing::Shared))
                 .add(
                     Condition::all()
-                        .add(
-                            entity::secrets::Column::Sharing
-                                .eq(sharing_to_i16(SharingMode::Tenant)),
-                        )
+                        .add(entity::secrets::Column::Sharing.eq(DbSharing::Tenant))
                         .add(entity::secrets::Column::TenantId.eq(req)),
                 ),
         );
@@ -217,12 +206,11 @@ pub(super) async fn resolve_for_get(
     // Winner: closest tenant in chain; private beats non-private at same level.
     let pos = |t: Uuid| chain.iter().position(|c| *c == t).unwrap_or(usize::MAX);
     let best = rows.into_iter().min_by(|a, b| {
-        pos(a.tenant_id).cmp(&pos(b.tenant_id)).then(
-            (a.sharing != sharing_to_i16(SharingMode::Private))
-                .cmp(&(b.sharing != sharing_to_i16(SharingMode::Private))),
-        )
+        pos(a.tenant_id)
+            .cmp(&pos(b.tenant_id))
+            .then((a.sharing != DbSharing::Private).cmp(&(b.sharing != DbSharing::Private)))
     });
-    best.map(RowWithFlags::into_row).transpose()
+    Ok(best.map(RowWithFlags::into_row))
 }
 
 /// Create-time upward type check: the record `req_tenant`'s reference
@@ -248,23 +236,20 @@ pub(super) async fn resolve_non_private(
         .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
         .filter(
             Condition::any()
-                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Shared)))
+                .add(entity::secrets::Column::Sharing.eq(DbSharing::Shared))
                 .add(
                     Condition::all()
-                        .add(
-                            entity::secrets::Column::Sharing
-                                .eq(sharing_to_i16(SharingMode::Tenant)),
-                        )
+                        .add(entity::secrets::Column::Sharing.eq(DbSharing::Tenant))
                         .add(entity::secrets::Column::TenantId.eq(req)),
                 ),
         );
     let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
 
     let pos = |t: Uuid| chain.iter().position(|c| *c == t).unwrap_or(usize::MAX);
-    rows.into_iter()
+    Ok(rows
+        .into_iter()
         .min_by_key(|r| pos(r.tenant_id))
-        .map(RowWithFlags::into_row)
-        .transpose()
+        .map(RowWithFlags::into_row))
 }
 
 /// Visibility predicate shared by [`resolve_candidates`] and the collection
@@ -284,7 +269,7 @@ fn chain_visibility_condition(req: Uuid, subject: Uuid, ancestors: &[Uuid]) -> C
         visibility = visibility.add(
             Condition::all()
                 .add(entity::secrets::Column::TenantId.is_in(ancestors.to_vec()))
-                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Shared)))
+                .add(entity::secrets::Column::Sharing.eq(DbSharing::Shared))
                 .add(resolution_eligible_condition()),
         );
     }
@@ -313,7 +298,7 @@ pub(super) async fn resolve_candidates(
         .await
         .map_err(scope_err_to_domain)?;
 
-    rows.into_iter().map(entity_to_model).collect()
+    Ok(rows.into_iter().map(entity_to_model).collect())
 }
 
 /// Row-shape helper for a `SELECT DISTINCT reference` projection.
@@ -346,7 +331,7 @@ pub(super) async fn list_tenants_with_other_type(
     let mut filter = Condition::all()
         .add(entity::secrets::Column::Reference.eq(reference.as_ref()))
         .add(entity::secrets::Column::SecretTypeUuid.ne(requested_type))
-        .add(entity::secrets::Column::Sharing.ne(sharing_to_i16(SharingMode::Private)))
+        .add(entity::secrets::Column::Sharing.ne(DbSharing::Private))
         .add(entity::secrets::Column::TenantId.ne(exclude_tenant.0));
     if let Some(after) = after {
         filter = filter.add(entity::secrets::Column::TenantId.gt(after));
@@ -470,7 +455,7 @@ pub(super) async fn list_candidates_for_references(
         .await
         .map_err(scope_err_to_domain)?;
 
-    rows.into_iter().map(entity_to_model).collect()
+    Ok(rows.into_iter().map(entity_to_model).collect())
 }
 
 pub(super) async fn find_own(
@@ -492,24 +477,18 @@ pub(super) async fn find_own(
             Condition::all()
                 .add(entity::secrets::Column::Reference.eq(key.as_ref()))
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
-                .add(entity::secrets::Column::Status.is_in([
-                    SecretStatus::Active.as_smallint(),
-                    SecretStatus::Declared.as_smallint(),
-                ]))
+                .add(entity::secrets::Column::Status.is_in([DbStatus::Active, DbStatus::Declared]))
                 .add(
                     Condition::any()
                         .add(
                             Condition::all()
-                                .add(
-                                    entity::secrets::Column::Sharing
-                                        .eq(sharing_to_i16(SharingMode::Private)),
-                                )
+                                .add(entity::secrets::Column::Sharing.eq(DbSharing::Private))
                                 .add(entity::secrets::Column::OwnerId.eq(subject.0)),
                         )
-                        .add(entity::secrets::Column::Sharing.is_in([
-                            sharing_to_i16(SharingMode::Tenant),
-                            sharing_to_i16(SharingMode::Shared),
-                        ])),
+                        .add(
+                            entity::secrets::Column::Sharing
+                                .is_in([DbSharing::Tenant, DbSharing::Shared]),
+                        ),
                 ),
         );
     let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
@@ -517,8 +496,8 @@ pub(super) async fn find_own(
     // Prefer the private row if both exist.
     let best = rows
         .into_iter()
-        .min_by_key(|r| i32::from(r.sharing != sharing_to_i16(SharingMode::Private)));
-    best.map(RowWithFlags::into_row).transpose()
+        .min_by_key(|r| i32::from(r.sharing != DbSharing::Private));
+    Ok(best.map(RowWithFlags::into_row))
 }
 
 pub(super) async fn find_for_write(
@@ -535,13 +514,11 @@ pub(super) async fn find_for_write(
     // tenant/shared row (and vice-versa); they are distinct secrets per design.
     let class = if sharing == SharingMode::Private {
         Condition::all()
-            .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Private)))
+            .add(entity::secrets::Column::Sharing.eq(DbSharing::Private))
             .add(entity::secrets::Column::OwnerId.eq(subject.0))
     } else {
-        Condition::all().add(entity::secrets::Column::Sharing.is_in([
-            sharing_to_i16(SharingMode::Tenant),
-            sharing_to_i16(SharingMode::Shared),
-        ]))
+        Condition::all()
+            .add(entity::secrets::Column::Sharing.is_in([DbSharing::Tenant, DbSharing::Shared]))
     };
     let select = entity::secrets::Entity::find()
         .secure()
@@ -550,18 +527,12 @@ pub(super) async fn find_for_write(
             Condition::all()
                 .add(entity::secrets::Column::Reference.eq(key.as_ref()))
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
-                .add(entity::secrets::Column::Status.is_in([
-                    SecretStatus::Active.as_smallint(),
-                    SecretStatus::Declared.as_smallint(),
-                ]))
+                .add(entity::secrets::Column::Status.is_in([DbStatus::Active, DbStatus::Declared]))
                 .add(class),
         )
         .limit(1);
     let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
-    rows.into_iter()
-        .next()
-        .map(RowWithFlags::into_row)
-        .transpose()
+    Ok(rows.into_iter().next().map(RowWithFlags::into_row))
 }
 
 pub(super) fn scope_includes_tenant(scope: &AccessScope, tenant: Uuid) -> bool {

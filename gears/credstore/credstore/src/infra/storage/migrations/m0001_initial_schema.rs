@@ -9,13 +9,18 @@
 //! id (like `tenants.tenant_type_uuid` in AM) — compact, and resolvable to
 //! the type id + traits via the types-registry at operation time.
 //!
-//! Per-backend raw `SQL` is used (not `SeaORM`'s schema-builder) so that
-//! `CHECK` constraints and partial unique indexes are preserved verbatim.
-//! `MySQL` is not supported; the migration fails fast with a typed error.
+//! Per-backend raw `SQL` keeps the shipped `CHECK`s and partial indexes
+//! verbatim: this migration must match, byte for byte, the schema v1
+//! shipped, so the SQL is the v1 migration's, unchanged. `MySQL` is not
+//! supported; the migration fails fast with a typed error.
 
-use credstore_sdk::types::GENERIC_TYPE_UUID_STR;
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
+
+/// The v5 UUID of the `generic` type as v1 shipped it in the column DEFAULT.
+/// Pinned here, not imported: this migration describes a schema that already
+/// exists in deployed databases and must not follow later SDK changes.
+const V1_GENERIC_TYPE_UUID: &str = "2a8aac98-cf09-58ed-acd6-f599f35cb5bf";
 
 const MYSQL_NOT_SUPPORTED: &str = "credstore migrations: MySQL is not supported \
     (this migration set targets PostgreSQL/SQLite)";
@@ -33,7 +38,7 @@ impl MigrationTrait for Migration {
         // the `generic` type (exactly the untyped semantics). SQLite stores
         // UUIDs as 16-byte blobs, so its DEFAULT is the hex-blob literal of
         // the same pinned value.
-        let generic_uuid_hex = GENERIC_TYPE_UUID_STR.replace('-', "");
+        let generic_uuid_hex = V1_GENERIC_TYPE_UUID.replace('-', "");
 
         let table_sql = match backend {
             sea_orm::DatabaseBackend::Postgres => format!(
@@ -48,7 +53,7 @@ CREATE TABLE IF NOT EXISTS credstore_secrets (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     version BIGINT NOT NULL DEFAULT 1,
-    secret_type_uuid UUID NOT NULL DEFAULT '{GENERIC_TYPE_UUID_STR}',
+    secret_type_uuid UUID NOT NULL DEFAULT '{V1_GENERIC_TYPE_UUID}',
     expires_at TIMESTAMPTZ NULL,
     value_fp BYTEA NULL,
     fp_key_id SMALLINT NULL,

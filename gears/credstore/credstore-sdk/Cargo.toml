@@ -32,6 +32,7 @@ schemars = { workspace = true }
 gts = { workspace = true }
 gts-macros = { workspace = true }
 toolkit-gts = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }

@@ -20,20 +20,14 @@ fn uuid_of(gts_id: &str) -> Uuid {
 }
 
 /// The credstore secret base type as registered by the SDK: abstract (a pure
-/// trait/schema carrier — secrets are always typed by a derived id), yet still
-/// carrying the generic trait *values* — the chain-merge inherited defaults
-/// (leaf wins, base fills the rest) — so every descendant that omits a trait
-/// inherits the complete generic value for it.
+/// trait/schema carrier — secrets are always typed by a derived id) and
+/// supplying no trait values: every non-abstract type declares the required
+/// `allow_sharing` and `max_size_bytes` itself.
 fn secret_envelope() -> Arc<GtsTypeSchema> {
     let raw = json!({
         "$id": format!("gts://{CREDENTIAL_RESOURCE_TYPE}"),
         "type": "object",
         "x-gts-abstract": true,
-        "x-gts-traits": {
-            "allow_sharing": ["private", "tenant", "shared"],
-            "expirable": false,
-            "utf8_only": false,
-        },
     });
     Arc::new(
         GtsTypeSchema::try_new(GtsTypeId::new(CREDENTIAL_RESOURCE_TYPE), raw, None, None)
@@ -81,8 +75,8 @@ async fn resolves_gts_id_and_effective_traits() {
     assert!(resolved.traits.allows_sharing(SharingMode::Private));
     assert!(!resolved.traits.allows_sharing(SharingMode::Tenant));
     assert!(resolved.traits.expirable);
-    assert_eq!(resolved.traits.max_size_bytes, Some(8192));
-    // Undeclared traits inherit the base type's generic values.
+    assert_eq!(resolved.traits.max_size_bytes, 8192);
+    // Undeclared optional traits take their schema defaults.
     assert!(!resolved.traits.utf8_only);
     assert_eq!(
         resolved.traits.value_schema,
@@ -178,7 +172,10 @@ async fn malformed_effective_traits_fail_closed_as_service_unavailable() {
     // `allow_sharing` declared with a value outside the SharingMode enum:
     // the registry would reject this at registration, so hitting it at
     // resolve time means the registered chain is broken — 503, not 400.
-    let schema = derived(CUSTOM_TYPE_ID, &json!({"allow_sharing": ["everyone"]}));
+    let schema = derived(
+        CUSTOM_TYPE_ID,
+        &json!({"allow_sharing": ["everyone"], "max_size_bytes": 1024}),
+    );
     let registry = Arc::new(MockTypesRegistryClient::new().with_type_schemas([schema]));
     let err = resolver(registry)
         .resolve(uuid_of(CUSTOM_TYPE_ID))
@@ -189,6 +186,27 @@ async fn malformed_effective_traits_fail_closed_as_service_unavailable() {
         "got: {err:?}"
     );
     assert!(err.to_string().contains("malformed"), "got: {err}");
+}
+
+#[tokio::test]
+async fn a_type_missing_a_required_trait_fails_closed_as_service_unavailable() {
+    // `max_size_bytes` has no default and the base supplies none: a chain
+    // that omits it (or `allow_sharing`) is a broken registration.
+    for traits in [
+        json!({"allow_sharing": ["private"]}),
+        json!({"max_size_bytes": 1024}),
+    ] {
+        let schema = derived(CUSTOM_TYPE_ID, &traits);
+        let registry = Arc::new(MockTypesRegistryClient::new().with_type_schemas([schema]));
+        let err = resolver(registry)
+            .resolve(uuid_of(CUSTOM_TYPE_ID))
+            .await
+            .expect_err("a missing required trait must fail closed");
+        assert!(
+            matches!(err, DomainError::ServiceUnavailable { .. }),
+            "got: {err:?}"
+        );
+    }
 }
 
 // -------- transport / infra --------

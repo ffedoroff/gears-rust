@@ -5,30 +5,28 @@
 //! gear enforces uniformly — most importantly which [`SharingMode`]s the
 //! type permits. Every type is a GTS type derived from the credstore
 //! credential base type ([`crate::CREDENTIAL_RESOURCE_TYPE`]), renamed from
-//! `secret.v1~` to `credential.v1~` by ADR-0004 (§5.4):
+//! `secret.v1~` to `credential.v1~` by ADR-0004, Naming:
 //!
 //! ```text
 //! gts.cf.core.credstore.credential.v1~cf.core.credstore.<name>.v1~
 //! ```
 //!
-//! The catalog below is the single source of truth for the traits; each
-//! entry's GTS schema is also registered with the types-registry via the
-//! link-time inventory (see [`crate::gts`]), which makes the types
-//! discoverable and per-type PDP targeting possible without new machinery.
-//! Adding a type means adding a catalog entry (and its schema struct); the
-//! enforcement code is trait-driven and needs no change unless a new *trait*
-//! is introduced.
+//! The types registry is the source of truth for types at run time; the
+//! catalog below only seeds the built-in types. Each entry's GTS schema is
+//! registered with the types-registry via the link-time inventory (see
+//! [`crate::gts`]), which makes the types discoverable and per-type PDP
+//! targeting possible without new machinery. Adding a built-in type means
+//! adding a catalog entry (and its schema struct); the enforcement code is
+//! trait-driven and needs no change unless a new *trait* is introduced.
 //!
-//! The type of a secret is chosen at creation (default [`SecretType::generic`])
-//! and is immutable for the secret's lifetime.
+//! The type of a secret is named at creation (a create without a type is
+//! rejected) and is immutable for the secret's lifetime.
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use crate::error::CredStoreError;
 use crate::models::SharingMode;
 
 /// Enforceable traits of a secret type.
@@ -39,16 +37,17 @@ use crate::models::SharingMode;
 /// itself stays visible with status `expired`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecretTypeDescriptor {
-    /// Short, stable label used on the REST transport (e.g. `"api-key"`).
+    /// Catalog name of a built-in type (e.g. `"api-key"`).
     pub name: &'static str,
-    /// Full derived GTS type id (stored in the gear metadata table).
+    /// Full derived GTS type id (the gear stores its v5 UUID).
     pub gts_id: &'static str,
     /// Sharing modes permitted for secrets of this type.
     pub allow_sharing: &'static [SharingMode],
     /// Embedded JSON Schema the (UTF-8, JSON) value must satisfy, if any.
     pub value_schema: Option<&'static str>,
-    /// Upper bound on the raw value size; `None` = platform default only.
-    pub max_size_bytes: Option<usize>,
+    /// Upper bound on the raw value size. Every type has a finite limit;
+    /// there is no platform default to fall back on.
+    pub max_size_bytes: usize,
     /// Whether secrets of this type may carry `expires_at`; the secret of an
     /// expired record is never served (`SecretExpired`, evaluated from the
     /// row at read time).
@@ -67,10 +66,16 @@ pub struct SecretTypeDescriptor {
 /// declare their `x-gts-traits` values against this shape; the registry
 /// validates them at registration (`deny_unknown_fields` ⇒
 /// `additionalProperties: false`, so no stray trait keys). At operation time
-/// the gear resolves a type's effective traits (chain-merged, leaf wins, base
-/// fills the rest) from the types-registry and deserializes them into this
-/// struct — the registry is the source of truth for enforcement;
-/// [`SECRET_TYPE_CATALOG`] only seeds the built-in schemas.
+/// the gear resolves a type's effective traits (chain-merged, leaf wins) from
+/// the types-registry and deserializes them into this struct — the registry is
+/// the source of truth for enforcement; [`SECRET_TYPE_CATALOG`] only seeds the
+/// built-in schemas.
+///
+/// `allow_sharing` and `max_size_bytes` are **required with no default**: the
+/// base type supplies no trait values, so every non-abstract type must declare
+/// both, and the registry refuses (at registration) a type that leaves either
+/// unset. The remaining traits are optional and fall back to their schema
+/// defaults.
 #[derive(
     Debug,
     Clone,
@@ -83,15 +88,13 @@ pub struct SecretTypeDescriptor {
 #[serde(deny_unknown_fields)]
 pub struct SecretTypeTraits {
     /// Sharing modes permitted for secrets of this type.
-    #[serde(default)]
     #[schemars(schema_with = "sharing_modes_schema")]
     pub allow_sharing: Vec<SharingMode>,
     /// Whether secrets of this type may carry an expiry.
     #[serde(default)]
     pub expirable: bool,
-    /// Upper bound on the raw value size in bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_size_bytes: Option<u64>,
+    /// Upper bound on the raw value size in bytes. Required, no default.
+    pub max_size_bytes: u64,
     /// Advisory rotation cadence in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation_period_secs: Option<u64>,
@@ -120,8 +123,7 @@ impl SecretTypeTraits {
 fn sharing_modes_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "array",
-        "items": {"type": "string", "enum": ["private", "tenant", "shared"]},
-        "default": []
+        "items": {"type": "string", "enum": ["private", "tenant", "shared"]}
     })
 }
 
@@ -142,7 +144,8 @@ impl SecretTypeDescriptor {
         SecretTypeTraits {
             allow_sharing: self.allow_sharing.to_vec(),
             expirable: self.expirable,
-            max_size_bytes: self.max_size_bytes.and_then(|n| u64::try_from(n).ok()),
+            // usize is at most 64 bits on every supported target: lossless.
+            max_size_bytes: self.max_size_bytes as u64,
             rotation_period_secs: self.rotation_period_secs,
             utf8_only: self.utf8_only,
             value_schema: self.value_schema.and_then(|s| serde_json::from_str(s).ok()),
@@ -189,7 +192,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"),
         allow_sharing: ALL,
         value_schema: None,
-        max_size_bytes: None,
+        max_size_bytes: 128 * 1024,
         expirable: false,
         rotation_period_secs: None,
         utf8_only: false,
@@ -199,7 +202,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.api_key.v1~"),
         allow_sharing: ALL,
         value_schema: None,
-        max_size_bytes: Some(8 * 1024),
+        max_size_bytes: 8 * 1024,
         expirable: false,
         rotation_period_secs: None,
         utf8_only: true,
@@ -209,7 +212,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.personal_token.v1~"),
         allow_sharing: PRIVATE_ONLY,
         value_schema: None,
-        max_size_bytes: Some(8 * 1024),
+        max_size_bytes: 8 * 1024,
         expirable: true,
         rotation_period_secs: None,
         utf8_only: true,
@@ -219,7 +222,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.oauth2_client.v1~"),
         allow_sharing: TENANT_SHARED,
         value_schema: Some(OAUTH2_CLIENT_SCHEMA),
-        max_size_bytes: Some(16 * 1024),
+        max_size_bytes: 16 * 1024,
         expirable: false,
         rotation_period_secs: None,
         utf8_only: true,
@@ -229,7 +232,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~"),
         allow_sharing: ALL,
         value_schema: Some(BASIC_AUTH_SCHEMA),
-        max_size_bytes: Some(16 * 1024),
+        max_size_bytes: 16 * 1024,
         expirable: false,
         rotation_period_secs: None,
         utf8_only: true,
@@ -239,7 +242,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.bearer_token.v1~"),
         allow_sharing: PRIVATE_TENANT,
         value_schema: None,
-        max_size_bytes: Some(64 * 1024),
+        max_size_bytes: 64 * 1024,
         expirable: true,
         rotation_period_secs: None,
         utf8_only: true,
@@ -249,7 +252,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.certificate.v1~"),
         allow_sharing: TENANT_SHARED,
         value_schema: None,
-        max_size_bytes: Some(256 * 1024),
+        max_size_bytes: 256 * 1024,
         expirable: true,
         rotation_period_secs: Some(90 * 24 * 3600),
         utf8_only: true,
@@ -259,7 +262,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.ssh_key.v1~"),
         allow_sharing: PRIVATE_TENANT,
         value_schema: None,
-        max_size_bytes: Some(64 * 1024),
+        max_size_bytes: 64 * 1024,
         expirable: false,
         rotation_period_secs: None,
         utf8_only: true,
@@ -269,7 +272,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.webhook_hmac.v1~"),
         allow_sharing: TENANT_SHARED,
         value_schema: None,
-        max_size_bytes: Some(8 * 1024),
+        max_size_bytes: 8 * 1024,
         expirable: false,
         rotation_period_secs: None,
         utf8_only: true,
@@ -279,39 +282,32 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
         gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.connection_string.v1~"),
         allow_sharing: TENANT_ONLY,
         value_schema: None,
-        max_size_bytes: Some(4 * 1024),
+        max_size_bytes: 4 * 1024,
         expirable: false,
         rotation_period_secs: None,
         utf8_only: true,
     },
 ];
 
-/// A validated secret type — always resolves to a catalog descriptor.
+/// A validated secret type: it names a built-in type of the catalog.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SecretType(&'static SecretTypeDescriptor);
 
 impl SecretType {
-    /// The default type: fully backward-compatible opaque secrets.
+    /// The built-in `generic` type: opaque secrets.
     #[must_use]
     pub fn generic() -> Self {
         Self(&SECRET_TYPE_CATALOG[0])
     }
 
-    /// Resolve a type by its REST label (e.g. `"api-key"`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CredStoreError::TypeViolation`] with reason
-    /// `UNKNOWN_SECRET_TYPE` when no catalog entry matches.
-    pub fn from_name(name: &str) -> Result<Self, CredStoreError> {
+    /// Resolve a built-in type by its catalog name (e.g. `"api-key"`); `None` when no
+    /// catalog entry matches.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
         SECRET_TYPE_CATALOG
             .iter()
             .find(|d| d.name == name)
             .map(Self)
-            .ok_or_else(|| CredStoreError::TypeViolation {
-                reason: "UNKNOWN_SECRET_TYPE".to_owned(),
-                detail: format!("unknown secret type: {name}"),
-            })
     }
 
     /// Resolve a type by its full GTS id (the stored representation).
@@ -323,7 +319,7 @@ impl SecretType {
             .map(Self)
     }
 
-    /// Short REST label.
+    /// Catalog name.
     #[must_use]
     pub fn name(self) -> &'static str {
         self.0.name
@@ -372,26 +368,6 @@ pub fn type_uuid(gts_id: &str) -> Option<Uuid> {
         .map(|parsed| parsed.to_uuid())
 }
 
-/// Deterministic v5 UUID of the generic (default) secret type, as a string —
-/// the value the `credstore_secrets.secret_type_uuid` column DEFAULT uses.
-/// Pinned by `type_uuid_is_deterministic_and_matches_registry_v5` so the
-/// migration default and the computed id can never drift.
-///
-/// **Changed by ADR-0004** (§5.4): the base type rename
-/// (`secret.v1~` → `credential.v1~`) changes the v5 UUID of every derived
-/// type, including `generic`, so this constant is re-pinned alongside it —
-/// a constant change while the gear has no production rows (`m0001`'s
-/// migration-time DEFAULT uses this constant directly, so it picks up the
-/// new value automatically); afterwards, renaming the base type is a data
-/// migration.
-pub const GENERIC_TYPE_UUID_STR: &str = "c57822de-3aae-58b7-b712-71d907c999e2";
-
-impl Default for SecretType {
-    fn default() -> Self {
-        Self::generic()
-    }
-}
-
 impl From<SecretType> for gts::GtsId {
     /// A built-in secret type's full GTS type id. Ergonomic for setting
     /// [`crate::CredentialWrite::secret_type`] to a catalog type.
@@ -413,19 +389,6 @@ impl fmt::Debug for SecretType {
 impl fmt::Display for SecretType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.0.name)
-    }
-}
-
-impl Serialize for SecretType {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.0.name)
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretType {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::from_name(&s).map_err(serde::de::Error::custom)
     }
 }
 

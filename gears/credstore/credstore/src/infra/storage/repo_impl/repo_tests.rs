@@ -36,6 +36,7 @@ use crate::domain::secret::model::{
 };
 use crate::domain::secret::repo::SecretRepo;
 use crate::infra::storage::entity;
+use crate::infra::storage::entity::enums::{DbFallback, DbSharing, DbStatus};
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo_impl::SecretRepoImpl;
 use crate::infra::storage::repo_impl::helpers::{TxFuture, entity_to_debt};
@@ -299,12 +300,13 @@ fn subtree_scope(root: Uuid) -> AccessScope {
 // ── migration schema contracts ───────────────────────────────────────────────
 
 /// Insert a `credstore_secrets` row bypassing the domain layer entirely, so
-/// tests can probe the raw migration `CHECK` contracts directly (an
-/// out-of-domain status, or a pointer/status pairing the domain would never
-/// construct).
+/// tests can probe the raw migration `CHECK` contracts directly (a
+/// pointer/status pairing the domain would never construct; the retired
+/// status codes cannot even be expressed by the typed entity and are
+/// covered by the migration tests).
 async fn insert_raw_secret(
     repo: &SecretRepoImpl,
-    status: i16,
+    status: DbStatus,
     value_version: Option<String>,
 ) -> Result<(), ScopeError> {
     let conn = repo.db.conn().expect("conn");
@@ -312,7 +314,7 @@ async fn insert_raw_secret(
         id: ActiveValue::Set(Uuid::new_v4()),
         tenant_id: ActiveValue::Set(Uuid::new_v4()),
         reference: ActiveValue::Set("x".to_owned()),
-        sharing: ActiveValue::Set(2),
+        sharing: ActiveValue::Set(DbSharing::Tenant),
         owner_id: ActiveValue::Set(Uuid::new_v4()),
         status: ActiveValue::Set(status),
         created_at: ActiveValue::NotSet,
@@ -321,7 +323,7 @@ async fn insert_raw_secret(
         secret_type_uuid: ActiveValue::Set(SecretType::generic().uuid()),
         expires_at: ActiveValue::Set(None),
         value_version: ActiveValue::Set(value_version),
-        fallback: ActiveValue::Set(1),
+        fallback: ActiveValue::Set(DbFallback::Inherit),
     })
     .secure()
     .scope_unchecked(&AccessScope::allow_all())?
@@ -331,40 +333,26 @@ async fn insert_raw_secret(
 }
 
 #[tokio::test]
-async fn migration_final_schema_rejects_retired_status_codes() {
-    let repo = setup().await;
-    for bad_status in [1_i16, 3_i16] {
-        let err = insert_raw_secret(&repo, bad_status, None)
-            .await
-            .expect_err("retired status code must violate the narrowed CHECK");
-        assert!(
-            err.to_string().to_lowercase().contains("check"),
-            "expected a CHECK violation, got: {err}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn migration_final_schema_enforces_value_version_with_status_pairing() {
     let repo = setup().await;
     // An active row with no value version violates
     // credstore_secrets_value_version_check.
-    let err = insert_raw_secret(&repo, 2, None)
+    let err = insert_raw_secret(&repo, DbStatus::Active, None)
         .await
         .expect_err("active row without a value version must violate the pairing CHECK");
     assert!(err.to_string().to_lowercase().contains("check"));
 
     // A declared row carrying a value version equally violates it.
-    let err = insert_raw_secret(&repo, 4, Some("1".to_owned()))
+    let err = insert_raw_secret(&repo, DbStatus::Declared, Some("1".to_owned()))
         .await
         .expect_err("declared row with a value version must violate the pairing CHECK");
     assert!(err.to_string().to_lowercase().contains("check"));
 
     // The two consistent shapes are accepted.
-    insert_raw_secret(&repo, 2, Some("1".to_owned()))
+    insert_raw_secret(&repo, DbStatus::Active, Some("1".to_owned()))
         .await
         .expect("active with a value version");
-    insert_raw_secret(&repo, 4, None)
+    insert_raw_secret(&repo, DbStatus::Declared, None)
         .await
         .expect("declared without one");
 }
@@ -960,7 +948,7 @@ fn the_create_insert_does_nothing_on_any_unique_conflict() {
     }
 }
 
-// ── write protocol: insert_declared (ADR-0004 Amendment B) ──────────────────
+// ── write protocol: insert_declared (ADR-0007, "PUT: whole replace, secret tri-state") ──────────────────
 
 fn new_declared_secret(
     tenant: Uuid,
@@ -2082,7 +2070,7 @@ async fn scope_includes_tenant_or_of_constraints_admits_on_broad_alternative() {
     );
 }
 
-// ── ADR-0004: update_metadata, remove_value, widened find_own/find_for_write,
+// ── ADR-0007: update_metadata, remove_value, widened find_own/find_for_write,
 //    widened resolve_for_get (suppression), resolve_candidates ──────────────
 
 #[tokio::test]

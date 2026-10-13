@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use crate::conformance::{self, run_all};
 use crate::{
-    CredStoreError, CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, ValueVersion,
+    CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError, DestroySelector,
+    SecretValue, StoreKey, ValueVersion,
 };
 
 /// One deliberate violation of the backend contract (or none).
@@ -92,9 +93,9 @@ impl CredStorePluginClientV2 for MemPlugin {
         _ctx: &SecurityContext,
         key: &StoreKey,
         value: SecretValue,
-    ) -> Result<ValueVersion, CredStoreError> {
+    ) -> Result<ValueVersion, CredStorePluginError> {
         if self.fault == Fault::PutFails {
-            return Err(CredStoreError::internal("injected put failure"));
+            return Err(CredStorePluginError::internal("injected put failure"));
         }
         let slot = self.slot(key);
         let bytes = if self.fault == Fault::LossyBytes {
@@ -144,10 +145,10 @@ impl CredStorePluginClientV2 for MemPlugin {
         _ctx: &SecurityContext,
         key: &StoreKey,
         version: &ValueVersion,
-    ) -> Result<Option<SecretValue>, CredStoreError> {
+    ) -> Result<Option<SecretValue>, CredStorePluginError> {
         let missing = || {
             if self.fault == Fault::GetUnknownFails {
-                Err(CredStoreError::internal("unknown key or version"))
+                Err(CredStorePluginError::internal("unknown key or version"))
             } else {
                 Ok(None)
             }
@@ -176,12 +177,12 @@ impl CredStorePluginClientV2 for MemPlugin {
         &self,
         _ctx: &SecurityContext,
         key: &StoreKey,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         let mut keys = self.keys.lock().unwrap();
         match self.fault {
             Fault::DeleteKeepsVersions => Ok(()),
             Fault::DeleteMissingFails if !keys.contains_key(&self.slot(key)) => {
-                Err(CredStoreError::NotFound)
+                Err(CredStorePluginError::internal("key not held"))
             }
             _ => {
                 keys.remove(&self.slot(key));
@@ -190,19 +191,22 @@ impl CredStorePluginClientV2 for MemPlugin {
         }
     }
 
-    fn supports_destroy(&self) -> bool {
-        self.fault != Fault::NoDestroyUnordered
+    fn destroyer(&self) -> Option<&dyn CredStorePluginDestroyerV2> {
+        (self.fault != Fault::NoDestroyUnordered).then_some(self as &dyn CredStorePluginDestroyerV2)
     }
+}
 
+#[async_trait]
+impl CredStorePluginDestroyerV2 for MemPlugin {
     async fn destroy(
         &self,
         _ctx: &SecurityContext,
         key: &StoreKey,
         selector: DestroySelector,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         assert!(
-            self.supports_destroy(),
-            "the suite called destroy on a plugin that does not declare it"
+            self.fault != Fault::NoDestroyUnordered,
+            "the suite called destroy on a plugin whose destroyer() is None"
         );
         let mut keys = self.keys.lock().unwrap();
         let slots: Vec<Slot> = if self.fault == Fault::DestroyHitsSiblings {
@@ -234,7 +238,7 @@ impl CredStorePluginClientV2 for MemPlugin {
                 }
             }
             if self.fault == Fault::DestroyTwiceFails && entry.versions.len() == before {
-                return Err(CredStoreError::internal("nothing to destroy"));
+                return Err(CredStorePluginError::internal("nothing to destroy"));
             }
         }
         Ok(())
@@ -398,7 +402,7 @@ async fn conformance_put_failure_is_reported() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "failed: internal error: injected put failure")]
+#[should_panic(expected = "failed: store error: injected put failure")]
 async fn conformance_put_failure_carries_the_plugin_error() {
     conformance::put_get_text(&MemPlugin::new(Fault::PutFails)).await;
 }

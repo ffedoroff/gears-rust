@@ -30,37 +30,16 @@ pub enum SecretStatus {
     /// The row resolves and points at a value (`value_version IS NOT NULL`).
     Active,
     /// The row holds its reference but carries no value (`value_version IS
-    /// NULL`), reached only via a value-removal write (`PATCH {"secret":
+    /// NULL`), reached by a create with `secret: null` (`PUT` with
+    /// `SecretWrite::Null`) or a value-removal write (`PATCH {"secret":
     /// null}`, or a `PATCH` that suppresses an active row in the same
     /// transaction). A resolution candidate only when its `fallback` is
-    /// `None` (ADR-0004, Suppression): `status = 2 OR (status = 4 AND
+    /// `None` (ADR-0008, Suppression): `status = 2 OR (status = 4 AND
     /// fallback = 2)`.
     Declared,
 }
-impl SecretStatus {
-    #[must_use]
-    pub fn as_smallint(self) -> i16 {
-        match self {
-            Self::Active => 2,
-            Self::Declared => 4,
-        }
-    }
 
-    /// Decode a stored status code. `1`/`3` (retired) and any other value are
-    /// out-of-domain — a storage corruption, not a reachable application
-    /// state — so this returns `None` for the caller to map onto
-    /// [`crate::domain::error::DomainError::Internal`], never a panic.
-    #[must_use]
-    pub fn from_smallint(v: i16) -> Option<Self> {
-        match v {
-            2 => Some(Self::Active),
-            4 => Some(Self::Declared),
-            _ => None,
-        }
-    }
-}
-
-/// Suppression policy for a `declared` row (ADR-0004): a record's policy for
+/// Suppression policy for a `declared` row (ADR-0008): a record's policy for
 /// the time it holds no value. `write` sets it (`PUT`, or `PATCH
 /// {"fallback": …}`); it is stored on every row (both `Active` and
 /// `Declared`) and consulted only while the row is `Declared`.
@@ -72,27 +51,6 @@ pub enum Fallback {
     /// This row blocks resolution outright when it is the nearest candidate.
     None,
 }
-impl Fallback {
-    #[must_use]
-    pub fn as_smallint(self) -> i16 {
-        match self {
-            Self::Inherit => 1,
-            Self::None => 2,
-        }
-    }
-
-    /// Decode a stored fallback code; out-of-domain values are storage
-    /// corruption, mapped by the caller onto `DomainError::Internal`.
-    #[must_use]
-    pub fn from_smallint(v: i16) -> Option<Self> {
-        match v {
-            1 => Some(Self::Inherit),
-            2 => Some(Self::None),
-            _ => None,
-        }
-    }
-}
-
 impl From<credstore_sdk::Fallback> for Fallback {
     fn from(f: credstore_sdk::Fallback) -> Self {
         match f {
@@ -127,7 +85,7 @@ pub struct SecretRow {
     pub version: i64,
     /// Last-write instant; bumped alongside `version` by every successful
     /// value switch or metadata update. Surfaced on `Credential` for the
-    /// caller's own row only (ADR-0004).
+    /// caller's own row only (ADR-0004, "Read actions follow the projection").
     pub updated_at: OffsetDateTime,
     /// Deterministic v5 UUID of the secret's GTS type id (the stored
     /// representation); immutable for the row's lifetime. Resolved to the
@@ -143,7 +101,7 @@ pub struct SecretRow {
     /// parsed or compared by the gear, and distinct from [`Self::version`],
     /// the row's optimistic-concurrency counter.
     pub value_version: Option<ValueVersion>,
-    /// Suppression policy of this row (ADR-0004): consulted only while the
+    /// Suppression policy of this row (ADR-0008): consulted only while the
     /// row is `Declared` — an `Active` row's own value always wins,
     /// `fallback` stays stored but not consulted.
     pub fallback: Fallback,
@@ -201,7 +159,7 @@ pub enum WritePrecondition {
     AnyVersion(Vec<(Uuid, i64)>),
 }
 
-/// Precondition for `put` (ADR-0004, "Two write verbs on one resource"):
+/// Precondition for `put` (ADR-0007, "PUT: whole replace, secret tri-state"):
 /// distinguishes create-only from a guarded or unconditional replace, parsed
 /// from `If-None-Match`/`If-Match`.
 #[domain_model]
@@ -242,13 +200,13 @@ pub struct NewSecret {
     pub expires_at: Option<OffsetDateTime>,
     /// The value version `plugin.put` returned for this create's value.
     pub value_version: ValueVersion,
-    /// Suppression policy carried into the row at create time (ADR-0004);
+    /// Suppression policy carried into the row at create time (ADR-0008);
     /// `PUT`'s default is [`Fallback::Inherit`] when the body omits it.
     pub fallback: Fallback,
 }
 
-/// A new declared row (ADR-0004 Amendment B, "The value-less record: reached
-/// only on purpose"): a create whose `value` is an explicit `null` inserts
+/// A new declared row (ADR-0007, "PUT: whole replace, secret tri-state": the
+/// value-less record, reached only on purpose): a create whose `value` is an explicit `null` inserts
 /// the row `declared` directly — no `value_version`, no backend call. Distinct from [`NewSecret`], which always carries a
 /// written value.
 #[domain_model]
@@ -262,7 +220,7 @@ pub struct NewDeclaredSecret {
     /// Deterministic v5 UUID of the (registry-validated) GTS type id.
     pub secret_type_uuid: Uuid,
     pub expires_at: Option<OffsetDateTime>,
-    /// Suppression policy carried into the row at create time (ADR-0004).
+    /// Suppression policy carried into the row at create time (ADR-0008).
     pub fallback: Fallback,
 }
 
@@ -418,45 +376,5 @@ impl SecretRow {
     #[must_use]
     pub fn store_key(&self) -> StoreKey {
         StoreKey::new(self.tenant_id, self.id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Fallback, SecretStatus};
-
-    #[test]
-    fn secret_status_smallint_round_trips() {
-        for s in [SecretStatus::Active, SecretStatus::Declared] {
-            assert_eq!(SecretStatus::from_smallint(s.as_smallint()), Some(s));
-        }
-        assert_eq!(SecretStatus::Active.as_smallint(), 2);
-        assert_eq!(SecretStatus::Declared.as_smallint(), 4);
-    }
-
-    #[test]
-    fn secret_status_from_smallint_rejects_retired_and_out_of_domain_codes() {
-        // 1 (provisioning) and 3 (deprovisioning) are retired by ADR-0006:
-        // reserved, never reassigned, never stored again.
-        assert_eq!(SecretStatus::from_smallint(1), None);
-        assert_eq!(SecretStatus::from_smallint(3), None);
-        assert_eq!(SecretStatus::from_smallint(0), None);
-        assert_eq!(SecretStatus::from_smallint(5), None);
-        assert_eq!(SecretStatus::from_smallint(-1), None);
-    }
-
-    #[test]
-    fn fallback_smallint_round_trips() {
-        for f in [Fallback::Inherit, Fallback::None] {
-            assert_eq!(Fallback::from_smallint(f.as_smallint()), Some(f));
-        }
-        assert_eq!(Fallback::Inherit.as_smallint(), 1);
-        assert_eq!(Fallback::None.as_smallint(), 2);
-    }
-
-    #[test]
-    fn fallback_from_smallint_rejects_out_of_domain() {
-        assert_eq!(Fallback::from_smallint(0), None);
-        assert_eq!(Fallback::from_smallint(3), None);
     }
 }

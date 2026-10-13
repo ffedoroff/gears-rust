@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use credstore_sdk::{
     CredentialPatch, CredentialStatus, CredentialWrite, Fallback as SdkFallback, InheritanceStatus,
-    OwnerId, PatchField, SecretRef, SecretType, SecretValue, SharingMode, TenantId, ValueVersion,
+    OwnerId, PatchField, SecretRef, SecretType, SecretValue, SecretWrite, SharingMode, TenantId,
+    ValueVersion,
 };
 use time::OffsetDateTime;
 use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir};
@@ -35,7 +36,7 @@ fn write_typed(sharing: SharingMode, value: &str, type_name: &str) -> Credential
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        secret: Some(SecretValue::from(value)),
+        secret: SecretWrite::Set(SecretValue::from(value)),
     }
 }
 
@@ -211,8 +212,13 @@ async fn metadata_page_reports_own_inherited_overridden_and_suppressed() {
             &key("d-suppressed"),
             patch_suppress(),
             crate::domain::secret::model::WritePrecondition::Version {
-                id: existing.validator.expect("own validator").id,
-                version: existing.validator.expect("own validator").version,
+                id: existing.own.as_ref().expect("own validator").validator.id,
+                version: existing
+                    .own
+                    .as_ref()
+                    .expect("own validator")
+                    .validator
+                    .version,
             },
         )
         .await
@@ -234,22 +240,28 @@ async fn metadata_page_reports_own_inherited_overridden_and_suppressed() {
 
     let a = by_ref("a-own");
     assert_eq!(a.credential.inheritance, InheritanceStatus::Own);
-    assert!(a.credential.owner_id.is_some());
-    assert_eq!(a.credential.status, CredentialStatus::Active);
+    assert!(a.credential.own.is_some());
+    assert_eq!(
+        a.credential.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Active)
+    );
 
     let b = by_ref("b-inherited");
     assert_eq!(b.credential.inheritance, InheritanceStatus::Inherited);
-    assert!(b.credential.owner_id.is_none());
-    assert_eq!(b.credential.status, CredentialStatus::None);
+    assert!(b.credential.own.is_none());
+    assert!(b.credential.own.is_none());
 
     let c = by_ref("c-overridden");
     assert_eq!(c.credential.inheritance, InheritanceStatus::Overridden);
-    assert!(c.credential.owner_id.is_some());
+    assert!(c.credential.own.is_some());
 
     let d = by_ref("d-suppressed");
     assert_eq!(d.credential.inheritance, InheritanceStatus::Suppressed);
-    assert!(d.credential.owner_id.is_some());
-    assert_eq!(d.credential.status, CredentialStatus::Declared);
+    assert!(d.credential.own.is_some());
+    assert_eq!(
+        d.credential.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Declared)
+    );
 
     // Without `secret` selected the item never carries a value.
     assert!(page.items.iter().all(|i| i.secret.is_none()));
@@ -1221,7 +1233,7 @@ async fn secret_selected_one_read_failure_fails_the_whole_request() {
 }
 
 #[tokio::test]
-async fn secret_selected_refused_item_is_omitted_others_present() {
+async fn secret_selected_rejected_plugin_credentials_fail_the_request() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -1244,11 +1256,22 @@ async fn secret_selected_refused_item_is_omitted_others_present() {
         .into_iter()
         .find(|r| r.reference == "r2")
         .expect("r2 row");
-    plugin.deny_get_for(&refused_row.store_key());
+    plugin.reject_get_for(&refused_row.store_key());
 
     let query = secret_query("reference in ('r1', 'r2', 'r3')");
-    let page = svc.list(&ctx, &query).await.expect("list");
-    assert_eq!(references_of(&page), vec!["r1", "r3"]);
+    // The store refusing the plugin's own credentials is an operator fault,
+    // not a per-item miss: the request fails (503, no retry hint).
+    let err = svc.list(&ctx, &query).await.expect_err("request fails");
+    assert!(
+        matches!(
+            err,
+            DomainError::ServiceUnavailable {
+                retry_after: None,
+                ..
+            }
+        ),
+        "got: {err:?}"
+    );
 }
 
 #[test]
@@ -1395,14 +1418,20 @@ async fn metadata_list_shows_an_expired_record_with_status_expired() {
     };
     // The caller's own expired override: status `expired`, normal validator,
     // still an override (the ancestor's value is not consulted).
-    assert_eq!(by_ref("over").status, CredentialStatus::Expired);
+    assert_eq!(
+        by_ref("over").own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Expired)
+    );
     assert_eq!(by_ref("over").inheritance, InheritanceStatus::Overridden);
-    assert!(by_ref("over").validator.is_some());
+    assert!(by_ref("over").own.is_some());
     // An expired inherited record: no own row, `expires_at` in the past.
-    assert_eq!(by_ref("inh").status, CredentialStatus::None);
+    assert_eq!(by_ref("inh").own.as_ref().map(|o| o.status), None);
     assert_eq!(by_ref("inh").inheritance, InheritanceStatus::Inherited);
     assert!(by_ref("inh").expires_at.expect("expiry") <= OffsetDateTime::now_utc());
-    assert_eq!(by_ref("live").status, CredentialStatus::Active);
+    assert_eq!(
+        by_ref("live").own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Active)
+    );
     assert!(page.items.iter().all(|i| i.secret.is_none()));
 }
 
@@ -1464,7 +1493,10 @@ async fn secret_selected_returns_an_expired_item_without_a_secret_and_does_not_f
         page.items[0].secret.as_ref().expect("secret").as_bytes(),
         b"r0"
     );
-    assert_eq!(page.items[1].credential.status, CredentialStatus::Expired);
+    assert_eq!(
+        page.items[1].credential.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Expired)
+    );
     assert!(
         page.items[1].secret.is_none(),
         "no secret for the expired item, and never the ancestor's value"
@@ -1497,7 +1529,10 @@ async fn secret_selected_with_only_expired_items_returns_them_without_secrets() 
         .await
         .expect("list");
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].credential.status, CredentialStatus::Expired);
+    assert_eq!(
+        page.items[0].credential.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Expired)
+    );
     assert!(page.items[0].secret.is_none());
 }
 

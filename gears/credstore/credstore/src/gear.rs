@@ -189,10 +189,10 @@ impl Gear for CredStoreGear {
             .set(Arc::clone(&svc))
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
-        let client: Arc<dyn credstore_sdk::CredStoreClientV1> =
+        let client: Arc<dyn credstore_sdk::CredStoreClientV2> =
             Arc::new(CredStoreLocalClient::new(svc));
         ctx.client_hub()
-            .register::<dyn credstore_sdk::CredStoreClientV1>(client);
+            .register::<dyn credstore_sdk::CredStoreClientV2>(client);
 
         info!("credstore module initialized");
         Ok(())

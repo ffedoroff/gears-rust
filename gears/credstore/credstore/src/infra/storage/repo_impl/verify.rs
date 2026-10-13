@@ -84,7 +84,7 @@ async fn probe_attempt_tx(
         // A pointer at the attempt's version can only have been set by this
         // attempt's tx1: versions are unique per key.
         Some(row) if row.value_version.as_deref() == Some(value_version.0.as_str()) => {
-            Ok(Probe::Committed(entity_to_model(row)?))
+            Ok(Probe::Committed(entity_to_model(row)))
         }
         _ => Ok(Probe::NotApplied),
     }
@@ -121,7 +121,7 @@ pub(super) async fn verify_insert_active(
         Box::pin(async move {
             match probe_attempt_tx(tx, &attempt, &value_version).await? {
                 Probe::IntentPresent => Ok(WriteVerification::Retried(
-                    insert_active_tx(tx, &scope, am, &attempt).await?,
+                    insert_active_tx(tx, &scope, am, &attempt, &value_version).await?,
                 )),
                 Probe::Committed(row) => Ok(WriteVerification::Committed { row }),
                 Probe::NotApplied => Ok(WriteVerification::NotApplied {

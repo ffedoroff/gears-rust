@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use credstore_sdk::{
     CredentialPatch, CredentialWrite, Fallback as SdkFallback, PatchField, SecretRef, SecretType,
-    SecretValue, SharingMode,
+    SecretValue, SecretWrite, SharingMode,
 };
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
@@ -38,7 +38,10 @@ fn write(secret: Option<&str>, sharing: SharingMode) -> CredentialWrite {
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        secret: secret.map(SecretValue::from),
+        secret: match secret {
+            Some(v) => SecretWrite::Set(SecretValue::from(v)),
+            None => SecretWrite::Null,
+        },
     }
 }
 
