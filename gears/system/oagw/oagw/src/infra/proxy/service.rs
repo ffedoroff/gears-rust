@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::AccessRequest;
 use bytes::Bytes;
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
 use oagw_sdk::body::{Body, BodyStream};
@@ -82,7 +82,7 @@ impl DataPlaneServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cp: Arc<dyn ControlPlaneService>,
-        credstore: Arc<dyn CredStoreClientV1>,
+        credstore: Arc<dyn CredStoreClientV2>,
         policy_enforcer: PolicyEnforcer,
         token_http_config: Option<toolkit_http::HttpClientConfig>,
         token_cache_config: TokenCacheConfig,
@@ -1882,7 +1882,7 @@ mod tests {
             AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
             PolicyEnforcer,
         };
-        use credstore_sdk::CredStoreClientV1;
+        use credstore_sdk::CredStoreClientV2;
         use toolkit_canonical_errors::CanonicalError;
         use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
@@ -1904,7 +1904,7 @@ mod tests {
             }
         }
 
-        let credstore: Arc<dyn CredStoreClientV1> =
+        let credstore: Arc<dyn CredStoreClientV2> =
             Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty());
         let policy_enforcer = PolicyEnforcer::new(Arc::new(AllowAllAuthZ));
 

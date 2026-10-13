@@ -4,7 +4,7 @@ use crate::domain::model::Upstream;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::{CredStoreClientV2, CredStoreError};
 use oagw_sdk::UPSTREAM_SCHEMA;
 use toolkit_security::SecurityContext;
 
@@ -156,14 +156,22 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
 /// is not accessible, the request is rejected (fail-closed).
 pub(in crate::domain::services) async fn validate_secret_ref_accessible(
     ctx: &SecurityContext,
-    credstore: &dyn CredStoreClientV1,
+    credstore: &dyn CredStoreClientV2,
     raw_ref: &str,
 ) -> Result<(), DomainError> {
     let bare = raw_ref.strip_prefix("cred://").unwrap_or(raw_ref);
-    let key = credstore_sdk::SecretRef::new(bare)
-        .map_err(|e| DomainError::validation(format!("invalid secret_ref '{raw_ref}': {e}")))?;
+    let key = credstore_sdk::SecretRef::new(bare).map_err(|e| {
+        DomainError::validation(format!(
+            "invalid secret_ref '{raw_ref}': {}",
+            CredStoreError::from(e)
+        ))
+    })?;
 
-    match credstore.get_record(ctx, &key).await {
+    match credstore
+        .get_record(ctx, &key)
+        .await
+        .map_err(CredStoreError::from)
+    {
         Ok(Some(_)) => Ok(()),
         // Not a malformed argument: the ref parses, the secret just isn't
         // there (yet) or isn't shared. Distinguished from `Validation` so
@@ -176,18 +184,24 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
             ),
             instance: String::new(),
         }),
-        Err(credstore_sdk::CredStoreError::Internal(msg)) => {
+        Err(e @ (CredStoreError::Internal { .. } | CredStoreError::Unavailable { .. })) => {
             // Fail-closed: cred_store unavailability → reject.
-            tracing::warn!(secret_ref = raw_ref, error = %msg, "cred_store unavailable during secret_ref validation");
+            tracing::warn!(secret_ref = raw_ref, error = %e, "cred_store unavailable during secret_ref validation");
             Err(DomainError::Internal {
-                message: format!("credential validation unavailable: {msg}"),
+                message: format!("credential validation unavailable: {e}"),
             })
         }
+        // A full PDP denial is not "not provisioned yet": retrying cannot
+        // help, so it fails fast like any other non-retryable error (below).
+        // Only a miss (`Ok(None)`) or a not-found error defers.
+        Err(e @ CredStoreError::PermissionDenied) => Err(DomainError::validation(format!(
+            "secret_ref '{raw_ref}' validation failed: {e}"
+        ))),
         // Same state as `Ok(None)`, reported as an error by some client
         // implementations (e.g. a metadata row whose value is still being
         // provisioned): not accessible *yet*, so provisioning callers must be
         // able to defer-and-retry rather than fail fast.
-        Err(e) if e.is_not_found() => Err(DomainError::SecretRefNotAccessible {
+        Err(CredStoreError::NotFound) => Err(DomainError::SecretRefNotAccessible {
             detail: format!(
                 "secret_ref '{raw_ref}' is not accessible to this tenant \
                  (not provisioned yet, or not shared)"

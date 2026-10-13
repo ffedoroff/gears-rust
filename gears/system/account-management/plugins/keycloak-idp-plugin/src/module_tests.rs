@@ -27,7 +27,7 @@ use crate::domain::system_actor::build_system_ctx;
 use crate::domain::test_support::NoopMetrics;
 use crate::domain::test_support::StubCredStore;
 use crate::infra::kc_http::ReqwestKcTransport;
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -66,7 +66,7 @@ fn cfg_no_transport_retries(base: &str) -> KeycloakConfig {
 
 fn factory_for(server: &MockServer) -> KeycloakAdminClientFactory {
     let cfg = cfg_no_transport_retries(&server.uri());
-    let stub: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let stub: Arc<dyn CredStoreClientV2> = Arc::new(StubCredStore);
     let reader = CredStoreReader::new(stub, build_system_ctx(Uuid::nil()));
     // `ReqwestKcTransport::new` defaults to `HttpRetryPolicy::default()`
     // (max_retries=3). The pre_warm tests need transport-level retries

@@ -5,7 +5,7 @@ use toolkit_auth::oauth2::types::ClientAuthMethod;
 
 use crate::config::TokenCacheConfig;
 use crate::domain::plugin::{AuthPlugin, GuardPlugin, PluginError, TransformPlugin};
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 
 use super::apikey_auth::ApiKeyAuthPlugin;
 use super::noop_auth::NoopAuthPlugin;
@@ -27,7 +27,7 @@ impl AuthPluginRegistry {
     /// Create a registry with the built-in plugins (apikey, noop, oauth2 CC).
     #[must_use]
     pub fn with_builtins(
-        credstore: Arc<dyn CredStoreClientV1>,
+        credstore: Arc<dyn CredStoreClientV2>,
         token_http_config: Option<toolkit_http::HttpClientConfig>,
         token_cache_config: TokenCacheConfig,
     ) -> Self {

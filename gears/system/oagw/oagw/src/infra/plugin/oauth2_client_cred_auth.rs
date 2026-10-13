@@ -1,5 +1,5 @@
 // Updated: 2026-10-06 by Constructor Tech
-use credstore_sdk::{CredStoreClientV1, CredStoreError, SecretRef};
+use credstore_sdk::{CredStoreClientV2, CredStoreError, SecretRef};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,7 +120,7 @@ fn hash_config(config: &HashMap<String, String>) -> u64 {
 
 /// Auth plugin implementing the OAuth2 Client Credentials flow.
 pub struct OAuth2ClientCredAuthPlugin {
-    credstore: Arc<dyn CredStoreClientV1>,
+    credstore: Arc<dyn CredStoreClientV2>,
     auth_method: ClientAuthMethod,
     http_config: Option<toolkit_http::HttpClientConfig>,
     cache: MemoryCache<String, CachedToken>,
@@ -130,7 +130,7 @@ pub struct OAuth2ClientCredAuthPlugin {
 impl OAuth2ClientCredAuthPlugin {
     #[must_use]
     pub fn new(
-        credstore: Arc<dyn CredStoreClientV1>,
+        credstore: Arc<dyn CredStoreClientV2>,
         auth_method: ClientAuthMethod,
         cache_ttl: Duration,
         cache_capacity: usize,
@@ -158,12 +158,17 @@ impl OAuth2ClientCredAuthPlugin {
         cred_ref: &str,
     ) -> Result<String, PluginError> {
         let raw = cred_ref.strip_prefix("cred://").unwrap_or(cred_ref);
-        let secret_ref = SecretRef::new(raw)
-            .map_err(|e| PluginError::Internal(format!("invalid secret ref '{raw}': {e}")))?;
+        let secret_ref = SecretRef::new(raw).map_err(|e| {
+            PluginError::Internal(format!(
+                "invalid secret ref '{raw}': {}",
+                CredStoreError::from(e)
+            ))
+        })?;
         let response = match self
             .credstore
             .get_secret(security_context, &secret_ref)
             .await
+            .map_err(CredStoreError::from)
         {
             Ok(Some(response)) => response,
             Ok(None) => return Err(PluginError::SecretNotFound(cred_ref.to_owned())),
@@ -271,7 +276,7 @@ mod tests {
     use toolkit_security::SecurityContext;
     use uuid::Uuid;
 
-    use credstore_sdk::CredStoreClientV1;
+    use credstore_sdk::CredStoreClientV2;
 
     use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
     use crate::domain::test_support::MockCredStoreClient;
@@ -323,7 +328,7 @@ mod tests {
         }
     }
 
-    fn make_plugin(credstore: Arc<dyn CredStoreClientV1>) -> OAuth2ClientCredAuthPlugin {
+    fn make_plugin(credstore: Arc<dyn CredStoreClientV2>) -> OAuth2ClientCredAuthPlugin {
         OAuth2ClientCredAuthPlugin::new(
             credstore,
             ClientAuthMethod::Form,

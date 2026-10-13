@@ -17,7 +17,7 @@ use authz_resolver_sdk::{
     AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
     PolicyEnforcer,
 };
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use tenant_resolver_sdk::{
     GetAncestorsOptions, GetAncestorsResponse, GetDescendantsOptions, GetDescendantsResponse,
@@ -162,7 +162,7 @@ impl AuthZResolverApi for CapturingAuthZResolverClient {
     }
 }
 
-// The `CredStoreClientV1` test double is centralized in the SDK
+// The `CredStoreClientV2` test double is centralized in the SDK
 // (`credstore_sdk::test_util`, behind its `test-util` feature) so every gear
 // shares one configurable mock instead of hand-rolling its own. Modes:
 // `empty()` (all `get` → None), `with_secrets(..)` (keyed store),
@@ -170,7 +170,7 @@ impl AuthZResolverApi for CapturingAuthZResolverClient {
 // `always_failing()` (every op → `Internal`).
 pub use credstore_sdk::test_util::MockCredStoreClient;
 
-/// Re-export for tests that need a `CredStoreClientV1` mock.
+/// Re-export for tests that need a `CredStoreClientV2` mock.
 pub use MockCredStoreClient as TestCredStoreClient;
 
 /// Mock `TenantResolverClient` for tests.
@@ -480,9 +480,9 @@ impl TestCpBuilder {
             self.tenant_resolver
                 .unwrap_or_else(MockTenantResolverClient::single_tenant),
         );
-        let credstore: Arc<dyn CredStoreClientV1> =
+        let credstore: Arc<dyn CredStoreClientV2> =
             Arc::new(MockCredStoreClient::with_secrets(self.credentials));
-        hub.register::<dyn CredStoreClientV1>(credstore.clone());
+        hub.register::<dyn CredStoreClientV2>(credstore.clone());
 
         let cp: Arc<dyn ControlPlaneService> = Arc::new(ControlPlaneServiceImpl::new(
             upstream_repo,
@@ -505,7 +505,7 @@ impl Default for TestCpBuilder {
 
 /// Builder for a fully-wired Data Plane test environment.
 ///
-/// Requires that a `CredStoreClientV1` is already registered in the
+/// Requires that a `CredStoreClientV2` is already registered in the
 /// `ClientHub` (e.g., via `TestCpBuilder`).
 pub struct TestDpBuilder {
     request_timeout: Option<Duration>,
@@ -600,7 +600,7 @@ impl TestDpBuilder {
         self
     }
 
-    /// Fetch `CredStoreClientV1` from the hub, create a DP service with
+    /// Fetch `CredStoreClientV2` from the hub, create a DP service with
     /// the given CP, and return the trait object.
     pub(crate) fn build_and_register(
         self,
@@ -608,8 +608,8 @@ impl TestDpBuilder {
         cp: Arc<dyn ControlPlaneService>,
     ) -> Arc<dyn DataPlaneService> {
         let credstore = hub
-            .get::<dyn CredStoreClientV1>()
-            .expect("CredStoreClientV1 must be registered before building DP");
+            .get::<dyn CredStoreClientV2>()
+            .expect("CredStoreClientV2 must be registered before building DP");
 
         let authz_client = self
             .authz_client

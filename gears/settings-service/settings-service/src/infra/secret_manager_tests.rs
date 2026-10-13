@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
-    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, SharingMode,
+    CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialWrite,
+    PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, SecretWrite, SharingMode,
     Validator, WritePrecondition,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
+use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -24,6 +25,38 @@ use crate::domain::error::DomainError;
 use crate::domain::ports::SecretManager;
 
 const KEY: &str = "gts.cf.core.settings.setting_type.v1~cf.demo.security.api_token.v1~";
+
+#[resource_error(gts_id!("cf.core.credstore.credential.v1~"))]
+struct CredentialScope;
+
+fn not_found() -> CanonicalError {
+    CredentialScope::not_found("credential not found")
+        .with_resource("credential")
+        .create()
+}
+
+fn already_exists() -> CanonicalError {
+    CredentialScope::already_exists("credential already exists")
+        .with_resource("credential")
+        .create()
+}
+
+fn precondition_failed() -> CanonicalError {
+    CredentialScope::aborted("write precondition failed")
+        .with_reason(credstore_sdk::reason::aborted::OPTIMISTIC_LOCK_FAILURE)
+        .create()
+}
+
+fn secret_expired() -> CanonicalError {
+    CredentialScope::failed_precondition()
+        .with_precondition_violation(
+            "secret",
+            "the credential's secret has expired",
+            credstore_sdk::reason::failed_precondition::SECRET_EXPIRED,
+        )
+        .with_override(Http::status_code(409))
+        .create()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Slot {
@@ -75,11 +108,11 @@ impl MemoryCredStore {
         self.presented_subject_types.lock().expect("lock").clone()
     }
 
-    fn check(&self) -> Result<(), CredStoreError> {
+    fn check(&self) -> Result<(), CanonicalError> {
         if self.down.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(CredStoreError::service_unavailable(
-                "credstore-db-7.internal:5432 refused",
-            ));
+            return Err(CanonicalError::service_unavailable()
+                .with_detail("credstore-db-7.internal:5432 refused")
+                .create());
         }
         Ok(())
     }
@@ -90,27 +123,27 @@ impl MemoryCredStore {
 }
 
 #[async_trait]
-impl CredStoreClientV1 for MemoryCredStore {
+impl CredStoreClientV2 for MemoryCredStore {
     async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Credential>, CredStoreError> {
+    ) -> Result<Option<Credential>, CanonicalError> {
         // The gear reads values only; the record read is not part of its path.
-        Err(CredStoreError::Internal("record read not modelled".into()))
+        Err(CanonicalError::internal("record read not modelled").create())
     }
 
     async fn get_secret(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<Secret>, CredStoreError> {
+    ) -> Result<Option<Secret>, CanonicalError> {
         self.check()?;
         let slot = self.slot(ctx, key, SharingMode::Private);
         if self.expired.load(std::sync::atomic::Ordering::SeqCst)
             && self.entries.lock().expect("lock").contains_key(&slot)
         {
-            return Err(CredStoreError::SecretExpired);
+            return Err(secret_expired());
         }
         Ok(self
             .entries
@@ -136,24 +169,24 @@ impl CredStoreClientV1 for MemoryCredStore {
         key: &SecretRef,
         write: CredentialWrite,
         precondition: PutPrecondition,
-    ) -> Result<PutOutcome, CredStoreError> {
+    ) -> Result<PutOutcome, CanonicalError> {
         self.check()?;
         let slot = self.slot(ctx, key, write.sharing);
-        let value = write
-            .secret
-            .map(|v| v.as_bytes().to_vec())
-            .unwrap_or_default();
+        let value = match write.secret {
+            SecretWrite::Set(v) => v.as_bytes().to_vec(),
+            SecretWrite::Null => Vec::new(),
+        };
         let mut entries = self.entries.lock().expect("lock");
         let created = match precondition {
             PutPrecondition::CreateOnly => {
                 if entries.contains_key(&slot) {
-                    return Err(CredStoreError::Conflict);
+                    return Err(already_exists());
                 }
                 true
             }
             PutPrecondition::Exists | PutPrecondition::Matches(_) => {
                 if !entries.contains_key(&slot) {
-                    return Err(CredStoreError::Conflict);
+                    return Err(precondition_failed());
                 }
                 false
             }
@@ -174,8 +207,8 @@ impl CredStoreClientV1 for MemoryCredStore {
         _key: &SecretRef,
         _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<Validator, CredStoreError> {
-        Err(CredStoreError::Internal("patch not modelled".into()))
+    ) -> Result<Validator, CanonicalError> {
+        Err(CanonicalError::internal("patch not modelled").create())
     }
 
     async fn delete(
@@ -183,7 +216,7 @@ impl CredStoreClientV1 for MemoryCredStore {
         ctx: &SecurityContext,
         key: &SecretRef,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CanonicalError> {
         self.check()?;
         let slot = self.slot(ctx, key, SharingMode::Private);
         self.entries
@@ -191,21 +224,21 @@ impl CredStoreClientV1 for MemoryCredStore {
             .expect("lock")
             .remove(&slot)
             .map(|_| ())
-            .ok_or(CredStoreError::NotFound)
+            .ok_or_else(not_found)
     }
 
     async fn list(
         &self,
         _ctx: &SecurityContext,
         _query: &ODataQuery,
-    ) -> Result<Page<CredentialListItem>, CredStoreError> {
-        Err(CredStoreError::Internal("list not modelled".into()))
+    ) -> Result<Page<CredentialListItem>, CanonicalError> {
+        Err(CanonicalError::internal("list not modelled").create())
     }
 }
 
 fn manager() -> (Arc<MemoryCredStore>, CredStoreSecretManager) {
     let store = Arc::new(MemoryCredStore::default());
-    let manager = CredStoreSecretManager::new(Arc::clone(&store) as Arc<dyn CredStoreClientV1>);
+    let manager = CredStoreSecretManager::new(Arc::clone(&store) as Arc<dyn CredStoreClientV2>);
     (store, manager)
 }
 

@@ -1863,6 +1863,92 @@ async fn bind_maps_not_found_error_to_secret_ref_not_accessible() {
     );
 }
 
+/// A full PDP denial on the record read is not "not provisioned yet": it must
+/// fail fast (non-retryable validation error), never defer as
+/// `SecretRefNotAccessible`.
+#[tokio::test]
+async fn bind_fails_fast_on_credstore_permission_denied() {
+    use credstore_sdk::{
+        CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialWrite,
+        PutOutcome, PutPrecondition, Secret, SecretRef, Validator, WritePrecondition,
+    };
+    use toolkit_canonical_errors::{CanonicalError, resource_error};
+
+    #[resource_error(gts_id!("cf.core.credstore.credential.v1~"))]
+    struct CredentialScope;
+
+    struct Denying;
+
+    fn denied() -> CanonicalError {
+        CredentialScope::permission_denied()
+            .with_reason(credstore_sdk::reason::permission_denied::ACCESS_DENIED)
+            .create()
+    }
+
+    #[async_trait::async_trait]
+    impl CredStoreClientV2 for Denying {
+        async fn get_record(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+        ) -> Result<Option<Credential>, CanonicalError> {
+            Err(denied())
+        }
+        async fn get_secret(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+        ) -> Result<Option<Secret>, CanonicalError> {
+            Err(denied())
+        }
+        async fn put(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+            _write: CredentialWrite,
+            _precondition: PutPrecondition,
+        ) -> Result<PutOutcome, CanonicalError> {
+            Err(denied())
+        }
+        async fn patch(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+            _patch: CredentialPatch,
+            _precondition: WritePrecondition,
+        ) -> Result<Validator, CanonicalError> {
+            Err(denied())
+        }
+        async fn delete(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+            _precondition: WritePrecondition,
+        ) -> Result<(), CanonicalError> {
+            Err(denied())
+        }
+        async fn list(
+            &self,
+            _ctx: &SecurityContext,
+            _query: &toolkit_odata::ODataQuery,
+        ) -> Result<toolkit_odata::Page<CredentialListItem>, CanonicalError> {
+            Err(denied())
+        }
+    }
+
+    let err = super::bind::validate_secret_ref_accessible(
+        &test_ctx(Uuid::new_v4()),
+        &Denying,
+        "cred://some-key",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected a fail-fast Validation error, got: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn bind_allows_accessible_secret_ref() {
     let root = Uuid::new_v4();

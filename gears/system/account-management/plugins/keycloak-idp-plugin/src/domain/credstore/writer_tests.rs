@@ -1,11 +1,15 @@
 // Updated: 2026-10-06 by Constructor Tech
 use super::*;
 use crate::domain::system_actor::build_system_ctx;
+use crate::domain::test_support::{
+    cs_already_exists, cs_not_found, cs_precondition_failed, cs_unavailable,
+};
 use async_trait::async_trait;
 use credstore_sdk::{
     Credential, CredentialListItem, CredentialPatch, PutOutcome, Secret, Validator,
 };
 use parking_lot::Mutex;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use uuid::Uuid;
 
@@ -20,16 +24,20 @@ struct StubMutator {
     /// All recorded `put` invocations.
     put_calls: Mutex<Vec<PutCall>>,
     /// One-shot response for the next `delete` call; defaults to `Ok(())`.
-    delete_response: Mutex<Option<Result<(), CredStoreError>>>,
+    delete_response: Mutex<Option<Result<(), CanonicalError>>>,
+    /// Scripted `put` responses, consumed in call order; empty → `Ok`.
+    put_responses: Mutex<std::collections::VecDeque<Result<(), CanonicalError>>>,
+    /// The precondition of every `put`, in call order.
+    put_preconditions: Mutex<Vec<PutPrecondition>>,
 }
 
 #[async_trait]
-impl CredStoreClientV1 for StubMutator {
+impl CredStoreClientV2 for StubMutator {
     async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Credential>, CredStoreError> {
+    ) -> Result<Option<Credential>, CanonicalError> {
         Ok(None)
     }
 
@@ -37,7 +45,7 @@ impl CredStoreClientV1 for StubMutator {
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Secret>, CredStoreError> {
+    ) -> Result<Option<Secret>, CanonicalError> {
         Ok(None)
     }
 
@@ -46,17 +54,18 @@ impl CredStoreClientV1 for StubMutator {
         _ctx: &SecurityContext,
         key: &SecretRef,
         write: CredentialWrite,
-        _precondition: PutPrecondition,
-    ) -> Result<PutOutcome, CredStoreError> {
+        precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CanonicalError> {
+        self.put_preconditions.lock().push(precondition);
         self.put_calls.lock().push((
             key.as_ref().to_owned(),
-            write
-                .secret
-                .as_ref()
-                .map(|v| v.as_bytes().to_vec())
-                .unwrap_or_default(),
+            match &write.secret {
+                credstore_sdk::SecretWrite::Set(v) => v.as_bytes().to_vec(),
+                credstore_sdk::SecretWrite::Null => Vec::new(),
+            },
             write.sharing,
         ));
+        self.put_responses.lock().pop_front().unwrap_or(Ok(()))?;
         Ok(PutOutcome {
             created: true,
             validator: Validator {
@@ -72,7 +81,7 @@ impl CredStoreClientV1 for StubMutator {
         _key: &SecretRef,
         _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<Validator, CredStoreError> {
+    ) -> Result<Validator, CanonicalError> {
         Ok(Validator {
             id: Uuid::nil(),
             version: 1,
@@ -84,7 +93,7 @@ impl CredStoreClientV1 for StubMutator {
         _ctx: &SecurityContext,
         _key: &SecretRef,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CanonicalError> {
         self.delete_response.lock().take().unwrap_or(Ok(()))
     }
 
@@ -92,7 +101,7 @@ impl CredStoreClientV1 for StubMutator {
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+    ) -> Result<Page<CredentialListItem>, CanonicalError> {
         Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
@@ -118,7 +127,7 @@ async fn put_forwards_with_system_ctx() {
 #[tokio::test]
 async fn delete_maps_not_found_to_ok() {
     let stub = Arc::new(StubMutator::default());
-    *stub.delete_response.lock() = Some(Err(CredStoreError::NotFound));
+    *stub.delete_response.lock() = Some(Err(cs_not_found()));
     let ctx = build_system_ctx(Uuid::nil());
     let writer = CredStoreWriter::new(stub, ctx);
     let key = SecretRef::new("k").expect("valid SecretRef");
@@ -131,7 +140,7 @@ async fn delete_maps_not_found_to_ok() {
 #[tokio::test]
 async fn delete_passes_other_errors_through() {
     let stub = Arc::new(StubMutator::default());
-    *stub.delete_response.lock() = Some(Err(CredStoreError::service_unavailable("nope")));
+    *stub.delete_response.lock() = Some(Err(cs_unavailable("nope")));
     let ctx = build_system_ctx(Uuid::nil());
     let writer = CredStoreWriter::new(stub, ctx);
     let key = SecretRef::new("k").expect("valid SecretRef");
@@ -139,7 +148,7 @@ async fn delete_passes_other_errors_through() {
         .delete(&key)
         .await
         .expect_err("non-NotFound MUST surface");
-    assert!(matches!(err, CredStoreError::ServiceUnavailable { .. }));
+    assert!(matches!(err, CredStoreError::Unavailable { .. }));
 }
 
 #[tokio::test]
@@ -149,4 +158,75 @@ async fn delete_ok_stays_ok() {
     let writer = CredStoreWriter::new(stub, ctx);
     let key = SecretRef::new("k").expect("valid SecretRef");
     writer.delete(&key).await.expect("Ok MUST stay Ok");
+}
+
+#[tokio::test]
+async fn put_on_a_fresh_reference_is_one_create_only_call() {
+    let stub = Arc::new(StubMutator::default());
+    let writer = CredStoreWriter::new(stub.clone(), build_system_ctx(Uuid::nil()));
+    let key = SecretRef::new("k").expect("valid SecretRef");
+    writer
+        .put(&key, SecretValue::from("v"), SharingMode::Tenant)
+        .await
+        .expect("put ok");
+    assert_eq!(
+        *stub.put_preconditions.lock(),
+        [PutPrecondition::CreateOnly]
+    );
+}
+
+#[tokio::test]
+async fn put_over_an_existing_reference_falls_back_to_an_exists_overwrite() {
+    let stub = Arc::new(StubMutator::default());
+    stub.put_responses
+        .lock()
+        .push_back(Err(cs_already_exists()));
+    let writer = CredStoreWriter::new(stub.clone(), build_system_ctx(Uuid::nil()));
+    let key = SecretRef::new("k").expect("valid SecretRef");
+    writer
+        .put(&key, SecretValue::from("v"), SharingMode::Tenant)
+        .await
+        .expect("overwrite ok");
+    assert_eq!(
+        *stub.put_preconditions.lock(),
+        [PutPrecondition::CreateOnly, PutPrecondition::Exists]
+    );
+    let calls = stub.put_calls.lock();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].1, b"v", "the overwrite carries the same value");
+}
+
+#[tokio::test]
+async fn put_propagates_a_precondition_failure_when_the_record_vanishes_between_the_steps() {
+    let stub = Arc::new(StubMutator::default());
+    stub.put_responses
+        .lock()
+        .push_back(Err(cs_already_exists()));
+    stub.put_responses
+        .lock()
+        .push_back(Err(cs_precondition_failed()));
+    let writer = CredStoreWriter::new(stub.clone(), build_system_ctx(Uuid::nil()));
+    let key = SecretRef::new("k").expect("valid SecretRef");
+    let err = writer
+        .put(&key, SecretValue::from("v"), SharingMode::Tenant)
+        .await
+        .expect_err("no retry loop");
+    assert!(matches!(err, CredStoreError::PreconditionFailed));
+    assert_eq!(stub.put_preconditions.lock().len(), 2, "no third attempt");
+}
+
+#[tokio::test]
+async fn put_propagates_other_create_errors_without_an_overwrite() {
+    let stub = Arc::new(StubMutator::default());
+    stub.put_responses
+        .lock()
+        .push_back(Err(cs_unavailable("down")));
+    let writer = CredStoreWriter::new(stub.clone(), build_system_ctx(Uuid::nil()));
+    let key = SecretRef::new("k").expect("valid SecretRef");
+    let err = writer
+        .put(&key, SecretValue::from("v"), SharingMode::Tenant)
+        .await
+        .expect_err("surfaces");
+    assert!(matches!(err, CredStoreError::Unavailable { .. }));
+    assert_eq!(stub.put_preconditions.lock().len(), 1);
 }

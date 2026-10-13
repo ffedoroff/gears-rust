@@ -8,7 +8,7 @@ use crate::domain::type_provisioning::TypeProvisioningService;
 use crate::infra::type_provisioning::TypeProvisioningServiceImpl;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use tenant_resolver_sdk::TenantResolverClient;
 use toolkit::api::OpenApiRegistry;
@@ -81,7 +81,7 @@ impl Gear for OutboundApiGatewayGear {
         let route_repo = Arc::new(InMemoryRouteRepo::new());
         let tenant_resolver = ctx.client_hub().get::<dyn TenantResolverClient>()?;
 
-        let credstore = ctx.client_hub().get::<dyn CredStoreClientV1>()?;
+        let credstore = ctx.client_hub().get::<dyn CredStoreClientV2>()?;
 
         // -- AuthZ resolver for permission checks --
         let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
