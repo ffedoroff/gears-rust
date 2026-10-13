@@ -1211,6 +1211,10 @@ pub struct FakeSecretRepo {
     /// id returns, the stored row is removed — a concurrent delete landing
     /// before the read's re-read.
     pending_vanish: Mutex<Option<Uuid>>,
+    /// One-shot: the next `resolve_for_get` returns the stored row with this
+    /// id instead of its own answer — a concurrent change making the
+    /// re-resolution land on another row than `resolve_candidates` saw.
+    pending_redirect: Mutex<Option<Uuid>>,
     /// When `> 0`, the next `insert_active` applies its change and THEN fails
     /// with a simulated internal error: an ambiguous commit that did happen.
     insert_active_fail_after_commit: Mutex<usize>,
@@ -1262,6 +1266,7 @@ impl FakeSecretRepo {
             force_switch_value_none: Mutex::new(0),
             pending_switch: Mutex::new(None),
             pending_vanish: Mutex::new(None),
+            pending_redirect: Mutex::new(None),
             insert_active_fail_after_commit: Mutex::new(0),
             switch_value_fail_after_commit: Mutex::new(0),
             delete_failures: Mutex::new(0),
@@ -1424,6 +1429,16 @@ impl FakeSecretRepo {
     /// Panics if the internal mutex is poisoned.
     pub fn vanish_after_next_resolve(&self, row_id: Uuid) {
         *self.pending_vanish.lock().expect("lock") = Some(row_id);
+    }
+
+    /// One-shot: the next `resolve_for_get` answers with the stored row
+    /// `row_id` whatever it would have resolved to.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn redirect_next_resolve_for_get(&self, row_id: Uuid) {
+        *self.pending_redirect.lock().expect("lock") = Some(row_id);
     }
 
     /// Arrange for the next `n` `delete_by_id` calls to report `NotFound`
@@ -2007,7 +2022,12 @@ impl SecretRepo for FakeSecretRepo {
                     (a.sharing != SharingMode::Private).cmp(&(b.sharing != SharingMode::Private)),
                 )
             });
-        let result = best.cloned().map(|r| self.with_flags(r));
+        let redirect = self.pending_redirect.lock().expect("lock").take();
+        let result = match redirect {
+            Some(id) => rows.iter().find(|r| r.id == id).cloned(),
+            None => best.cloned(),
+        }
+        .map(|r| self.with_flags(r));
         drop(rows);
 
         // Apply a one-shot pending switch (read-races-a-switch test support):

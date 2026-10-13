@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
     CredStoreError, CredStorePluginClientV2, Credential, CredentialPatch, CredentialStatus,
-    CredentialWrite, Fallback as SdkFallback, InheritanceStatus, OwnerId, PatchField, PutOutcome,
-    Secret, SecretRef, SecretValue, SharingMode, StoreKey, TenantId, Validator, ValueVersion,
+    CredentialWrite, Fallback as SdkFallback, OwnerId, PatchField, PutOutcome, Secret, SecretRef,
+    SecretValue, SharingMode, StoreKey, TenantId, Validator, ValueVersion,
 };
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -45,6 +45,7 @@ use crate::domain::secret::model::{
     NewSecret, PutPrecondition, SecretRow, SecretStatus, WriteAttempt, WritePrecondition,
     WriteVerification,
 };
+use crate::domain::secret::reduce::{self, Reduced};
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
 use crate::domain::secret::typing;
@@ -415,8 +416,19 @@ impl Service {
     /// `updated_at`/`owner_id`), `read_secret` when `fields` names `secret`,
     /// both when both — and reads the value via
     /// `read_value_for_row` only when `secret` is selected and the
-    /// winner has one. A denial on either required action is the canonical
-    /// 404 (`Ok(None)`), before either representation is assembled. A
+    /// winner has one. Reads authorize first, like writes: the PDP is
+    /// evaluated BEFORE any row lookup, so a denial on either required
+    /// action, or a scope that excludes the caller's own tenant, is
+    /// `AccessDenied` (403) whether or not the record exists, and a PDP
+    /// outage is a 503 also for a reference that does not exist. After the
+    /// lookup the decisive row is chosen unclamped; the record the caller
+    /// sees is the caller's own row, else the decisive one, and the scope's
+    /// type/reference constraints are applied to it: a record they do not
+    /// admit is the canonical miss (`Ok(None)`). A value is served only from
+    /// a decisive row of the same type as that record (ADR-0010,
+    /// Inheritance): otherwise there is no value, the inheritance status is
+    /// `own`, the row never yields `SecretExpired` and nothing is read or
+    /// audited. A
     /// `secret`-only projection (no administrative field alongside it — the
     /// shape [`Self::get_secret`] uses) against a winner with no value to
     /// serve is the canonical miss too, exactly as the withdrawn
@@ -426,7 +438,8 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
+    /// Returns [`DomainError::AccessDenied`] if the PDP denies a required
+    /// action or the scope excludes the caller's tenant (before any lookup).
     /// Returns [`DomainError::NotFound`] or [`DomainError::ServiceUnavailable`]
     /// from the value read, exactly as [`Self::get_secret`] documents, when
     /// `secret` is selected and the winner has one.
@@ -479,83 +492,14 @@ impl Service {
 
         let req = TenantId(ctx.subject_tenant_id());
         let subject = OwnerId(ctx.subject_id());
-        let chain = self.dir.ancestor_chain(ctx, req).await?;
 
-        let candidates = self
-            .repo
-            .resolve_candidates(req, subject, key, &chain)
-            .await?;
-        if candidates.is_empty() {
-            if need_read_secret {
-                self.metrics.read_outcome(ReadOutcome::Miss);
-            }
-            return Ok(None);
-        }
-
-        // The caller's own row: two-phase priority, private beats non-private
-        // at the same (own) tenant — mirrors `find_own`/`resolve_for_get`.
-        let own = candidates
-            .iter()
-            .filter(|r| r.tenant_id == req)
-            .min_by_key(|r| i32::from(r.sharing != SharingMode::Private));
-
-        // The winner: nearest row that actually resolves — `active` (expired
-        // or not: expiry applies to the secret, so an expired record stays
-        // the decisive one), or `declared` with `fallback: none` (a
-        // suppressing row that competes and blocks). A `declared`/`inherit`
-        // row never competes (ADR-0004, Suppression; ADR-0005, "Reducing a
-        // reference to one item").
-        let now = OffsetDateTime::now_utc();
-        let resolvable = |r: &&SecretRow| match r.status {
-            SecretStatus::Active => true,
-            SecretStatus::Declared => r.fallback == Fallback::None,
-        };
-        let pos = |t: TenantId| chain.iter().position(|c| *c == t.0).unwrap_or(usize::MAX);
-        let winner = candidates.iter().filter(resolvable).min_by(|a, b| {
-            pos(a.tenant_id)
-                .cmp(&pos(b.tenant_id))
-                .then((a.sharing != SharingMode::Private).cmp(&(b.sharing != SharingMode::Private)))
-        });
-
-        let Some(effective) = own.or(winner) else {
-            // Nothing resolves and the caller holds no row at all.
-            if need_read_secret {
-                self.metrics.read_outcome(ReadOutcome::Miss);
-            }
-            return Ok(None);
-        };
-
-        let inheritance = if let Some(w) = winner {
-            if w.status == SecretStatus::Declared {
-                // A declared/none winner blocks the walk — the caller's own
-                // row or an ancestor's, either way the outcome is the same
-                // name (ADR-0004, Suppression).
-                InheritanceStatus::Suppressed
-            } else if own.is_some_and(|o| o.id == w.id) {
-                let ancestor_candidate_exists = candidates.iter().any(|r| r.tenant_id != req);
-                if ancestor_candidate_exists {
-                    InheritanceStatus::Overridden
-                } else {
-                    InheritanceStatus::Own
-                }
-            } else {
-                InheritanceStatus::Inherited
-            }
-        } else {
-            // Nothing resolves; the caller has an own `declared`/`inherit`
-            // row with nothing behind it — reported as `Own` (ADR-0004:
-            // "choose Own and document").
-            InheritanceStatus::Own
-        };
-
-        // Evaluate whichever of `read`/`read_secret` the projection needs -
-        // ONE PDP evaluation per action on the base credential type, never
-        // one per type - gated on the caller's own tenant, before either
-        // representation is assembled (mirrors the write paths). The PDP's
-        // type constraint must admit the effective record's type. A PDP
-        // denial, an out-of-scope tenant or an unadmitted type is
-        // indistinguishable from a missing record (anti-enumeration 404); a
-        // PDP or registry *outage* propagates.
+        // Reads authorize first, like writes: evaluate whichever of
+        // `read`/`read_secret` the projection needs - ONE PDP evaluation per
+        // action on the base credential type, never one per type - gated on
+        // the caller's own tenant, BEFORE any row lookup. A full denial or a
+        // scope that excludes the caller's own tenant is `AccessDenied`
+        // (403) whether or not the record exists, and is not a read miss; a
+        // PDP outage propagates, also for a reference that does not exist.
         let mut required: Vec<&str> = Vec::with_capacity(2);
         if need_read {
             required.push(actions::READ);
@@ -563,18 +507,38 @@ impl Service {
         if need_read_secret {
             required.push(actions::READ_SECRET);
         }
-        let scope = match self.authorize_actions(ctx, req, &required).await {
-            Ok(scope) => scope,
-            Err(DomainError::AccessDenied { .. }) => {
-                if need_read_secret {
-                    self.metrics.read_outcome(ReadOutcome::Miss);
-                }
-                return Ok(None);
+        let scope = self.authorize_actions(ctx, req, &required).await?;
+        let clamp = authz::row_clamp(&scope, req.0);
+
+        let chain = self.dir.ancestor_chain(ctx, req).await?;
+
+        let candidates = self
+            .repo
+            .resolve_candidates(req, subject, key, &chain)
+            .await?;
+
+        // Choose the decisive row unclamped, then the record the caller sees
+        // (own row, else the decisive one) - shared with the collection read.
+        let Some(reduced) = reduce::reduce_reference(&candidates, req, subject, &chain) else {
+            // Nothing resolves and the caller holds no row at all.
+            if need_read_secret {
+                self.metrics.read_outcome(ReadOutcome::Miss);
             }
-            Err(e) => return Err(e),
+            return Ok(None);
         };
-        if !authz::row_clamp(&scope, req.0).admits(effective.secret_type_uuid, &effective.reference)
-        {
+        let Reduced {
+            own,
+            winner,
+            effective,
+            value_row,
+            inheritance,
+        } = reduced;
+        let now = OffsetDateTime::now_utc();
+
+        // The PDP's type/reference constraints must admit the record the
+        // caller sees. A record they do not admit is answered exactly as a
+        // missing one.
+        if !clamp.admits(effective.secret_type_uuid, &effective.reference) {
             if need_read_secret {
                 self.metrics.read_outcome(ReadOutcome::Miss);
             }
@@ -626,18 +590,33 @@ impl Service {
             validator,
         };
 
-        // Read the value only when it was asked for and the winner actually
-        // has one. This re-resolves the winning row through
-        // `resolve_for_get` — the same single targeted query
-        // `get_secret`'s classic implementation issued — rather than reusing
-        // the in-memory `winner` above: it is what carries this read's
-        // retry-once protocol (ADR-0006 §6.2), and
-        // its `Secret::validator` is the row the value actually came from,
-        // which a concurrent switch can make momentarily different from the
-        // `winner` snapshot taken above.
+        // Read the value only when it was asked for and the decisive row
+        // (of the effective record's type) actually has one. This
+        // re-resolves the row through `resolve_for_get` — the same single
+        // targeted query `get_secret`'s classic implementation issued — and
+        // carries this read's retry-once protocol (ADR-0006 §6.2); the
+        // re-resolved row must be the expected one (same id), else the read
+        // is a miss, so a concurrent switch can never serve a row the
+        // authorization and the type rule were not evaluated on.
         let secret = if need_read_secret {
-            self.read_secret_audited(ctx, req, subject, key, &chain, &credential.secret_type)
+            if let Some(row) = value_row {
+                self.read_secret_audited(
+                    ctx,
+                    req,
+                    subject,
+                    key,
+                    &chain,
+                    &credential.secret_type,
+                    row.id,
+                )
                 .await?
+            } else {
+                // Nothing resolves, or the decisive row is of another type
+                // than the record the caller sees: no value, and nothing is
+                // read, expired-checked or audited.
+                self.metrics.read_outcome(ReadOutcome::Miss);
+                None
+            }
         } else {
             None
         };
@@ -665,7 +644,13 @@ impl Service {
     /// secret actually returned is audited as a success; an error after
     /// authorization that follows a resolved record as a failure. A miss
     /// (nothing, a value-less winner, or a re-read that finds the row gone or
-    /// another record - 404) discloses nothing and is not audited.
+    /// a row other than `expected_id`, the decisive row of the effective
+    /// record's type the caller authorized - 404) discloses nothing and is
+    /// not audited.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the resolve_for_get key, the audit type and the expected decisive row id"
+    )]
     async fn read_secret_audited(
         &self,
         ctx: &SecurityContext,
@@ -674,10 +659,19 @@ impl Service {
         key: &SecretRef,
         chain: &[Uuid],
         secret_type: &str,
+        expected_id: Uuid,
     ) -> Result<Option<Secret>, DomainError> {
         let mut debts_of = None;
         let read = async {
             let value_row = self.repo.resolve_for_get(req, subject, key, chain).await?;
+            // Re-resolution guard: the row served must be the very row the
+            // authorization and the type rule were evaluated on. A type and a
+            // reference are immutable, so the same id implies the same type;
+            // anything else (a concurrent switch) is a miss, nothing audited.
+            if value_row.as_ref().is_none_or(|row| row.id != expected_id) {
+                self.metrics.read_outcome(ReadOutcome::Miss);
+                return Ok(None);
+            }
             if let Some(row) = value_row.as_ref().filter(|row| row.heal.debts) {
                 debts_of = Some(row.store_key());
             }
@@ -747,7 +741,9 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
+    /// Returns [`DomainError::AccessDenied`] if the PDP denies `read_secret`
+    /// or the scope excludes the caller's tenant (a full denial is 403,
+    /// before any lookup, whether or not the reference exists).
     /// Returns [`DomainError::SecretExpired`] if the decisive record is an
     /// expired `active` row (the answer never falls through to an ancestor).
     /// Returns [`DomainError::NotFound`] if the reference resolves to nothing
@@ -797,8 +793,11 @@ impl Service {
     ///
     /// Callers MUST have already checked `row.value_version.is_some()` (a
     /// `declared`/suppressed row has nothing to read, and never causes a store
-    /// call) and authorized `resolved_gts_id` - this method performs neither
-    /// the resolution nor the PDP gate, only the read.
+    /// call), authorized `resolved_gts_id` (the PDP decision taken before any
+    /// lookup and its constraints applied to the record the caller sees) and
+    /// checked that `row` has the type of that record - this method performs
+    /// neither the resolution nor the PDP gate nor the type rule, only the
+    /// read.
     ///
     /// Returns `Ok(None)` (with the corresponding metric already recorded) on
     /// a legitimate miss: the retry finds the reference gone or switched to a
@@ -1377,8 +1376,9 @@ impl Service {
         }
 
         // Type consistency (`fr-override-type-consistency`) binds non-private
-        // records only: a private record is read by its owner alone, who
-        // chose its type, so it is neither checked nor counted.
+        // records only: a private record may carry any type, so it is
+        // neither checked nor counted; that is safe because a value is only
+        // ever served under a record of its own type (read rule, ADR-0010).
         if sharing != SharingMode::Private {
             // Upward: if the reference currently resolves, among non-private
             // records (the nearest ancestor's `shared` one), to a record of a

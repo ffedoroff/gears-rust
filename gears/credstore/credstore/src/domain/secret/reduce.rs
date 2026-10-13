@@ -33,6 +33,15 @@ pub(crate) struct Reduced<'a> {
     /// `own.or(winner)`: the row whose `sharing`/`expires_at`/
     /// `secret_type_uuid` describe the reference's effective record.
     pub effective: &'a SecretRow,
+    /// The row a value may be served from: the decisive `winner`, but only
+    /// when its `secret_type_uuid` equals the effective record's type (the
+    /// read rule of ADR-0010, Inheritance). `None` when nothing resolves or
+    /// when the caller's own row of one type sits over a decisive row of
+    /// another — which `private` rows, exempt from the create-time type
+    /// checks, or a race between creates can produce. Callers check this
+    /// BEFORE any expiry test, so such a winner never yields `SecretExpired`,
+    /// and never fall through to a farther row.
+    pub value_row: Option<&'a SecretRow>,
     /// Whether the effective value is the caller's own, inherited, an
     /// override of an inherited value, or a suppressing record with no
     /// value.
@@ -71,6 +80,12 @@ fn resolvable(r: &SecretRow) -> bool {
 /// Reduce every visible row of one reference — `candidates`, in any order —
 /// to a single outcome, or `None` if `candidates` is empty (nothing to
 /// report: neither an own row nor a resolvable ancestor row exists).
+///
+/// The decisive row is chosen from all candidates, unclamped by type or
+/// reference; the caller then applies the PDP scope to `effective` (the
+/// record the caller sees) and serves a value only from `value_row`. When
+/// the winner is of another type than `effective`, the inheritance status is
+/// reported as `Own`, as if that winner did not exist.
 ///
 /// `candidates` MUST be every row of the reference visible to `req`/`subject`
 /// across `chain` (ADR-0005: "reduction sees every row a value read would
@@ -112,7 +127,11 @@ pub(crate) fn reduce_reference<'a>(
 
     let effective = own.or(winner)?;
 
-    let inheritance = if let Some(w) = winner {
+    // A winner of another type than the record the caller sees is not a
+    // source of value, and does not shape the reported inheritance.
+    let value_row = winner.filter(|w| w.secret_type_uuid == effective.secret_type_uuid);
+
+    let inheritance = if let Some(w) = value_row {
         if w.status == SecretStatus::Declared {
             // A declared/none winner blocks the walk — the caller's own row
             // or an ancestor's, either way the outcome is the same name
@@ -129,8 +148,8 @@ pub(crate) fn reduce_reference<'a>(
             InheritanceStatus::Inherited
         }
     } else {
-        // Nothing resolves; the caller has an own `declared`/`inherit` row
-        // with nothing behind it — reported as `Own`
+        // Nothing (of the effective type) resolves; the caller has an own
+        // `declared`/`inherit` row with nothing behind it — reported as `Own`
         // (ADR-0004: "choose Own and document").
         InheritanceStatus::Own
     };
@@ -139,6 +158,7 @@ pub(crate) fn reduce_reference<'a>(
         own,
         winner,
         effective,
+        value_row,
         inheritance,
     })
 }
