@@ -324,3 +324,69 @@ fn own_status_reflects_the_callers_own_row_only() {
     let reduced = reduce(&candidates, own, &[own]).expect("reduces");
     assert_eq!(reduced.own_status(), CredentialStatus::Declared);
 }
+
+// ── a value only from a decisive row of the effective record's type ─────────
+
+fn typed(mut r: SecretRow, type_name: &str) -> SecretRow {
+    r.secret_type_uuid = SecretType::from_name(type_name).expect("type").uuid();
+    r
+}
+
+#[test]
+fn own_declared_a_over_ancestor_shared_b_has_no_value_row_and_is_own() {
+    let own = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let candidates = [
+        row(
+            own,
+            "r",
+            SharingMode::Private,
+            SecretStatus::Declared,
+            Fallback::Inherit,
+        ),
+        typed(
+            row(
+                parent,
+                "r",
+                SharingMode::Shared,
+                SecretStatus::Active,
+                Fallback::Inherit,
+            ),
+            "api-key",
+        ),
+    ];
+    let reduced = reduce(&candidates, own, &[own, parent]).expect("some");
+    assert_eq!(reduced.effective.id, candidates[0].id);
+    assert!(reduced.winner.is_some(), "the decisive row is still chosen");
+    assert!(reduced.value_row.is_none());
+    assert_eq!(reduced.inheritance, InheritanceStatus::Own);
+}
+
+#[test]
+fn own_declared_a_over_ancestor_shared_a_keeps_the_value_row() {
+    let own = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let candidates = [
+        row(
+            own,
+            "r",
+            SharingMode::Private,
+            SecretStatus::Declared,
+            Fallback::Inherit,
+        ),
+        row(
+            parent,
+            "r",
+            SharingMode::Shared,
+            SecretStatus::Active,
+            Fallback::Inherit,
+        ),
+    ];
+    let reduced = reduce(&candidates, own, &[own, parent]).expect("some");
+    assert_eq!(
+        reduced.value_row.map(|w| w.id),
+        Some(candidates[1].id),
+        "same type: the ancestor's row serves the value"
+    );
+    assert_eq!(reduced.inheritance, InheritanceStatus::Inherited);
+}

@@ -22,7 +22,7 @@ use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::service::{ListSettings, Service};
 use crate::domain::secret::test_support::{
     FakeDir, FakeMetrics, FakePlugin, FakePluginSelector, FakeSecretRepo, action_deny_enforcer,
-    catalog_type_resolver, make_ctx, mock_enforcer,
+    catalog_type_resolver, deny_enforcer, make_ctx, mock_enforcer,
 };
 use credstore_sdk::{CredentialWrite, Fallback, SecretRef, SecretType, SecretValue, SharingMode};
 
@@ -1719,6 +1719,21 @@ async fn get_credential_select_unknown_field_returns_400() {
     );
     let resp = h.router.oneshot(req).await.expect("router");
     assert_problem(resp, StatusCode::BAD_REQUEST, Some("INVALID_SELECT")).await;
+}
+
+#[tokio::test]
+async fn get_credential_fully_denied_by_the_pdp_returns_403_even_for_a_missing_reference() {
+    // Reads authorize first: a flat denial is 403 whether or not the
+    // reference exists, for the record and for the value alike.
+    let h = build_harness_with_enforcer(deny_enforcer());
+    for uri in [
+        "/credstore/v1/credentials/nothing",
+        "/credstore/v1/credentials/nothing?%24select=secret",
+    ] {
+        let req = json_request("GET", uri, None, test_ctx());
+        let resp = h.router.clone().oneshot(req).await.expect("router");
+        assert_problem(resp, StatusCode::FORBIDDEN, None).await;
+    }
 }
 
 #[tokio::test]

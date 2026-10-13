@@ -461,9 +461,12 @@ async fn empty_permitted_type_set_returns_empty_page_without_running_step_1() {
         .expect("create");
 
     let svc = service_with(repo.clone(), plugin, dir, deny_enforcer(), 200);
-    let page = svc.list(&ctx, &ODataQuery::new()).await.expect("list");
-    assert!(page.items.is_empty());
-    assert_eq!(page.page_info.next_cursor, None);
+    // A full denial is a refusal (403), never an empty page.
+    let err = svc
+        .list(&ctx, &ODataQuery::new())
+        .await
+        .expect_err("a denied list is refused");
+    assert!(matches!(err, DomainError::AccessDenied { .. }), "{err:?}");
     assert!(
         repo.list_candidate_references_type_clamps().is_empty(),
         "step 1 must not run when nothing is permitted"
