@@ -7,17 +7,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use credstore_sdk::{DestroySelector, OwnerId, SharingMode, StoreKey, TenantId, ValueVersion};
+use credstore_sdk::{DestroySelector, OwnerId, StoreKey, TenantId, ValueVersion};
 use sea_orm::{DbBackend, DbErr};
 use toolkit_db::DBProvider;
 use toolkit_db::secure::{DbTx, ScopeError, TxConfig};
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{
-    CleanupDebt, CleanupTask, Fallback, HealFlags, SecretRow, SecretStatus,
-};
+use crate::domain::secret::model::{CleanupDebt, CleanupTask, HealFlags, SecretRow};
 use crate::infra::canonical_mapping::classify_db_err_to_domain;
 use crate::infra::storage::entity;
+use crate::infra::storage::entity::enums::{DbCleanupOp, DbDestroySelector};
 
 pub type CredstoreDbProvider = DBProvider<DomainError>;
 
@@ -85,27 +84,28 @@ pub(crate) fn db_now_sql(backend: DbBackend) -> &'static str {
     }
 }
 
-/// `credstore_store_cleanup.op` codes.
-const OP_PURGE: i16 = 1;
-const OP_DESTROY: i16 = 2;
-/// `credstore_store_cleanup.selector` codes (destroy only).
-const SELECTOR_BELOW: i16 = 1;
-const SELECTOR_EXACT: i16 = 2;
-
 /// The `(op, selector, version)` columns of a debt row for `task`.
-pub(crate) fn task_to_columns(task: &CleanupTask) -> (i16, Option<i16>, Option<String>) {
+pub(crate) fn task_to_columns(
+    task: &CleanupTask,
+) -> (DbCleanupOp, Option<DbDestroySelector>, Option<String>) {
     match task {
-        CleanupTask::Purge(_) => (OP_PURGE, None, None),
-        CleanupTask::Destroy { selector, .. } => match selector {
-            DestroySelector::Below(v) => (OP_DESTROY, Some(SELECTOR_BELOW), Some(v.0.clone())),
-            DestroySelector::Exactly(v) => (OP_DESTROY, Some(SELECTOR_EXACT), Some(v.0.clone())),
-        },
+        CleanupTask::Purge(_) => (DbCleanupOp::from(task), None, None),
+        CleanupTask::Destroy { selector, .. } => {
+            let version = match selector {
+                DestroySelector::Below(v) | DestroySelector::Exactly(v) => v.0.clone(),
+            };
+            (
+                DbCleanupOp::from(task),
+                Some(DbDestroySelector::from(selector)),
+                Some(version),
+            )
+        }
     }
 }
 
 /// Map a `credstore_store_cleanup` row to the domain [`CleanupDebt`]. A
-/// stored code outside the documented set is storage corruption, like any
-/// other out-of-domain column.
+/// combination of columns the writer never produces (a purge with a
+/// selector, a destroy without one) is storage corruption.
 pub(crate) fn entity_to_debt(m: entity::store_cleanup::Model) -> Result<CleanupDebt, DomainError> {
     let corrupt = |what: &str| DomainError::Internal {
         diagnostic: format!("credstore_store_cleanup out-of-domain {what}"),
@@ -113,47 +113,27 @@ pub(crate) fn entity_to_debt(m: entity::store_cleanup::Model) -> Result<CleanupD
     };
     let key = StoreKey::new(TenantId(m.tenant_id), m.record_id);
     let task = match (m.op, m.selector, m.version) {
-        (OP_PURGE, None, None) => CleanupTask::Purge(key),
-        (OP_DESTROY, Some(SELECTOR_BELOW), Some(v)) => CleanupTask::Destroy {
+        (DbCleanupOp::Purge, None, None) => CleanupTask::Purge(key),
+        (DbCleanupOp::Destroy, Some(selector), Some(v)) => CleanupTask::Destroy {
             key,
-            selector: DestroySelector::Below(ValueVersion(v)),
-        },
-        (OP_DESTROY, Some(SELECTOR_EXACT), Some(v)) => CleanupTask::Destroy {
-            key,
-            selector: DestroySelector::Exactly(ValueVersion(v)),
+            selector: selector.with_version(ValueVersion(v)),
         },
         _ => return Err(corrupt("op/selector/version combination")),
     };
     Ok(CleanupDebt { id: m.id, task })
 }
 
-/// Map an entity row to the domain [`SecretRow`].
-pub(crate) fn entity_to_model(m: entity::secrets::Model) -> Result<SecretRow, DomainError> {
-    let sharing = sharing_from_i16(m.sharing).ok_or_else(|| DomainError::Internal {
-        diagnostic: format!(
-            "credstore_secrets.sharing out-of-domain value: {}",
-            m.sharing
-        ),
-        cause: None,
-    })?;
-    let status = SecretStatus::from_smallint(m.status).ok_or_else(|| DomainError::Internal {
-        diagnostic: format!("credstore_secrets.status out-of-domain value: {}", m.status),
-        cause: None,
-    })?;
-    let fallback = Fallback::from_smallint(m.fallback).ok_or_else(|| DomainError::Internal {
-        diagnostic: format!(
-            "credstore_secrets.fallback out-of-domain value: {}",
-            m.fallback
-        ),
-        cause: None,
-    })?;
-    Ok(SecretRow {
+/// Map an entity row to the domain [`SecretRow`]. The `SMALLINT` columns are
+/// typed by the storage enums, so a code outside the stored domain never gets
+/// this far: the column decode rejects it.
+pub(crate) fn entity_to_model(m: entity::secrets::Model) -> SecretRow {
+    SecretRow {
         id: m.id,
         tenant_id: TenantId(m.tenant_id),
         reference: m.reference,
-        sharing,
+        sharing: m.sharing.into(),
         owner_id: OwnerId(m.owner_id),
-        status,
+        status: m.status.into(),
         version: m.version,
         updated_at: m.updated_at,
         // Opaque here: the domain layer resolves the UUID to the type id +
@@ -161,27 +141,8 @@ pub(crate) fn entity_to_model(m: entity::secrets::Model) -> Result<SecretRow, Do
         secret_type_uuid: m.secret_type_uuid,
         expires_at: m.expires_at,
         value_version: m.value_version.map(ValueVersion),
-        fallback,
+        fallback: m.fallback.into(),
         heal: HealFlags::default(),
-    })
-}
-
-/// Map [`SharingMode`] to its `SMALLINT` storage value.
-pub(crate) fn sharing_to_i16(s: SharingMode) -> i16 {
-    match s {
-        SharingMode::Private => 1,
-        SharingMode::Tenant => 2,
-        SharingMode::Shared => 3,
-    }
-}
-
-/// Map a `SMALLINT` storage value to [`SharingMode`].
-pub(crate) fn sharing_from_i16(v: i16) -> Option<SharingMode> {
-    match v {
-        1 => Some(SharingMode::Private),
-        2 => Some(SharingMode::Tenant),
-        3 => Some(SharingMode::Shared),
-        _ => None,
     }
 }
 
@@ -215,13 +176,13 @@ mod tests {
     use toolkit_db::secure::ScopeError;
     use uuid::Uuid;
 
-    use super::{
-        domain_db_err, entity_to_debt, entity_to_model, map_scope_err, sharing_from_i16,
-        sharing_to_i16, task_to_columns,
-    };
+    use super::{domain_db_err, entity_to_debt, entity_to_model, map_scope_err, task_to_columns};
     use crate::domain::error::DomainError;
     use crate::domain::secret::model::{Fallback, SecretStatus};
     use crate::infra::storage::entity;
+    use crate::infra::storage::entity::enums::{
+        DbCleanupOp, DbDestroySelector, DbFallback, DbSharing, DbStatus,
+    };
     use credstore_sdk::SharingMode;
 
     /// An `Active`, `Tenant`-shared row with every column in domain.
@@ -230,38 +191,24 @@ mod tests {
             id: Uuid::new_v4(),
             tenant_id: Uuid::new_v4(),
             reference: "openai-key".to_owned(),
-            sharing: 2,
+            sharing: DbSharing::Tenant,
             owner_id: Uuid::nil(),
-            status: 2,
+            status: DbStatus::Active,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
             version: 1,
             secret_type_uuid: Uuid::new_v4(),
             expires_at: None,
             value_version: Some("7".to_owned()),
-            fallback: 1,
+            fallback: DbFallback::Inherit,
         }
-    }
-
-    #[test]
-    fn sharing_round_trips_through_its_smallint_encoding() {
-        for mode in [
-            SharingMode::Private,
-            SharingMode::Tenant,
-            SharingMode::Shared,
-        ] {
-            assert_eq!(sharing_from_i16(sharing_to_i16(mode)), Some(mode));
-        }
-        // Codes outside the stored domain have no mode.
-        assert_eq!(sharing_from_i16(0), None);
-        assert_eq!(sharing_from_i16(4), None);
     }
 
     #[test]
     fn entity_to_model_maps_every_column_onto_the_domain_row() {
         let m = row();
         let (id, tenant_id) = (m.id, m.tenant_id);
-        let mapped = entity_to_model(m).expect("in-domain row maps");
+        let mapped = entity_to_model(m);
         assert_eq!(mapped.id, id);
         assert_eq!(mapped.tenant_id.0, tenant_id);
         assert_eq!(mapped.reference, "openai-key");
@@ -269,36 +216,6 @@ mod tests {
         assert_eq!(mapped.status, SecretStatus::Active);
         assert_eq!(mapped.fallback, Fallback::Inherit);
         assert_eq!(mapped.value_version.map(|v| v.0).as_deref(), Some("7"));
-    }
-
-    #[test]
-    fn entity_to_model_reports_each_out_of_domain_column_as_internal() {
-        for (column, m) in [
-            (
-                "sharing",
-                entity::secrets::Model {
-                    sharing: 9,
-                    ..row()
-                },
-            ),
-            ("status", entity::secrets::Model { status: 9, ..row() }),
-            (
-                "fallback",
-                entity::secrets::Model {
-                    fallback: 9,
-                    ..row()
-                },
-            ),
-        ] {
-            let err = entity_to_model(m).expect_err("out-of-domain column must be rejected");
-            let DomainError::Internal { diagnostic, .. } = err else {
-                panic!("{column}: expected Internal");
-            };
-            assert!(
-                diagnostic.contains(column),
-                "{column}: diagnostic must name the column, got {diagnostic}"
-            );
-        }
     }
 
     #[test]
@@ -337,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_debt_row_with_a_corrupt_shape_is_internal() {
-        let bad = |op: i16, selector: Option<i16>, version: Option<&str>| {
+        let bad = |op: DbCleanupOp, selector: Option<DbDestroySelector>, version: Option<&str>| {
             entity_to_debt(entity::store_cleanup::Model {
                 id: Uuid::new_v4(),
                 tenant_id: Uuid::new_v4(),
@@ -349,10 +266,10 @@ mod tests {
             })
         };
         for (op, selector, version) in [
-            (9, None, None),
-            (1, Some(1), None),
-            (2, None, Some("7")),
-            (2, Some(3), Some("7")),
+            (DbCleanupOp::Purge, Some(DbDestroySelector::Below), None),
+            (DbCleanupOp::Purge, None, Some("7")),
+            (DbCleanupOp::Destroy, None, Some("7")),
+            (DbCleanupOp::Destroy, Some(DbDestroySelector::Exactly), None),
         ] {
             assert!(matches!(
                 bad(op, selector, version),

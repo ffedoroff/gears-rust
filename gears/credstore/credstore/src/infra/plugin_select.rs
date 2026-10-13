@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStorePluginClientV2, CredStorePluginSpecV1};
+use credstore_sdk::{CredStorePluginClientV2, CredStorePluginSpecV2};
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
@@ -46,7 +46,7 @@ impl GtsCredStorePluginSelector {
             }
         })?;
 
-        let type_id = CredStorePluginSpecV1::gts_type_id();
+        let type_id = CredStorePluginSpecV2::gts_type_id();
         let instances = registry
             .list_instances(InstanceQuery::new().with_pattern(format!("{type_id}*")))
             .await
@@ -59,7 +59,7 @@ impl GtsCredStorePluginSelector {
                 }
             })?;
 
-        let gts_id = choose_plugin_instance::<CredStorePluginSpecV1>(
+        let gts_id = choose_plugin_instance::<CredStorePluginSpecV2>(
             &self.vendor,
             instances.iter().map(|e| (e.id.as_ref(), &e.object)),
         )

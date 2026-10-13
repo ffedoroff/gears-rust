@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use credstore_sdk::{
     CredentialPatch, CredentialWrite, DestroySelector, Fallback as SdkFallback, PatchField,
-    SecretRef, SecretType, SecretValue, SharingMode, StoreKey, ValueVersion,
+    SecretRef, SecretType, SecretValue, SecretWrite, SharingMode, StoreKey, ValueVersion,
 };
 use uuid::Uuid;
 
@@ -37,7 +37,7 @@ fn write_create(value: &str) -> CredentialWrite {
         sharing: SharingMode::Tenant,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        secret: Some(SecretValue::from(value)),
+        secret: SecretWrite::Set(SecretValue::from(value)),
     }
 }
 

@@ -5,14 +5,15 @@
 //! write half is a no-op that reports a placeholder validator, and `list`
 //! returns the seeded references sorted, with values only when `secret` is selected.
 
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::ODataQuery;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::MockCredStoreClient;
 use crate::{
-    CredStoreClientV1, CredStoreError, CredentialPatch, CredentialWrite, Fallback, PutPrecondition,
-    SecretRef, SecretValue, SharingMode, Validator, WritePrecondition,
+    CredStoreClientV2, CredStoreError, CredentialPatch, CredentialWrite, Fallback, PutPrecondition,
+    SecretRef, SecretValue, SecretWrite, SharingMode, Validator, WritePrecondition,
 };
 
 /// The validator every successful write of the mock reports.
@@ -21,6 +22,12 @@ fn placeholder_validator() -> Validator {
         id: Uuid::nil(),
         version: 1,
     }
+}
+
+/// The typed projection of the error of a result (`None` for `Ok`); the
+/// success value is dropped unprinted.
+fn projection<T>(result: Result<T, CanonicalError>) -> Option<CredStoreError> {
+    result.err().map(CredStoreError::from)
 }
 
 fn ctx() -> SecurityContext {
@@ -37,7 +44,7 @@ fn write() -> CredentialWrite {
         sharing: SharingMode::default(),
         fallback: Fallback::default(),
         expires_at: None,
-        secret: Some(SecretValue::from("new-value")),
+        secret: SecretWrite::Set(SecretValue::from("new-value")),
     }
 }
 
@@ -136,11 +143,11 @@ async fn mock_write_result_secret_expired_is_ok_for_writes() {
     let client = MockCredStoreClient::with_expired_secret();
     let key = reference("expired-ref");
     let secret_read = client.get_secret(&ctx(), &key).await;
+    // Only the error is printed: a secret-bearing result never goes to a log.
+    let projected = projection(secret_read);
     assert!(
-        matches!(secret_read, Err(CredStoreError::SecretExpired)),
-        // Only the error is printed: a secret-bearing result never goes to a log.
-        "premise: the secret read reports the expiry, got error: {:?}",
-        secret_read.as_ref().err()
+        matches!(projected, Some(CredStoreError::SecretExpired)),
+        "premise: the secret read reports the expiry, got error: {projected:?}"
     );
 
     let put = client
@@ -170,23 +177,26 @@ async fn mock_always_failing_write_half_returns_internal() {
     let put = client
         .put(&ctx(), &key, write(), PutPrecondition::CreateOnly)
         .await;
+    let projected = projection(put);
     assert!(
-        matches!(put, Err(CredStoreError::Internal(_))),
-        "put: expected Internal, got: {put:?}"
+        matches!(projected, Some(CredStoreError::Internal { .. })),
+        "put: expected Internal, got: {projected:?}"
     );
 
     let patched = client
         .patch(&ctx(), &key, patch(), WritePrecondition::Exists)
         .await;
+    let projected = projection(patched);
     assert!(
-        matches!(patched, Err(CredStoreError::Internal(_))),
-        "patch: expected Internal, got: {patched:?}"
+        matches!(projected, Some(CredStoreError::Internal { .. })),
+        "patch: expected Internal, got: {projected:?}"
     );
 
     let deleted = client.delete(&ctx(), &key, WritePrecondition::Exists).await;
+    let projected = projection(deleted);
     assert!(
-        matches!(deleted, Err(CredStoreError::Internal(_))),
-        "delete: expected Internal, got: {deleted:?}"
+        matches!(projected, Some(CredStoreError::Internal { .. })),
+        "delete: expected Internal, got: {projected:?}"
     );
 }
 
@@ -341,8 +351,9 @@ async fn mock_always_failing_list_returns_internal() {
 
     let result = client.list(&ctx(), &ODataQuery::new()).await;
 
+    let projected = projection(result);
     assert!(
-        matches!(result, Err(CredStoreError::Internal(_))),
-        "expected Internal, got: {result:?}"
+        matches!(projected, Some(CredStoreError::Internal { .. })),
+        "expected Internal, got: {projected:?}"
     );
 }

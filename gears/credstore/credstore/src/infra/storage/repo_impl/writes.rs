@@ -12,7 +12,7 @@
 //! intent first, in the same transaction - see the module docs on
 //! [`crate::domain::secret::repo::SecretRepo`].
 
-use credstore_sdk::{DestroySelector, SharingMode, StoreKey, TenantId, ValueVersion};
+use credstore_sdk::{SharingMode, StoreKey, TenantId, ValueVersion};
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveValue, ColumnTrait, Condition, DbBackend, DbErr, EntityTrait, ExprTrait, QueryFilter,
@@ -26,13 +26,14 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::secret::cleanup::{DeadContent, cleanup_tasks};
 use crate::domain::secret::model::{
-    CleanupDebt, CleanupTask, Fallback, IntentCommit, NewDeclaredSecret, NewSecret, SecretRow,
-    SecretStatus, WriteAttempt,
+    CleanupDebt, Fallback, IntentCommit, NewDeclaredSecret, NewSecret, SecretRow, WriteAttempt,
 };
 use crate::infra::storage::entity;
+use crate::infra::storage::entity::enums::{DbFallback, DbSharing, DbStatus};
 use crate::infra::storage::repo_impl::helpers::{
-    SecretRepoImpl, TxFuture, entity_to_model, map_scope_err, sharing_to_i16,
+    SecretRepoImpl, TxFuture, entity_to_model, map_scope_err,
 };
 use crate::infra::storage::repo_impl::intents::{
     delete_expired_intents_tx, delete_intent_tx, lost_write_tasks, record_debts,
@@ -83,9 +84,11 @@ pub(super) async fn insert_active(
     let am = active_model(new);
     let scope = scope.clone();
     let attempt = attempt.clone();
+    let version = new.value_version.clone();
     repo.run_tx(move |tx: &DbTx<'_>| {
         let (scope, am, attempt) = (scope.clone(), am.clone(), attempt.clone());
-        Box::pin(async move { insert_active_tx(tx, &scope, am, &attempt).await })
+        let version = version.clone();
+        Box::pin(async move { insert_active_tx(tx, &scope, am, &attempt, &version).await })
             as TxFuture<'_, IntentCommit<()>>
     })
     .await
@@ -98,16 +101,16 @@ pub(super) fn active_model(new: &NewSecret) -> entity::secrets::ActiveModel {
         id: ActiveValue::Set(new.id),
         tenant_id: ActiveValue::Set(new.tenant_id.0),
         reference: ActiveValue::Set(new.reference.as_ref().to_owned()),
-        sharing: ActiveValue::Set(sharing_to_i16(new.sharing)),
+        sharing: ActiveValue::Set(DbSharing::from(new.sharing)),
         owner_id: ActiveValue::Set(new.owner_id.0),
-        status: ActiveValue::Set(SecretStatus::Active.as_smallint()),
+        status: ActiveValue::Set(DbStatus::Active),
         created_at: ActiveValue::Set(now),
         updated_at: ActiveValue::Set(now),
         version: ActiveValue::NotSet,
         secret_type_uuid: ActiveValue::Set(new.secret_type_uuid),
         expires_at: ActiveValue::Set(new.expires_at),
         value_version: ActiveValue::Set(Some(new.value_version.0.clone())),
-        fallback: ActiveValue::Set(new.fallback.as_smallint()),
+        fallback: ActiveValue::Set(DbFallback::from(new.fallback)),
     }
 }
 
@@ -125,6 +128,7 @@ pub(super) async fn insert_active_tx(
     scope: &AccessScope,
     am: entity::secrets::ActiveModel,
     attempt: &WriteAttempt,
+    version: &ValueVersion,
 ) -> Result<IntentCommit<()>, DomainError> {
     // The intent first: if it was healed, nothing else may happen.
     if !delete_intent_tx(tx, attempt.attempt_id).await? {
@@ -147,14 +151,22 @@ pub(super) async fn insert_active_tx(
         // The reference is taken: a definite loss. The fresh record id can
         // never get a row, so the whole key is dead.
         Err(ScopeError::Db(DbErr::RecordNotInserted)) => {
-            let debts = record_debts(tx, vec![CleanupTask::Purge(attempt.key.clone())]).await?;
+            let tasks = cleanup_tasks(
+                DeadContent::LostWrite {
+                    key: &attempt.key,
+                    version,
+                    row_exists: false,
+                },
+                attempt.destroy_supported,
+            );
+            let debts = record_debts(tx, tasks).await?;
             Ok(IntentCommit::Lost { debts })
         }
         Err(e) => Err(map_scope_err(e)),
     }
 }
 
-/// Create-with-no-value path (ADR-0004 Amendment B): `status = declared`,
+/// Create-with-no-value path (ADR-0007, "PUT: whole replace, secret tri-state"): `status = declared`,
 /// `value_version` `NULL`; no plugin call is ever made. A unique-index
 /// conflict maps to `DomainError::Conflict` through the same
 /// `classify_db_err_to_domain` ladder every other write uses.
@@ -168,16 +180,16 @@ pub(super) async fn insert_declared(
         id: ActiveValue::Set(new.id),
         tenant_id: ActiveValue::Set(new.tenant_id.0),
         reference: ActiveValue::Set(new.reference.as_ref().to_owned()),
-        sharing: ActiveValue::Set(sharing_to_i16(new.sharing)),
+        sharing: ActiveValue::Set(DbSharing::from(new.sharing)),
         owner_id: ActiveValue::Set(new.owner_id.0),
-        status: ActiveValue::Set(SecretStatus::Declared.as_smallint()),
+        status: ActiveValue::Set(DbStatus::Declared),
         created_at: ActiveValue::Set(now),
         updated_at: ActiveValue::Set(now),
         version: ActiveValue::NotSet,
         secret_type_uuid: ActiveValue::Set(new.secret_type_uuid),
         expires_at: ActiveValue::Set(new.expires_at),
         value_version: ActiveValue::Set(None),
-        fallback: ActiveValue::Set(new.fallback.as_smallint()),
+        fallback: ActiveValue::Set(DbFallback::from(new.fallback)),
     };
     create_row(repo, scope, am).await
 }
@@ -250,8 +262,8 @@ pub(super) async fn switch_value_tx(
     // The compare-and-set: `version` is the one the caller read before its
     // `plugin.put`, so a concurrent change of any kind matches nothing.
     // Accepts either resting status: a `declared` row switches to `active`
-    // exactly like an `active` row being rotated (ADR-0004, "Writing a value
-    // to a suppressed record is not a conflict").
+    // exactly like an `active` row being rotated (ADR-0008, "Suppression is one
+    // request, always").
     let rows_affected = entity::secrets::Entity::update_many()
         .col_expr(
             entity::secrets::Column::ValueVersion,
@@ -259,11 +271,11 @@ pub(super) async fn switch_value_tx(
         )
         .col_expr(
             entity::secrets::Column::Sharing,
-            Expr::value(sharing_to_i16(sharing)),
+            Expr::value(DbSharing::from(sharing)),
         )
         .col_expr(
             entity::secrets::Column::Fallback,
-            Expr::value(fallback.as_smallint()),
+            Expr::value(DbFallback::from(fallback)),
         )
         .col_expr(entity::secrets::Column::ExpiresAt, Expr::value(expires_at))
         .col_expr(
@@ -273,7 +285,7 @@ pub(super) async fn switch_value_tx(
         .col_expr(entity::secrets::Column::UpdatedAt, Expr::value(now))
         .col_expr(
             entity::secrets::Column::Status,
-            Expr::value(SecretStatus::Active.as_smallint()),
+            Expr::value(DbStatus::Active),
         )
         .filter(
             Condition::all()
@@ -308,20 +320,19 @@ pub(super) async fn switch_value_tx(
         .await
         .map_err(map_scope_err)?
         .ok_or_else(|| DomainError::internal("switch_value: row vanished after its own update"))?;
-    let row = entity_to_model(row)?;
+    let row = entity_to_model(row);
 
     // Every version below the one just committed is dead: destroy by position
     // (safe because the CAS base is the row read before the `put`). This also
     // covers whatever version a crashed writer of an expired intent may have
     // landed: versions are ordered and that writer's version is older.
-    let tasks = if attempt.destroy_supported {
-        vec![CleanupTask::Destroy {
-            key: attempt.key.clone(),
-            selector: DestroySelector::Below(new_value_version),
-        }]
-    } else {
-        Vec::new()
-    };
+    let tasks = cleanup_tasks(
+        DeadContent::Superseded {
+            key: &attempt.key,
+            new: &new_value_version,
+        },
+        attempt.destroy_supported,
+    );
     let debts = record_debts(tx, tasks).await?;
     // Heal the record's expired intents (the row read reported some).
     let healed = if attempt.heal_expired_intents {
@@ -336,7 +347,7 @@ pub(super) async fn switch_value_tx(
     })
 }
 
-/// Metadata-only update (ADR-0004 `PATCH` with no `value` key): never
+/// Metadata-only update (ADR-0007, "PATCH: merge, never creates", no `secret` key): never
 /// touches `value_version`/`status`. One transaction,
 /// mirroring `switch_value_tx`/`remove_value_tx`: lock + read the row first,
 /// then gate the UPDATE on the version just read under that lock.
@@ -404,11 +415,11 @@ async fn update_metadata_tx(
     let rows_affected = entity::secrets::Entity::update_many()
         .col_expr(
             entity::secrets::Column::Sharing,
-            Expr::value(sharing_to_i16(sharing)),
+            Expr::value(DbSharing::from(sharing)),
         )
         .col_expr(
             entity::secrets::Column::Fallback,
-            Expr::value(fallback.as_smallint()),
+            Expr::value(DbFallback::from(fallback)),
         )
         .col_expr(entity::secrets::Column::ExpiresAt, Expr::value(expires_at))
         .col_expr(
@@ -440,10 +451,10 @@ async fn update_metadata_tx(
         .ok_or_else(|| {
             DomainError::internal("update_metadata: row vanished after its own update")
         })?;
-    Some(entity_to_model(row)).transpose()
+    Ok(Some(entity_to_model(row)))
 }
 
-/// Secret removal (ADR-0004 `PATCH {"secret": null}`): ONE transaction - the
+/// Secret removal (ADR-0007, "PATCH: merge, never creates", `{"secret": null}`): ONE transaction - the
 /// compare-and-set that nulls the pointer and moves the row to `declared`
 /// (applying the merged metadata), plus the debts `destroy(Below(old))` and
 /// `destroy(Exactly(old))` for the value version the row held. Never touches
@@ -527,15 +538,15 @@ async fn remove_value_tx(
         )
         .col_expr(
             entity::secrets::Column::Status,
-            Expr::value(SecretStatus::Declared.as_smallint()),
+            Expr::value(DbStatus::Declared),
         )
         .col_expr(
             entity::secrets::Column::Sharing,
-            Expr::value(sharing_to_i16(sharing)),
+            Expr::value(DbSharing::from(sharing)),
         )
         .col_expr(
             entity::secrets::Column::Fallback,
-            Expr::value(fallback.as_smallint()),
+            Expr::value(DbFallback::from(fallback)),
         )
         .col_expr(entity::secrets::Column::ExpiresAt, Expr::value(expires_at))
         .col_expr(
@@ -567,23 +578,14 @@ async fn remove_value_tx(
         .await
         .map_err(map_scope_err)?
         .ok_or_else(|| DomainError::internal("remove_value: row vanished after its own update"))?;
-    let row = entity_to_model(row)?;
+    let row = entity_to_model(row);
 
     // `destroy`, never `delete_key`: a concurrent writer may already have put
     // a newer version under the same key. Below first, then the version
     // itself (`Below` is exclusive).
-    let tasks = match old_value_version {
-        Some(old) if destroy_supported => vec![
-            CleanupTask::Destroy {
-                key: key.clone(),
-                selector: DestroySelector::Below(old.clone()),
-            },
-            CleanupTask::Destroy {
-                key,
-                selector: DestroySelector::Exactly(old),
-            },
-        ],
-        _ => Vec::new(),
+    let tasks = match &old_value_version {
+        Some(old) => cleanup_tasks(DeadContent::Removed { key: &key, old }, destroy_supported),
+        None => Vec::new(),
     };
     let debts = record_debts(tx, tasks).await?;
     Ok(Some((row, debts)))
@@ -628,5 +630,6 @@ pub(super) async fn delete_row_tx(
     if rows_affected == 0 {
         return Err(DomainError::NotFound);
     }
-    record_debts(tx, vec![CleanupTask::Purge(key.clone())]).await
+    let tasks = cleanup_tasks(DeadContent::DeadKey { key }, false);
+    record_debts(tx, tasks).await
 }

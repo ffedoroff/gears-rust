@@ -14,7 +14,9 @@ use zeroize::Zeroize;
 
 use gts::GtsId;
 
-use crate::error::CredStoreError;
+use toolkit_canonical_errors::{CanonicalError, resource_error};
+
+use crate::field;
 
 /// Re-export from tenant-resolver-sdk for cross-gear type consistency.
 pub use tenant_resolver_sdk::TenantId;
@@ -53,11 +55,11 @@ impl StoreKey {
 }
 
 /// Opaque provider-assigned identifier of one stored value version
-/// (ADR-0006): a Vault/OpenBao `version`, a GCP secret version, an AWS
-/// `VersionId`. The provider chooses it, `put` returns it, the gear stores it
-/// verbatim in the row's `value_version` and passes it back to `get` and
-/// `destroy`. The gear never parses or compares it; ordering is a plugin-internal
-/// guarantee (required only together with `destroy`).
+/// (ADR-0006): a Vault/OpenBao `version`. The provider chooses it, `put`
+/// returns it, the gear stores it verbatim in the row's `value_version` and
+/// passes it back to `get` and `destroy`. The gear never parses or compares
+/// it; ordering is a plugin-internal guarantee (required only together with
+/// `destroy`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValueVersion(pub String);
 
@@ -104,7 +106,8 @@ impl fmt::Display for OwnerId {
 /// A validated secret reference key.
 ///
 /// Format: `[a-zA-Z0-9_-]+`, max 255 characters.
-/// Colons are prohibited to prevent `ExternalID` collisions in backend storage.
+/// Kept to one URL-safe token so a reference is usable verbatim as the `{ref}`
+/// path segment and in `$filter`; it is never part of the store key (ADR-0006).
 #[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct SecretRef(String);
 
@@ -120,29 +123,39 @@ impl SecretRef {
     ///
     /// # Errors
     ///
-    /// Returns `CredStoreError::InvalidSecretRef` if the input is empty,
-    /// exceeds 255 characters, or contains characters outside `[a-zA-Z0-9_-]`.
+    /// Returns a [`CanonicalError::InvalidArgument`] whose single field
+    /// violation names `reference` with reason [`field::INVALID_SECRET_REF`]
+    /// if the input is empty, exceeds 255 characters, or contains characters
+    /// outside `[a-zA-Z0-9_-]`; the same error the gear answers for an invalid
+    /// reference.
     #[must_use = "returns a Result that may contain a validation error"]
-    pub fn new(value: impl Into<String>) -> Result<Self, CredStoreError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, CanonicalError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(CredStoreError::invalid_ref("must not be empty"));
+            return Err(invalid_ref("must not be empty"));
         }
         if value.len() > 255 {
-            return Err(CredStoreError::invalid_ref(
-                "exceeds maximum length of 255 characters",
-            ));
+            return Err(invalid_ref("exceeds maximum length of 255 characters"));
         }
         if !value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
-            return Err(CredStoreError::invalid_ref(
+            return Err(invalid_ref(
                 "contains invalid characters; only [a-zA-Z0-9_-] are allowed",
             ));
         }
         Ok(Self(value))
     }
+}
+
+#[resource_error(gts_id!("cf.core.credstore.credential.v1~"))]
+struct CredentialScope;
+
+fn invalid_ref(detail: &str) -> CanonicalError {
+    CredentialScope::invalid_argument()
+        .with_field_violation("reference", detail, field::INVALID_SECRET_REF)
+        .create()
 }
 
 impl AsRef<str> for SecretRef {
@@ -239,7 +252,7 @@ pub enum SharingMode {
 /// every update/delete: there are no unconditional overwrites. Read the
 /// current generation from a prior [`Credential`]/[`Secret`] validator
 /// (`id` + `version`) and send [`Self::Matches`]; a failed precondition
-/// surfaces as [`CredStoreError::Conflict`].
+/// surfaces as [`crate::CredStoreError::PreconditionFailed`].
 ///
 /// [`Self::Exists`] is the deliberate, visible-in-code opt-out for blind
 /// create-or-replace flows that cannot hold a version (rotation /
@@ -248,7 +261,8 @@ pub enum SharingMode {
 /// carries no meaning beyond RFC 9110 last-writer-wins.
 ///
 /// `put` uses the distinct [`PutPrecondition`] instead, which additionally
-/// carries the create-only intent (`If-None-Match: *`, ADR-0004).
+/// carries the create-only intent (`If-None-Match: *`, ADR-0007, "PUT: whole replace,
+/// secret tri-state").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePrecondition {
     /// The target credential must already exist (REST `If-Match: *`). This is
@@ -274,7 +288,7 @@ pub enum WritePrecondition {
 
 /// The strong `ETag` source (ADR-0004, D4): a credential row's generation id
 /// plus its per-generation monotonic version. Renders on the wire as
-/// `"<id>.<version>"`. `Credential::validator` is `None` exactly when the
+/// `"<id>.<version>"`. `Credential::own` is `None` exactly when the
 /// caller's tenant holds no row under the reference, in which case the REST
 /// layer serves a weak, opaque validator instead (derived from the winning
 /// row, never usable in `If-Match`).
@@ -286,7 +300,7 @@ pub struct Validator {
     pub version: i64,
 }
 
-/// Outcome of [`CredStoreClientV1::put`](crate::CredStoreClientV1::put):
+/// Outcome of [`CredStoreClientV2::put`](crate::CredStoreClientV2::put):
 /// whether the call created the record (`If-None-Match: *`, 201) or replaced
 /// it (204), and the validator to hand back as the response `ETag`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,26 +311,27 @@ pub struct PutOutcome {
     pub validator: Validator,
 }
 
-/// Precondition for [`CredStoreClientV1::put`](crate::CredStoreClientV1::put)
-/// (ADR-0004, "Two write verbs on one resource"). Unlike [`WritePrecondition`],
+/// Precondition for [`CredStoreClientV2::put`](crate::CredStoreClientV2::put)
+/// (ADR-0007, "Two Write Verbs on One Address"). Unlike [`WritePrecondition`],
 /// `put` distinguishes a create-only intent from a guarded or unconditional
 /// replace, because `PUT` is the one address that can both create and
 /// replace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutPrecondition {
-    /// `If-None-Match: *` — create-only; `Conflict` if the caller's own
+    /// `If-None-Match: *` — create-only; `AlreadyExists` if the caller's own
     /// tenant already holds a record under the reference (an inherited
-    /// representation does not count, ADR-0004 "If it exists is judged
-    /// against the caller's own tenant").
+    /// representation does not count, ADR-0007, "PUT: whole replace,
+    /// secret tri-state").
     CreateOnly,
-    /// `If-Match: *` — replace, last-writer-wins; `Conflict` if no own record
+    /// `If-Match: *` — replace, last-writer-wins; `PreconditionFailed` if no own record
     /// exists (a `PUT` never creates under this precondition).
     Exists,
-    /// `If-Match: "<id>.<version>"` — guarded replace.
+    /// `If-Match: "<id>.<version>"` — guarded replace; `PreconditionFailed` if
+    /// the validator no longer holds or no own record exists.
     Matches(Validator),
 }
 
-/// Suppression policy for the caller's own record (ADR-0004, "Suppression"):
+/// Suppression policy for the caller's own record (ADR-0008):
 /// what a reference means while its record holds no value. Shown only for
 /// the caller's own row — an ancestor's policy is not the caller's to see —
 /// and is present in [`CredentialWrite`]/[`CredentialPatch`] under the
@@ -337,18 +352,22 @@ pub enum Fallback {
     None,
 }
 
-/// The state of the caller's **own row** under a reference (ADR-0004, "Two
-/// representations"): never a saga state, never `provisioning` or
+/// The state of the caller's **own row** under a reference (ADR-0004): never a saga state, never `provisioning` or
 /// `deprovisioning` — those are invisible to every read.
 ///
-/// Wire form: lowercase `"none"` / `"declared"` / `"active"` / `"expired"`.
+/// Closed on purpose: the REST DTO mirrors it one-to-one, so a new variant must
+/// fail to compile there.
+///
+/// Wire form: lowercase `"declared"` / `"active"` / `"expired"`. The REST
+/// `"none"` status (the caller's tenant holds no row under the reference) is
+/// produced by the REST layer when [`Credential::own`] is absent; it has no
+/// variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialStatus {
-    /// The caller's tenant holds no row under the reference at all.
-    None,
-    /// The caller's own row exists but carries no value
-    /// (`PATCH {"secret": null}` was the last write to touch it).
+    /// The caller's own row exists but carries no value: it was created with
+    /// `secret: null` (`PUT` with `SecretWrite::Null`), or the value was
+    /// removed (`PATCH {"secret": null}`).
     Declared,
     /// The caller's own row exists and carries a value.
     Active,
@@ -360,9 +379,12 @@ pub enum CredentialStatus {
     Expired,
 }
 
-/// The state of the **effective row** a reference resolves to (ADR-0004,
-/// "Two representations"), which need not be the caller's own row. Computed
-/// at resolution/reduction time, never a stored or filterable column.
+/// The state of the **effective row** a reference resolves to (ADR-0004),
+/// which need not be the caller's own row. Computed at resolution/reduction
+/// time, never a stored or filterable column.
+///
+/// Closed on purpose: the REST DTO mirrors it one-to-one, so a new variant must
+/// fail to compile there.
 ///
 /// Wire form: lowercase `"own"` / `"inherited"` / `"overridden"` /
 /// `"suppressed"`.
@@ -370,7 +392,9 @@ pub enum CredentialStatus {
 #[serde(rename_all = "snake_case")]
 pub enum InheritanceStatus {
     /// The winning row is the caller's own, and no ancestor's `shared` row
-    /// under the same reference is in play.
+    /// under the same reference is in play. Also reported when the decisive
+    /// row has another type than the record the caller sees (its value is
+    /// then not served).
     Own,
     /// The winning row is an ancestor's `shared` row.
     Inherited,
@@ -382,54 +406,59 @@ pub enum InheritanceStatus {
     Suppressed,
 }
 
-/// The addressable **credential record** (ADR-0004, "Two representations"):
-/// reference, type, sharing, and two independent status fields — never the
-/// value, and never the owning tenant. `GET /credentials/{ref}`'s response
-/// shape and the collection item's shape (Phase 3).
+/// The caller's **own row** under a reference: its state and write metadata.
+/// Populated by the own row alone, even when the effective value is inherited
+/// (`inheritance: inherited` with a `declared` own row), never by an
+/// ancestor's row: an inherited entry must not disclose identifiers from
+/// another tenant, and a caller who needs the ancestor's owner acts in that
+/// tenant's context and reads it there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnRow {
+    /// State of the own row: `declared`/`active`/`expired`.
+    pub status: CredentialStatus,
+    /// Suppression policy of the own row.
+    pub fallback: Fallback,
+    /// Last-write instant of the own row.
+    pub updated_at: OffsetDateTime,
+    /// Subject id that created the own row.
+    pub owner_id: OwnerId,
+    /// The own row's validator (the strong `ETag` source); its `version` is
+    /// the row's monotonic version.
+    pub validator: Validator,
+}
+
+/// The addressable **credential record** (ADR-0004):
+/// reference, type, sharing, the effective-row state, and the caller's own
+/// row when there is one — never the value, and never the owning tenant. `GET /credentials/{ref}`'s response
+/// shape and the collection item's shape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Credential {
     /// The caller-chosen reference this record answers to.
     pub reference: SecretRef,
     /// The resolved record's full GTS type id (the effective record's type —
-    /// the caller's own row's type if it has one, else the winner's).
+    /// the caller's own row's type if it has one, else the winner's). A value
+    /// is only ever served under a record of its own type: a decisive row of
+    /// another type yields no value and inheritance `own`.
     pub secret_type: String,
     /// Sharing mode of the effective record.
     pub sharing: SharingMode,
-    /// Suppression policy of the caller's **own** row; `None` when the
-    /// caller's tenant holds no row under the reference (`status: none`).
-    pub fallback: Option<Fallback>,
-    /// State of the caller's own row: `none`/`declared`/`active`/`expired`.
-    pub status: CredentialStatus,
     /// State of the effective row this reference resolves to.
     pub inheritance: InheritanceStatus,
-    /// Monotonic version of the caller's own row; `None` iff `status: none`.
-    pub version: Option<i64>,
-    /// Last-write instant of the caller's own row; `None` iff `status: none`.
-    pub updated_at: Option<OffsetDateTime>,
-    /// Subject id that created the caller's own row; `None` iff `status:
-    /// none` (the effective record is inherited from an ancestor with no
-    /// own row in play). Populated by the *own* row alone — even when the
-    /// effective value is inherited (`inheritance: inherited` with a
-    /// `declared` own row) — never by an ancestor's row: an inherited
-    /// entry must not disclose identifiers from another tenant, and a
-    /// caller who needs the ancestor's owner acts in that tenant's context
-    /// and reads it there.
-    pub owner_id: Option<OwnerId>,
     /// Expiry instant of the effective record, when the type is expirable
     /// and one was set.
     pub expires_at: Option<OffsetDateTime>,
-    /// The caller's own row's validator (the strong `ETag` source);
-    /// `None` iff the caller's tenant holds no row under the reference, in
-    /// which case the REST layer serves a weak, opaque `ETag` instead.
-    pub validator: Option<Validator>,
+    /// The caller's own row; `None` when the caller's tenant holds no row
+    /// under the reference (the REST layer then serves status `none` and a
+    /// weak, opaque `ETag`).
+    pub own: Option<OwnRow>,
 }
 
-/// The value, with exactly what is needed to use it (ADR-0004, "Two
-/// representations"): nothing administrative rides along — `sharing`,
+/// The value, with exactly what is needed to use it (ADR-0004): nothing administrative rides along — `sharing`,
 /// `inheritance`, `status` stay on [`Credential`]. The SDK-side convenience
-/// envelope [`CredStoreClientV1::get_secret`](crate::CredStoreClientV1::get_secret)
+/// envelope [`CredStoreClientV2::get_secret`](crate::CredStoreClientV2::get_secret)
 /// wraps, projecting `GET /credentials/{ref}?$select=reference,type,expires_at,secret`
-/// to exactly these four fields (ADR-0004 Amendment A) — the shape the
+/// to these four wire fields plus the row's validator (ADR-0004, "Read actions
+/// follow the projection") — the shape the
 /// withdrawn `GET /credentials/{ref}/secret` used to return.
 #[derive(Debug)]
 #[allow(
@@ -440,7 +469,9 @@ pub struct Secret {
     /// The reference this value was resolved through.
     pub reference: SecretRef,
     /// The resolved value's full GTS type id (a consumer must know whether
-    /// it is parsing a `basic_auth` object or an `api_key` string).
+    /// it is parsing a `basic_auth` object or an `api_key` string). Always the
+    /// type of the record the value is served under; a decisive row of another
+    /// type yields no value.
     pub secret_type: String,
     /// Expiry instant, when the type is expirable and one was set.
     pub expires_at: Option<OffsetDateTime>,
@@ -451,17 +482,33 @@ pub struct Secret {
     pub validator: Validator,
 }
 
-/// Body of [`CredStoreClientV1::put`](crate::CredStoreClientV1::put) — a
-/// whole-credential replace: fields absent reset to their defaults (ADR-0004,
-/// "Two write verbs"). `secret` is required at the REST boundary (its
-/// *absence* on the wire is 400 `SECRET_REQUIRED`, before this type is even
-/// built), but once past that gate it is tri-state (ADR-0004 Amendment B,
-/// "The value-less record: reached only on purpose"): `Some(_)` writes a
-/// value (create, or replace/rotate), `None` is an explicit `null` — no value
-/// is written: on create the row is inserted `declared`; on replace of an
-/// `active` row the value is removed in the same one transaction
-/// `PATCH {"secret": null}` uses; on replace of an already-`declared` row
-/// nothing about the value changes.
+/// The secret part of a [`CredentialWrite`], tri-state once past the REST
+/// gate (a wire body that omits `secret` is rejected before this type is
+/// built).
+///
+/// `Set` stores a new value version. `Null` on create makes a value-less
+/// (`declared`) record; on a replace it removes the stored value (needs
+/// `write_secret` when a value existed) — a removal is always an explicit
+/// decision. To change metadata (for example `sharing`) without touching the
+/// secret, use `patch`.
+#[derive(Debug)]
+pub enum SecretWrite {
+    /// Store this value as a new version.
+    Set(SecretValue),
+    /// Write no value: a value-less create, or a removal on replace.
+    Null,
+}
+
+/// Body of [`CredStoreClientV2::put`](crate::CredStoreClientV2::put) — a
+/// whole-credential replace: fields absent reset to their defaults (ADR-0007,
+/// "PUT: whole replace, secret tri-state"). `secret` is required
+/// at the REST boundary (its *absence* on the wire is 400 `SECRET_REQUIRED`,
+/// before this type is even built); past that gate it is a [`SecretWrite`]:
+/// `Set` writes a value (create, or replace/rotate), `Null` writes none: on
+/// create the row is inserted `declared`; on replace of an `active` row the
+/// value is removed in the same one transaction `PATCH {"secret": null}`
+/// uses; on replace of an already-`declared` row nothing about the value
+/// changes.
 #[derive(Debug)]
 pub struct CredentialWrite {
     /// Full GTS type id. Required on create: nothing is defaulted, and a
@@ -472,18 +519,15 @@ pub struct CredentialWrite {
     pub sharing: SharingMode,
     /// Suppression policy; defaults to [`Fallback::Inherit`].
     pub fallback: Fallback,
-    /// Expiry instant. `None` clears any stored expiry — a `PUT` is a whole
-    /// replace, so an absent `expires_at` on the wire means "no expiry",
-    /// exactly as an omitted field on today's shipped `PUT` already clears
-    /// one.
+    /// Expiry instant. `put` replaces the whole record, so `None` clears any
+    /// stored expiry. To rotate the secret and keep the expiry, `patch` with
+    /// only `secret`.
     pub expires_at: Option<OffsetDateTime>,
-    /// The value to write, or `None` for an explicit `null` (no value on
-    /// either side of the request — a value-less create, or a value removal/
-    /// no-op on replace, per the type's own doc above). The REST layer maps
-    /// the wire's *absent* `secret` key to 400 (`SECRET_REQUIRED`) before this
-    /// type is ever constructed, so `None` here is unambiguously "explicit
-    /// null", never "the caller forgot the field".
-    pub secret: Option<SecretValue>,
+    /// The secret to write: a new value, or an explicit `Null`. The REST
+    /// layer maps the wire's *absent* `secret` key to 400 (`SECRET_REQUIRED`)
+    /// before this type is ever constructed, so `Null` here is unambiguously
+    /// an explicit `null`, never "the caller forgot the field".
+    pub secret: SecretWrite,
 }
 
 /// Tri-state field for an RFC 7396 JSON Merge Patch: absent (untouched),
@@ -509,9 +553,9 @@ impl<T> PatchField<T> {
     }
 }
 
-/// Body of [`CredStoreClientV1::patch`](crate::CredStoreClientV1::patch) — an
+/// Body of [`CredStoreClientV2::patch`](crate::CredStoreClientV2::patch) — an
 /// RFC 7396 JSON Merge Patch over the mutable fields of [`Credential`] plus
-/// `secret` (ADR-0004). A field absent from every one of these is untouched; a
+/// `secret` (ADR-0007, "PATCH: merge, never creates"). A field absent from every one of these is untouched; a
 /// `PatchField::Null` on `expires_at`/`secret` clears/removes it. `sharing`,
 /// `fallback` and `secret_type` have no `Null` state on the wire — a
 /// merge-patch `null` for any of them is a REST-layer 400
@@ -547,17 +591,17 @@ impl CredentialPatch {
     }
 }
 
-/// One item of the collection read (`CredStoreClientV1::list`, ADR-0005): the
+/// One item of the collection read (`CredStoreClientV2::list`, ADR-0005): the
 /// reduced [`Credential`] a reference resolves to, plus its decrypted value
 /// (`secret`) when the request selected it (`$select` containing `secret`,
-/// ADR-0004). `secret` is `None` otherwise — the collection never carries a
+/// ADR-0004, "Read actions follow the projection"). `secret` is `None` otherwise — the collection never carries a
 /// value unless the caller opted in, and even then only for the items whose
 /// value the caller may read.
 #[derive(Debug)]
 pub struct CredentialListItem {
     /// The reduced credential record (ADR-0005, "Reducing a reference to one
     /// item"): one item per reference, matching what a point read
-    /// (`CredStoreClientV1::get`) of that reference would resolve to.
+    /// (`CredStoreClientV2::get_record`) of that reference would resolve to.
     pub credential: Credential,
     /// The decrypted value, present only when `secret` is selected and only for an item
     /// the caller may read (`read_secret`); an item the caller may not read
@@ -673,7 +717,6 @@ mod models_tests {
     #[test]
     fn credential_status_wire_form_is_lowercase() {
         for (s, expected) in [
-            (CredentialStatus::None, "\"none\""),
             (CredentialStatus::Declared, "\"declared\""),
             (CredentialStatus::Active, "\"active\""),
             (CredentialStatus::Expired, "\"expired\""),
@@ -739,20 +782,31 @@ mod models_tests {
             secret_type: "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"
                 .to_owned(),
             sharing: SharingMode::Tenant,
-            fallback: Some(Fallback::Inherit),
-            status: CredentialStatus::Active,
             inheritance: InheritanceStatus::Own,
-            version: Some(1),
-            updated_at: None,
-            owner_id: Some(OwnerId::nil()),
             expires_at: None,
-            validator: None,
+            own: Some(OwnRow {
+                status: CredentialStatus::Active,
+                fallback: Fallback::Inherit,
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+                owner_id: OwnerId::nil(),
+                validator: Validator {
+                    id: Uuid::nil(),
+                    version: 1,
+                },
+            }),
         };
         let item = CredentialListItem {
             credential,
             secret: None,
         };
         assert!(item.secret.is_none());
+    }
+
+    #[test]
+    fn secret_write_debug_redacts_the_value() {
+        let set = SecretWrite::Set(SecretValue::from("s3cr3t"));
+        assert!(!format!("{set:?}").contains("s3cr3t"));
+        assert_eq!(format!("{:?}", SecretWrite::Null), "Null");
     }
 
     #[test]

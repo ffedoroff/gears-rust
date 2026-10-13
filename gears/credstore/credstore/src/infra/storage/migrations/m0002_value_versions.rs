@@ -6,7 +6,9 @@
 //! (`active`/`declared`; `1`/`3` retired and reserved), the pointer/status
 //! `CHECK` `credstore_secrets_value_version_check` is added, the
 //! value-fingerprint fence columns (`value_fp`, `fp_key_id`) and their
-//! `CHECK` are dropped, and the reaper's `idx_credstore_pending` is dropped.
+//! `CHECK` are dropped, the reaper's `idx_credstore_pending` is dropped, and
+//! the `DEFAULT` of `secret_type_uuid` (the v1 `generic` type) is dropped: a
+//! row must now name its type explicitly.
 //! The write-intent journal `credstore_write_intents` is added: a secret write
 //! inserts `(attempt_id, tenant_id, record_id, reference, lease_until)` before
 //! it `put`s under the store key `(tenant_id, record_id)` and deletes it in the
@@ -19,7 +21,9 @@
 //! read by point lookups only (no index on a time column: nothing scans them),
 //! and neither is a task queue; nothing in the schema tracks garbage by itself.
 //!
-//! Per-backend raw SQL, like `m0001_initial_schema`. `PostgreSQL` rewrites the
+//! Per-backend raw SQL, because the steps need what a schema builder does not
+//! express: `PostgreSQL` `DO` blocks, a lookup of the unnamed `CHECK` in
+//! `pg_constraint`, and a table rebuild on `SQLite`. `PostgreSQL` rewrites the
 //! shipped anonymous status `CHECK` in place - its auto-generated name is
 //! looked up from `pg_constraint` by the exact column it references, never
 //! guessed. `SQLite` cannot `DROP CONSTRAINT` or widen an existing `CHECK`,
@@ -50,7 +54,6 @@
 //! pre-migration database snapshot together with the store snapshot (credstore
 //! DESIGN section 8).
 
-use credstore_sdk::types::GENERIC_TYPE_UUID_STR;
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
 
@@ -71,6 +74,15 @@ pub const VALUE_MIGRATION_STATE_TABLE: &str = "credstore_value_migration";
 /// has finished copying values, so this migration may run: `schema` is the
 /// phase in which the tool itself applies it.
 pub const VALUE_MIGRATION_COPY_DONE_PHASES: [&str; 4] = ["schema", "activating", "tidying", "done"];
+
+/// Column of [`VALUE_MIGRATION_STATE_TABLE`] that holds the tool's phase. Part
+/// of the contract the external migration tool writes.
+pub const VALUE_MIGRATION_PHASE_COLUMN: &str = "phase";
+
+/// Boolean column of [`VALUE_MIGRATION_STATE_TABLE`] that records the
+/// `--discard-values` decision. Part of the contract the external migration
+/// tool writes.
+pub const VALUE_MIGRATION_DISCARD_VALUES_COLUMN: &str = "discard_values";
 
 /// The guard's error text.
 pub const VALUES_NOT_MIGRATED: &str = "credstore holds credentials written before the \
@@ -149,8 +161,11 @@ impl Migration {
         let phases = VALUE_MIGRATION_COPY_DONE_PHASES
             .map(|p| format!("'{p}'"))
             .join(", ");
-        let recorded =
-            format!("SELECT 1 FROM {table} WHERE phase IN ({phases}) OR discard_values LIMIT 1");
+        let phase_col = VALUE_MIGRATION_PHASE_COLUMN;
+        let discard_col = VALUE_MIGRATION_DISCARD_VALUES_COLUMN;
+        let recorded = format!(
+            "SELECT 1 FROM {table} WHERE {phase_col} IN ({phases}) OR {discard_col} LIMIT 1"
+        );
         Self::exists(conn, backend, &recorded).await
     }
 
@@ -254,6 +269,8 @@ $do$;
             "ALTER TABLE credstore_secrets DROP COLUMN IF EXISTS fp_key_id;",
             // The reaper's sweep index has nothing left to sweep.
             "DROP INDEX IF EXISTS idx_credstore_pending;",
+            // Rows must name their type: the v1 `DEFAULT` goes (idempotent).
+            "ALTER TABLE credstore_secrets ALTER COLUMN secret_type_uuid DROP DEFAULT;",
             // The write-intent journal: one row per in-flight secret write
             // attempt; `lease_until` is on the database clock.
             "CREATE TABLE IF NOT EXISTS credstore_write_intents (
@@ -294,10 +311,8 @@ $do$;
     }
 
     async fn up_sqlite(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
-        let generic_uuid_hex = GENERIC_TYPE_UUID_STR.replace('-', "");
         let statements = [
-            format!(
-                r"
+            r"
 CREATE TABLE credstore_secrets_new (
     id BLOB PRIMARY KEY NOT NULL,
     tenant_id BLOB NOT NULL,
@@ -308,14 +323,14 @@ CREATE TABLE credstore_secrets_new (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     version BIGINT NOT NULL DEFAULT 1,
-    secret_type_uuid BLOB NOT NULL DEFAULT (x'{generic_uuid_hex}'),
+    secret_type_uuid BLOB NOT NULL,
     expires_at TEXT NULL,
     value_version TEXT NULL,
     fallback SMALLINT NOT NULL DEFAULT 1 CHECK (fallback IN (1, 2)),
     CONSTRAINT credstore_secrets_value_version_check CHECK ((value_version IS NULL) = (status = 4))
 );
-                "
-            ),
+            "
+            .to_owned(),
             // Only `active` rows are carried, and only as `declared`: the
             // store key shape changes from `tenant/reference/class` to
             // `(tenant_id, record_id)`, so no pre-migration value was ever

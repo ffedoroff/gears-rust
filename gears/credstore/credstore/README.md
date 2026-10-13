@@ -54,7 +54,7 @@ The `cf-gears-credstore` module provides:
   store side effect is executed by the request that caused it
 - **Store cleanup debt in `PostgreSQL`** — the `credstore_store_cleanup` table
   holds one row per obligation: `purge` (`delete_key`) or `destroy` (only where
-  the plugin declares `supports_destroy`). A debt is written in the same
+  the plugin exposes a `destroyer`). A debt is written in the same
   transaction that makes store content dead (a rotation, a secret removal, a
   lost compare-and-set, a record delete). After a **confirmed** commit the
   same request executes the debts it just recorded and deletes each row on
@@ -86,7 +86,7 @@ The `cf-gears-credstore` module provides:
   (`credstore_*_total` OpenTelemetry instruments); no inventory gauge, never a
   `COUNT` query
 - **Backend plugin** — a versioned value store (`CredStorePluginClientV2`: `put`, `get`, `delete_key`, optional `destroy`) keyed by `(tenant_id, record_id)`, discovered via the types registry (vendor)
-- **`ClientHub` + REST** — registers `CredStoreClientV1`; exposes `/credstore/v1/credentials`
+- **`ClientHub` + REST** — registers `CredStoreClientV2`; exposes `/credstore/v1/credentials`
 
 This module depends on `types-registry`, `tenant-resolver`, and `authz-resolver`,
 and **requires a database**. The secret value is stored in a plugin (e.g.
@@ -115,7 +115,7 @@ falling through to an ancestor's value. The owner renews it in place with a
 
 A version the backend holds but can never return (lost or rotated decryption
 key, corrupt entry) — or one that is gone although the row's pointer did not
-move — is permanent: the read fails `500` (SDK `CredStoreError::Internal`, logged),
+move — is permanent: the read fails `500` (canonical `Internal`, logged),
 unlike the transient `503` for a version that vanished while the pointer moved.
 The record must be rewritten or deleted; in a collection read with `secret` selected such
 an item fails the whole request. Rotating
@@ -132,7 +132,7 @@ formatting or logging it; the record itself is read with `get_record` (`read`):
 ```no_run
 use std::error::Error;
 
-use credstore_sdk::{CredStoreClientV1, SecretRef};
+use credstore_sdk::{CredStoreClientV2, SecretRef};
 use toolkit::ClientHub;
 use toolkit_security::SecurityContext;
 
@@ -140,7 +140,7 @@ async fn secret_length(
     hub: &ClientHub,
     security: &SecurityContext,
 ) -> Result<Option<usize>, Box<dyn Error>> {
-    let credstore = hub.get::<dyn CredStoreClientV1>()?;
+    let credstore = hub.get::<dyn CredStoreClientV2>()?;
     let key = SecretRef::new("my-api-key")?;
     let secret = credstore.get_secret(security, &key).await?;
 

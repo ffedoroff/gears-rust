@@ -245,13 +245,14 @@ fn expired_own_row_stays_decisive_and_shadows_the_ancestor() {
     assert_eq!(reduced.own.map(|o| o.tenant_id.0), Some(own));
     assert_eq!(reduced.winner.map(|w| w.tenant_id.0), Some(own));
     assert_eq!(reduced.inheritance, InheritanceStatus::Overridden);
-    assert_eq!(reduced.own_status(), CredentialStatus::Expired);
+    assert_eq!(
+        reduced.own_row().map(|o| o.status),
+        Some(CredentialStatus::Expired)
+    );
 }
 
 #[test]
 fn expired_ancestor_shared_row_is_the_decisive_winner() {
-    use credstore_sdk::CredentialStatus;
-
     let own = Uuid::new_v4();
     let parent = Uuid::new_v4();
     let grandparent = Uuid::new_v4();
@@ -276,7 +277,7 @@ fn expired_ancestor_shared_row_is_the_decisive_winner() {
     let reduced = reduce(&candidates, own, &[own, parent, grandparent]).expect("reduces");
     assert_eq!(reduced.winner.map(|w| w.tenant_id.0), Some(parent));
     assert_eq!(reduced.inheritance, InheritanceStatus::Inherited);
-    assert_eq!(reduced.own_status(), CredentialStatus::None);
+    assert_eq!(reduced.own_row().map(|o| o.status), None);
 }
 
 #[test]
@@ -294,12 +295,15 @@ fn a_declared_row_never_expires() {
     declared.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(5));
     let candidates = [declared];
     let reduced = reduce(&candidates, own, &[own]).expect("reduces");
-    assert_eq!(reduced.own_status(), CredentialStatus::Declared);
+    assert_eq!(
+        reduced.own_row().map(|o| o.status),
+        Some(CredentialStatus::Declared)
+    );
     assert_eq!(reduced.inheritance, InheritanceStatus::Suppressed);
 }
 
 #[test]
-fn own_status_reflects_the_callers_own_row_only() {
+fn own_row_reflects_the_callers_own_row_only() {
     use credstore_sdk::CredentialStatus;
 
     let own = Uuid::new_v4();
@@ -312,7 +316,7 @@ fn own_status_reflects_the_callers_own_row_only() {
         Fallback::Inherit,
     )];
     let reduced = reduce(&candidates, own, &[own, parent]).expect("reduces");
-    assert_eq!(reduced.own_status(), CredentialStatus::None);
+    assert_eq!(reduced.own_row().map(|o| o.status), None);
 
     let candidates = [row(
         own,
@@ -322,7 +326,10 @@ fn own_status_reflects_the_callers_own_row_only() {
         Fallback::Inherit,
     )];
     let reduced = reduce(&candidates, own, &[own]).expect("reduces");
-    assert_eq!(reduced.own_status(), CredentialStatus::Declared);
+    assert_eq!(
+        reduced.own_row().map(|o| o.status),
+        Some(CredentialStatus::Declared)
+    );
 }
 
 // ── a value only from a decisive row of the effective record's type ─────────
