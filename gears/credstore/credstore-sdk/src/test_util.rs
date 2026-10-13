@@ -1,5 +1,5 @@
 // Updated: 2026-10-06 by Constructor Tech
-//! Test-only [`CredStoreClientV1`] doubles, behind the `test-util` feature.
+//! Test-only [`CredStoreClientV2`] doubles, behind the `test-util` feature.
 //!
 //! A single configurable [`MockCredStoreClient`] covering the shapes consumers
 //! exercise in tests, so each gear no longer hand-rolls its own:
@@ -10,7 +10,7 @@
 //! * [`MockCredStoreClient::returning_raw_value`] — a fixed raw value for any
 //!   reference (e.g. non-UTF-8 bytes to drive malformed-value paths);
 //! * [`MockCredStoreClient::always_failing`] — every operation fails with
-//!   [`CredStoreError::Internal`].
+//!   a canonical `Internal` error.
 //!
 //! Only `get`/`get_secret`/`list` carry behaviour; the write half (`put`/
 //! `patch`/`delete`) is a no-op that succeeds (or fails, in the
@@ -23,16 +23,42 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use time::OffsetDateTime;
+use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
 use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+use crate::reason::failed_precondition::SECRET_EXPIRED;
 use crate::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
-    CredentialStatus, CredentialWrite, Fallback, InheritanceStatus, OwnerId, PutOutcome,
-    PutPrecondition, Secret, SecretRef, SecretType, SecretValue, SharingMode, Validator,
-    WritePrecondition,
+    CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialStatus,
+    CredentialWrite, Fallback, InheritanceStatus, OwnRow, OwnerId, PutOutcome, PutPrecondition,
+    Secret, SecretRef, SecretType, SecretValue, SharingMode, Validator, WritePrecondition,
 };
+
+#[resource_error(gts_id!("cf.core.credstore.credential.v1~"))]
+struct CredentialScope;
+
+fn backend_failure() -> CanonicalError {
+    CanonicalError::internal("backend failure").create()
+}
+
+fn not_found() -> CanonicalError {
+    CredentialScope::not_found("credential not found")
+        .with_resource("credential")
+        .create()
+}
+
+fn secret_expired() -> CanonicalError {
+    CredentialScope::failed_precondition()
+        .with_precondition_violation(
+            "secret",
+            "the credential's secret has expired; renew the credential",
+            SECRET_EXPIRED,
+        )
+        .with_override(Http::status_code(409))
+        .create()
+}
 
 enum Behavior {
     /// `get`/`get_secret` return the mapped value for a known reference, else
@@ -40,18 +66,18 @@ enum Behavior {
     Store(HashMap<String, Vec<u8>>),
     /// `get`/`get_secret` return this raw value for *any* reference.
     AnyValue(Vec<u8>),
-    /// Every operation fails with [`CredStoreError::Internal`].
+    /// Every operation fails with a canonical `Internal` error.
     Failing,
-    /// `get`/`get_secret` fail with [`CredStoreError::NotFound`] — a client
+    /// `get`/`get_secret` fail with a canonical `NotFound` error — a client
     /// implementation that reports the not-found surface as an error instead
     /// of `Ok(None)`.
     NotFound,
     /// `get` returns the record; `get_secret` fails with
-    /// [`CredStoreError::SecretExpired`] for any reference.
+    /// a canonical `FailedPrecondition` (`SECRET_EXPIRED`) for any reference.
     SecretExpired,
 }
 
-/// Configurable in-process [`CredStoreClientV1`] test double. See the module
+/// Configurable in-process [`CredStoreClientV2`] test double. See the module
 /// docs for the available modes.
 pub struct MockCredStoreClient {
     behavior: Behavior,
@@ -93,7 +119,7 @@ impl MockCredStoreClient {
         }
     }
 
-    /// Every operation fails with [`CredStoreError::Internal`] — for
+    /// Every operation fails with a canonical `Internal` error — for
     /// error-handling paths.
     #[must_use]
     pub fn always_failing() -> Self {
@@ -102,7 +128,7 @@ impl MockCredStoreClient {
         }
     }
 
-    /// `get`/`get_secret` fail with [`CredStoreError::NotFound`] for any
+    /// `get`/`get_secret` fail with a canonical `NotFound` error for any
     /// reference — for consumers hardening against clients that report the
     /// not-found surface as an error instead of `Ok(None)`.
     #[must_use]
@@ -112,7 +138,7 @@ impl MockCredStoreClient {
         }
     }
 
-    /// `get_secret` fails with [`CredStoreError::SecretExpired`] for any
+    /// `get_secret` fails with a canonical `FailedPrecondition` (`SECRET_EXPIRED`) for any
     /// reference (and `get` returns the record) — for consumers exercising
     /// the expired-secret path.
     #[must_use]
@@ -123,20 +149,21 @@ impl MockCredStoreClient {
     }
 
     /// Build a canned [`Credential`] record with placeholder metadata (nil
-    /// generation id, `generic` type, version 1, own/active, no expiry).
+    /// generation id, `generic` type, own/active, no expiry).
     fn credential(reference: &SecretRef) -> Credential {
         Credential {
             reference: reference.clone(),
             secret_type: SecretType::generic().gts_id().to_owned(),
             sharing: SharingMode::default(),
-            fallback: Some(Fallback::default()),
-            status: CredentialStatus::Active,
             inheritance: InheritanceStatus::Own,
-            version: Some(1),
-            updated_at: None,
-            owner_id: Some(OwnerId::nil()),
             expires_at: None,
-            validator: Some(Self::validator()),
+            own: Some(OwnRow {
+                status: CredentialStatus::Active,
+                fallback: Fallback::default(),
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+                owner_id: OwnerId::nil(),
+                validator: Self::validator(),
+            }),
         }
     }
 
@@ -158,9 +185,9 @@ impl MockCredStoreClient {
         }
     }
 
-    fn write_result(&self) -> Result<(), CredStoreError> {
+    fn write_result(&self) -> Result<(), CanonicalError> {
         match self.behavior {
-            Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
+            Behavior::Failing => Err(backend_failure()),
             Behavior::Store(_)
             | Behavior::AnyValue(_)
             | Behavior::NotFound
@@ -170,19 +197,19 @@ impl MockCredStoreClient {
 }
 
 #[async_trait]
-impl CredStoreClientV1 for MockCredStoreClient {
+impl CredStoreClientV2 for MockCredStoreClient {
     async fn get_record(
         &self,
         _ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<Credential>, CredStoreError> {
+    ) -> Result<Option<Credential>, CanonicalError> {
         match &self.behavior {
             Behavior::Store(store) => Ok(store
                 .contains_key(key.as_ref())
                 .then(|| Self::credential(key))),
             Behavior::AnyValue(_) | Behavior::SecretExpired => Ok(Some(Self::credential(key))),
-            Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
-            Behavior::NotFound => Err(CredStoreError::NotFound),
+            Behavior::Failing => Err(backend_failure()),
+            Behavior::NotFound => Err(not_found()),
         }
     }
 
@@ -190,16 +217,16 @@ impl CredStoreClientV1 for MockCredStoreClient {
         &self,
         _ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<Secret>, CredStoreError> {
+    ) -> Result<Option<Secret>, CanonicalError> {
         match &self.behavior {
             Behavior::Store(store) => Ok(store
                 .get(key.as_ref())
                 .cloned()
                 .map(|v| Self::secret(key, v))),
             Behavior::AnyValue(value) => Ok(Some(Self::secret(key, value.clone()))),
-            Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
-            Behavior::NotFound => Err(CredStoreError::NotFound),
-            Behavior::SecretExpired => Err(CredStoreError::SecretExpired),
+            Behavior::Failing => Err(backend_failure()),
+            Behavior::NotFound => Err(not_found()),
+            Behavior::SecretExpired => Err(secret_expired()),
         }
     }
 
@@ -209,7 +236,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
         _key: &SecretRef,
         _write: CredentialWrite,
         precondition: PutPrecondition,
-    ) -> Result<PutOutcome, CredStoreError> {
+    ) -> Result<PutOutcome, CanonicalError> {
         self.write_result().map(|()| PutOutcome {
             created: matches!(precondition, PutPrecondition::CreateOnly),
             validator: Self::validator(),
@@ -222,7 +249,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
         _key: &SecretRef,
         _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<Validator, CredStoreError> {
+    ) -> Result<Validator, CanonicalError> {
         self.write_result().map(|()| Self::validator())
     }
 
@@ -231,7 +258,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
         _ctx: &SecurityContext,
         _key: &SecretRef,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CanonicalError> {
         self.write_result()
     }
 
@@ -244,13 +271,13 @@ impl CredStoreClientV1 for MockCredStoreClient {
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+    ) -> Result<Page<CredentialListItem>, CanonicalError> {
         let limit = query.limit.unwrap_or(50);
         let with_secrets = query
             .selected_fields()
             .is_some_and(|fields| fields.iter().any(|f| f.eq_ignore_ascii_case("secret")));
         match &self.behavior {
-            Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
+            Behavior::Failing => Err(backend_failure()),
             Behavior::NotFound | Behavior::AnyValue(_) | Behavior::SecretExpired => {
                 Ok(Page::empty(limit))
             }

@@ -5,7 +5,7 @@
 //! The backend contract (ADR-0006, [`crate::plugin_api`]) is small but strict:
 //! `put` returns a durable, provider-assigned version; `get` returns exactly
 //! the bytes of the `put` that returned a version, or `None` when it is gone;
-//! `delete_key` and `destroy` are idempotent; and a backend that declares
+//! `delete_key` and `destroy` are idempotent; and a backend that provides
 //! `destroy` must hand out versions in order per key. The gear builds its
 //! write protocol on those guarantees, so a plugin that bends one of them
 //! corrupts data rather than failing loudly. This module is the executable
@@ -27,7 +27,7 @@
 //! # mod conformance_tests {
 //! # use async_trait::async_trait;
 //! # use credstore_sdk::{
-//! #     CredStoreError, CredStorePluginClientV2, SecretValue, StoreKey, ValueVersion,
+//! #     CredStorePluginClientV2, CredStorePluginError, SecretValue, StoreKey, ValueVersion,
 //! # };
 //! # use toolkit_security::SecurityContext;
 //! # struct MyPlugin;
@@ -39,11 +39,11 @@
 //! # #[async_trait]
 //! # impl CredStorePluginClientV2 for MyPlugin {
 //! #     async fn put(&self, _: &SecurityContext, _: &StoreKey, _: SecretValue)
-//! #         -> Result<ValueVersion, CredStoreError> { unimplemented!() }
+//! #         -> Result<ValueVersion, CredStorePluginError> { unimplemented!() }
 //! #     async fn get(&self, _: &SecurityContext, _: &StoreKey, _: &ValueVersion)
-//! #         -> Result<Option<SecretValue>, CredStoreError> { unimplemented!() }
+//! #         -> Result<Option<SecretValue>, CredStorePluginError> { unimplemented!() }
 //! #     async fn delete_key(&self, _: &SecurityContext, _: &StoreKey)
-//! #         -> Result<(), CredStoreError> { unimplemented!() }
+//! #         -> Result<(), CredStorePluginError> { unimplemented!() }
 //! # }
 //! use credstore_sdk::credstore_plugin_conformance;
 //!
@@ -67,7 +67,7 @@
 //! # mod conformance_tests {
 //! # use async_trait::async_trait;
 //! # use credstore_sdk::{
-//! #     CredStoreError, CredStorePluginClientV2, SecretValue, StoreKey, ValueVersion,
+//! #     CredStorePluginClientV2, CredStorePluginError, SecretValue, StoreKey, ValueVersion,
 //! # };
 //! # use toolkit_security::SecurityContext;
 //! # struct MyPlugin;
@@ -79,11 +79,11 @@
 //! # #[async_trait]
 //! # impl CredStorePluginClientV2 for MyPlugin {
 //! #     async fn put(&self, _: &SecurityContext, _: &StoreKey, _: SecretValue)
-//! #         -> Result<ValueVersion, CredStoreError> { unimplemented!() }
+//! #         -> Result<ValueVersion, CredStorePluginError> { unimplemented!() }
 //! #     async fn get(&self, _: &SecurityContext, _: &StoreKey, _: &ValueVersion)
-//! #         -> Result<Option<SecretValue>, CredStoreError> { unimplemented!() }
+//! #         -> Result<Option<SecretValue>, CredStorePluginError> { unimplemented!() }
 //! #     async fn delete_key(&self, _: &SecurityContext, _: &StoreKey)
-//! #         -> Result<(), CredStoreError> { unimplemented!() }
+//! #         -> Result<(), CredStorePluginError> { unimplemented!() }
 //! # }
 //! credstore_sdk::credstore_plugin_conformance!(
 //!     #[ignore = "needs Docker; run with `-- --ignored`"]
@@ -121,7 +121,7 @@
 //!   for this key") is borrowed from another key of the same plugin, so it is
 //!   always in the plugin's own format.
 //! * The checks marked "destroy" below are skipped, with a `tracing` warning
-//!   (install a subscriber to see it), when `supports_destroy()` is `false`;
+//!   (install a subscriber to see it), when `destroyer()` is `None`;
 //!   the suite never calls `destroy` on such a plugin.
 //! * The concurrent checks drive their calls with `join_all` on the calling
 //!   task, so they overlap exactly as far as the plugin awaits (network or
@@ -147,7 +147,7 @@
 //! | [`delete_key_does_not_touch_other_keys`] | `delete_key` removes only its own key |
 //! | [`concurrent_puts_yield_distinct_versions`] | concurrent puts to one key all succeed with pairwise distinct, readable versions |
 //!
-//! Destroy (only when `supports_destroy()`):
+//! Destroy (only when `destroyer()` is `Some`):
 //!
 //! | Check | What it proves |
 //! |-------|----------------|
@@ -162,8 +162,9 @@
 //!
 //! # What the suite does not cover
 //!
-//! * [`CredStoreError::ServiceUnavailable`](crate::CredStoreError::ServiceUnavailable)
-//!   and the permanent [`CredStoreError::Internal`](crate::CredStoreError::Internal)
+//! * [`CredStorePluginError::Unavailable`](crate::CredStorePluginError::Unavailable),
+//!   [`CredStorePluginError::CredentialsRejected`](crate::CredStorePluginError::CredentialsRejected)
+//!   and the permanent [`CredStorePluginError::Internal`](crate::CredStorePluginError::Internal)
 //!   of a version that exists but can never be read: a backend cannot be
 //!   made to go down or lose a decryption key from the outside. Test those
 //!   in the plugin.
@@ -288,7 +289,7 @@ macro_rules! __credstore_conformance_parse {
 /// # mod conformance_tests {
 /// # use async_trait::async_trait;
 /// # use credstore_sdk::{
-/// #     CredStoreError, CredStorePluginClientV2, SecretValue, StoreKey, ValueVersion,
+/// #     CredStorePluginClientV2, CredStorePluginError, SecretValue, StoreKey, ValueVersion,
 /// # };
 /// # use toolkit_security::SecurityContext;
 /// # #[derive(Default)]
@@ -296,11 +297,11 @@ macro_rules! __credstore_conformance_parse {
 /// # #[async_trait]
 /// # impl CredStorePluginClientV2 for MyPlugin {
 /// #     async fn put(&self, _: &SecurityContext, _: &StoreKey, _: SecretValue)
-/// #         -> Result<ValueVersion, CredStoreError> { unimplemented!() }
+/// #         -> Result<ValueVersion, CredStorePluginError> { unimplemented!() }
 /// #     async fn get(&self, _: &SecurityContext, _: &StoreKey, _: &ValueVersion)
-/// #         -> Result<Option<SecretValue>, CredStoreError> { unimplemented!() }
+/// #         -> Result<Option<SecretValue>, CredStorePluginError> { unimplemented!() }
 /// #     async fn delete_key(&self, _: &SecurityContext, _: &StoreKey)
-/// #         -> Result<(), CredStoreError> { unimplemented!() }
+/// #         -> Result<(), CredStorePluginError> { unimplemented!() }
 /// # }
 /// credstore_sdk::credstore_plugin_conformance!(MyPlugin::default());
 /// # }
@@ -314,7 +315,7 @@ macro_rules! __credstore_conformance_parse {
 /// # mod conformance_tests {
 /// # use async_trait::async_trait;
 /// # use credstore_sdk::{
-/// #     CredStoreError, CredStorePluginClientV2, SecretValue, StoreKey, ValueVersion,
+/// #     CredStorePluginClientV2, CredStorePluginError, SecretValue, StoreKey, ValueVersion,
 /// # };
 /// # use toolkit_security::SecurityContext;
 /// # #[derive(Default)]
@@ -322,11 +323,11 @@ macro_rules! __credstore_conformance_parse {
 /// # #[async_trait]
 /// # impl CredStorePluginClientV2 for MyPlugin {
 /// #     async fn put(&self, _: &SecurityContext, _: &StoreKey, _: SecretValue)
-/// #         -> Result<ValueVersion, CredStoreError> { unimplemented!() }
+/// #         -> Result<ValueVersion, CredStorePluginError> { unimplemented!() }
 /// #     async fn get(&self, _: &SecurityContext, _: &StoreKey, _: &ValueVersion)
-/// #         -> Result<Option<SecretValue>, CredStoreError> { unimplemented!() }
+/// #         -> Result<Option<SecretValue>, CredStorePluginError> { unimplemented!() }
 /// #     async fn delete_key(&self, _: &SecurityContext, _: &StoreKey)
-/// #         -> Result<(), CredStoreError> { unimplemented!() }
+/// #         -> Result<(), CredStorePluginError> { unimplemented!() }
 /// # }
 /// credstore_sdk::credstore_plugin_conformance!(
 ///     #[ignore = "needs Docker"]
@@ -653,7 +654,7 @@ pub async fn concurrent_puts_yield_distinct_versions(plugin: &dyn CredStorePlugi
 }
 
 // ---------------------------------------------------------------------------
-// Checks: destroy (skipped when the plugin does not declare it)
+// Checks: destroy (skipped when the plugin has no destroyer())
 // ---------------------------------------------------------------------------
 
 /// Destroy: `Below(v2)` over `v1 < v2 < v3` removes `v1` only; `v2` and `v3`
@@ -1117,14 +1118,14 @@ impl<'a> Harness<'a> {
     }
 
     /// A harness for a check that needs `destroy`, or `None` (after a
-    /// `tracing` warning) when the plugin does not declare it.
+    /// `tracing` warning) when the plugin has no `destroyer()`.
     fn for_destroy(check: &'static str, plugin: &'a dyn CredStorePluginClientV2) -> Option<Self> {
-        if plugin.supports_destroy() {
+        if plugin.destroyer().is_some() {
             Some(Self::new(check, plugin))
         } else {
             tracing::warn!(
                 check,
-                "conformance check skipped: the plugin does not declare supports_destroy()"
+                "conformance check skipped: the plugin does not provide destroyer()"
             );
             None
         }
@@ -1184,7 +1185,14 @@ impl<'a> Harness<'a> {
     }
 
     async fn destroy(&self, key: &StoreKey, selector: DestroySelector, what: &str) {
-        if let Err(e) = self.plugin.destroy(&self.ctx, key, selector).await {
+        let Some(destroyer) = self.plugin.destroyer() else {
+            self.fail(format_args!(
+                "{what} ({}): the plugin returned no destroyer(); destroy checks run only for \
+                 plugins that provide one",
+                describe(key)
+            ))
+        };
+        if let Err(e) = destroyer.destroy(&self.ctx, key, selector).await {
             self.fail(format_args!("{what} ({}) failed: {e}", describe(key)));
         }
     }

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use credstore_sdk::{CredentialPatch, CredentialStatus, CredentialWrite};
+use credstore_sdk::{CredentialPatch, CredentialStatus, CredentialWrite, SecretWrite};
 use credstore_sdk::{
     DestroySelector, Fallback as SdkFallback, InheritanceStatus, OwnerId, PatchField, SecretRef,
     SecretType, SecretValue, SharingMode, TenantId, ValueVersion,
@@ -103,7 +103,7 @@ fn write_create_typed(sharing: SharingMode, value: &str, type_name: &str) -> Cre
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        secret: Some(SecretValue::from(value)),
+        secret: SecretWrite::Set(SecretValue::from(value)),
     }
 }
 
@@ -115,24 +115,24 @@ fn write_replace(sharing: SharingMode, value: &str) -> CredentialWrite {
         sharing,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        secret: Some(SecretValue::from(value)),
+        secret: SecretWrite::Set(SecretValue::from(value)),
     }
 }
 
-/// A `CredentialWrite` for a create with an explicit `null` value (ADR-0004
-/// Amendment B): the row is inserted `declared`, `fallback` as given.
+/// A `CredentialWrite` for a create with an explicit `null` value (ADR-0007,
+/// "PUT: whole replace, secret tri-state"): the row is inserted `declared`, `fallback` as given.
 fn write_create_null(sharing: SharingMode, fallback: SdkFallback) -> CredentialWrite {
     CredentialWrite {
         secret_type: Some(SecretType::generic().into()),
         sharing,
         fallback,
         expires_at: None,
-        secret: None,
+        secret: SecretWrite::Null,
     }
 }
 
 /// A `CredentialWrite` for a replace with an explicit `null` value
-/// (ADR-0004 Amendment B): removes an existing value (active row) or leaves
+/// (ADR-0007, "PUT: whole replace, secret tri-state"): removes an existing value (active row) or leaves
 /// an already value-less row's value untouched (declared row), depending on
 /// the target's current state.
 fn write_replace_null(sharing: SharingMode, fallback: SdkFallback) -> CredentialWrite {
@@ -141,7 +141,7 @@ fn write_replace_null(sharing: SharingMode, fallback: SdkFallback) -> Credential
         sharing,
         fallback,
         expires_at: None,
-        secret: None,
+        secret: SecretWrite::Null,
     }
 }
 
@@ -219,7 +219,10 @@ async fn get_own_tenant_secret_returns_hit_own() {
         .expect("get")
         .expect("some");
     assert_eq!(cred.inheritance, InheritanceStatus::Own);
-    assert_eq!(cred.status, CredentialStatus::Active);
+    assert_eq!(
+        cred.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Active)
+    );
 }
 
 #[tokio::test]
@@ -256,11 +259,8 @@ async fn get_inherited_shared_from_parent_sets_inherited_status() {
         .expect("get")
         .expect("some");
     assert_eq!(cred.inheritance, InheritanceStatus::Inherited);
-    assert_eq!(cred.status, CredentialStatus::None);
-    assert!(
-        cred.validator.is_none(),
-        "no own row => no strong validator"
-    );
+    assert!(cred.own.is_none());
+    assert!(cred.own.is_none(), "no own row => no strong validator");
 }
 
 #[tokio::test]
@@ -565,7 +565,7 @@ async fn put_create_without_type_is_rejected() {
         sharing: SharingMode::Tenant,
         fallback: SdkFallback::Inherit,
         expires_at: None,
-        secret: Some(SecretValue::from("v")),
+        secret: SecretWrite::Set(SecretValue::from("v")),
     };
     let err = svc
         .put(&ctx, &key("k"), write, create_only())
@@ -1476,10 +1476,13 @@ async fn expired_own_override_is_secret_expired_not_the_ancestors_value() {
         .await
         .expect("get")
         .expect("the record stays visible");
-    assert_eq!(cred.status, CredentialStatus::Expired);
+    assert_eq!(
+        cred.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Expired)
+    );
     assert_eq!(cred.inheritance, InheritanceStatus::Overridden);
     assert!(cred.expires_at.is_some());
-    let validator = cred.validator.expect("normal validator");
+    let validator = cred.own.as_ref().expect("normal validator").validator;
     assert_eq!((validator.id, validator.version), (own.id, own.version));
 
     // The point read with the secret selected fails the same way, with or
@@ -1542,7 +1545,7 @@ async fn expired_decisive_ancestor_shared_record_is_secret_expired() {
         .expect("get")
         .expect("visible");
     assert_eq!(cred.inheritance, InheritanceStatus::Inherited);
-    assert_eq!(cred.status, CredentialStatus::None);
+    assert!(cred.own.is_none());
     assert!(cred.expires_at.expect("expiry") <= OffsetDateTime::now_utc());
 }
 
@@ -1619,7 +1622,10 @@ async fn secret_expired_is_only_disclosed_to_a_caller_who_may_read_the_secret() 
         .await
         .expect("get")
         .expect("visible");
-    assert_eq!(cred.status, CredentialStatus::Expired);
+    assert_eq!(
+        cred.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Expired)
+    );
 }
 
 #[tokio::test]
@@ -1673,7 +1679,10 @@ async fn patching_expires_at_renews_in_place_and_the_secret_is_served_again() {
         .await
         .expect("get")
         .expect("some");
-    assert_eq!(cred.status, CredentialStatus::Active);
+    assert_eq!(
+        cred.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Active)
+    );
 }
 
 #[tokio::test]
@@ -2354,110 +2363,76 @@ async fn removing_the_secret_needs_write_secret_on_the_reference() {
 // ── plugin-error mapping ─────────────────────────────────────────────────────
 
 #[test]
-#[allow(
-    clippy::cognitive_complexity,
-    reason = "a flat enumeration of every PluginError variant's DomainError mapping; splitting \
-              it would only scatter the one-to-one correspondence this test is checking"
-)]
-fn map_plugin_err_covers_all_variants() {
-    use crate::domain::secret::service::map_plugin_err;
-    use credstore_sdk::CredStoreError as E;
-    assert!(matches!(map_plugin_err(E::NotFound), DomainError::NotFound));
-    assert!(matches!(
-        map_plugin_err(E::AccessDenied),
-        DomainError::AccessDenied { .. }
-    ));
-    assert!(matches!(map_plugin_err(E::Conflict), DomainError::Conflict));
-    assert!(matches!(
-        map_plugin_err(E::ServiceUnavailable {
-            detail: "x".into(),
-            retry_after: None
-        }),
-        DomainError::ServiceUnavailable { .. }
-    ));
-    assert!(matches!(
-        map_plugin_err(E::NoPluginAvailable),
+fn plugin_errors_map_onto_the_domain_taxonomy() {
+    use credstore_sdk::CredStorePluginError as P;
+    // Unavailable: 503 with the plugin's retry hint, generic public detail,
+    // the underlying cause kept for in-process diagnostics.
+    let hint = std::time::Duration::from_secs(7);
+    match DomainError::from(
+        P::unavailable("raw backend secret leak attempt", Some(hint))
+            .with_source(std::io::Error::other("root cause")),
+    ) {
         DomainError::ServiceUnavailable {
-            retry_after: None,
-            ..
-        }
-    ));
-    assert!(matches!(
-        map_plugin_err(E::invalid_ref("x")),
-        DomainError::Internal { .. }
-    ));
-    assert!(matches!(
-        map_plugin_err(E::unsupported_transition("x")),
-        DomainError::Internal { .. }
-    ));
-    assert!(matches!(
-        map_plugin_err(E::TypeViolation {
-            reason: "R".into(),
-            detail: "d".into()
-        }),
-        DomainError::Internal { .. }
-    ));
-    assert!(matches!(
-        map_plugin_err(E::InvalidRequest {
-            reason: "R".into(),
-            detail: "d".into()
-        }),
-        DomainError::Internal { .. }
-    ));
-    assert!(matches!(
-        map_plugin_err(E::Internal("x".into())),
-        DomainError::Internal { .. }
-    ));
-}
-
-#[test]
-fn no_plugin_available_maps_to_distinct_non_retryable_unavailable() {
-    use crate::domain::secret::service::map_plugin_err;
-    let mapped = map_plugin_err(credstore_sdk::CredStoreError::NoPluginAvailable);
-    match mapped {
-        DomainError::ServiceUnavailable {
-            retry_after,
             detail,
-            ..
+            retry_after,
+            cause,
         } => {
-            assert!(retry_after.is_none());
-            assert_eq!(detail, "no storage plugin registered");
+            assert_eq!(detail, "storage backend unavailable");
+            assert!(!detail.contains("secret"));
+            assert_eq!(retry_after, Some(hint));
+            assert!(cause.is_some(), "the cause stays in the error chain");
         }
         other => panic!("unexpected: {other:?}"),
     }
-}
-
-#[test]
-fn plugin_unavailable_detail_is_curated_off_the_wire() {
-    use crate::domain::secret::service::map_plugin_err;
-    let mapped = map_plugin_err(credstore_sdk::CredStoreError::ServiceUnavailable {
-        detail: "raw backend secret leak attempt".into(),
-        retry_after: None,
-    });
-    match mapped {
-        DomainError::ServiceUnavailable { detail, .. } => {
+    // CredentialsRejected: 503 WITHOUT a retry hint, generic detail.
+    match DomainError::from(P::credentials_rejected("token abc rejected")) {
+        DomainError::ServiceUnavailable {
+            detail,
+            retry_after,
+            ..
+        } => {
             assert_eq!(detail, "storage backend unavailable");
-            assert!(!detail.contains("secret"));
+            assert!(retry_after.is_none(), "retrying cannot help");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    // Internal: 500, text redacted, cause kept.
+    match DomainError::from(P::internal("raw text").with_source(std::io::Error::other("c"))) {
+        DomainError::Internal { diagnostic, cause } => {
+            assert!(!diagnostic.contains("raw text"));
+            assert!(cause.is_some());
         }
         other => panic!("unexpected: {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn get_secret_folds_plugin_access_denied_into_anti_enumeration_miss() {
+async fn plugin_credentials_rejected_is_503_without_hint_and_its_own_metric_outcome() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::with_get_denied();
+    let plugin = FakePlugin::with_get_rejected();
     let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo.clone(), plugin, dir);
+    let metrics = FakeMetrics::new();
+    let svc = make_service(repo.clone(), plugin, dir, mock_enforcer(), metrics.clone());
     let ctx = make_ctx(Uuid::new_v4(), tenant);
     repo.seed(seeded_row(tenant, Uuid::new_v4(), "k", SharingMode::Tenant));
+    let err = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect_err("a rejected plugin credential is a request failure, not a miss");
     assert!(
-        svc.get_secret(&ctx, &key("k"))
-            .await
-            .expect("get_secret")
-            .is_none()
+        matches!(
+            err,
+            DomainError::ServiceUnavailable {
+                retry_after: None,
+                ..
+            }
+        ),
+        "got: {err:?}"
     );
+    assert!(metrics.deps().iter().any(|(d, op, o)| *d == Dep::Plugin
+        && *op == DepOp::PluginGet
+        && *o == Outcome::CredentialsRejected));
 }
 
 #[tokio::test]
@@ -2753,8 +2728,11 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
         .expect("t2 get")
         .expect("cred");
     assert_eq!(t2_cred.inheritance, InheritanceStatus::Overridden);
-    assert_eq!(t2_cred.status, CredentialStatus::Active);
-    assert!(t2_cred.validator.is_some(), "own row => strong validator");
+    assert_eq!(
+        t2_cred.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Active)
+    );
+    assert!(t2_cred.own.is_some(), "own row => strong validator");
     assert_eq!(
         svc_t3
             .get_secret(&ctx3, &name)
@@ -2782,15 +2760,15 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             &name,
             patch_value("V3"),
             matches(
-                t2_cred.validator.expect("some").id,
-                t2_cred.validator.expect("some").version,
+                t2_cred.own.as_ref().expect("some").validator.id,
+                t2_cred.own.as_ref().expect("some").validator.version,
             ),
         )
         .await
         .expect("T2 rotates");
     assert_eq!(
         validator.version,
-        t2_cred.validator.expect("some").version + 1
+        t2_cred.own.as_ref().expect("some").validator.version + 1
     );
     assert_eq!(
         svc_t3
@@ -2823,8 +2801,13 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             &name,
             patch_suppress(),
             matches(
-                t2_after_rotate.validator.expect("some").id,
-                t2_after_rotate.validator.expect("some").version,
+                t2_after_rotate.own.as_ref().expect("some").validator.id,
+                t2_after_rotate
+                    .own
+                    .as_ref()
+                    .expect("some")
+                    .validator
+                    .version,
             ),
         )
         .await
@@ -2848,7 +2831,10 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
         .await
         .expect("t2 get")
         .expect("cred");
-    assert_eq!(t2_suppressed.status, CredentialStatus::Declared);
+    assert_eq!(
+        t2_suppressed.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Declared)
+    );
     assert_eq!(t2_suppressed.inheritance, InheritanceStatus::Suppressed);
     assert_eq!(
         svc_t1
@@ -2868,8 +2854,8 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             &ctx2,
             &name,
             matches(
-                t2_suppressed.validator.expect("some").id,
-                t2_suppressed.validator.expect("some").version,
+                t2_suppressed.own.as_ref().expect("some").validator.id,
+                t2_suppressed.own.as_ref().expect("some").validator.version,
             ),
         )
         .await
@@ -2899,12 +2885,12 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
         .await
         .expect("t2 get")
         .expect("cred");
-    assert_eq!(t2_final.status, CredentialStatus::None);
-    assert!(t2_final.validator.is_none());
+    assert!(t2_final.own.is_none());
+    assert!(t2_final.own.is_none());
     assert_eq!(t2_final.inheritance, InheritanceStatus::Inherited);
 }
 
-// ── ADR-0004: body-derived actions ───────────────────────────────────────────
+// ── ADR-0007: body-derived actions ───────────────────────────────────────────
 
 #[tokio::test]
 async fn put_evaluates_both_write_and_write_secret() {
@@ -3664,8 +3650,8 @@ async fn declared_inherit_own_row_reports_declared_status_inherited_inheritance(
             &key("k"),
             patch_value_null_keep_inherit(),
             matches(
-                cred_before.validator.expect("some").id,
-                cred_before.validator.expect("some").version,
+                cred_before.own.as_ref().expect("some").validator.id,
+                cred_before.own.as_ref().expect("some").validator.version,
             ),
         )
         .await
@@ -3676,12 +3662,15 @@ async fn declared_inherit_own_row_reports_declared_status_inherited_inheritance(
         .await
         .expect("get")
         .expect("cred");
-    assert_eq!(cred.status, CredentialStatus::Declared);
+    assert_eq!(
+        cred.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Declared)
+    );
     assert_eq!(cred.inheritance, InheritanceStatus::Inherited);
     // The record's own row is `declared` (no value of its own) even though
     // the *value* resolves from the parent, so `owner_id` still reports the
     // child's own creator, not the parent's.
-    assert_eq!(cred.owner_id, Some(OwnerId(owner)));
+    assert_eq!(cred.own.as_ref().map(|o| o.owner_id), Some(OwnerId(owner)));
     assert_eq!(
         svc_child
             .get_secret(&child_ctx, &key("k"))
@@ -3776,7 +3765,10 @@ async fn get_reports_the_creators_subject_id_as_owner_id_for_an_own_row() {
         .await
         .expect("get")
         .expect("some");
-    assert_eq!(cred.owner_id, Some(OwnerId(subject)));
+    assert_eq!(
+        cred.own.as_ref().map(|o| o.owner_id),
+        Some(OwnerId(subject))
+    );
 }
 
 // ── ADR-0004: resolve_credential's weak-validator source ────────────────────
@@ -3811,15 +3803,15 @@ async fn resolve_credential_carries_the_winner_identity_when_no_own_row() {
         .await
         .expect("resolve_credential")
         .expect("some");
-    assert!(cred.validator.is_none());
+    assert!(cred.own.is_none());
     // No own row in play: the ancestor's owner id must never leak across
     // the tenant boundary (ADDENDUM 3) — reads it in its own tenant's
     // context instead.
-    assert!(cred.owner_id.is_none());
+    assert!(cred.own.is_none());
     assert_eq!(weak_source, Some((parent_row.id, parent_row.version)));
 }
 
-// ── ADR-0004 Amendment A: Service::get_item (projection-aware point read) ───
+// ── ADR-0004, "Read actions follow the projection": Service::get_item (projection-aware point read) ───
 
 #[tokio::test]
 async fn get_item_without_select_evaluates_read_only_and_carries_no_value() {
@@ -3997,7 +3989,10 @@ async fn get_item_suppressed_winner_with_secret_only_selected_returns_none_but_r
         .expect("get_item")
         .expect("record still visible");
     assert!(item.value.is_none());
-    assert_eq!(item.credential.status, CredentialStatus::Declared);
+    assert_eq!(
+        item.credential.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Declared)
+    );
 }
 
 #[tokio::test]
@@ -4023,7 +4018,7 @@ async fn get_item_rejects_an_unknown_select_field() {
     ));
 }
 
-// ── ADR-0004 Amendment B: create/replace with an explicit `null` value ──────
+// ── ADR-0007, "PUT: whole replace, secret tri-state": create/replace with an explicit `null` value ──────
 
 #[tokio::test]
 async fn put_create_with_explicit_null_creates_a_declared_row_write_only() {
@@ -4115,7 +4110,7 @@ async fn put_create_null_suppresses_an_inherited_credential_t1_t2_t3() {
     );
 
     // T2 suppresses the inherited credential without ever holding a value of
-    // its own — one request, `write` alone (ADR-0004 Amendment B,
+    // its own — one request, `write` alone (ADR-0007, "PUT: whole replace, secret tri-state",
     // "Suppressing an inherited credential without ever holding a value of
     // your own is therefore one request too").
     let (enforcer, resolver) = type_recording_enforcer();
@@ -4149,7 +4144,10 @@ async fn put_create_null_suppresses_an_inherited_credential_t1_t2_t3() {
         .await
         .expect("t2 get")
         .expect("cred");
-    assert_eq!(t2_cred.status, CredentialStatus::Declared);
+    assert_eq!(
+        t2_cred.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Declared)
+    );
     assert_eq!(t2_cred.inheritance, InheritanceStatus::Suppressed);
 
     assert!(
@@ -5227,7 +5225,10 @@ async fn assert_no_value_under_the_callers_record(w: &GapWorld) {
         .expect("get_item")
         .expect("some");
     assert_eq!(meta.credential.inheritance, InheritanceStatus::Own);
-    assert_eq!(meta.credential.status, CredentialStatus::Declared);
+    assert_eq!(
+        meta.credential.own.as_ref().map(|o| o.status),
+        Some(CredentialStatus::Declared)
+    );
     // The collection in secret mode omits the item.
     let page = w.svc.list(ctx, &secret_list_query()).await.expect("list");
     assert!(page.items.is_empty(), "{:?}", page.items.len());

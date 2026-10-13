@@ -166,6 +166,8 @@ pub enum Outcome {
     Success,
     NotFound,
     Error,
+    /// The store refused the plugin's own credentials.
+    CredentialsRejected,
 }
 impl Outcome {
     #[must_use]
@@ -174,6 +176,7 @@ impl Outcome {
             Self::Success => "success",
             Self::NotFound => "not_found",
             Self::Error => "error",
+            Self::CredentialsRejected => "credentials_rejected",
         }
     }
 }
@@ -253,6 +256,10 @@ mod tests {
         );
         assert_eq!(Outcome::Success.as_str(), "success");
         assert_eq!(Outcome::Error.as_str(), "error");
+        assert_eq!(
+            Outcome::CredentialsRejected.as_str(),
+            "credentials_rejected"
+        );
         assert_eq!(ReadRetryOutcome::Recovered.as_str(), "recovered");
         assert_eq!(ReadRetryOutcome::SecondMiss.as_str(), "second_miss");
         assert_eq!(CleanupOp::Purge.as_str(), "purge");

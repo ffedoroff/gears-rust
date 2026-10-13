@@ -38,7 +38,7 @@ use crate::infra::tenant_resolver::TenantResolverDir;
 use crate::infra::types_registry::GtsSecretTypeResolver;
 
 // `system` capability is required in this platform: consumers like `oagw` are
-// system modules and resolve `CredStoreClientV1` from the ClientHub during their
+// system modules and resolve `CredStoreClientV2` from the ClientHub during their
 // `init`. System modules initialize before non-system ones
 // (`modules_by_system_priority`), so credstore must also be a system module to
 // register its client before those consumers init.
@@ -194,10 +194,10 @@ impl Gear for CredStoreGear {
             .set(Arc::clone(&svc))
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
-        let client: Arc<dyn credstore_sdk::CredStoreClientV1> =
+        let client: Arc<dyn credstore_sdk::CredStoreClientV2> =
             Arc::new(CredStoreLocalClient::new(svc));
         ctx.client_hub()
-            .register::<dyn credstore_sdk::CredStoreClientV1>(client);
+            .register::<dyn credstore_sdk::CredStoreClientV2>(client);
 
         info!("credstore module initialized");
         Ok(())

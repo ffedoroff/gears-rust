@@ -13,45 +13,18 @@ use time::OffsetDateTime;
 
 use crate::domain::error::DomainError;
 
-/// Stable reason codes (wire-visible in the canonical field violation).
+/// Stable reason codes: re-exports of the SDK constants (the single source
+/// of truth for the wire vocabulary), grouped for the domain's use.
 pub mod reasons {
-    pub const UNKNOWN_SECRET_TYPE: &str = "UNKNOWN_SECRET_TYPE";
-    pub const SHARING_NOT_ALLOWED_FOR_TYPE: &str = "SHARING_NOT_ALLOWED_FOR_TYPE";
-    pub const VALUE_TOO_LARGE: &str = "VALUE_TOO_LARGE";
-    pub const VALUE_NOT_UTF8: &str = "VALUE_NOT_UTF8";
-    pub const VALUE_SCHEMA_VIOLATION: &str = "VALUE_SCHEMA_VIOLATION";
-    pub const EXPIRY_NOT_SUPPORTED_FOR_TYPE: &str = "EXPIRY_NOT_SUPPORTED_FOR_TYPE";
-    pub const EXPIRY_IN_THE_PAST: &str = "EXPIRY_IN_THE_PAST";
-    pub const TYPE_IMMUTABLE: &str = "TYPE_IMMUTABLE";
-    /// ADR-0004: a `PUT` creating a record over a reference that currently
-    /// resolves to an ancestor's `shared` record of a *different* type
-    /// (`cpt-cf-credstore-fr-override-type-consistency`). Canonical `Aborted`
-    /// (409), like `TYPE_IMMUTABLE`.
-    pub const TYPE_MISMATCH_WITH_INHERITED: &str = "TYPE_MISMATCH_WITH_INHERITED";
-    /// ADR-0010: a `PUT` creating a record over a reference that a descendant
-    /// tenant of the creator already holds (any status, any sharing) with a
-    /// *different* type (`cpt-cf-credstore-fr-override-type-consistency`).
-    /// Canonical `Aborted` (409), like `TYPE_MISMATCH_WITH_INHERITED`.
-    pub const TYPE_MISMATCH_WITH_DESCENDANT: &str = "TYPE_MISMATCH_WITH_DESCENDANT";
-    /// ADR-0004: `PUT` creation requires an explicit `secret_type`; there is
-    /// no default-to-generic on create as there was pre-ADR-0004. Canonical
-    /// `InvalidArgument` (400), like the other `*_REQUIRED`/`*_ALLOWED`
-    /// request-shape reasons below.
-    pub const TYPE_REQUIRED: &str = "TYPE_REQUIRED";
-    /// ADR-0004: `PUT` without a `secret` key, or `CredentialWrite::secret`
-    /// otherwise unset. Canonical `InvalidArgument` (400).
-    pub const SECRET_REQUIRED: &str = "SECRET_REQUIRED";
-    /// ADR-0004: `PATCH` whose body touches nothing at all
-    /// (`CredentialPatch::is_empty`). Canonical `InvalidArgument` (400).
-    pub const EMPTY_PATCH: &str = "EMPTY_PATCH";
-    /// ADR-0004: a merge-patch `null` on `sharing`/`fallback`/`secret_type` —
-    /// none is a nullable column. Canonical `InvalidArgument` (400).
-    pub const NULL_NOT_ALLOWED: &str = "NULL_NOT_ALLOWED";
-    /// ADR-0004: `PUT` with neither `If-None-Match` nor `If-Match` (or both).
-    /// Distinct from the plain `IF_MATCH_REQUIRED` `PATCH`/`DELETE` use,
-    /// since `PUT` accepts either precondition header. Canonical
-    /// `InvalidArgument` (400).
-    pub const PRECONDITION_REQUIRED: &str = "PRECONDITION_REQUIRED";
+    pub use credstore_sdk::field::{
+        EMPTY_PATCH, EXPIRY_IN_THE_PAST, EXPIRY_NOT_SUPPORTED_FOR_TYPE, INVALID_FILTER,
+        INVALID_ORDERBY_FIELD, INVALID_SELECT, NULL_NOT_ALLOWED, PRECONDITION_REQUIRED,
+        SECRET_REQUIRED, SECRET_SELECT_FIELDS, SHARING_NOT_ALLOWED_FOR_TYPE, TYPE_REQUIRED,
+        UNKNOWN_SECRET_TYPE, VALUE_NOT_UTF8, VALUE_SCHEMA_VIOLATION, VALUE_TOO_LARGE,
+    };
+    pub use credstore_sdk::reason::aborted::{
+        TYPE_IMMUTABLE, TYPE_MISMATCH_WITH_DESCENDANT, TYPE_MISMATCH_WITH_INHERITED,
+    };
 }
 
 fn violation(field: &'static str, reason: &'static str, detail: String) -> DomainError {
@@ -150,9 +123,8 @@ pub fn validate_value(
 ) -> Result<(), DomainError> {
     // A value too large for u64 is definitely over any declared limit.
     let len = u64::try_from(value.as_bytes().len()).unwrap_or(u64::MAX);
-    if let Some(max) = traits.max_size_bytes
-        && len > max
-    {
+    let max = traits.max_size_bytes;
+    if len > max {
         return Err(violation(
             "secret",
             reasons::VALUE_TOO_LARGE,
