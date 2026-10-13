@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use credstore_sdk::CredStoreError;
+use credstore_sdk::CredStorePluginError;
 use toolkit_macros::domain_model;
 
 /// HTTP verb of a KV v2 call.
@@ -78,17 +78,17 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    /// Maps the failure to the SDK's "backend unavailable" variant. Never
+    /// Maps the failure to the plugin error's "store unavailable" variant. Never
     /// includes anything but the coarse kind — see the type docs.
     #[must_use]
-    pub fn into_sdk_error(self) -> CredStoreError {
+    pub fn into_sdk_error(self) -> CredStorePluginError {
         let kind = match self {
             Self::Timeout => "timeout",
             Self::Connect => "connection failed",
             Self::Credentials => "token unavailable",
             Self::Other => "request failed",
         };
-        CredStoreError::service_unavailable(format!("vault credstore plugin: {kind}"))
+        CredStorePluginError::unavailable(format!("vault credstore plugin: {kind}"), None)
     }
 }
 

@@ -22,7 +22,7 @@ use credstore_sdk::ValueVersion;
 ///
 /// Any [`MigrationError`]; rows done so far stay and a re-run resumes.
 pub async fn run(env: &Env<'_>, out: Out<'_>) -> Result<(), MigrationError> {
-    if !env.new.supports_destroy() {
+    if !env.new.can_destroy() {
         say!(
             out,
             "tidy: skipped, the new store does not support destroy (versions left behind by \

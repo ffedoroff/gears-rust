@@ -145,10 +145,10 @@ flowchart LR
 
 ### 4.1 In Scope
 
-- The `CredStorePluginClientV2` contract on KV v2: durable `put` returning the provider's version, exact-bytes `get` of one version, idempotent `delete_key`, idempotent `destroy` of one version or of all versions below one, and the capability declaration (`supports_destroy`).
+- The `CredStorePluginClientV2` contract on KV v2: durable `put` returning the provider's version, exact-bytes `get` of one version, idempotent `delete_key`, idempotent `destroy` of one version or of all versions below one, and the optional destroy capability (`destroyer()` returns `Some`).
 - Token authentication from a configured value, file or environment variable, with a re-read of the source and a single retry when Vault answers `403`.
 - Bounded retries with exponential backoff for the idempotent operations; none for `put`.
-- Classification of Vault's answers into the SDK error taxonomy, including the soft-deleted, destroyed and evicted version cases.
+- Classification of Vault's answers into the plugin error type `CredStorePluginError`, including the soft-deleted, destroyed and evicted version cases.
 - Fail-fast validation of the configuration; registration in the types-registry and the scoped ClientHub client.
 - Documentation of the mount requirements, the minimal ACL policy and the Vault Agent sidecar deployment.
 
@@ -232,7 +232,7 @@ The plugin **MUST** authenticate every request with a Vault token and **MUST** a
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-vault-fr-failure-classification`
 
-Every failure **MUST** be mapped to the SDK error taxonomy by a fixed table: no response, timeout, `5xx`, `408` and `429` are "service unavailable" (with the server's `Retry-After` when it sent one); a `403` that survived the token re-read is also "service unavailable" and **MUST NOT** be reported as "access denied" (the gear folds a plugin's access denial into "not found" on reads, which would hide a revoked or under-privileged token); a `400` or any other unexpected status is an internal error carrying Vault's error text; a `404` that explains itself (the mount does not exist) is an internal error and **MUST NOT** be read as a missing key; a response that is not the expected shape is an internal error. Error messages **MUST NOT** contain the token or secret bytes.
+Every failure **MUST** be mapped to the plugin error type `CredStorePluginError` by a fixed table: no response, timeout, `5xx`, `408` and `429` are "unavailable" (with the server's `Retry-After` when it sent one); a `403` that survived the token re-read is "credentials rejected" (the gear answers 503 without a retry hint and logs an error for the operator, so a revoked or under-privileged token stays visible and is never turned into a 403 or a miss for the caller); a `400` or any other unexpected status is an internal error carrying Vault's error text; a `404` that explains itself (the mount does not exist) is an internal error and **MUST NOT** be read as a missing key; a response that is not the expected shape is an internal error. Error messages **MUST NOT** contain the token or secret bytes.
 
 - **Rationale**: The gear reacts differently to each category (retry, answer 503, answer an internal error (500), treat as a miss); a misclassified permission or routing error would be invisible or destructive.
 - **Actors**: `cpt-cf-credstore-vault-actor-credstore-gear`
@@ -367,8 +367,8 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 - The value is a durable immutable version in Vault.
 
 **Alternative Flows**:
-- **Vault unavailable during `put`**: the plugin answers "service unavailable" after one attempt; the gear's write intent covers a version that may have been stored.
-- **Vault unavailable during `get`**: the plugin retries within its budget, then answers "service unavailable".
+- **Vault unavailable during `put`**: the plugin answers "unavailable" after one attempt; the gear's write intent covers a version that may have been stored.
+- **Vault unavailable during `get`**: the plugin retries within its budget, then answers "unavailable".
 
 #### Clean Up After a Commit
 
@@ -407,7 +407,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 - Later requests use the new token; no request failed because of the rotation.
 
 **Alternative Flows**:
-- **The token was revoked and the file holds no new token**: the request fails as "service unavailable" and recovers when the file is updated.
+- **The token was revoked and the file holds no new token**: the request fails as "credentials rejected" and recovers when the file is updated.
 
 #### Delete a Record's Key
 
@@ -427,7 +427,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 - [ ] The SDK conformance suite passes against `hashicorp/vault` with a token that holds only the minimal ACL policy.
 - [ ] `get` answers "no value" for absent, soft-deleted, destroyed and evicted versions and for version `0`; it reports an internal (permanent) error, distinct from "no value" and from a transient outage (the gear answers 500), for an entry the plugin did not write or can never read; the answers are verified against the real server's response shapes.
 - [ ] `destroy(Below)` over a key with many versions destroys exactly the versions below the cut, soft-deleted ones included, and is idempotent.
-- [ ] A rotated token file is used after one rejected request; a persistent `403` is "service unavailable" and never leaks the token.
+- [ ] A rotated token file is used after one rejected request; a persistent `403` is "credentials rejected" and never leaks the token.
 - [ ] Idempotent operations retry transient failures up to the configured attempts; `put` is never retried.
 - [ ] A missing mount is an error for every operation, never a missing secret and never a successful delete.
 - [ ] Configuration with zero or several token sources, bad paths, a zero timeout or out-of-range retry values is rejected with the key named; unknown keys are rejected.
@@ -457,10 +457,10 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | More versions than `max_versions` accumulate above a record's pointer (orphans of failed or ambiguous writes, versions of CAS losers, destroyed or not). | Vault drops the oldest versions, possibly the referenced one (versions below the pointer go first); the record answers an internal error (500) until rewritten. | Documented mount obligation with the 10-version default spelled out; operators size `max_versions` for their failure profile; superseded versions are destroyed after each commit. |
-| The token is revoked or its policy is too narrow. | Every call fails as "service unavailable". | Explicit, logged `403` handling; documented minimal policy verified by the integration tests; sidecar rotation without restart. |
+| The token is revoked or its policy is too narrow. | Every call fails as "credentials rejected" (503 from the gear). | Explicit, logged `403` handling; documented minimal policy verified by the integration tests; sidecar rotation without restart. |
 | The mount is misconfigured (`delete_version_after`, `cas_required`, wrong name). | Versions expire, writes fail, or calls fail with an explained error. | Documented operator obligations; a missing mount is an error, not a miss; no silent success. |
 | A write is sent and its response is lost. | An unreferenced version stays in Vault. | The plugin never retries `put`; the gear's write intent covers the orphan and cleans it later. |
-| Vault is sealed or unreachable. | All operations fail as "service unavailable". | Bounded retries for idempotent calls; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job); recovery needs no restart. |
+| Vault is sealed or unreachable. | All operations fail as "unavailable". | Bounded retries for idempotent calls; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job); recovery needs no restart. |
 | The Vault token file is world-readable or the token is exposed in the environment. | Token compromise. | Documented least-privilege file permissions and the sidecar pattern; the plugin never logs the token. |
 
 ## 13. Open Questions

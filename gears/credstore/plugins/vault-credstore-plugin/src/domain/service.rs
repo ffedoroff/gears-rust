@@ -16,7 +16,7 @@
 //! covers that.
 use std::sync::Arc;
 
-use credstore_sdk::{CredStoreError, DestroySelector, SecretValue, StoreKey, ValueVersion};
+use credstore_sdk::{CredStorePluginError, DestroySelector, SecretValue, StoreKey, ValueVersion};
 use tracing::{debug, warn};
 
 use super::retry::RetryPolicy;
@@ -57,7 +57,7 @@ impl Service {
     ///
     /// A transient failure (no response, `5xx`, `408`, `429`) is retried with
     /// backoff while attempts remain; once they are used up it becomes
-    /// [`CredStoreError::ServiceUnavailable`] (with the server's
+    /// [`CredStorePluginError::Unavailable`] (with the server's
     /// `Retry-After` when it gave one). Any other response is returned for
     /// the caller to classify. `redact` lists strings that must not appear
     /// in an error message.
@@ -66,7 +66,7 @@ impl Service {
         request: VaultRequest,
         policy: RetryPolicy,
         redact: &[&str],
-    ) -> Result<VaultResponse, CredStoreError> {
+    ) -> Result<VaultResponse, CredStorePluginError> {
         let mut attempt = 1;
         loop {
             let sent = self.transport.send(request.clone()).await;
@@ -89,7 +89,7 @@ impl Service {
         sent: Result<VaultResponse, TransportError>,
         attempt: u32,
         redact: &[&str],
-    ) -> Result<VaultResponse, CredStoreError> {
+    ) -> Result<VaultResponse, CredStorePluginError> {
         match sent {
             Ok(response) if !wire::is_transient_status(response.status) => {
                 if response.status == wire::FORBIDDEN {
@@ -175,15 +175,15 @@ impl Service {
     /// answer is `None`.
     ///
     /// # Errors
-    /// [`CredStoreError::ServiceUnavailable`] on a network failure, a backend
-    /// `5xx`/`429`, or a token Vault rejects; [`CredStoreError::Internal`] on
+    /// [`CredStorePluginError::Unavailable`] on a network failure, a backend
+    /// `5xx`/`429`, or a token Vault rejects; [`CredStorePluginError::Internal`] on
     /// an unexpected response shape, a non-numeric version, or a stored entry
     /// that is not a value this plugin wrote (permanent).
     pub async fn get_value(
         &self,
         key: &StoreKey,
         version: &ValueVersion,
-    ) -> Result<Option<SecretValue>, CredStoreError> {
+    ) -> Result<Option<SecretValue>, CredStorePluginError> {
         let n = wire::parse_version(version.as_str())?;
         if n == 0 {
             return Ok(None);
@@ -213,7 +213,7 @@ impl Service {
         &self,
         key: &StoreKey,
         value: SecretValue,
-    ) -> Result<ValueVersion, CredStoreError> {
+    ) -> Result<ValueVersion, CredStorePluginError> {
         debug!(
             tenant_id = %key.tenant_id.0,
             record_id = %key.record_id,
@@ -239,7 +239,7 @@ impl Service {
     ///
     /// # Errors
     /// As in [`Self::get_value`].
-    pub async fn delete_key_value(&self, key: &StoreKey) -> Result<(), CredStoreError> {
+    pub async fn delete_key_value(&self, key: &StoreKey) -> Result<(), CredStorePluginError> {
         debug!(
             tenant_id = %key.tenant_id.0,
             record_id = %key.record_id,
@@ -267,7 +267,7 @@ impl Service {
         &self,
         key: &StoreKey,
         selector: &DestroySelector,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         debug!(
             tenant_id = %key.tenant_id.0,
             record_id = %key.record_id,
@@ -303,7 +303,11 @@ impl Service {
     /// The versions of `key` older than `below` that are not destroyed yet,
     /// from the key's metadata (empty when the key does not exist). Versions
     /// are numbered from 1, so nothing is older than 1 and no call is made.
-    async fn versions_below(&self, key: &StoreKey, below: u64) -> Result<Vec<u64>, CredStoreError> {
+    async fn versions_below(
+        &self,
+        key: &StoreKey,
+        below: u64,
+    ) -> Result<Vec<u64>, CredStorePluginError> {
         if below <= 1 {
             return Ok(Vec::new());
         }

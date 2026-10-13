@@ -107,13 +107,15 @@ async fn declares_and_delegates_destroy() {
     });
 
     let svc = service_for(&server);
-    assert!(svc.supports_destroy());
-    svc.destroy(
-        &ctx(),
-        &key(),
-        DestroySelector::Exactly(ValueVersion::new("2")),
-    )
-    .await
-    .unwrap();
+    assert!(svc.destroyer().is_some());
+    svc.destroyer()
+        .unwrap()
+        .destroy(
+            &ctx(),
+            &key(),
+            DestroySelector::Exactly(ValueVersion::new("2")),
+        )
+        .await
+        .unwrap();
     mock.assert();
 }

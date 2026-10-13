@@ -7,7 +7,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStorePluginClientV2, CredStorePluginSpecV1};
+use credstore_sdk::{CredStorePluginClientV2, CredStorePluginSpecV2};
 use toolkit::Gear;
 use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
@@ -58,7 +58,7 @@ impl Gear for StaticCredStorePlugin {
         let service = Arc::new(Service::from_config(&cfg)?);
 
         // Build registration payload and instance id for this plugin.
-        let (instance_id, instance_json) = PluginV1::<CredStorePluginSpecV1>::build_registration(
+        let (instance_id, instance_json) = PluginV1::<CredStorePluginSpecV2>::build_registration(
             "cf.core._.static_credstore.v1",
             cfg.vendor.clone(),
             cfg.priority,

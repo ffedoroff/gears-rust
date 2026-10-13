@@ -57,7 +57,7 @@ Every operation is one or two Vault KV v2 calls:
 - `delete_key` is one `DELETE` of the key's metadata, which removes all versions.
 - `destroy(Exactly(v))` is one `POST` to the destroy endpoint; `destroy(Below(v))` first reads the key's metadata to learn which versions exist, then destroys those below `v`.
 
-The plugin adds three things the contract leaves to the backend: **token authentication with rotation** (a rejected request re-reads the token source once and is retried once), **bounded retries** of the idempotent operations with exponential backoff (never of `put`), and a **precise classification of Vault's answers** into the SDK error taxonomy. The latter matters because Vault signals very different situations with the same status code: `404` means an absent key, a soft-deleted version, a destroyed version or a missing mount, and each of these maps differently (§3.3).
+The plugin adds three things the contract leaves to the backend: **token authentication with rotation** (a rejected request re-reads the token source once and is retried once), **bounded retries** of the idempotent operations with exponential backoff (never of `put`), and a **precise classification of Vault's answers** into the plugin error type (`CredStorePluginError`). The latter matters because Vault signals very different situations with the same status code: `404` means an absent key, a soft-deleted version, a destroyed version or a missing mount, and each of these maps differently (§3.3).
 
 ### 1.2 Architecture Drivers
 
@@ -68,7 +68,7 @@ The plugin adds three things the contract leaves to the backend: **token authent
 | Idempotent `delete_key` / `destroy` | A plain `404` and Vault's `204` for a missing key or version are success; `destroy(Below)` makes no call when nothing is left to destroy |
 | Token rotation without restart | `TokenStore` caches the token; a `403` makes the transport re-read the source once and resend the request once if the token changed |
 | No startup dependency on Vault | Config validation is static; the transport performs no I/O when built; a `token_file` is read on first use |
-| Honest failure classes | Fixed mapping table (§3.3); a `403` is "service unavailable", a plain `404` on read is "no value", an explained `404` is an internal error |
+| Honest failure classes | Fixed mapping table (§3.3); a `403` is "credentials rejected", a plain `404` on read is "no value", an explained `404` is an internal error |
 | Secret non-disclosure | Redacted `VaultToken`, no `Debug` of secrets, bounded and scrubbed Vault error text, request and response bodies never logged |
 | Layering (DE0301 / DE0308) | `domain` (service, wire logic, retry policy, transport port) imports no HTTP types; `infra` holds the `reqwest` adapter and the token source |
 
@@ -206,8 +206,8 @@ A value is stored as `{"data": {"value": "<base64 of the bytes>"}}`: base64 (sta
 
 | Component | Notes |
 |---|---|
-| `VaultCredStorePlugin` (gear) | Registered with the ToolKit macro, `deps = [types_registry]`. Publishes `PluginV1<CredStorePluginSpecV1>` with instance segment `cf.core._.vault_credstore.v1`, the configured vendor (default `openbao`) and priority (default 100), then registers the scoped client. |
-| `Service` | Holds `Arc<dyn VaultTransport>`, address, mount, prefix and the `RetryPolicy`. Inherent methods `put_value`, `get_value`, `delete_key_value`, `destroy_value`; the trait implementation in `client.rs` forwards to them. `supports_destroy()` is `true`. |
+| `VaultCredStorePlugin` (gear) | Registered with the ToolKit macro, `deps = [types_registry]`. Publishes `PluginV1<CredStorePluginSpecV2>` with instance segment `cf.core._.vault_credstore.v1`, the configured vendor (default `openbao`) and priority (default 100), then registers the scoped client. |
+| `Service` | Holds `Arc<dyn VaultTransport>`, address, mount, prefix and the `RetryPolicy`. Inherent methods `put_value`, `get_value`, `delete_key_value`, `destroy_value`; the trait implementation in `client.rs` forwards to them. `destroyer()` returns `Some(self)`; `destroy` is implemented through `CredStorePluginDestroyerV2`. |
 | `wire` | Path builders, request bodies (`PutRequestBody`, `DestroyRequestBody`), response parsing, `classify_*` functions, `map_error_status`, `error_text`. No I/O. |
 | `RetryPolicy` | `max_attempts`, base delay; `backoff(n)` doubles from the base and never exceeds 2 s; `jittered_backoff(n)` picks a random point in its upper half. |
 | `VaultTransport` / `ReqwestTransport` | The port and its adapter. The adapter owns the HTTP client with `timeout_secs`, sends `X-Vault-Token` (marked sensitive) and `X-Vault-Namespace`, parses `Retry-After` (seconds only, capped at 300 s) and applies the single 403 retry. A body that cannot be read is a transport failure, not an empty response. |
@@ -225,23 +225,23 @@ All calls carry `X-Vault-Token` (and `X-Vault-Namespace` when configured). "Tran
 
 | Operation | HTTP call | Success | `404` | Other errors |
 |---|---|---|---|---|
-| `put(key, value)` | `POST data/...` with `{"data":{"value":"<base64>"}}` (no `cas`) | `200` with `data.version` -> that version | Explained `404` (missing mount) -> `Internal`; a plain `404` on a write does not occur | Not retried. Transient -> `ServiceUnavailable`; `403` -> `ServiceUnavailable`; `400` -> `Internal` with Vault's text; anything else -> `Internal` |
-| `get(key, version)` | `GET data/...?version=N` (never sent for `N = 0`) | `200` with a value -> bytes | Plain `404` (absent, soft-deleted, destroyed, evicted, key missing) -> `None`; explained `404` -> `Internal` | Retried on transient. `403` -> `ServiceUnavailable`; an entry with no string `value` or invalid base64 -> `Internal` (permanent); unexpected shape -> `Internal` |
-| `delete_key(key)` | `DELETE metadata/...` | `204` / `2xx` -> `Ok` | Plain `404` -> `Ok`; explained `404` -> `Internal` | Retried on transient; `403` -> `ServiceUnavailable`; others -> `Internal` |
+| `put(key, value)` | `POST data/...` with `{"data":{"value":"<base64>"}}` (no `cas`) | `200` with `data.version` -> that version | Explained `404` (missing mount) -> `Internal`; a plain `404` on a write does not occur | Not retried. Transient -> `Unavailable`; `403` -> `CredentialsRejected`; `400` -> `Internal` with Vault's text; anything else -> `Internal` |
+| `get(key, version)` | `GET data/...?version=N` (never sent for `N = 0`) | `200` with a value -> bytes | Plain `404` (absent, soft-deleted, destroyed, evicted, key missing) -> `None`; explained `404` -> `Internal` | Retried on transient. `403` -> `CredentialsRejected`; an entry with no string `value` or invalid base64 -> `Internal` (permanent); unexpected shape -> `Internal` |
+| `delete_key(key)` | `DELETE metadata/...` | `204` / `2xx` -> `Ok` | Plain `404` -> `Ok`; explained `404` -> `Internal` | Retried on transient; `403` -> `CredentialsRejected`; others -> `Internal` |
 | `destroy(key, Exactly(v))` | `POST destroy/...` with `{"versions":[v]}` (no call for `v = 0`) | `204` -> `Ok` | Plain `404` -> `Ok`; explained `404` -> `Internal` | As `delete_key` |
-| `destroy(key, Below(v))` | `GET metadata/...`, then `POST destroy/...` with every version `< v` that has `destroyed = false` | `Ok` | Plain `404` on the metadata read (no such key) -> `Ok`, no destroy call; empty selection -> `Ok`, no destroy call; `v <= 1` -> `Ok` without any call | Each of the two calls retried on transient; `403` -> `ServiceUnavailable`; others -> `Internal` |
-| `supports_destroy()` | none | `true` | | |
+| `destroy(key, Below(v))` | `GET metadata/...`, then `POST destroy/...` with every version `< v` that has `destroyed = false` | `Ok` | Plain `404` on the metadata read (no such key) -> `Ok`, no destroy call; empty selection -> `Ok`, no destroy call; `v <= 1` -> `Ok` without any call | Each of the two calls retried on transient; `403` -> `CredentialsRejected`; others -> `Internal` |
+| `destroyer()` | none | `Some(self)` | | |
 
 A soft-deleted version has `destroyed = false` and a `deletion_time`: it is included in a `Below` selection, so that a cleanup turns it into a destroyed one.
 
 #### Error mapping
 
-| Vault answer or local failure | `CredStoreError` | Retried (idempotent calls) | Notes |
+| Vault answer or local failure | `CredStorePluginError` | Retried (idempotent calls) | Notes |
 |---|---|---|---|
-| No response: connect failure, timeout, broken body | `ServiceUnavailable` | yes | The message holds the coarse kind only, never the request URL |
-| The token cannot be loaded (missing file, unset variable, empty) | `ServiceUnavailable` | yes | Recovers when the file appears |
-| `5xx`, `408`, `429` | `ServiceUnavailable` | yes | `retry_after` set from a `Retry-After` header in seconds; text of Vault's error included (for example `Vault is sealed`) |
-| `403` after the token re-read | `ServiceUnavailable` | no | Message names the `403`, not the token. Not `AccessDenied`: the gear turns a plugin's `AccessDenied` into "not found" on reads, which would hide a revoked or under-privileged token |
+| No response: connect failure, timeout, broken body | `Unavailable` | yes | The message holds the coarse kind only, never the request URL |
+| The token cannot be loaded (missing file, unset variable, empty) | `Unavailable` | yes | Recovers when the file appears |
+| `5xx`, `408`, `429` | `Unavailable` | yes | `retry_after` set from a `Retry-After` header in seconds; text of Vault's error included (for example `Vault is sealed`) |
+| `403` after the token re-read | `CredentialsRejected` | no | Message names the `403`, not the token. The gear answers 503 without a retry hint and logs an error for the operator; it never answers the caller with a 403 |
 | `400` | `Internal` | no | Message carries Vault's error text, flattened, 200 characters at most, with the encoded value scrubbed |
 | Any other `4xx` / `3xx` | `Internal` | no | Status and text |
 | Explained `404` (`no handler for route`) | `Internal` | no | A missing mount is a configuration error |
@@ -330,7 +330,7 @@ Exactly one of `token`, `token_file`, `token_env` must be set; none or several i
 
 | Internal dependency | Purpose |
 |---|---|
-| `cf-gears-credstore-sdk` | `CredStorePluginClientV2`, `StoreKey`, `ValueVersion`, `SecretValue`, `CredStoreError`; the `conformance` feature in tests |
+| `cf-gears-credstore-sdk` | `CredStorePluginClientV2`, `CredStorePluginDestroyerV2`, `CredStorePluginError`, `StoreKey`, `ValueVersion`, `SecretValue`; the `conformance` feature in tests |
 | `cf-gears-types-registry-sdk` and the types-registry gear | `PluginV1` catalogue publication (hard init prerequisite) |
 | ToolKit and ClientHub | Gear lifecycle, `${VAR}` expansion, scoped client registration |
 
@@ -339,7 +339,7 @@ Exactly one of `token`, `token_file`, `token_env` must be set; none or several i
 | Dependency | Contract and failure boundary |
 |---|---|
 | CredStore gear | The only caller; `delete_key` / `destroy` called by the gear right after the commit or when it heals a record on access, possibly again for the same version or key (idempotent); `put` and `get` on request paths |
-| Vault or OpenBao | KV v2 HTTP API at `address`, per-request timeout `timeout_secs`; unavailability is `ServiceUnavailable` and recovers without restart |
+| Vault or OpenBao | KV v2 HTTP API at `address`, per-request timeout `timeout_secs`; unavailability is `Unavailable` and recovers without restart |
 | Vault Agent sidecar (optional) | Keeps the token file fresh; the plugin only reads the file |
 | types-registry | Catalogue instance publication at init |
 
@@ -366,7 +366,7 @@ sequenceDiagram
     S-->>G: ValueVersion(N)
 ```
 
-One attempt. A transport failure or a `5xx` after the request was sent is `ServiceUnavailable`; whether Vault stored the version is unknown, which the gear's write intent covers. A `403` goes through the token re-read of the transport (below) before it surfaces; a `403` proves nothing was executed, so that resend cannot duplicate a write.
+One attempt. A transport failure or a `5xx` after the request was sent is `Unavailable`; whether Vault stored the version is unknown, which the gear's write intent covers. A `403` goes through the token re-read of the transport (below) before it surfaces; a `403` proves nothing was executed, so that resend cannot duplicate a write.
 
 #### Read a version
 
@@ -552,7 +552,7 @@ The recommended deployment on Kubernetes keeps the Vault login out of the plugin
          token_file: "/vault/secrets/token"
    ```
 
-Behaviour at the edges: the file may not exist when the host starts (the sidecar is still logging in); the plugin starts anyway and its calls answer "service unavailable" until the file appears. When the agent re-authenticates and rewrites the file, the first request that Vault rejects with `403` re-reads it and succeeds on its single resend. A token that Vault revokes and that the agent has not yet replaced makes calls answer "service unavailable" until the file changes; no restart is needed.
+Behaviour at the edges: the file may not exist when the host starts (the sidecar is still logging in); the plugin starts anyway and its calls fail as `Unavailable` until the file appears. When the agent re-authenticates and rewrites the file, the first request that Vault rejects with `403` re-reads it and succeeds on its single resend. A token that Vault revokes and that the agent has not yet replaced makes calls fail as `CredentialsRejected` until the file changes; no restart is needed.
 
 Other deployments follow the same shape: any process that keeps a valid token in a file works as the sidecar; a long-lived token can be given as `token: "${VAULT_TOKEN}"` or `token_env: "VAULT_TOKEN"` when rotation is handled by redeploying.
 
@@ -560,10 +560,10 @@ Other deployments follow the same shape: any process that keeps a valid token in
 
 | Condition | What the plugin does | Operator action |
 |---|---|---|
-| Vault unreachable, timeouts, `5xx`, `429` | Idempotent calls retried within their budget, then `ServiceUnavailable`; `put` fails after one attempt | Restore Vault; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job) |
+| Vault unreachable, timeouts, `5xx`, `429` | Idempotent calls retried within their budget, then `Unavailable`; `put` fails after one attempt | Restore Vault; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job) |
 | Vault sealed (`503`) | As above; the message includes `Vault is sealed` | Unseal |
-| Token revoked, expired, or policy too narrow (`403`) | Token source re-read once; if unchanged or still rejected, `ServiceUnavailable` with a `403` message and a `warn` log naming the token source, never the token | Renew the token or fix the policy; a changed `token_file` is picked up without restart |
-| `token_file` missing, empty or malformed | `ServiceUnavailable` for the calls that need a token; startup is not affected | Provide the file |
+| Token revoked, expired, or policy too narrow (`403`) | Token source re-read once; if unchanged or still rejected, `CredentialsRejected` with a `403` message and a `warn` log naming the token source, never the token | Renew the token or fix the policy; a changed `token_file` is picked up without restart |
+| `token_file` missing, empty or malformed | `Unavailable` for the calls that need a token; startup is not affected | Provide the file |
 | `token_env` unset or empty, inline token empty or malformed | Startup fails with the key named | Fix the configuration |
 | Mount does not exist or is misspelled | `Internal` for every operation (`no handler for route` text); `delete_key` does not report success | Fix `mount`, or enable the mount |
 | Mount is not KV v2 | Reads and writes hit different paths than expected and fail or return unexpected shapes (`Internal`) | Use a KV v2 mount |
@@ -572,8 +572,8 @@ Other deployments follow the same shape: any process that keeps a valid token in
 | More versions than the retention limit | The oldest are evicted; the referenced one may be among them (500) | Raise `max_versions`; rewrite affected records |
 | Entry written by something else | `Internal` for that version (the gear answers 500) | Keep the prefix exclusive to CredStore |
 | Response not valid JSON or not the KV v2 shape | `Internal` | Check for a proxy between the plugin and Vault |
-| `put` times out after the request was sent | `ServiceUnavailable`; a version may exist | None: the gear's write intent tracks it and the record's next write or delete removes it |
-| Wrong or not permitted `namespace` | Vault answers with an error status; the plugin reports it by the table of §3.3 (`Internal` for an explained `404`, `ServiceUnavailable` for `403`) | Fix `namespace` or the token's access to it |
+| `put` times out after the request was sent | `Unavailable`; a version may exist | None: the gear's write intent tracks it and the record's next write or delete removes it |
+| Wrong or not permitted `namespace` | Vault answers with an error status; the plugin reports it by the table of §3.3 (`Internal` for an explained `404`, `CredentialsRejected` for `403`) | Fix `namespace` or the token's access to it |
 
 Enablement gates before production use:
 

@@ -22,9 +22,10 @@
 )]
 
 mod common;
+use common::PluginErrorExt as _;
 
 use common::{MOUNT, VaultFixture, fresh_key, key_path, plugin_from};
-use credstore_sdk::{CredStoreError, DestroySelector, SecretValue, StoreKey, ValueVersion};
+use credstore_sdk::{CredStorePluginError, DestroySelector, SecretValue, StoreKey, ValueVersion};
 use serde_json::{Value, json};
 use vault_credstore_plugin::domain::Service;
 
@@ -185,7 +186,7 @@ docker_test! {
 
         for n in [1, 2] {
             let err = svc.get_value(&key, &vv(n)).await.unwrap_err();
-            assert!(matches!(err, CredStoreError::Internal(_)), "version {n}: {err:?}");
+            assert!(matches!(err, CredStorePluginError::Internal { .. }), "version {n}: {err:?}");
         }
     }
 }
@@ -400,7 +401,7 @@ docker_test! {
         // Persistent 403: the token is revoked and the file holds nothing new.
         vault.revoke_token(&token_c).await;
         let err = svc.get_value(&key, &v3).await.unwrap_err();
-        assert!(err.is_unavailable(), "{err:?}");
+        assert!(err.is_credentials_rejected(), "{err:?}");
         let message = err.to_string();
         assert!(message.contains("403"), "{message}");
         for token in [&token_a, &token_b, &token_c] {
@@ -410,7 +411,7 @@ docker_test! {
             .put_value(&key, SecretValue::from("rejected"))
             .await
             .unwrap_err();
-        assert!(err.is_unavailable(), "{err:?}");
+        assert!(err.is_credentials_rejected(), "{err:?}");
 
         // The operator (or the sidecar) provides a working token: recovered
         // without a restart.
@@ -476,35 +477,35 @@ docker_test! {
         let svc = plugin_from(&cfg);
         let key = fresh_key();
 
-        assert!(matches!(svc.get_value(&key, &vv(1)).await, Err(CredStoreError::Internal(_))));
+        assert!(matches!(svc.get_value(&key, &vv(1)).await, Err(CredStorePluginError::Internal { .. })));
         assert!(matches!(
             svc.put_value(&key, SecretValue::from("x")).await,
-            Err(CredStoreError::Internal(_))
+            Err(CredStorePluginError::Internal { .. })
         ));
-        assert!(matches!(svc.delete_key_value(&key).await, Err(CredStoreError::Internal(_))));
+        assert!(matches!(svc.delete_key_value(&key).await, Err(CredStorePluginError::Internal { .. })));
         assert!(matches!(
             svc.destroy_value(&key, &DestroySelector::Exactly(vv(1))).await,
-            Err(CredStoreError::Internal(_))
+            Err(CredStorePluginError::Internal { .. })
         ));
         assert!(matches!(
             svc.destroy_value(&key, &DestroySelector::Below(vv(5))).await,
-            Err(CredStoreError::Internal(_))
+            Err(CredStorePluginError::Internal { .. })
         ));
     }
 }
 
 docker_test! {
-    async fn a_token_without_the_policy_is_service_unavailable(vault) {
+    async fn a_token_without_the_policy_is_credentials_rejected(vault) {
         let mut cfg = vault.config();
         cfg.token = Some(vault_credstore_plugin::config::VaultToken::from("hvs.not-a-token"));
         let svc = plugin_from(&cfg);
         let key = fresh_key();
 
         let err = svc.get_value(&key, &vv(1)).await.unwrap_err();
-        assert!(err.is_unavailable(), "{err:?}");
+        assert!(err.is_credentials_rejected(), "{err:?}");
         assert!(!err.to_string().contains("hvs.not-a-token"));
-        assert!(svc.put_value(&key, SecretValue::from("x")).await.unwrap_err().is_unavailable());
-        assert!(svc.delete_key_value(&key).await.unwrap_err().is_unavailable());
+        assert!(svc.put_value(&key, SecretValue::from("x")).await.unwrap_err().is_credentials_rejected());
+        assert!(svc.delete_key_value(&key).await.unwrap_err().is_credentials_rejected());
     }
 }
 

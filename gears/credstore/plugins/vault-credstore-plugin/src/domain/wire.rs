@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use credstore_sdk::CredStoreError;
+use credstore_sdk::CredStorePluginError;
 use serde::{Deserialize, Serialize};
 
 /// `403 Forbidden`.
@@ -100,18 +100,18 @@ pub fn encode_value(bytes: &[u8]) -> String {
 /// Decodes the KV v2 `data.data.value` field back into secret bytes.
 ///
 /// # Errors
-/// Returns [`CredStoreError::Internal`] if the stored value is not valid
+/// Returns [`CredStorePluginError::Internal`] if the stored value is not valid
 /// base64: the entry exists but is not something this plugin wrote (a
 /// hand-edited or foreign row), so retrying cannot help. Never echoes the
 /// payload.
-pub fn decode_value(encoded: &str) -> Result<Vec<u8>, CredStoreError> {
+pub fn decode_value(encoded: &str) -> Result<Vec<u8>, CredStorePluginError> {
     BASE64.decode(encoded).map_err(|_| not_a_written_value())
 }
 
 /// The permanent error for an entry that is present but not a value this
 /// plugin wrote. A curated message: no URL, no payload.
-fn not_a_written_value() -> CredStoreError {
-    CredStoreError::internal(
+fn not_a_written_value() -> CredStorePluginError {
+    CredStorePluginError::internal(
         "vault credstore plugin: stored entry is not a value written by this plugin",
     )
 }
@@ -148,11 +148,11 @@ pub struct DestroyRequestBody {
 /// Serializes a request body for the transport.
 ///
 /// # Errors
-/// [`CredStoreError::Internal`] if serialization fails (not reachable for the
+/// [`CredStorePluginError::Internal`] if serialization fails (not reachable for the
 /// plain body types above; mapped rather than unwrapped).
-pub fn to_json_body<T: Serialize>(body: &T) -> Result<String, CredStoreError> {
+pub fn to_json_body<T: Serialize>(body: &T) -> Result<String, CredStorePluginError> {
     serde_json::to_string(body).map_err(|_| {
-        CredStoreError::internal("vault credstore plugin: failed to encode request body")
+        CredStorePluginError::internal("vault credstore plugin: failed to encode request body")
     })
 }
 
@@ -195,14 +195,14 @@ impl VersionMetadata {
 /// destroyed).
 ///
 /// # Errors
-/// * [`CredStoreError::Internal`] if the body is not a KV v2 read response.
+/// * [`CredStorePluginError::Internal`] if the body is not a KV v2 read response.
 ///   Never echoes the raw body (it could carry the secret's base64 form).
-/// * [`CredStoreError::Internal`] (permanent) if the entry has data but no
+/// * [`CredStorePluginError::Internal`] (permanent) if the entry has data but no
 ///   string `value`, or the value is not valid base64: a version Vault holds
 ///   but this plugin can never return.
-pub fn parse_get_body(body: &str) -> Result<Option<Vec<u8>>, CredStoreError> {
+pub fn parse_get_body(body: &str) -> Result<Option<Vec<u8>>, CredStorePluginError> {
     let parsed: GetResponseBody = serde_json::from_str(body).map_err(|_| {
-        CredStoreError::internal("vault credstore plugin: unexpected read-response shape")
+        CredStorePluginError::internal("vault credstore plugin: unexpected read-response shape")
     })?;
     if parsed
         .data
@@ -235,10 +235,10 @@ struct PutResponseData {
 /// Parses the version number the backend assigned from a write response.
 ///
 /// # Errors
-/// [`CredStoreError::Internal`] if the body is not the expected shape.
-pub fn parse_put_body(body: &str) -> Result<String, CredStoreError> {
+/// [`CredStorePluginError::Internal`] if the body is not the expected shape.
+pub fn parse_put_body(body: &str) -> Result<String, CredStorePluginError> {
     let parsed: PutResponseBody = serde_json::from_str(body).map_err(|_| {
-        CredStoreError::internal("vault credstore plugin: unexpected write-response shape")
+        CredStorePluginError::internal("vault credstore plugin: unexpected write-response shape")
     })?;
     Ok(parsed.data.version.to_string())
 }
@@ -266,10 +266,10 @@ struct VersionInfo {
 /// destroyed, so a cleanup must destroy it.
 ///
 /// # Errors
-/// [`CredStoreError::Internal`] if the body is not the expected shape.
-pub fn parse_live_versions(body: &str) -> Result<Vec<u64>, CredStoreError> {
+/// [`CredStorePluginError::Internal`] if the body is not the expected shape.
+pub fn parse_live_versions(body: &str) -> Result<Vec<u64>, CredStorePluginError> {
     let parsed: MetadataResponseBody = serde_json::from_str(body).map_err(|_| {
-        CredStoreError::internal("vault credstore plugin: unexpected metadata-response shape")
+        CredStorePluginError::internal("vault credstore plugin: unexpected metadata-response shape")
     })?;
     let mut live: Vec<u64> = parsed
         .data
@@ -285,11 +285,11 @@ pub fn parse_live_versions(body: &str) -> Result<Vec<u64>, CredStoreError> {
 /// Parses a version string the gear passed back into a KV v2 version number.
 ///
 /// # Errors
-/// [`CredStoreError::Internal`] if it is not a non-negative integer (the gear
+/// [`CredStorePluginError::Internal`] if it is not a non-negative integer (the gear
 /// only ever passes back what `put` returned).
-pub fn parse_version(v: &str) -> Result<u64, CredStoreError> {
+pub fn parse_version(v: &str) -> Result<u64, CredStorePluginError> {
     v.parse().map_err(|_| {
-        CredStoreError::internal(
+        CredStorePluginError::internal(
             "vault credstore plugin: value version is not a KV v2 version number",
         )
     })
@@ -338,28 +338,23 @@ fn is_plain_not_found(status: u16, body: &str) -> bool {
     status == NOT_FOUND && error_messages(body).is_empty()
 }
 
-/// Maps a response that is not a success into the SDK's stable error
-/// taxonomy. `redact` lists strings that must not appear in the message (the
-/// encoded secret of a `put`).
+/// Maps a response that is not a success into the plugin error taxonomy.
+/// `redact` lists strings that must not appear in the message (the encoded
+/// secret of a `put`).
 ///
 /// | Status | Error |
 /// |--------|-------|
-/// | `5xx`, `408`, `429` | `ServiceUnavailable` (with `retry_after` when given) |
-/// | `403` | `ServiceUnavailable`: the plugin's token is missing, revoked or lacks the policy |
+/// | `5xx`, `408`, `429` | `Unavailable` (with `retry_after` when given) |
+/// | `403` | `CredentialsRejected`: the plugin's token is missing, revoked or lacks the policy |
 /// | `400` | `Internal` with Vault's error text |
 /// | anything else | `Internal` |
-///
-/// A `403` is deliberately not `AccessDenied`: the gear folds a plugin
-/// `AccessDenied` into "not found" on reads, which would hide a revoked or
-/// under-privileged token behind 404s; `ServiceUnavailable` stays visible,
-/// is retried by a later request, and recovers once the token is fixed or renewed.
 #[must_use]
 pub fn map_error_status(
     status: u16,
     body: &str,
     retry_after: Option<Duration>,
     redact: &[&str],
-) -> CredStoreError {
+) -> CredStorePluginError {
     let text = error_text(body, redact);
     let with_text = |head: String| {
         if text.is_empty() {
@@ -369,7 +364,7 @@ pub fn map_error_status(
         }
     };
     if status == FORBIDDEN {
-        return CredStoreError::service_unavailable(
+        return CredStorePluginError::credentials_rejected(
             "vault credstore plugin: backend rejected the plugin's token (HTTP 403); \
              check that the token is valid and its policy covers the mount and path_prefix",
         );
@@ -378,17 +373,14 @@ pub fn map_error_status(
         let detail = with_text(format!(
             "vault credstore plugin: backend responded with {status}"
         ));
-        return match retry_after {
-            Some(after) => CredStoreError::service_unavailable_with_retry(detail, after),
-            None => CredStoreError::service_unavailable(detail),
-        };
+        return CredStorePluginError::unavailable(detail, retry_after);
     }
     if status == 400 {
-        return CredStoreError::internal(with_text(
+        return CredStorePluginError::internal(with_text(
             "vault credstore plugin: backend rejected the request (400)".to_owned(),
         ));
     }
-    CredStoreError::internal(with_text(format!(
+    CredStorePluginError::internal(with_text(format!(
         "vault credstore plugin: backend responded with unexpected status {status}"
     )))
 }
@@ -400,7 +392,10 @@ pub fn map_error_status(
 ///
 /// # Errors
 /// See [`map_error_status`] and [`parse_get_body`].
-pub fn classify_get_response(status: u16, body: &str) -> Result<Option<Vec<u8>>, CredStoreError> {
+pub fn classify_get_response(
+    status: u16,
+    body: &str,
+) -> Result<Option<Vec<u8>>, CredStorePluginError> {
     if is_plain_not_found(status, body) {
         return Ok(None);
     }
@@ -420,7 +415,7 @@ pub fn classify_put_response(
     status: u16,
     body: &str,
     encoded_value: &str,
-) -> Result<String, CredStoreError> {
+) -> Result<String, CredStorePluginError> {
     if is_success(status) {
         return parse_put_body(body);
     }
@@ -432,7 +427,7 @@ pub fn classify_put_response(
 ///
 /// # Errors
 /// See [`map_error_status`].
-pub fn classify_delete_response(status: u16, body: &str) -> Result<(), CredStoreError> {
+pub fn classify_delete_response(status: u16, body: &str) -> Result<(), CredStorePluginError> {
     if is_success(status) || is_plain_not_found(status, body) {
         Ok(())
     } else {
@@ -445,7 +440,10 @@ pub fn classify_delete_response(status: u16, body: &str) -> Result<(), CredStore
 ///
 /// # Errors
 /// See [`map_error_status`] and [`parse_live_versions`].
-pub fn classify_metadata_response(status: u16, body: &str) -> Result<Vec<u64>, CredStoreError> {
+pub fn classify_metadata_response(
+    status: u16,
+    body: &str,
+) -> Result<Vec<u64>, CredStorePluginError> {
     if is_plain_not_found(status, body) {
         return Ok(Vec::new());
     }
@@ -460,7 +458,7 @@ pub fn classify_metadata_response(status: u16, body: &str) -> Result<Vec<u64>, C
 ///
 /// # Errors
 /// See [`map_error_status`].
-pub fn classify_destroy_response(status: u16, body: &str) -> Result<(), CredStoreError> {
+pub fn classify_destroy_response(status: u16, body: &str) -> Result<(), CredStorePluginError> {
     classify_delete_response(status, body)
 }
 

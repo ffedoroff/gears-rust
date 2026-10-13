@@ -29,7 +29,7 @@ fn building_sends_nothing_to_vault() {
 
     let client = client_from_config(&config_for(&server)).expect("a valid configuration builds");
 
-    assert!(client.supports_destroy());
+    assert!(client.destroyer().is_some());
     any.assert_calls(0);
 }
 

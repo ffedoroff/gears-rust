@@ -143,12 +143,12 @@ HTTP API with the root token.
 | `destroy_below_over_many_versions` | 30 versions: `Below(25)` destroys 1 to 24 (a soft-deleted one among them) and keeps 25 to 30 byte-exact; repeated and raised cuts are idempotent; `Exactly` for one version, for a destroyed one and for one never issued |
 | `destroy_and_delete_on_missing_keys_succeed` | `destroy` and `delete_key` of a key that was never written succeed, repeatedly |
 | `delete_key_removes_every_version` | After `delete_key` the metadata is gone and every version reads as `None`; Vault restarts the numbering at 1 (documented) |
-| `token_file_rotation_is_picked_up_after_a_403` | Rotate the file and revoke the old token: the next request succeeds through one re-read and one resend, for a read and for a write; a persistent `403` (revoked, file unchanged) is `ServiceUnavailable` for every operation and never contains a token; a new token in the file recovers without restart |
-| `token_file_that_appears_after_startup_is_used` | The plugin starts with no token file; calls are `ServiceUnavailable` until the file appears |
+| `token_file_rotation_is_picked_up_after_a_403` | Rotate the file and revoke the old token: the next request succeeds through one re-read and one resend, for a read and for a write; a persistent `403` (revoked, file unchanged) is `CredentialsRejected` for every operation and never contains a token; a new token in the file recovers without restart |
+| `token_file_that_appears_after_startup_is_used` | The plugin starts with no token file; calls are `Unavailable` until the file appears |
 | `the_documented_policy_is_confined_to_the_prefix` | The minimal policy denies another prefix, another mount and soft delete |
 | `a_missing_mount_is_an_error_not_a_miss` | Vault's explained `404` for an unknown mount is an `Internal` error for `put`, `get`, `delete_key` and both `destroy` forms (root token) |
-| `a_token_without_the_policy_is_service_unavailable` | An unknown token yields `403`; the plugin answers `ServiceUnavailable` without echoing the token |
-| `a_sealed_vault_is_service_unavailable` | A sealed server (`503 Vault is sealed`) is `ServiceUnavailable` for every operation, after the bounded retries |
+| `a_token_without_the_policy_is_credentials_rejected` | An unknown token yields `403`; the plugin answers `CredentialsRejected` without echoing the token |
+| `a_sealed_vault_is_service_unavailable` | A sealed server (`503 Vault is sealed`) is `Unavailable` for every operation, after the bounded retries |
 
 ## 5. Running the Tests
 

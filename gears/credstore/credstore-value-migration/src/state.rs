@@ -19,7 +19,10 @@
 
 use std::fmt;
 
-use credstore::infra::storage::migrations::m0002_value_versions::VALUE_MIGRATION_STATE_TABLE;
+use credstore::infra::storage::migrations::m0002_value_versions::{
+    VALUE_MIGRATION_DISCARD_VALUES_COLUMN, VALUE_MIGRATION_PHASE_COLUMN,
+    VALUE_MIGRATION_STATE_TABLE,
+};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, TransactionTrait, Value};
 use uuid::Uuid;
 
@@ -308,9 +311,10 @@ pub async fn create_tables(
         format!(
             "CREATE TABLE IF NOT EXISTS {HEADER_TABLE} (\
              id SMALLINT PRIMARY KEY CHECK (id = 1), \
-             phase TEXT NOT NULL CHECK (phase IN ({phases})), \
+             {VALUE_MIGRATION_PHASE_COLUMN} TEXT NOT NULL \
+             CHECK ({VALUE_MIGRATION_PHASE_COLUMN} IN ({phases})), \
              accept_losses BOOLEAN NOT NULL DEFAULT FALSE, \
-             discard_values BOOLEAN NOT NULL DEFAULT FALSE, \
+             {VALUE_MIGRATION_DISCARD_VALUES_COLUMN} BOOLEAN NOT NULL DEFAULT FALSE, \
              started_at {ts} NOT NULL DEFAULT CURRENT_TIMESTAMP, \
              updated_at {ts} NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         ),
@@ -370,19 +374,21 @@ pub async fn load_header(
     if !db::table_exists(db, backend, HEADER_TABLE).await? {
         return Ok(None);
     }
-    let sql =
-        format!("SELECT phase, accept_losses, discard_values FROM {HEADER_TABLE} WHERE id = 1");
+    let sql = format!(
+        "SELECT {VALUE_MIGRATION_PHASE_COLUMN}, accept_losses, \
+         {VALUE_MIGRATION_DISCARD_VALUES_COLUMN} FROM {HEADER_TABLE} WHERE id = 1"
+    );
     let Some(row) = db.query_one_raw(stmt(backend, &sql, vec![])).await? else {
         return Ok(None);
     };
-    let phase: String = row.try_get("", "phase")?;
+    let phase: String = row.try_get("", VALUE_MIGRATION_PHASE_COLUMN)?;
     let phase = Phase::parse(&phase).ok_or_else(|| {
         MigrationError::State(format!("unknown phase {phase:?} in {HEADER_TABLE}"))
     })?;
     Ok(Some(Header {
         phase,
         accept_losses: row.try_get("", "accept_losses")?,
-        discard_values: row.try_get("", "discard_values")?,
+        discard_values: row.try_get("", VALUE_MIGRATION_DISCARD_VALUES_COLUMN)?,
     }))
 }
 
@@ -456,7 +462,8 @@ pub async fn take_snapshot(
     exec(&txn, backend, &format!("DELETE FROM {ROWS_TABLE}"), vec![]).await?;
     if header_exists {
         let sql = format!(
-            "UPDATE {HEADER_TABLE} SET phase = {}, discard_values = {}, \
+            "UPDATE {HEADER_TABLE} SET {VALUE_MIGRATION_PHASE_COLUMN} = {}, \
+             {VALUE_MIGRATION_DISCARD_VALUES_COLUMN} = {}, \
              updated_at = CURRENT_TIMESTAMP WHERE id = 1",
             ph(backend, 1),
             ph(backend, 2)
@@ -470,7 +477,8 @@ pub async fn take_snapshot(
         .await?;
     } else {
         let sql = format!(
-            "INSERT INTO {HEADER_TABLE} (id, phase, accept_losses, discard_values) \
+            "INSERT INTO {HEADER_TABLE} (id, {VALUE_MIGRATION_PHASE_COLUMN}, accept_losses, \
+             {VALUE_MIGRATION_DISCARD_VALUES_COLUMN}) \
              VALUES (1, {}, FALSE, {})",
             ph(backend, 1),
             ph(backend, 2)
@@ -512,8 +520,9 @@ pub async fn set_phase(
     to: Phase,
 ) -> Result<(), MigrationError> {
     let sql = format!(
-        "UPDATE {HEADER_TABLE} SET phase = {}, updated_at = CURRENT_TIMESTAMP \
-         WHERE id = 1 AND phase = {}",
+        "UPDATE {HEADER_TABLE} SET {VALUE_MIGRATION_PHASE_COLUMN} = {}, \
+         updated_at = CURRENT_TIMESTAMP \
+         WHERE id = 1 AND {VALUE_MIGRATION_PHASE_COLUMN} = {}",
         ph(backend, 1),
         ph(backend, 2)
     );

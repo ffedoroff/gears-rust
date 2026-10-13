@@ -135,7 +135,7 @@ resumes from them.
 | `tidying` | per copied row: `destroy(key, Below(value_version))`, which removes the versions an interrupted `put` left behind (nobody else writes during the downtime and versions are ordered). Skipped when the new store does not support `destroy` | `done` |
 | `done` | prints the tally per state; a re-run only reports it | |
 
-Transient errors (`ServiceUnavailable`) of either store are retried with a bounded
+Transient errors (`Unavailable`) of either store are retried with a bounded
 backoff (5 attempts, 1 s doubling to at most 30 s); anything else, or running out
 of attempts, aborts the run (exit `1`) with nothing wrongly marked. A `put` whose
 result was not recorded leaves a version nobody points at; the tidy phase removes it.

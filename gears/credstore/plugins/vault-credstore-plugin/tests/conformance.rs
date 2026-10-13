@@ -25,7 +25,8 @@ mod common;
 use async_trait::async_trait;
 use common::VaultFixture;
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, ValueVersion,
+    CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError, DestroySelector,
+    SecretValue, StoreKey, ValueVersion,
 };
 use toolkit_security::SecurityContext;
 use vault_credstore_plugin::domain::Service;
@@ -55,7 +56,7 @@ impl CredStorePluginClientV2 for PluginWithServer {
         ctx: &SecurityContext,
         key: &StoreKey,
         value: SecretValue,
-    ) -> Result<ValueVersion, CredStoreError> {
+    ) -> Result<ValueVersion, CredStorePluginError> {
         self.plugin.put(ctx, key, value).await
     }
 
@@ -64,7 +65,7 @@ impl CredStorePluginClientV2 for PluginWithServer {
         ctx: &SecurityContext,
         key: &StoreKey,
         version: &ValueVersion,
-    ) -> Result<Option<SecretValue>, CredStoreError> {
+    ) -> Result<Option<SecretValue>, CredStorePluginError> {
         self.plugin.get(ctx, key, version).await
     }
 
@@ -72,21 +73,30 @@ impl CredStorePluginClientV2 for PluginWithServer {
         &self,
         ctx: &SecurityContext,
         key: &StoreKey,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CredStorePluginError> {
         self.plugin.delete_key(ctx, key).await
     }
 
-    fn supports_destroy(&self) -> bool {
-        self.plugin.supports_destroy()
+    fn destroyer(&self) -> Option<&dyn CredStorePluginDestroyerV2> {
+        self.plugin
+            .destroyer()
+            .map(|_| self as &dyn CredStorePluginDestroyerV2)
     }
+}
 
+#[async_trait]
+impl CredStorePluginDestroyerV2 for PluginWithServer {
     async fn destroy(
         &self,
         ctx: &SecurityContext,
         key: &StoreKey,
         selector: DestroySelector,
-    ) -> Result<(), CredStoreError> {
-        self.plugin.destroy(ctx, key, selector).await
+    ) -> Result<(), CredStorePluginError> {
+        self.plugin
+            .destroyer()
+            .expect("the vault plugin supports destroy")
+            .destroy(ctx, key, selector)
+            .await
     }
 }
 

@@ -49,7 +49,7 @@ pub enum MigrationError {
     },
     /// The new store failed (after the retries).
     #[error("new store: {0}")]
-    Target(#[from] credstore_sdk::CredStoreError),
+    Target(#[from] credstore_sdk::CredStorePluginError),
     /// Rows carry value fingerprints but the old store holds no fence key, so
     /// none of them can be verified.
     #[error(

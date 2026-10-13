@@ -3,13 +3,14 @@
 use std::sync::Arc;
 
 use credstore_sdk::{
-    CredStoreError, DestroySelector, SecretValue, StoreKey, TenantId, ValueVersion,
+    CredStorePluginError, DestroySelector, SecretValue, StoreKey, TenantId, ValueVersion,
 };
 use httpmock::prelude::*;
 use uuid::Uuid;
 
 use super::*;
 use crate::config::{RetryConfig, VaultCredStorePluginConfig, VaultToken};
+use crate::domain::test_ext::PluginErrorExt as _;
 use crate::infra::http::ReqwestTransport;
 
 /// Builds a service over the real `reqwest` transport, so these tests drive
@@ -111,7 +112,7 @@ async fn get_non_numeric_version_is_internal_error() {
     let server = MockServer::start();
     let svc = service_from(&config_for(&server));
     let err = svc.get_value(&key(), &vv("x")).await.unwrap_err();
-    assert!(matches!(err, CredStoreError::Internal(_)));
+    assert!(matches!(err, CredStorePluginError::Internal { .. }));
 }
 
 #[tokio::test]
@@ -352,7 +353,7 @@ async fn get_entry_without_value_is_internal() {
     });
     let svc = service_from(&config_for(&server));
     let err = svc.get_value(&key(), &vv("1")).await.unwrap_err();
-    assert!(matches!(err, CredStoreError::Internal(_)));
+    assert!(matches!(err, CredStorePluginError::Internal { .. }));
 }
 
 #[tokio::test]
@@ -366,11 +367,11 @@ async fn get_on_a_missing_mount_is_an_error_not_a_miss() {
     });
     let svc = service_from(&config_for(&server));
     let err = svc.get_value(&key(), &vv("1")).await.unwrap_err();
-    assert!(matches!(err, CredStoreError::Internal(_)));
+    assert!(matches!(err, CredStorePluginError::Internal { .. }));
 }
 
 #[tokio::test]
-async fn forbidden_maps_to_service_unavailable_and_is_not_retried() {
+async fn forbidden_maps_to_credentials_rejected_and_is_not_retried() {
     let server = MockServer::start();
     let mock = server.mock(|when, then| {
         when.method(GET).path_includes("/v1/secret/data/credstore/");
@@ -379,7 +380,7 @@ async fn forbidden_maps_to_service_unavailable_and_is_not_retried() {
     });
     let svc = service_from(&config_for(&server));
     let err = svc.get_value(&key(), &vv("1")).await.unwrap_err();
-    assert!(err.is_unavailable());
+    assert!(err.is_credentials_rejected());
     assert!(!err.to_string().contains("test-token"));
     // The transport re-reads an inline token never (it cannot change), so
     // exactly one request reaches Vault, and the service does not retry a 403.
@@ -402,7 +403,7 @@ async fn put_400_is_internal_with_vault_text_and_without_the_secret() {
         .await
         .unwrap_err();
     let msg = err.to_string();
-    assert!(matches!(err, CredStoreError::Internal(_)));
+    assert!(matches!(err, CredStorePluginError::Internal { .. }));
     assert!(msg.contains("rejected"), "{msg}");
     assert!(!msg.contains(&wire::encode_value(b"s3cret")), "{msg}");
 }
@@ -418,7 +419,7 @@ async fn retry_after_header_reaches_the_error() {
     let svc = service_from(&config_for(&server));
     let err = svc.delete_key_value(&key()).await.unwrap_err();
     assert!(err.is_unavailable());
-    assert_eq!(err.retry_after_seconds(), Some(9));
+    assert_eq!(err.retry_after().map(|d| d.as_secs()), Some(9));
 }
 
 #[tokio::test]
@@ -523,5 +524,5 @@ async fn destroy_on_a_missing_mount_is_an_error() {
         .destroy_value(&key(), &DestroySelector::Exactly(vv("3")))
         .await
         .unwrap_err();
-    assert!(matches!(err, CredStoreError::Internal(_)));
+    assert!(matches!(err, CredStorePluginError::Internal { .. }));
 }
