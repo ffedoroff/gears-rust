@@ -12,8 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, CredentialWrite, Fallback, PutPrecondition, SecretRef,
-    SecretType, SecretValue, SharingMode, WritePrecondition,
+    CredStoreClientV2, CredStoreError, CredentialWrite, Fallback, PutPrecondition, SecretRef,
+    SecretType, SecretValue, SecretWrite, SharingMode, WritePrecondition,
 };
 use secrecy::SecretString;
 use serde_json::Value;
@@ -69,7 +69,7 @@ const STORE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_
 /// The Secret Manager bound to `credstore`.
 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-manager:p1
 pub struct CredStoreSecretManager {
-    client: Arc<dyn CredStoreClientV1>,
+    client: Arc<dyn CredStoreClientV2>,
     namespace: Uuid,
     principal: Uuid,
 }
@@ -77,7 +77,7 @@ pub struct CredStoreSecretManager {
 impl CredStoreSecretManager {
     /// Bind to the store's client.
     #[must_use]
-    pub fn new(client: Arc<dyn CredStoreClientV1>) -> Self {
+    pub fn new(client: Arc<dyn CredStoreClientV2>) -> Self {
         let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, NAMESPACE_NAME);
         let principal = Uuid::new_v5(&namespace, b"principal");
         Self {
@@ -144,7 +144,10 @@ impl CredStoreSecretManager {
 
     fn parse_ref(secret_ref: &str) -> Result<SecretRef, DomainError> {
         SecretRef::new(secret_ref).map_err(|err| DomainError::Internal {
-            diagnostic: format!("stored secret reference does not parse: {err}"),
+            diagnostic: format!(
+                "stored secret reference does not parse: {}",
+                CredStoreError::from(err)
+            ),
         })
     }
 }
@@ -191,12 +194,12 @@ impl SecretManager for CredStoreSecretManager {
             sharing: SharingMode::Private,
             fallback: Fallback::Inherit,
             expires_at: None,
-            secret: Some(SecretValue::new(bytes_of(plaintext))),
+            secret: SecretWrite::Set(SecretValue::new(bytes_of(plaintext))),
         };
         self.client
             .put(&ctx, &secret_ref, write, PutPrecondition::CreateOnly)
             .await
-            .map_err(|err| unavailable("store the secret", &err))?;
+            .map_err(|err| unavailable("store the secret", &CredStoreError::from(err)))?;
         Ok(())
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-5
         // @cpt-end:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-4
@@ -210,7 +213,12 @@ impl SecretManager for CredStoreSecretManager {
     ) -> Result<SecretString, DomainError> {
         let reference = Self::parse_ref(secret_ref)?;
         let ctx = self.context(tenant)?;
-        let found = match self.client.get_secret(&ctx, &reference).await {
+        let found = match self
+            .client
+            .get_secret(&ctx, &reference)
+            .await
+            .map_err(CredStoreError::from)
+        {
             Ok(found) => found,
             Err(CredStoreError::NotFound) => None,
             // The record exists but its secret has expired: the plaintext is
@@ -253,6 +261,7 @@ impl SecretManager for CredStoreSecretManager {
             .client
             .delete(&ctx, &reference, WritePrecondition::Exists)
             .await
+            .map_err(CredStoreError::from)
         {
             Ok(()) | Err(CredStoreError::NotFound) => Ok(()),
             Err(err) => Err(unavailable("release the secret", &err)),

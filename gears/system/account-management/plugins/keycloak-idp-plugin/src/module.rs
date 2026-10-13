@@ -110,10 +110,10 @@ impl Gear for KeycloakIdpPluginGear {
         let system_ctx = build_system_ctx(cfg.security_context.platform_tenant_id);
 
         // ---- CredStore unified client (credstore-sdk). ----
-        let cs_client: Arc<dyn credstore_sdk::CredStoreClientV1> = ctx
+        let cs_client: Arc<dyn credstore_sdk::CredStoreClientV2> = ctx
             .client_hub()
-            .get::<dyn credstore_sdk::CredStoreClientV1>()
-            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: get CredStoreClientV1: {e}"))?;
+            .get::<dyn credstore_sdk::CredStoreClientV2>()
+            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: get CredStoreClientV2: {e}"))?;
         let cs_reader = CredStoreReader::new(Arc::clone(&cs_client), Arc::clone(&system_ctx));
         let cs_writer = CredStoreWriter::new(cs_client, Arc::clone(&system_ctx));
 

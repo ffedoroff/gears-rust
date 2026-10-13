@@ -688,7 +688,7 @@ When required dependencies meet their objectives, the plugin **MUST** support th
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-contract-credstore`
 
-- **Direction**: required from client (`CredStoreClientV1` via ClientHub)
+- **Direction**: required from client (`CredStoreClientV2` via ClientHub)
 - **Protocol/Format**: Platform secret-storage contract, invoked under the plugin's stable system actor
 - **Compatibility**: The plugin reads adopted/created realm-admin secrets and the optional TLS CA bundle, and writes/deletes created-realm admin secrets under the templated reference (`keycloak-idp-realm-admin-{realm_name}-secret` by default). References remain stable across rotation; secret values never enter provider metadata, logs, or metrics.
 

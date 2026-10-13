@@ -11,12 +11,12 @@ use crate::domain::test_support::{NoopMetrics, StubCredStore, keycloak_cfg};
 use crate::infra::kc_http::ReqwestKcTransport;
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
-    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, Validator,
-    WritePrecondition,
+    CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialWrite,
+    PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, Validator, WritePrecondition,
 };
 use parking_lot::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -32,12 +32,12 @@ struct StubOnce {
 }
 
 #[async_trait]
-impl CredStoreClientV1 for StubOnce {
+impl CredStoreClientV2 for StubOnce {
     async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Credential>, CredStoreError> {
+    ) -> Result<Option<Credential>, CanonicalError> {
         Ok(None)
     }
 
@@ -45,7 +45,7 @@ impl CredStoreClientV1 for StubOnce {
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Secret>, CredStoreError> {
+    ) -> Result<Option<Secret>, CanonicalError> {
         Ok(self.response.lock().take())
     }
 
@@ -55,7 +55,7 @@ impl CredStoreClientV1 for StubOnce {
         _key: &SecretRef,
         _write: CredentialWrite,
         _precondition: PutPrecondition,
-    ) -> Result<PutOutcome, CredStoreError> {
+    ) -> Result<PutOutcome, CanonicalError> {
         Ok(PutOutcome {
             created: true,
             validator: Validator {
@@ -71,7 +71,7 @@ impl CredStoreClientV1 for StubOnce {
         _key: &SecretRef,
         _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<Validator, CredStoreError> {
+    ) -> Result<Validator, CanonicalError> {
         Ok(Validator {
             id: Uuid::nil(),
             version: 1,
@@ -83,7 +83,7 @@ impl CredStoreClientV1 for StubOnce {
         _ctx: &SecurityContext,
         _key: &SecretRef,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CanonicalError> {
         Ok(())
     }
 
@@ -91,7 +91,7 @@ impl CredStoreClientV1 for StubOnce {
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+    ) -> Result<Page<CredentialListItem>, CanonicalError> {
         Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
@@ -113,7 +113,7 @@ fn default_transport() -> Arc<dyn KcTransport> {
 }
 
 fn factory_for_cfg(cfg: KeycloakConfig) -> KeycloakAdminClientFactory {
-    let stub: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let stub: Arc<dyn CredStoreClientV2> = Arc::new(StubCredStore);
     let reader = CredStoreReader::new(Arc::clone(&stub), build_system_ctx(Uuid::nil()));
     KeycloakAdminClientFactory::new(cfg, default_transport(), reader, Arc::new(NoopMetrics))
 }
@@ -184,7 +184,7 @@ async fn factory_with_tls_ca_bundle_ref_loads_bundle() {
 #[tokio::test]
 async fn factory_with_missing_tls_ca_bundle_ref_fails_init() {
     // CredStore returns Ok(None) — the ref is absent.
-    let stub: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let stub: Arc<dyn CredStoreClientV2> = Arc::new(StubCredStore);
     let reader = CredStoreReader::new(stub, build_system_ctx(Uuid::nil()));
     let mut cfg = keycloak_cfg("https://kc.example/auth");
     cfg.tls_ca_bundle_ref = Some("platform-ca-bundle".into());
@@ -755,7 +755,7 @@ fn factory_with_metrics(
     server: &MockServer,
     metrics: Arc<dyn KcAdminMetricsPort>,
 ) -> KeycloakAdminClientFactory {
-    let stub: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let stub: Arc<dyn CredStoreClientV2> = Arc::new(StubCredStore);
     let reader = CredStoreReader::new(stub, build_system_ctx(Uuid::nil()));
     KeycloakAdminClientFactory::new(
         keycloak_cfg(&server.uri()),

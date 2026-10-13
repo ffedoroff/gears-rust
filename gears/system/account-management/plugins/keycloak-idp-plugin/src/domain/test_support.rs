@@ -3,8 +3,8 @@
 //!
 //! Only compiled under `#[cfg(test)]`. Provides:
 //!
-//! - [`StubCredStore`] — no-op `CredStoreClientV1` (every `get` returns `None`).
-//! - [`ConfigurableStubCS`] — keyed-map `CredStoreClientV1` for tests that
+//! - [`StubCredStore`] — no-op `CredStoreClientV2` (every `get` returns `None`).
+//! - [`ConfigurableStubCS`] — keyed-map `CredStoreClientV2` for tests that
 //!   need predetermined `get` responses.
 //! - [`keycloak_cfg`]`(base_url)` — minimal valid `KeycloakConfig` builder.
 //! - [`noop_metrics_*`]`()` typed-port accessors — one `Arc<dyn ...Port>`
@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
-    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, Validator,
-    WritePrecondition,
+    CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialWrite,
+    PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, Validator, WritePrecondition,
 };
+use toolkit_canonical_errors::{CanonicalError, resource_error};
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
@@ -87,7 +87,42 @@ impl SaOpMetricsPort for NoopMetrics {
     fn sa_op_duration(&self, _op: SaOp, _secs: f64) {}
 }
 
-/// No-op `CredStoreClientV1` — every read returns `Ok(None)`.
+#[resource_error(gts_id!("cf.core.credstore.credential.v1~"))]
+struct CredentialScope;
+
+/// Canonical `NotFound` as the credstore gear emits it.
+#[must_use]
+pub fn cs_not_found() -> CanonicalError {
+    CredentialScope::not_found("credential not found")
+        .with_resource("credential")
+        .create()
+}
+
+/// Canonical `AlreadyExists` (a `CreateOnly` put over an existing record).
+#[must_use]
+pub fn cs_already_exists() -> CanonicalError {
+    CredentialScope::already_exists("credential already exists")
+        .with_resource("credential")
+        .create()
+}
+
+/// Canonical `Aborted` / `OPTIMISTIC_LOCK_FAILURE` (a failed write precondition).
+#[must_use]
+pub fn cs_precondition_failed() -> CanonicalError {
+    CredentialScope::aborted("write precondition failed")
+        .with_reason(credstore_sdk::reason::aborted::OPTIMISTIC_LOCK_FAILURE)
+        .create()
+}
+
+/// Canonical `ServiceUnavailable` with `detail`.
+#[must_use]
+pub fn cs_unavailable(detail: &str) -> CanonicalError {
+    CanonicalError::service_unavailable()
+        .with_detail(detail)
+        .create()
+}
+
+/// No-op `CredStoreClientV2` — every read returns `Ok(None)`.
 ///
 /// Suitable for Shared-mode tests that never resolve a `SecretSource::OpenBaoRef`
 /// (the bootstrap path uses the inline secret carried on the parsed config).
@@ -95,12 +130,12 @@ impl SaOpMetricsPort for NoopMetrics {
 pub struct StubCredStore;
 
 #[async_trait]
-impl CredStoreClientV1 for StubCredStore {
+impl CredStoreClientV2 for StubCredStore {
     async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Credential>, CredStoreError> {
+    ) -> Result<Option<Credential>, CanonicalError> {
         Ok(None)
     }
 
@@ -108,7 +143,7 @@ impl CredStoreClientV1 for StubCredStore {
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Secret>, CredStoreError> {
+    ) -> Result<Option<Secret>, CanonicalError> {
         Ok(None)
     }
 
@@ -118,7 +153,7 @@ impl CredStoreClientV1 for StubCredStore {
         _key: &SecretRef,
         _write: CredentialWrite,
         _precondition: PutPrecondition,
-    ) -> Result<PutOutcome, CredStoreError> {
+    ) -> Result<PutOutcome, CanonicalError> {
         Ok(PutOutcome {
             created: true,
             validator: Validator {
@@ -134,7 +169,7 @@ impl CredStoreClientV1 for StubCredStore {
         _key: &SecretRef,
         _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<Validator, CredStoreError> {
+    ) -> Result<Validator, CanonicalError> {
         Ok(Validator {
             id: Uuid::nil(),
             version: 1,
@@ -146,7 +181,7 @@ impl CredStoreClientV1 for StubCredStore {
         _ctx: &SecurityContext,
         _key: &SecretRef,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CanonicalError> {
         Ok(())
     }
 
@@ -154,7 +189,7 @@ impl CredStoreClientV1 for StubCredStore {
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+    ) -> Result<Page<CredentialListItem>, CanonicalError> {
         Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
@@ -195,12 +230,12 @@ impl ConfigurableStubCS {
 }
 
 #[async_trait]
-impl CredStoreClientV1 for ConfigurableStubCS {
+impl CredStoreClientV2 for ConfigurableStubCS {
     async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Credential>, CredStoreError> {
+    ) -> Result<Option<Credential>, CanonicalError> {
         Ok(None)
     }
 
@@ -208,7 +243,7 @@ impl CredStoreClientV1 for ConfigurableStubCS {
         &self,
         _ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<Secret>, CredStoreError> {
+    ) -> Result<Option<Secret>, CanonicalError> {
         Ok(self.responses.lock().remove(key.as_ref()))
     }
 
@@ -218,7 +253,7 @@ impl CredStoreClientV1 for ConfigurableStubCS {
         _key: &SecretRef,
         _write: CredentialWrite,
         _precondition: PutPrecondition,
-    ) -> Result<PutOutcome, CredStoreError> {
+    ) -> Result<PutOutcome, CanonicalError> {
         Ok(PutOutcome {
             created: true,
             validator: Validator {
@@ -234,7 +269,7 @@ impl CredStoreClientV1 for ConfigurableStubCS {
         _key: &SecretRef,
         _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<Validator, CredStoreError> {
+    ) -> Result<Validator, CanonicalError> {
         Ok(Validator {
             id: Uuid::nil(),
             version: 1,
@@ -246,7 +281,7 @@ impl CredStoreClientV1 for ConfigurableStubCS {
         _ctx: &SecurityContext,
         _key: &SecretRef,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CanonicalError> {
         Ok(())
     }
 
@@ -254,7 +289,7 @@ impl CredStoreClientV1 for ConfigurableStubCS {
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+    ) -> Result<Page<CredentialListItem>, CanonicalError> {
         Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }

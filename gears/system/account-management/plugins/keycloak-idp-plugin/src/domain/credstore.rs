@@ -2,7 +2,7 @@
 //! accidentally pass AM-forwarded ctx to `CredStore`.
 //!
 //! [`CredStoreReader`] is the canonical read-only path (DESIGN "Component Model").
-//! [`CredStoreWriter`] wraps the unified `credstore_sdk::CredStoreClientV1`
+//! [`CredStoreWriter`] wraps the unified `credstore_sdk::CredStoreClientV2`
 //! (the gateway client resolved from the `ClientHub`) for `put`/`delete`.
 //!
 //! Reader and writer are deliberately separate types — not one `CredStore` —

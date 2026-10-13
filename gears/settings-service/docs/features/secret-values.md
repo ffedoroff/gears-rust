@@ -239,7 +239,7 @@ The system **MUST** bind the Secret Manager port to the `credstore` gear's clien
 
 **Touches**:
 - Entities: Secret Manager port, `SecretRef`
-- External: `credstore` gear, `CredStoreClientV1`
+- External: `credstore` gear, `CredStoreClientV2`
 
 ### Reference Only, Never Plaintext
 
@@ -335,7 +335,7 @@ The system **MUST** let an interactive caller stage a `secret`-trait value ahead
 **Touches**:
 - API: `POST /settings-service/v1/settings/{key}/secret-stage`, `POST /settings-service/v1/settings/batch`
 - Entities: `pending_secrets`, Secret Manager port
-- External: `credstore` gear, `CredStoreClientV1`
+- External: `credstore` gear, `CredStoreClientV2`
 
 ## 6. Acceptance Criteria
 

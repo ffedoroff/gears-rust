@@ -12,13 +12,14 @@ use account_management_sdk::idp::IdpProvisionTenantRequest;
 use account_management_sdk::idp_user::IdpTenantContext;
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
-    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, SharingMode,
-    Validator, WritePrecondition,
+    CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialWrite,
+    PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, SharingMode, Validator,
+    WritePrecondition,
 };
 use gts::GtsTypeId;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use wiremock::matchers::{method, path, path_regex, query_param};
@@ -87,13 +88,13 @@ struct ConfigurableStubOpenBao {
     delete_calls: Mutex<Vec<RecordedDelete>>,
     /// One-shot override for the next `put` call's response. `None` →
     /// default `Ok(())`. Consumed on read.
-    next_put_response: Mutex<Option<Result<(), CredStoreError>>>,
+    next_put_response: Mutex<Option<Result<(), CanonicalError>>>,
     /// One-shot override for the next `delete` call's response. `None` →
     /// default `Ok(())`. Consumed on read.
-    next_delete_response: Mutex<Option<Result<(), CredStoreError>>>,
+    next_delete_response: Mutex<Option<Result<(), CanonicalError>>>,
     /// One-shot failure for the next `get` call. `None` → answer from
     /// `get_responses`. Consumed on read.
-    next_get_error: Mutex<Option<CredStoreError>>,
+    next_get_error: Mutex<Option<CanonicalError>>,
     /// Keyed read responses (consumed on first match — same semantics as
     /// [`ConfigurableStubCS`]).
     get_responses: Mutex<std::collections::HashMap<String, Secret>>,
@@ -101,7 +102,7 @@ struct ConfigurableStubOpenBao {
 
 impl ConfigurableStubOpenBao {
     /// Stub whose next `put` fails with `err`.
-    fn with_put_failure(err: CredStoreError) -> Self {
+    fn with_put_failure(err: CanonicalError) -> Self {
         Self {
             next_put_response: Mutex::new(Some(Err(err))),
             ..Self::default()
@@ -109,7 +110,7 @@ impl ConfigurableStubOpenBao {
     }
 
     /// Stub whose next `delete` fails with `err`.
-    fn with_delete_failure(err: CredStoreError) -> Self {
+    fn with_delete_failure(err: CanonicalError) -> Self {
         Self {
             next_delete_response: Mutex::new(Some(Err(err))),
             ..Self::default()
@@ -117,7 +118,7 @@ impl ConfigurableStubOpenBao {
     }
 
     /// Stub whose next `get` fails with `err`.
-    fn with_get_failure(err: CredStoreError) -> Self {
+    fn with_get_failure(err: CanonicalError) -> Self {
         Self {
             next_get_error: Mutex::new(Some(err)),
             ..Self::default()
@@ -142,12 +143,12 @@ impl ConfigurableStubOpenBao {
 }
 
 #[async_trait]
-impl CredStoreClientV1 for ConfigurableStubOpenBao {
+impl CredStoreClientV2 for ConfigurableStubOpenBao {
     async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Credential>, CredStoreError> {
+    ) -> Result<Option<Credential>, CanonicalError> {
         Ok(None)
     }
 
@@ -155,7 +156,7 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
         &self,
         _ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<Secret>, CredStoreError> {
+    ) -> Result<Option<Secret>, CanonicalError> {
         if let Some(err) = self.next_get_error.lock().take() {
             return Err(err);
         }
@@ -168,14 +169,13 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
         key: &SecretRef,
         write: CredentialWrite,
         _precondition: PutPrecondition,
-    ) -> Result<PutOutcome, CredStoreError> {
+    ) -> Result<PutOutcome, CanonicalError> {
         self.put_calls.lock().push((
             key.as_ref().to_owned(),
-            write
-                .secret
-                .as_ref()
-                .map(|v| v.as_bytes().to_vec())
-                .unwrap_or_default(),
+            match &write.secret {
+                credstore_sdk::SecretWrite::Set(v) => v.as_bytes().to_vec(),
+                credstore_sdk::SecretWrite::Null => Vec::new(),
+            },
             write.sharing,
         ));
         self.next_put_response
@@ -197,7 +197,7 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
         _key: &SecretRef,
         _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<Validator, CredStoreError> {
+    ) -> Result<Validator, CanonicalError> {
         Ok(Validator {
             id: uuid::Uuid::nil(),
             version: 1,
@@ -209,7 +209,7 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
         _ctx: &SecurityContext,
         key: &SecretRef,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CanonicalError> {
         self.delete_calls.lock().push(key.as_ref().to_owned());
         self.next_delete_response.lock().take().unwrap_or(Ok(()))
     }
@@ -218,7 +218,7 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+    ) -> Result<Page<CredentialListItem>, CanonicalError> {
         Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
@@ -236,26 +236,26 @@ fn build_facade(server: &MockServer) -> TenantFacade {
 }
 
 /// Variant of [`build_facade`] that lets the caller inject a custom
-/// [`CredStoreClientV1`] — Adopted-mode tests use this to seed the
+/// [`CredStoreClientV2`] — Adopted-mode tests use this to seed the
 /// per-realm `OpenBao` response.
-fn build_facade_with_cs(server: &MockServer, cs: Arc<dyn CredStoreClientV1>) -> TenantFacade {
+fn build_facade_with_cs(server: &MockServer, cs: Arc<dyn CredStoreClientV2>) -> TenantFacade {
     build_facade_with_unified_client(server, cs)
 }
 
 /// Builder for Created-mode tests that record `put`/`delete` calls.
 /// The `mutator` is a [`ConfigurableStubOpenBao`] used as the single
-/// unified [`CredStoreClientV1`]; pre-seed any needed `get` responses via
+/// unified [`CredStoreClientV2`]; pre-seed any needed `get` responses via
 /// [`ConfigurableStubOpenBao::seed_get`] before calling this.
 fn build_facade_with_cs_and_mutator(
     server: &MockServer,
-    mutator: Arc<dyn CredStoreClientV1>,
+    mutator: Arc<dyn CredStoreClientV2>,
 ) -> TenantFacade {
     build_facade_with_unified_client(server, mutator)
 }
 
 fn build_facade_with_unified_client(
     server: &MockServer,
-    client: Arc<dyn CredStoreClientV1>,
+    client: Arc<dyn CredStoreClientV2>,
 ) -> TenantFacade {
     build_facade_with_client_and_purge(server, client, noop_purge_hook())
 }
@@ -269,7 +269,7 @@ fn build_facade_with_purge_hook(
 
 fn build_facade_with_client_and_purge(
     server: &MockServer,
-    client: Arc<dyn CredStoreClientV1>,
+    client: Arc<dyn CredStoreClientV2>,
     hook: Arc<dyn TenantAccountPurgeHook>,
 ) -> TenantFacade {
     build_facade_with_tenant_metrics(server, client, hook, noop_tenant_metrics())
@@ -1444,7 +1444,7 @@ async fn created_happy_path_writes_secret_and_returns_created_metadata() {
         mutator.seed_get(&secret_key, "the-generated-client-secret");
         let facade = build_facade_with_unified_client(
             &server,
-            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
         );
         let ctx = build_system_ctx(Uuid::nil());
         let req = created_request(tenant_uuid);
@@ -1564,7 +1564,7 @@ async fn created_against_existing_realm_returns_clean_failure_equivalent() {
         let mutator = Arc::new(ConfigurableStubOpenBao::default());
         let facade = build_facade_with_cs_and_mutator(
             &server,
-            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
         );
         let ctx = build_system_ctx(Uuid::nil());
         let req = created_request(tenant_uuid);
@@ -1613,7 +1613,7 @@ async fn created_kc_realm_create_503_then_absent_is_clean_retryable() {
         let mutator = Arc::new(ConfigurableStubOpenBao::default());
         let facade = build_facade_with_cs_and_mutator(
             &server,
-            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
         );
         let ctx = build_system_ctx(Uuid::nil());
         let req = created_request(tenant_uuid);
@@ -1671,7 +1671,7 @@ async fn created_kc_realm_create_503_then_probe_503_remains_ambiguous() {
         let mutator = Arc::new(ConfigurableStubOpenBao::default());
         let facade = build_facade_with_cs_and_mutator(
             &server,
-            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
         );
         let ctx = build_system_ctx(Uuid::nil());
         let req = created_request(tenant_uuid);
@@ -1922,7 +1922,7 @@ async fn created_kc_client_create_5xx_returns_ambiguous_kc_client_create() {
 
         let mutator = Arc::new(ConfigurableStubOpenBao::default());
         let facade =
-            build_facade_with_cs_and_mutator(&server, Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>);
+            build_facade_with_cs_and_mutator(&server, Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>);
         let ctx = build_system_ctx(Uuid::nil());
         let req = created_request(tenant_uuid);
 
@@ -2032,7 +2032,7 @@ async fn created_kc_role_mapping_5xx_returns_ambiguous_kc_role_mapping() {
 
         let mutator = Arc::new(ConfigurableStubOpenBao::default());
         let facade =
-            build_facade_with_cs_and_mutator(&server, Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>);
+            build_facade_with_cs_and_mutator(&server, Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>);
         let ctx = build_system_ctx(Uuid::nil());
         let req = created_request(tenant_uuid);
 
@@ -2072,13 +2072,13 @@ async fn created_openbao_put_failure_returns_ambiguous_openbao_after_kc_success(
         let _ = mount_created_happy_path(&server, tenant_uuid, &realm, "secret-value").await;
 
         let mutator = Arc::new(ConfigurableStubOpenBao::with_put_failure(
-            CredStoreError::service_unavailable("openbao down"),
+            crate::domain::test_support::cs_unavailable("openbao down"),
         ));
         // put fails before the realm-admin token exchange (step 7), so no
         // get-response seed is needed.
         let facade = build_facade_with_cs_and_mutator(
             &server,
-            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
         );
         let ctx = build_system_ctx(Uuid::nil());
         let req = created_request(tenant_uuid);
@@ -2201,7 +2201,7 @@ async fn created_client_secret_read_failure_returns_ambiguous_kc_client_secret_r
 
         let mutator = Arc::new(ConfigurableStubOpenBao::default());
         let facade =
-            build_facade_with_cs_and_mutator(&server, Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>);
+            build_facade_with_cs_and_mutator(&server, Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>);
         let ctx = build_system_ctx(Uuid::nil());
         let req = created_request(tenant_uuid);
 
@@ -2480,7 +2480,7 @@ async fn deprovision_created_last_tenant_tears_down_realm_and_secret() {
         );
         let facade = build_facade_with_unified_client(
             &server,
-            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
         );
         let ctx = build_system_ctx(Uuid::nil());
         let req = deprovision_req(
@@ -2563,7 +2563,7 @@ async fn deprovision_created_with_remaining_tenants_keeps_realm() {
         );
         let facade = build_facade_with_unified_client(
             &server,
-            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
         );
         let ctx = build_system_ctx(Uuid::nil());
         let req = deprovision_req(
@@ -2870,7 +2870,7 @@ async fn deprovision_created_with_realm_gone_retries_when_secret_delete_fails() 
     mount_realm_probe(&server, "partner-created", 404).await;
 
     let mutator = Arc::new(ConfigurableStubOpenBao::with_delete_failure(
-        CredStoreError::service_unavailable("openbao down"),
+        crate::domain::test_support::cs_unavailable("openbao down"),
     ));
     mutator.seed_get(
         "keycloak-idp-realm-admin-partner-created-secret",
@@ -3259,7 +3259,7 @@ async fn deprovision_created_with_realm_gone_and_secret_read_error_returns_not_f
     mount_no_deletes(&server).await;
 
     let mutator = Arc::new(ConfigurableStubOpenBao::with_get_failure(
-        CredStoreError::service_unavailable("openbao flaky"),
+        crate::domain::test_support::cs_unavailable("openbao flaky"),
     ));
     let facade = build_facade_with_unified_client(
         &server,
@@ -3643,7 +3643,7 @@ async fn provision_tenant_returns_ambiguous_timeout_when_saga_exceeds_provision_
         provision_timeout_ms: 50,
     };
 
-    let client: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let client: Arc<dyn CredStoreClientV2> = Arc::new(StubCredStore);
     let cs_reader = crate::domain::credstore::CredStoreReader::new(
         Arc::clone(&client),
         crate::domain::system_actor::build_system_ctx(uuid::Uuid::nil()),
@@ -3753,7 +3753,7 @@ async fn provision_tenant_records_duration_when_saga_times_out() {
         provision_timeout_ms: 50,
     };
 
-    let client: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let client: Arc<dyn CredStoreClientV2> = Arc::new(StubCredStore);
     let cs_reader = CredStoreReader::new(Arc::clone(&client), build_system_ctx(Uuid::nil()));
     let cs_writer = CredStoreWriter::new(client, build_system_ctx(Uuid::nil()));
     let transport: Arc<dyn KcTransport> = Arc::new(ReqwestKcTransport::new(reqwest::Client::new()));
@@ -4431,7 +4431,7 @@ async fn deprovision_tenant_returns_retryable_when_saga_exceeds_provision_timeou
         provision_timeout_ms: 50,
     };
 
-    let client: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let client: Arc<dyn CredStoreClientV2> = Arc::new(StubCredStore);
     let cs_reader = crate::domain::credstore::CredStoreReader::new(
         Arc::clone(&client),
         crate::domain::system_actor::build_system_ctx(uuid::Uuid::nil()),
@@ -4528,7 +4528,7 @@ async fn create_realm_rejects_non_allowlisted_realm_defaults_key() {
         provision_timeout_ms: 30_000,
     };
 
-    let client: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let client: Arc<dyn CredStoreClientV2> = Arc::new(StubCredStore);
     let cs_reader = crate::domain::credstore::CredStoreReader::new(
         Arc::clone(&client),
         crate::domain::system_actor::build_system_ctx(uuid::Uuid::nil()),

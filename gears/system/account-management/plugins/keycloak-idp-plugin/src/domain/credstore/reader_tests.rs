@@ -8,6 +8,7 @@ use credstore_sdk::{
 };
 use parking_lot::Mutex;
 use secrecy::ExposeSecret;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use uuid::Uuid;
 
@@ -20,12 +21,12 @@ struct StubClient {
 }
 
 #[async_trait]
-impl CredStoreClientV1 for StubClient {
+impl CredStoreClientV2 for StubClient {
     async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Credential>, CredStoreError> {
+    ) -> Result<Option<Credential>, CanonicalError> {
         Ok(None)
     }
 
@@ -33,7 +34,7 @@ impl CredStoreClientV1 for StubClient {
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<Secret>, CredStoreError> {
+    ) -> Result<Option<Secret>, CanonicalError> {
         Ok(self.response.lock().take())
     }
 
@@ -43,7 +44,7 @@ impl CredStoreClientV1 for StubClient {
         _key: &SecretRef,
         _write: CredentialWrite,
         _precondition: PutPrecondition,
-    ) -> Result<PutOutcome, CredStoreError> {
+    ) -> Result<PutOutcome, CanonicalError> {
         Ok(PutOutcome {
             created: true,
             validator: Validator {
@@ -59,7 +60,7 @@ impl CredStoreClientV1 for StubClient {
         _key: &SecretRef,
         _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<Validator, CredStoreError> {
+    ) -> Result<Validator, CanonicalError> {
         Ok(Validator {
             id: Uuid::nil(),
             version: 1,
@@ -71,7 +72,7 @@ impl CredStoreClientV1 for StubClient {
         _ctx: &SecurityContext,
         _key: &SecretRef,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
+    ) -> Result<(), CanonicalError> {
         Ok(())
     }
 
@@ -79,7 +80,7 @@ impl CredStoreClientV1 for StubClient {
         &self,
         _ctx: &SecurityContext,
         query: &ODataQuery,
-    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+    ) -> Result<Page<CredentialListItem>, CanonicalError> {
         Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
@@ -142,5 +143,5 @@ async fn non_utf8_value_surfaces_as_internal_error() {
     let reader = CredStoreReader::new(stub, ctx);
     let key = SecretRef::new("k").expect("valid SecretRef");
     let err = reader.get(&key).await.expect_err("must reject non-UTF-8");
-    assert!(matches!(err, CredStoreError::Internal(_)));
+    assert!(matches!(err, CredStoreError::Internal { .. }));
 }

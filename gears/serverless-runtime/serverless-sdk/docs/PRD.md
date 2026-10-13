@@ -411,7 +411,7 @@ The SDK MUST provide an `Environment` trait for synchronous, **read-only**
 key-based access to configuration values and secrets, populated before each
 invocation. The SDK MUST
 provide a standard `Environment` implementation backed by the platform credstore
-(`CredStoreClientV1`). Custom `Environment` implementations remain possible for
+(`CredStoreClientV2`). Custom `Environment` implementations remain possible for
 testing or non-standard secret sources.
 
 - **Rationale**: Provides engine-agnostic access to function configuration and credentials
@@ -616,7 +616,7 @@ surface, stability classifications, and breaking change policies, see [DESIGN.md
 
 - Invocation record → context mapping (deterministic field mapping)
 - Compensation context → compensation input mapping (deterministic field mapping)
-- Credstore → environment population (standard `CredStoreClientV1`-backed implementation)
+- Credstore → environment population (standard `CredStoreClientV2`-backed implementation)
 
 ---
 

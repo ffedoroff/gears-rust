@@ -673,7 +673,7 @@ impl Gear for SettingsService {
         // `credstore` is in `deps`, so its client is available here.
         let credstore = ctx
             .client_hub()
-            .get::<dyn credstore_sdk::CredStoreClientV1>()
+            .get::<dyn credstore_sdk::CredStoreClientV2>()
             .map_err(|e| anyhow::anyhow!("{}: credstore client: {e}", Self::MODULE_NAME))?;
         let secrets: Arc<dyn crate::domain::ports::SecretManager> = Arc::new(
             crate::infra::secret_manager::CredStoreSecretManager::new(credstore),

@@ -60,7 +60,7 @@ use {
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use tenant_resolver_sdk::TenantResolverClient;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
@@ -74,7 +74,7 @@ pub(crate) struct ControlPlaneServiceImpl {
     routes: Arc<dyn RouteRepository>,
     tenant_resolver: Arc<dyn TenantResolverClient>,
     policy_enforcer: PolicyEnforcer,
-    credstore: Arc<dyn CredStoreClientV1>,
+    credstore: Arc<dyn CredStoreClientV2>,
     ssrf_guard: Arc<SsrfGuard>,
     proxy_reader: Option<Arc<dyn ProxyConfigReader>>,
     /// Counts withheld ancestor credentials on the proxy path; none in tests
@@ -93,7 +93,7 @@ impl ControlPlaneServiceImpl {
         routes: Arc<dyn RouteRepository>,
         tenant_resolver: Arc<dyn TenantResolverClient>,
         policy_enforcer: PolicyEnforcer,
-        credstore: Arc<dyn CredStoreClientV1>,
+        credstore: Arc<dyn CredStoreClientV2>,
         ssrf_guard: Arc<SsrfGuard>,
         proxy_reader: Option<Arc<dyn ProxyConfigReader>>,
     ) -> Self {
