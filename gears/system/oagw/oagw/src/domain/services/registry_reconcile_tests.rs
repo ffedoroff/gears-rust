@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use tenant_resolver_sdk::{TenantId, TenantResolverClient};
 use tokio_util::sync::CancellationToken;
 use toolkit_db::{DBProvider, Db};
@@ -209,7 +209,7 @@ impl Stores {
 pub(crate) fn planes_over(
     stores: Stores,
     tenants: Arc<dyn TenantResolverClient>,
-    credstore: Arc<dyn CredStoreClientV1>,
+    credstore: Arc<dyn CredStoreClientV2>,
 ) -> (Arc<ControlPlaneServiceImpl>, Arc<RegistryProvisionerImpl>) {
     planes_guarded(stores, tenants, credstore, SsrfGuard::disabled())
 }
@@ -218,7 +218,7 @@ pub(crate) fn planes_over(
 fn planes_guarded(
     stores: Stores,
     tenants: Arc<dyn TenantResolverClient>,
-    credstore: Arc<dyn CredStoreClientV1>,
+    credstore: Arc<dyn CredStoreClientV2>,
     ssrf: SsrfGuard,
 ) -> (Arc<ControlPlaneServiceImpl>, Arc<RegistryProvisionerImpl>) {
     let cp = Arc::new(ControlPlaneServiceImpl::new(
@@ -262,7 +262,7 @@ impl Fixture {
     fn with(
         backend: Backend,
         tenants: Arc<dyn TenantResolverClient>,
-        credstore: Arc<dyn CredStoreClientV1>,
+        credstore: Arc<dyn CredStoreClientV2>,
     ) -> Self {
         Self::over(Stores::new(backend), tenants, credstore)
     }
@@ -270,7 +270,7 @@ impl Fixture {
     fn over(
         stores: Stores,
         tenants: Arc<dyn TenantResolverClient>,
-        credstore: Arc<dyn CredStoreClientV1>,
+        credstore: Arc<dyn CredStoreClientV2>,
     ) -> Self {
         let (cp, provisioner) = planes_over(stores, tenants, credstore);
         Self {
@@ -1421,9 +1421,9 @@ async fn a_credstore_outage_aborts_and_a_refusal_skips(b: Backend) {
     let outage = Fixture::over(
         stores.clone(),
         tenants.clone(),
-        Arc::new(ErroringCredStore(|| {
-            credstore_sdk::CredStoreError::NoPluginAvailable
-        })),
+        Arc::new(ErroringCredStore(
+            crate::domain::test_support::credstore_unavailable_error,
+        )),
     );
     let root = Uuid::new_v4();
     let err = outage
@@ -1436,9 +1436,9 @@ async fn a_credstore_outage_aborts_and_a_refusal_skips(b: Backend) {
     let refusal = Fixture::over(
         stores,
         tenants,
-        Arc::new(ErroringCredStore(|| {
-            credstore_sdk::CredStoreError::AccessDenied
-        })),
+        Arc::new(ErroringCredStore(
+            crate::domain::test_support::credstore_denied_error,
+        )),
     );
     let counts = refusal
         .ok(

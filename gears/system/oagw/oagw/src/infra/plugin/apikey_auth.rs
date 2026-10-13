@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStoreClientV1, CredStoreError, SecretRef};
+use credstore_sdk::{CredStoreClientV2, CredStoreError, SecretRef};
 use serde::Deserialize;
 
 use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
@@ -21,13 +21,13 @@ struct ApiKeyConfig {
 
 /// Auth plugin that resolves a secret reference and injects it as a header value.
 pub struct ApiKeyAuthPlugin {
-    credstore: Arc<dyn CredStoreClientV1>,
+    credstore: Arc<dyn CredStoreClientV2>,
 }
 
 impl ApiKeyAuthPlugin {
     /// Create the plugin, resolving secrets through the given credential store.
     #[must_use]
-    pub fn new(credstore: Arc<dyn CredStoreClientV1>) -> Self {
+    pub fn new(credstore: Arc<dyn CredStoreClientV2>) -> Self {
         Self { credstore }
     }
 }
@@ -45,10 +45,19 @@ impl AuthPlugin for ApiKeyAuthPlugin {
             .secret_ref
             .strip_prefix("cred://")
             .unwrap_or(&config.secret_ref);
-        let key = SecretRef::new(raw_ref)
-            .map_err(|e| PluginError::Internal(format!("invalid secret ref '{raw_ref}': {e}")))?;
+        let key = SecretRef::new(raw_ref).map_err(|e| {
+            PluginError::Internal(format!(
+                "invalid secret ref '{raw_ref}': {}",
+                CredStoreError::from(e)
+            ))
+        })?;
 
-        let response = match self.credstore.get_secret(&ctx.security_context, &key).await {
+        let response = match self
+            .credstore
+            .get_secret(&ctx.security_context, &key)
+            .await
+            .map_err(CredStoreError::from)
+        {
             Ok(Some(response)) => response,
             Ok(None) => return Err(PluginError::SecretNotFound(config.secret_ref.clone())),
             // The record exists but its secret has expired: not usable, so

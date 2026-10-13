@@ -222,7 +222,7 @@ depending on any adapter. This directly enforces
 `cpt-cf-serverless-runtime-principle-impl-agnostic` at the SDK layer.
 
 `Environment` is synchronous because handlers should not perform async I/O for config/secret
-resolution. The SDK pre-fetches values from the platform credstore (`CredStoreClientV1`)
+resolution. The SDK pre-fetches values from the platform credstore (`CredStoreClientV2`)
 before invocation and exposes them through the synchronous `Environment` trait.
 
 #### GTS Identity by Reference
@@ -473,7 +473,7 @@ that satisfies this need synchronously.
 ##### Responsibility scope
 
 Owns: `Environment` trait with `get_config` and `get_secret`, plus `CredStoreEnvironment`
-— the standard implementation backed by `CredStoreClientV1` that plugins instantiate
+— the standard implementation backed by `CredStoreClientV2` that plugins instantiate
 before each invocation. Custom implementations remain possible for testing or non-standard
 secret sources.
 

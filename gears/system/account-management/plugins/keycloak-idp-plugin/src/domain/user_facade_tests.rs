@@ -13,7 +13,7 @@ use account_management_sdk::idp_user::{
     IdpTenantContext, IdpUpdateUserRequest, IdpUserAttribute, IdpUserFilterField,
     IdpUserPagination, IdpUserPatch,
 };
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use gts::GtsTypeId;
 use toolkit_odata::filter::{FilterNode, FilterOp, ODataValue};
 use wiremock::matchers::{method, path, query_param};
@@ -28,13 +28,13 @@ fn user_facade_cfg() -> UserFacadeConfig {
     }
 }
 
-fn build_facade_with_cs(server: &MockServer, cs: Arc<dyn CredStoreClientV1>) -> UserFacade {
+fn build_facade_with_cs(server: &MockServer, cs: Arc<dyn CredStoreClientV2>) -> UserFacade {
     build_facade_with_cs_and_cfg(server, cs, user_facade_cfg())
 }
 
 fn build_facade_with_cs_and_cfg(
     server: &MockServer,
-    cs: Arc<dyn CredStoreClientV1>,
+    cs: Arc<dyn CredStoreClientV2>,
     user_cfg: UserFacadeConfig,
 ) -> UserFacade {
     let kc_cfg = keycloak_cfg(&server.uri());

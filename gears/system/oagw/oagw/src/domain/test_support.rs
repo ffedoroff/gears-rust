@@ -17,7 +17,7 @@ use authz_resolver_sdk::{
     AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
     PolicyEnforcer,
 };
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use tenant_resolver_sdk::{
     GetAncestorsOptions, GetAncestorsResponse, GetDescendantsOptions, GetDescendantsResponse,
@@ -162,7 +162,7 @@ impl AuthZResolverApi for CapturingAuthZResolverClient {
     }
 }
 
-// The `CredStoreClientV1` test double is centralized in the SDK
+// The `CredStoreClientV2` test double is centralized in the SDK
 // (`credstore_sdk::test_util`, behind its `test-util` feature) so every gear
 // shares one configurable mock instead of hand-rolling its own. Modes:
 // `empty()` (all `get` → None), `with_secrets(..)` (keyed store),
@@ -170,7 +170,7 @@ impl AuthZResolverApi for CapturingAuthZResolverClient {
 // `always_failing()` (every op → `Internal`).
 pub use credstore_sdk::test_util::MockCredStoreClient;
 
-/// Re-export for tests that need a `CredStoreClientV1` mock.
+/// Re-export for tests that need a `CredStoreClientV2` mock.
 pub use MockCredStoreClient as TestCredStoreClient;
 
 #[cfg(test)]
@@ -218,38 +218,73 @@ impl crate::domain::ports::OagwMetricsPort for ProvisioningMetrics {
 }
 
 #[cfg(test)]
+#[toolkit_canonical_errors::resource_error(gts_id!("cf.core.credstore.credential.v1~"))]
+struct CredentialScope;
+
+/// The canonical error of a credential store that is down or has no plugin.
+#[cfg(test)]
+#[must_use]
+pub fn credstore_unavailable_error() -> toolkit_canonical_errors::CanonicalError {
+    toolkit_canonical_errors::CanonicalError::service_unavailable()
+        .with_detail("down")
+        .create()
+}
+
+/// The canonical error of a full PDP denial on a credential read.
+#[cfg(test)]
+#[must_use]
+pub fn credstore_denied_error() -> toolkit_canonical_errors::CanonicalError {
+    CredentialScope::permission_denied()
+        .with_reason(credstore_sdk::reason::permission_denied::ACCESS_DENIED)
+        .create()
+}
+
+/// The canonical error of a malformed secret reference.
+#[cfg(test)]
+#[must_use]
+pub fn credstore_invalid_ref_error() -> toolkit_canonical_errors::CanonicalError {
+    CredentialScope::invalid_argument()
+        .with_field_violation("reference", "bad", credstore_sdk::field::INVALID_SECRET_REF)
+        .create()
+}
+
+#[cfg(test)]
 /// A credential store answering every call with one error.
-pub struct ErroringCredStore(pub fn() -> credstore_sdk::CredStoreError);
+pub struct ErroringCredStore(pub fn() -> toolkit_canonical_errors::CanonicalError);
 
 #[cfg(test)]
 #[async_trait]
-impl CredStoreClientV1 for ErroringCredStore {
-    async fn get(
+impl CredStoreClientV2 for ErroringCredStore {
+    async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &credstore_sdk::SecretRef,
-    ) -> Result<Option<credstore_sdk::GetSecretResponse>, credstore_sdk::CredStoreError> {
+    ) -> Result<Option<credstore_sdk::Credential>, toolkit_canonical_errors::CanonicalError> {
         Err((self.0)())
     }
-    async fn put_opts(
+    async fn get_secret(
         &self,
         _ctx: &SecurityContext,
         _key: &credstore_sdk::SecretRef,
-        _value: credstore_sdk::SecretValue,
-        _sharing: credstore_sdk::SharingMode,
+    ) -> Result<Option<credstore_sdk::Secret>, toolkit_canonical_errors::CanonicalError> {
+        Err((self.0)())
+    }
+    async fn put(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _write: credstore_sdk::CredentialWrite,
+        _precondition: credstore_sdk::PutPrecondition,
+    ) -> Result<credstore_sdk::PutOutcome, toolkit_canonical_errors::CanonicalError> {
+        Err((self.0)())
+    }
+    async fn patch(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _patch: credstore_sdk::CredentialPatch,
         _precondition: credstore_sdk::WritePrecondition,
-        _opts: credstore_sdk::WriteOptions,
-    ) -> Result<(), credstore_sdk::CredStoreError> {
-        Err((self.0)())
-    }
-    async fn create_opts(
-        &self,
-        _ctx: &SecurityContext,
-        _key: &credstore_sdk::SecretRef,
-        _value: credstore_sdk::SecretValue,
-        _sharing: credstore_sdk::SharingMode,
-        _opts: credstore_sdk::WriteOptions,
-    ) -> Result<(), credstore_sdk::CredStoreError> {
+    ) -> Result<credstore_sdk::Validator, toolkit_canonical_errors::CanonicalError> {
         Err((self.0)())
     }
     async fn delete(
@@ -257,7 +292,17 @@ impl CredStoreClientV1 for ErroringCredStore {
         _ctx: &SecurityContext,
         _key: &credstore_sdk::SecretRef,
         _precondition: credstore_sdk::WritePrecondition,
-    ) -> Result<(), credstore_sdk::CredStoreError> {
+    ) -> Result<(), toolkit_canonical_errors::CanonicalError> {
+        Err((self.0)())
+    }
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        _query: &toolkit_odata::ODataQuery,
+    ) -> Result<
+        toolkit_odata::Page<credstore_sdk::CredentialListItem>,
+        toolkit_canonical_errors::CanonicalError,
+    > {
         Err((self.0)())
     }
 }
@@ -625,9 +670,9 @@ impl TestCpBuilder {
             self.tenant_resolver
                 .unwrap_or_else(MockTenantResolverClient::single_tenant),
         );
-        let credstore: Arc<dyn CredStoreClientV1> =
+        let credstore: Arc<dyn CredStoreClientV2> =
             Arc::new(MockCredStoreClient::with_secrets(self.credentials));
-        hub.register::<dyn CredStoreClientV1>(credstore.clone());
+        hub.register::<dyn CredStoreClientV2>(credstore.clone());
 
         let cp: Arc<dyn ControlPlaneService> = Arc::new(ControlPlaneServiceImpl::new(
             upstream_repo,
@@ -650,7 +695,7 @@ impl Default for TestCpBuilder {
 
 /// Builder for a fully-wired Data Plane test environment.
 ///
-/// Requires that a `CredStoreClientV1` is already registered in the
+/// Requires that a `CredStoreClientV2` is already registered in the
 /// `ClientHub` (e.g., via `TestCpBuilder`).
 pub struct TestDpBuilder {
     request_timeout: Option<Duration>,
@@ -745,7 +790,7 @@ impl TestDpBuilder {
         self
     }
 
-    /// Fetch `CredStoreClientV1` from the hub, create a DP service with
+    /// Fetch `CredStoreClientV2` from the hub, create a DP service with
     /// the given CP, and return the trait object.
     pub(crate) fn build_and_register(
         self,
@@ -753,8 +798,8 @@ impl TestDpBuilder {
         cp: Arc<dyn ControlPlaneService>,
     ) -> Arc<dyn DataPlaneService> {
         let credstore = hub
-            .get::<dyn CredStoreClientV1>()
-            .expect("CredStoreClientV1 must be registered before building DP");
+            .get::<dyn CredStoreClientV2>()
+            .expect("CredStoreClientV2 must be registered before building DP");
 
         let authz_client = self
             .authz_client

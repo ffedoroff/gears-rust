@@ -976,7 +976,7 @@ mod tests {
         };
 
         let hub = toolkit::client_hub::ClientHub::new();
-        hub.register::<dyn credstore_sdk::CredStoreClientV1>(
+        hub.register::<dyn credstore_sdk::CredStoreClientV2>(
             Arc::new(MockCredStoreClient::empty()),
         );
         let (cp, provisioner) = in_memory_planes();
