@@ -653,7 +653,7 @@ impl Gear for SettingsService {
         // gear, so its client is in the hub before this init runs.
         let credstore = ctx
             .client_hub()
-            .get::<dyn credstore_sdk::CredStoreClientV1>()
+            .get::<dyn credstore_sdk::CredStoreClientV2>()
             .map_err(|e| anyhow::anyhow!("{}: credstore client: {e}", Self::MODULE_NAME))?;
         let secrets: Arc<dyn crate::domain::ports::SecretManager> = Arc::new(
             crate::infra::secret_manager::CredStoreSecretManager::new(credstore),

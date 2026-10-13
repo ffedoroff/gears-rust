@@ -2025,25 +2025,16 @@ async fn bind_maps_not_found_error_to_secret_ref_not_accessible() {
 /// refusal stays a validation error (400).
 #[tokio::test]
 async fn secret_ref_check_maps_a_credstore_outage_to_internal() {
-    use credstore_sdk::CredStoreError;
-    type MakeError = fn() -> CredStoreError;
+    use crate::domain::test_support::{
+        credstore_denied_error, credstore_invalid_ref_error, credstore_unavailable_error,
+    };
+    use toolkit_canonical_errors::CanonicalError;
+    type MakeError = fn() -> CanonicalError;
 
-    let cases: [(MakeError, bool); 4] = [
-        (
-            || CredStoreError::ServiceUnavailable {
-                detail: "down".into(),
-                retry_after: None,
-            },
-            true,
-        ),
-        (|| CredStoreError::NoPluginAvailable, true),
-        (|| CredStoreError::AccessDenied, false),
-        (
-            || CredStoreError::InvalidSecretRef {
-                reason: "bad".into(),
-            },
-            false,
-        ),
+    let cases: [(MakeError, bool); 3] = [
+        (credstore_unavailable_error, true),
+        (credstore_denied_error, false),
+        (credstore_invalid_ref_error, false),
     ];
     for (error, outage) in cases {
         let svc = ControlPlaneServiceImpl::new(
@@ -2077,9 +2068,9 @@ async fn malformed_secret_ref_is_rejected_before_the_credstore_is_asked() {
         Arc::new(InMemoryRouteRepo::new()),
         Arc::new(MockTenantResolverClient::single_tenant()),
         allow_all_enforcer(),
-        Arc::new(crate::domain::test_support::ErroringCredStore(|| {
-            credstore_sdk::CredStoreError::NoPluginAvailable
-        })),
+        Arc::new(crate::domain::test_support::ErroringCredStore(
+            crate::domain::test_support::credstore_unavailable_error,
+        )),
         Arc::new(SsrfGuard::disabled()),
     );
     let mut req = make_create_upstream_hostname();
@@ -2091,6 +2082,92 @@ async fn malformed_secret_ref_is_rejected_before_the_credstore_is_asked() {
     assert!(
         matches!(&err, DomainError::Validation { detail, .. } if detail.contains("invalid secret_ref")),
         "{err:?}"
+    );
+}
+
+/// A full PDP denial on the record read is not "not provisioned yet": it must
+/// fail fast (non-retryable validation error), never defer as
+/// `SecretRefNotAccessible`.
+#[tokio::test]
+async fn bind_fails_fast_on_credstore_permission_denied() {
+    use credstore_sdk::{
+        CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialWrite,
+        PutOutcome, PutPrecondition, Secret, SecretRef, Validator, WritePrecondition,
+    };
+    use toolkit_canonical_errors::{CanonicalError, resource_error};
+
+    #[resource_error(gts_id!("cf.core.credstore.credential.v1~"))]
+    struct CredentialScope;
+
+    struct Denying;
+
+    fn denied() -> CanonicalError {
+        CredentialScope::permission_denied()
+            .with_reason(credstore_sdk::reason::permission_denied::ACCESS_DENIED)
+            .create()
+    }
+
+    #[async_trait::async_trait]
+    impl CredStoreClientV2 for Denying {
+        async fn get_record(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+        ) -> Result<Option<Credential>, CanonicalError> {
+            Err(denied())
+        }
+        async fn get_secret(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+        ) -> Result<Option<Secret>, CanonicalError> {
+            Err(denied())
+        }
+        async fn put(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+            _write: CredentialWrite,
+            _precondition: PutPrecondition,
+        ) -> Result<PutOutcome, CanonicalError> {
+            Err(denied())
+        }
+        async fn patch(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+            _patch: CredentialPatch,
+            _precondition: WritePrecondition,
+        ) -> Result<Validator, CanonicalError> {
+            Err(denied())
+        }
+        async fn delete(
+            &self,
+            _ctx: &SecurityContext,
+            _key: &SecretRef,
+            _precondition: WritePrecondition,
+        ) -> Result<(), CanonicalError> {
+            Err(denied())
+        }
+        async fn list(
+            &self,
+            _ctx: &SecurityContext,
+            _query: &toolkit_odata::ODataQuery,
+        ) -> Result<toolkit_odata::Page<CredentialListItem>, CanonicalError> {
+            Err(denied())
+        }
+    }
+
+    let err = super::bind::validate_secret_ref_accessible(
+        &test_ctx(Uuid::new_v4()),
+        &Denying,
+        "cred://some-key",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected a fail-fast Validation error, got: {err:?}"
     );
 }
 

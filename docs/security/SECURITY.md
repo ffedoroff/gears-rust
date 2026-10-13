@@ -253,7 +253,7 @@ Custom architecture lints (`DE0901`, `DE0902`, via `cargo gears lint`) validate 
 Gears provide a **plugin-based credential storage gateway** for managing secrets across the platform. The architecture separates the gateway (routing, authorization) from storage backends (plugin implementations).
 
 ```
-Consumer → CredStoreClientV1 → Gateway Service → GTS Plugin Discovery
+Consumer → CredStoreClientV2 → Gateway Service → GTS Plugin Discovery
          → CredStorePluginClientV1 (vendor backend)
 ```
 
@@ -313,7 +313,7 @@ Ancestor bind flows (descendant reusing parent upstream aliases) have separate a
 
 ### Credential Isolation
 
-Outbound authentication credentials are **never stored in OAGW configuration**. Auth configs reference secrets via `cred://` URIs, resolved through `CredStoreClientV1` under the caller's `SecurityContext`. OAuth2 client-credentials tokens are cached with keys scoped by `(tenant, subject, auth_method)`, preventing cross-tenant token reuse.
+Outbound authentication credentials are **never stored in OAGW configuration**. Auth configs reference secrets via `cred://` URIs, resolved through `CredStoreClientV2` under the caller's `SecurityContext`. OAuth2 client-credentials tokens are cached with keys scoped by `(tenant, subject, auth_method)`, preventing cross-tenant token reuse.
 
 ### Auth Plugins
 

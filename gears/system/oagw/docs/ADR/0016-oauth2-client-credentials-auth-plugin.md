@@ -49,7 +49,7 @@ Current built-in auth plugins (`ApiKeyAuthPlugin`, `NoopAuthPlugin`) handle stat
 **Existing infrastructure**:
 
 - `AuthPlugin` trait in `oagw/src/domain/plugin/mod.rs` — `authenticate(&self, ctx: &mut AuthContext)` interface
-- `CredStoreClientV1` in `credstore-sdk` — resolves `cred://` references to secret values
+- `CredStoreClientV2` in `credstore-sdk` — resolves `cred://` references to secret values
 - `toolkit_auth::oauth2::fetch_token` in `libs/toolkit-auth` — one-shot token exchange returning bearer + `expires_in`, OIDC Discovery, `Basic`/`Form` client auth (no background watcher)
 - GTS identifiers already reserved in `gts_helpers.rs`:
   - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1` (Form)
@@ -173,7 +173,7 @@ Failed token fetches are **not** cached — the next request for the same key re
 use pingora_memory_cache::MemoryCache;
 
 pub struct OAuth2ClientCredAuthPlugin {
-    credstore: Arc<dyn CredStoreClientV1>,
+    credstore: Arc<dyn CredStoreClientV2>,
     auth_method: ClientAuthMethod,
     http_config: Option<toolkit_http::HttpClientConfig>,
     cache: MemoryCache<String, CachedToken>,
@@ -182,7 +182,7 @@ pub struct OAuth2ClientCredAuthPlugin {
 
 impl OAuth2ClientCredAuthPlugin {
     pub fn new(
-        credstore: Arc<dyn CredStoreClientV1>,
+        credstore: Arc<dyn CredStoreClientV2>,
         auth_method: ClientAuthMethod,
         cache_ttl: Duration,
         cache_capacity: usize,
@@ -203,7 +203,7 @@ impl OAuth2ClientCredAuthPlugin {
 ```rust
 impl AuthPluginRegistry {
     pub fn with_builtins(
-        credstore: Arc<dyn CredStoreClientV1>,
+        credstore: Arc<dyn CredStoreClientV2>,
         token_http_config: Option<toolkit_http::HttpClientConfig>,
         token_cache_config: TokenCacheConfig,
     ) -> Self {

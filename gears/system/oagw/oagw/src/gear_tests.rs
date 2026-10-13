@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverApi;
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use serde_json::{Value, json};
 use tenant_resolver_sdk::{TenantId, TenantResolverClient};
@@ -163,7 +163,7 @@ fn hub_over(
 ) -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn TenantResolverClient>(Arc::new(tenants));
-    hub.register::<dyn CredStoreClientV1>(Arc::new(MockCredStoreClient::empty()));
+    hub.register::<dyn CredStoreClientV2>(Arc::new(MockCredStoreClient::empty()));
     hub.register::<dyn AuthZResolverApi>(Arc::new(CapturingAuthZResolverClient::new()));
     hub.register::<dyn TypesRegistryClient>(Arc::new(AcceptingTypesRegistry(registry)));
     hub

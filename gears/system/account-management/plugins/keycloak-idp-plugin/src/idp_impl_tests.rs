@@ -376,7 +376,7 @@ mod deprovision_cascade {
     fn build_plugin(server: &MockServer) -> KeycloakIdpPlugin {
         let kc_cfg = keycloak_cfg(&server.uri());
         let realm_admin_cfg = kc_cfg.realm_admin.clone();
-        let cs: Arc<dyn credstore_sdk::CredStoreClientV1> = Arc::new(StubCredStore);
+        let cs: Arc<dyn credstore_sdk::CredStoreClientV2> = Arc::new(StubCredStore);
         let cs_reader = CredStoreReader::new(Arc::clone(&cs), build_system_ctx(Uuid::nil()));
         let cs_writer = CredStoreWriter::new(cs, build_system_ctx(Uuid::nil()));
         let transport: Arc<dyn KcTransport> =

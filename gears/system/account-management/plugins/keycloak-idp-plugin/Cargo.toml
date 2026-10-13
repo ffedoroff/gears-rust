@@ -59,6 +59,7 @@ serde-saphyr = { workspace = true }
 wiremock.workspace = true
 temp-env = { workspace = true }
 gts.workspace = true
+toolkit-canonical-errors = { workspace = true }
 # Self-signed CA generation for `tls_ca_bundle_ref` factory tests.
 # The cert is never used over the wire — we only need a syntactically-valid
 # PEM so reqwest's `ClientBuilder::add_root_certificate` accepts it.

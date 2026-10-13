@@ -8,7 +8,7 @@ use crate::domain::type_provisioning::TypeProvisioningService;
 use crate::infra::type_provisioning::TypeProvisioningServiceImpl;
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use oagw_sdk::api::ServiceGatewayClientV1;
 use sea_orm_migration::MigrationTrait;
 use tenant_resolver_sdk::TenantResolverClient;
@@ -198,7 +198,7 @@ impl Gear for OutboundApiGatewayGear {
             .map_err(|_| anyhow::anyhow!("registry config already set"))?;
         let tenant_resolver = ctx.client_hub().get::<dyn TenantResolverClient>()?;
 
-        let credstore = ctx.client_hub().get::<dyn CredStoreClientV1>()?;
+        let credstore = ctx.client_hub().get::<dyn CredStoreClientV2>()?;
 
         // -- AuthZ resolver for permission checks --
         // Consumed, not depended on: wired after `init` (local or remote), so

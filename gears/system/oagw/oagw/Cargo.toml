@@ -112,6 +112,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 async-trait = { workspace = true }
+toolkit-odata = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 httpmock = { workspace = true }
 tokio-rustls = { workspace = true }

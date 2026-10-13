@@ -340,7 +340,7 @@ fn wired_hub() -> Arc<ClientHub> {
     hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
         types_registry_sdk::testing::MockTypesRegistryClient::new(),
     ));
-    hub.register::<dyn credstore_sdk::CredStoreClientV1>(Arc::new(
+    hub.register::<dyn credstore_sdk::CredStoreClientV2>(Arc::new(
         credstore_sdk::test_util::MockCredStoreClient::empty(),
     ));
     hub
@@ -492,7 +492,7 @@ async fn init_refuses_to_start_without_the_registry_it_calls_during_init() {
     // so a registry that is absent must be found here — not by a read that has
     // already passed authorization and reached the database.
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn credstore_sdk::CredStoreClientV1>(Arc::new(
+    hub.register::<dyn credstore_sdk::CredStoreClientV2>(Arc::new(
         credstore_sdk::test_util::MockCredStoreClient::empty(),
     ));
     let ctx = context_with(json!({}), hub).await;

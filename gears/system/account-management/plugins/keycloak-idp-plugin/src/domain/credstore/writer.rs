@@ -1,5 +1,5 @@
 // Updated: 2026-10-06 by Constructor Tech
-//! Write wrapper over [`credstore_sdk::CredStoreClientV1`].
+//! Write wrapper over [`credstore_sdk::CredStoreClientV2`].
 //!
 //! The plugin's system [`SecurityContext`] is baked in at construction so call
 //! sites cannot accidentally pass an AM-forwarded ctx to mutation paths
@@ -9,24 +9,24 @@
 use std::sync::Arc;
 
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, CredentialWrite, Fallback, PutPrecondition, SecretRef,
-    SecretType, SecretValue, SharingMode, WritePrecondition,
+    CredStoreClientV2, CredStoreError, CredentialWrite, Fallback, PutPrecondition, SecretRef,
+    SecretType, SecretValue, SecretWrite, SharingMode, WritePrecondition,
 };
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
-/// Ctx-baked-in write wrapper over [`CredStoreClientV1`].
+/// Ctx-baked-in write wrapper over [`CredStoreClientV2`].
 #[domain_model]
 #[derive(Clone)]
 pub struct CredStoreWriter {
-    inner: Arc<dyn CredStoreClientV1>,
+    inner: Arc<dyn CredStoreClientV2>,
     system_ctx: Arc<SecurityContext>,
 }
 
 impl CredStoreWriter {
-    /// Wrap a [`CredStoreClientV1`] with the plugin-owned system ctx.
+    /// Wrap a [`CredStoreClientV2`] with the plugin-owned system ctx.
     #[must_use]
-    pub fn new(inner: Arc<dyn CredStoreClientV1>, system_ctx: Arc<SecurityContext>) -> Self {
+    pub fn new(inner: Arc<dyn CredStoreClientV2>, system_ctx: Arc<SecurityContext>) -> Self {
         Self { inner, system_ctx }
     }
 
@@ -34,7 +34,7 @@ impl CredStoreWriter {
     ///
     /// ADR-0004's `put` never creates on a missing target when guarded by
     /// [`PutPrecondition::Exists`] — it fails the precondition with
-    /// [`CredStoreError::Conflict`] instead. So create-or-replace is a
+    /// [`CredStoreError::PreconditionFailed`] instead. So create-or-replace is a
     /// [`PutPrecondition::CreateOnly`] attempt first (with `secret_type` set
     /// to `generic`, since a create must name a type), falling back to a
     /// [`PutPrecondition::Exists`] overwrite (which must *not* repeat the
@@ -44,7 +44,10 @@ impl CredStoreWriter {
     /// provisioning writer that owns its references and whose new value is
     /// not derived from the stored one, so there is no validator to carry.
     /// Concurrent writers to one reference therefore race last-writer-wins,
-    /// which is the pre-existing behaviour of this path.
+    /// which is the pre-existing behaviour of this path. If the record is
+    /// deleted between the two steps, the `Exists` overwrite fails with
+    /// [`CredStoreError::PreconditionFailed`], which is returned as is (no
+    /// retry loop).
     ///
     /// # Errors
     ///
@@ -64,27 +67,29 @@ impl CredStoreWriter {
             sharing,
             fallback: Fallback::Inherit,
             expires_at: None,
-            secret: Some(value),
+            secret: SecretWrite::Set(value),
         };
         match self
             .inner
             .put(&self.system_ctx, key, create, PutPrecondition::CreateOnly)
             .await
+            .map_err(CredStoreError::from)
         {
             Ok(_) => Ok(()),
             // Already present: fall through to the explicit overwrite.
-            Err(CredStoreError::Conflict) => {
+            Err(CredStoreError::AlreadyExists) => {
                 let replace = CredentialWrite {
                     secret_type: None,
                     sharing,
                     fallback: Fallback::Inherit,
                     expires_at: None,
-                    secret: Some(SecretValue::new(bytes)),
+                    secret: SecretWrite::Set(SecretValue::new(bytes)),
                 };
                 self.inner
                     .put(&self.system_ctx, key, replace, PutPrecondition::Exists)
                     .await
                     .map(|_| ())
+                    .map_err(CredStoreError::from)
             }
             Err(e) => Err(e),
         }
@@ -105,6 +110,7 @@ impl CredStoreWriter {
             .inner
             .delete(&self.system_ctx, key, WritePrecondition::Exists)
             .await
+            .map_err(CredStoreError::from)
         {
             Ok(()) | Err(CredStoreError::NotFound) => Ok(()),
             Err(e) => Err(e),
