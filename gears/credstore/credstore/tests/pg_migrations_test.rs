@@ -424,9 +424,12 @@ async fn insert_migrated_row(
     let id = Uuid::new_v4();
     conn.execute_unprepared(&format!(
         "INSERT INTO credstore_secrets
-           (id, tenant_id, reference, sharing, owner_id, status, value_version, fallback)
-         VALUES ('{id}', '{TENANT}', 'probe-{id}', 2, '{}', {status}, {value_version}, {fallback})",
+           (id, tenant_id, reference, sharing, owner_id, status, value_version, fallback,
+            secret_type_uuid)
+         VALUES ('{id}', '{TENANT}', 'probe-{id}', 2, '{}', {status}, {value_version}, {fallback},
+                 '{}')",
         Uuid::new_v4(),
+        Uuid::from_u128(0xC0FF_EE),
     ))
     .await
     .map(|_| ())

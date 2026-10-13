@@ -5,14 +5,19 @@
 //! Tenant-scoped (`tenant_col = "tenant_id"`, `resource_col = "id"`), plus
 //! the PDP row properties (`secret_type` -> `secret_type_uuid`, `reference` ->
 //! `reference`, ADR-0010): a PDP constraint on either compiles to a predicate
-//! on that column, so row-scoped authorization is applied in SQL.
-//! Sharing, status, and fallback columns are stored as `SMALLINT` at the DB
-//! level and mapped to typed enums in the repository layer.
+//! on that column. Writes, deletes and the collection's candidate query apply
+//! it in SQL; a read applies the scope in the service to the effective record
+//! (and serves a value only from a decisive row of the same type).
+//! Sharing, status, and fallback columns are stored as `SMALLINT`; the entity
+//! types them with the storage enums of [`super::enums`], which carry the
+//! numbers, and the infra layer converts them to the domain and SDK types.
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
 use toolkit_db::secure::Scopable;
 use uuid::Uuid;
+
+use super::enums::{DbFallback, DbSharing, DbStatus};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "credstore_secrets")]
@@ -30,12 +35,12 @@ pub struct Model {
     pub tenant_id: Uuid,
     pub reference: String,
     /// Sharing mode: 1=Private, 2=Tenant, 3=Shared.
-    pub sharing: i16,
+    pub sharing: DbSharing,
     pub owner_id: Uuid,
     /// Status: 2=Active, 4=Declared. Codes 1 (provisioning) and 3
     /// (deprovisioning) are retired by ADR-0006 and reserved, never
     /// reassigned.
-    pub status: i16,
+    pub status: DbStatus,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     /// Monotonic version for optimistic locking; seeded at 1 on insert,
@@ -52,10 +57,10 @@ pub struct Model {
     /// (`credstore_secrets_value_version_check`). The store key is
     /// `(tenant_id, id)`.
     pub value_version: Option<String>,
-    /// Suppression fallback: 1=Inherit (default), 2=None. Only consulted for
-    /// a `Declared` row's resolution competition (ADR-0004); always 1 in
-    /// Phase 1.
-    pub fallback: i16,
+    /// Suppression fallback: 1=Inherit (default), 2=None. Stored on every row,
+    /// consulted only for a `Declared` row's resolution competition
+    /// (ADR-0008, Suppression).
+    pub fallback: DbFallback,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

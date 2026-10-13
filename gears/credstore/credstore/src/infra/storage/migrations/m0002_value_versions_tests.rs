@@ -238,8 +238,18 @@ mod guard {
 
     use super::super::super::Migrator;
     use super::super::{
-        VALUE_MIGRATION_COPY_DONE_PHASES, VALUE_MIGRATION_STATE_TABLE, VALUES_NOT_MIGRATED,
+        VALUE_MIGRATION_COPY_DONE_PHASES, VALUE_MIGRATION_DISCARD_VALUES_COLUMN,
+        VALUE_MIGRATION_PHASE_COLUMN, VALUE_MIGRATION_STATE_TABLE, VALUES_NOT_MIGRATED,
     };
+
+    /// The tool's header table, with the columns the guard reads.
+    fn marker_table_ddl() -> String {
+        format!(
+            "CREATE TABLE {VALUE_MIGRATION_STATE_TABLE} \
+             ({VALUE_MIGRATION_PHASE_COLUMN} TEXT NOT NULL, \
+             {VALUE_MIGRATION_DISCARD_VALUES_COLUMN} BOOLEAN NOT NULL)"
+        )
+    }
 
     /// A database in the shipped (`m0001` only) state.
     async fn shipped_db() -> DatabaseConnection {
@@ -265,14 +275,12 @@ mod guard {
     /// Creates the tool's header table the way the tool does (the columns the
     /// guard reads) holding one header row.
     async fn mark(db: &DatabaseConnection, phase: &str, discard_values: bool) {
+        db.execute_unprepared(&marker_table_ddl())
+            .await
+            .expect("marker table creates");
         db.execute_unprepared(&format!(
-            "CREATE TABLE {VALUE_MIGRATION_STATE_TABLE} \
-             (phase TEXT NOT NULL, discard_values BOOLEAN NOT NULL)"
-        ))
-        .await
-        .expect("marker table creates");
-        db.execute_unprepared(&format!(
-            "INSERT INTO {VALUE_MIGRATION_STATE_TABLE} (phase, discard_values) \
+            "INSERT INTO {VALUE_MIGRATION_STATE_TABLE} \
+             ({VALUE_MIGRATION_PHASE_COLUMN}, {VALUE_MIGRATION_DISCARD_VALUES_COLUMN}) \
              VALUES ('{phase}', {})",
             i32::from(discard_values)
         ))
@@ -313,7 +321,8 @@ mod guard {
         // Header says copying is not finished: still refused.
         assert_refused(&Migrator::up(&db, None).await);
         db.execute_unprepared(&format!(
-            "UPDATE {VALUE_MIGRATION_STATE_TABLE} SET phase = 'verifying'"
+            "UPDATE {VALUE_MIGRATION_STATE_TABLE} \
+             SET {VALUE_MIGRATION_PHASE_COLUMN} = 'verifying'"
         ))
         .await
         .expect("update");
@@ -351,12 +360,9 @@ mod guard {
     async fn an_empty_marker_table_is_not_a_marker() {
         let db = shipped_db().await;
         insert_row(&db, 2).await;
-        db.execute_unprepared(&format!(
-            "CREATE TABLE {VALUE_MIGRATION_STATE_TABLE} \
-             (phase TEXT NOT NULL, discard_values BOOLEAN NOT NULL)"
-        ))
-        .await
-        .expect("marker table creates");
+        db.execute_unprepared(&marker_table_ddl())
+            .await
+            .expect("marker table creates");
 
         assert_refused(&Migrator::up(&db, None).await);
     }
@@ -381,5 +387,147 @@ mod guard {
             .await
             .expect("only retired statuses: passes");
         assert!(is_migrated(&db).await);
+    }
+}
+
+// -- the `secret_type_uuid` DEFAULT: shipped by m0001, dropped by m0002 --------
+
+mod type_default {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+    use sea_orm_migration::MigratorTrait;
+    use uuid::Uuid;
+
+    use super::super::super::Migrator;
+    use super::migrated_db;
+
+    /// The v5 UUID of the `generic` type as v1 shipped it.
+    const V1_GENERIC: &str = "2a8aac98-cf09-58ed-acd6-f599f35cb5bf";
+
+    #[tokio::test]
+    async fn m0001_alone_defaults_the_type_to_the_v1_generic_uuid() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite connects");
+        Migrator::up(&db, Some(1)).await.expect("m0001 applies");
+
+        db.execute_unprepared(&format!(
+            "INSERT INTO credstore_secrets (id, tenant_id, reference, sharing, owner_id, status) \
+             VALUES (x'{}', x'{}', 'ref', 2, x'{}', 2)",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple(),
+            Uuid::nil().simple()
+        ))
+        .await
+        .expect("an insert without secret_type_uuid takes the default");
+
+        let stored = db
+            .query_one_raw(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT hex(secret_type_uuid) FROM credstore_secrets".to_owned(),
+            ))
+            .await
+            .expect("select")
+            .expect("row")
+            .try_get_by_index::<String>(0)
+            .expect("hex");
+        assert_eq!(stored.to_lowercase(), V1_GENERIC.replace('-', ""));
+    }
+
+    // The PostgreSQL `DROP DEFAULT` path is covered by the PostgreSQL
+    // migration test added in plan step 2 (`gears/credstore/v2/plan.md`);
+    // this one pins the `SQLite` rebuild.
+    #[tokio::test]
+    async fn m0002_drops_the_default() {
+        let db = migrated_db().await;
+
+        let err = db
+            .execute_unprepared(&format!(
+                "INSERT INTO credstore_secrets \
+                 (id, tenant_id, reference, sharing, owner_id, status, value_version) \
+                 VALUES (x'{}', x'{}', 'ref', 2, x'{}', 2, '1')",
+                Uuid::new_v4().simple(),
+                Uuid::new_v4().simple(),
+                Uuid::nil().simple()
+            ))
+            .await
+            .expect_err("secret_type_uuid is NOT NULL with no default");
+        assert!(err.to_string().contains("NOT NULL"), "{err}");
+    }
+}
+
+/// The storage enums' codes against the live `credstore_secrets` `CHECK`
+/// constraints after m0002: every code accepted, retired or unknown codes
+/// rejected.
+mod enum_codes {
+    use sea_orm::{ActiveEnum, ConnectionTrait, DatabaseConnection, Iterable};
+    use uuid::Uuid;
+
+    use super::migrated_db;
+    use crate::infra::storage::entity::enums::{DbFallback, DbSharing, DbStatus};
+
+    async fn insert(
+        db: &DatabaseConnection,
+        sharing: i16,
+        status: i16,
+        fallback: i16,
+    ) -> Result<(), sea_orm::DbErr> {
+        // `status = 4` (declared) carries no value; `2` (active) carries one.
+        let value_version = if status == 4 { "NULL" } else { "'1'" };
+        db.execute_unprepared(&format!(
+            "INSERT INTO credstore_secrets \
+             (id, tenant_id, reference, sharing, owner_id, status, secret_type_uuid, \
+              value_version, fallback) \
+             VALUES (x'{}', x'{}', 'ref', {sharing}, x'{}', {status}, x'{}', \
+                     {value_version}, {fallback})",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple(),
+            Uuid::nil().simple(),
+            Uuid::new_v4().simple(),
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    fn assert_check_failure(result: Result<(), sea_orm::DbErr>, what: &str) {
+        let err = result.expect_err(what);
+        assert!(err.to_string().contains("CHECK"), "{what}: {err}");
+    }
+
+    #[tokio::test]
+    async fn every_storage_enum_code_is_accepted_by_the_checks() {
+        let db = migrated_db().await;
+        for sharing in DbSharing::iter() {
+            insert(&db, sharing.to_value(), 2, 1)
+                .await
+                .expect("sharing");
+        }
+        for status in DbStatus::iter() {
+            insert(&db, 2, status.to_value(), 1).await.expect("status");
+        }
+        for fallback in DbFallback::iter() {
+            insert(&db, 2, 2, fallback.to_value())
+                .await
+                .expect("fallback");
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_and_unknown_codes_are_rejected_by_the_checks() {
+        let db = migrated_db().await;
+        for status in [1, 3, 5] {
+            assert_check_failure(insert(&db, 2, status, 1).await, &format!("status {status}"));
+        }
+        for fallback in [0, 3] {
+            assert_check_failure(
+                insert(&db, 2, 2, fallback).await,
+                &format!("fallback {fallback}"),
+            );
+        }
+        for sharing in [0, 4] {
+            assert_check_failure(
+                insert(&db, sharing, 2, 1).await,
+                &format!("sharing {sharing}"),
+            );
+        }
     }
 }

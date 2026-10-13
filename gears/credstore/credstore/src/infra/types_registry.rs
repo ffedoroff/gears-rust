@@ -14,8 +14,10 @@
 //!    renamed from `secret.v1~` by ADR-0004) — anything else cannot
 //!    legitimately carry `SecretTypeTraits`.
 //! 3. Read the effective traits via [`GtsTypeSchema::effective_traits`]
-//!    (chain merge: leaf-declared values win, the base fills the rest)
-//!    and deserialize them into [`SecretTypeTraits`].
+//!    (chain merge: the leaf's declared values win; the abstract base
+//!    supplies none) and deserialize them into [`SecretTypeTraits`]:
+//!    `allow_sharing` and `max_size_bytes` are required, the optional
+//!    traits take their schema defaults.
 //! 4. Map failures fail-closed: not-registered / non-secret types onto
 //!    [`DomainError::TypeViolation`] (reason `UNKNOWN_SECRET_TYPE`, 400);
 //!    registry transport failures, timeouts, and trait-resolution
@@ -167,8 +169,10 @@ impl SecretTypeResolver for GtsSecretTypeResolver {
             )));
         }
 
-        // The base type declares `x-gts-traits` values for every trait, so
-        // a properly registered descendant always resolves a complete map;
+        // The base type supplies no trait values: `allow_sharing` and
+        // `max_size_bytes` are required traits the registry refuses a
+        // non-abstract type without, so a properly registered descendant
+        // always resolves them (the optional traits take their defaults);
         // a deserialization failure means the registered chain is malformed
         // — fail closed as a (registration-fixable) 503, not a caller error.
         let traits: SecretTypeTraits =

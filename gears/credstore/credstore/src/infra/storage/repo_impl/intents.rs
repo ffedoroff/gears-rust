@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use credstore_sdk::{DestroySelector, SecretRef, StoreKey, TenantId, ValueVersion};
+use credstore_sdk::{SecretRef, StoreKey, TenantId, ValueVersion};
 use sea_orm::sea_query::{Expr, Query, SelectStatement, SimpleExpr};
 use sea_orm::{
     ActiveValue, ColumnTrait, Condition, DbBackend, EntityTrait, ExprTrait, QueryFilter,
@@ -28,6 +28,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::secret::cleanup::{DeadContent, cleanup_tasks};
 use crate::domain::secret::model::{CleanupDebt, CleanupTask, HealedCreates, WriteAttempt};
 use crate::infra::storage::entity;
 use crate::infra::storage::repo_impl::helpers::{
@@ -167,26 +168,23 @@ pub(super) async fn row_exists_tx(tx: &DbTx<'_>, record_id: Uuid) -> Result<bool
 }
 
 /// What a write that lost definitively (or lost its intent) leaves behind as
-/// debts: `destroy(key, Exactly(version))` when a row with the record id
-/// still exists and the plugin supports destroy, nothing when it exists and
-/// the plugin does not, `purge(key)` when no row exists (the key can never
-/// hold a live value).
+/// debts: the row-existence fact this transaction can see, fed to the one
+/// cleanup rule ([`cleanup_tasks`], `DeadContent::LostWrite`).
 pub(super) async fn lost_write_tasks(
     tx: &DbTx<'_>,
     key: &StoreKey,
     version: &ValueVersion,
     destroy_supported: bool,
 ) -> Result<Vec<CleanupTask>, DomainError> {
-    if !row_exists_tx(tx, key.record_id).await? {
-        return Ok(vec![CleanupTask::Purge(key.clone())]);
-    }
-    if destroy_supported {
-        return Ok(vec![CleanupTask::Destroy {
-            key: key.clone(),
-            selector: DestroySelector::Exactly(version.clone()),
-        }]);
-    }
-    Ok(Vec::new())
+    let row_exists = row_exists_tx(tx, key.record_id).await?;
+    Ok(cleanup_tasks(
+        DeadContent::LostWrite {
+            key,
+            version,
+            row_exists,
+        },
+        destroy_supported,
+    ))
 }
 
 /// Records every task of `tasks` as a debt row in `tx` (the commit of `tx`
@@ -295,7 +293,10 @@ pub(super) async fn heal_failed_creates(
                     keys.push(StoreKey::new(TenantId(intent.tenant_id), intent.record_id));
                 }
             }
-            let tasks = keys.into_iter().map(CleanupTask::Purge).collect();
+            let tasks = keys
+                .iter()
+                .flat_map(|key| cleanup_tasks(DeadContent::DeadKey { key }, false))
+                .collect();
             let debts = record_debts(tx, tasks).await?;
             Ok(HealedCreates {
                 intents: healed,

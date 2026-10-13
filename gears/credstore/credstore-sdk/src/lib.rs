@@ -5,21 +5,27 @@ pub mod api;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod error;
+pub mod field;
 pub mod gts;
 pub mod models;
 pub mod plugin_api;
+pub mod reason;
 #[cfg(feature = "test-util")]
 pub mod test_util;
 pub mod types;
 
 pub use ::gts::GtsId;
-pub use api::CredStoreClientV1;
+pub use api::CredStoreClientV2;
 pub use error::CredStoreError;
-pub use gts::{CREDENTIAL_RESOURCE_TYPE, CredStorePluginSpecV1, CredentialV1, SecretTypeTraits};
+pub use gts::{CREDENTIAL_RESOURCE_TYPE, CredStorePluginSpecV2, CredentialV1, SecretTypeTraits};
 pub use models::{
     Credential, CredentialListItem, CredentialPatch, CredentialStatus, CredentialWrite, Fallback,
-    InheritanceStatus, OwnerId, PatchField, PutOutcome, PutPrecondition, Secret, SecretRef,
-    SecretValue, SharingMode, StoreKey, TenantId, Validator, ValueVersion, WritePrecondition,
+    InheritanceStatus, OwnRow, OwnerId, PatchField, PutOutcome, PutPrecondition, Secret, SecretRef,
+    SecretValue, SecretWrite, SharingMode, StoreKey, TenantId, Validator, ValueVersion,
+    WritePrecondition,
 };
-pub use plugin_api::{CredStorePluginClientV2, DestroySelector};
+pub use plugin_api::{
+    BoxError, CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError,
+    DestroySelector,
+};
 pub use types::{SECRET_TYPE_CATALOG, SecretType, SecretTypeDescriptor};

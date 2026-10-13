@@ -5,6 +5,10 @@ use toolkit_gts::GTS_ID_PREFIX;
 
 use super::*;
 
+/// Pinned v5 UUID of the v2 `generic` type id. Test-only: no production code
+/// reads it (a create always names its type; the migration DEFAULT is gone).
+const GENERIC_TYPE_UUID_STR: &str = "c57822de-3aae-58b7-b712-71d907c999e2";
+
 #[test]
 fn catalog_names_and_ids_are_unique_and_well_formed() {
     let mut names: Vec<_> = SECRET_TYPE_CATALOG.iter().map(|d| d.name).collect();
@@ -64,12 +68,11 @@ fn type_uuid_is_deterministic_and_matches_registry_v5() {
     uuids.dedup();
     assert_eq!(uuids.len(), SECRET_TYPE_CATALOG.len(), "type uuids collide");
 
-    // Pin the generic default — this is the value the m0001 column DEFAULT
-    // must use; a drift here means the migration default is stale.
+    // Pin the v2 generic type uuid; a drift here means the constant is stale.
     assert_eq!(
         SecretType::generic().uuid().to_string(),
         GENERIC_TYPE_UUID_STR,
-        "generic type uuid drifted; update the m0001 DEFAULT and this pin"
+        "generic type uuid drifted; update GENERIC_TYPE_UUID_STR and this pin"
     );
 }
 
@@ -81,13 +84,13 @@ fn resolution_by_name_and_gts_id_round_trips() {
         let by_id = SecretType::from_gts_id(d.gts_id).expect("known id");
         assert_eq!(by_id.name(), d.name);
     }
-    assert!(SecretType::from_name("no-such-type").is_err());
+    assert!(SecretType::from_name("no-such-type").is_none());
     assert!(SecretType::from_gts_id(&format!("{GTS_ID_PREFIX}nope~")).is_none());
 }
 
 #[test]
-fn generic_is_default_and_allows_everything() {
-    let g = SecretType::default();
+fn generic_allows_everything() {
+    let g = SecretType::generic();
     assert_eq!(g.name(), "generic");
     for m in [
         SharingMode::Private,
@@ -108,18 +111,27 @@ fn personal_token_is_private_only_flagship_restriction() {
 }
 
 #[test]
-fn serde_round_trip_uses_short_name() {
-    let t = SecretType::from_name("api-key").expect("known");
-    let json = serde_json::to_string(&t).expect("serialize");
-    assert_eq!(json, "\"api-key\"");
-    let back: SecretType = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back, t);
-    assert!(serde_json::from_str::<SecretType>("\"bogus\"").is_err());
-}
-
-#[test]
 fn secret_type_debug_and_display_name_the_catalog_entry() {
     let t = SecretType::from_name("api-key").expect("known");
     assert_eq!(t.to_string(), "api-key");
     assert_eq!(format!("{t:?}"), "SecretType(\"api-key\")");
+}
+
+#[test]
+fn secret_type_traits_require_allow_sharing_and_max_size_bytes() {
+    use serde_json::json;
+    assert!(
+        serde_json::from_value::<SecretTypeTraits>(json!({"allow_sharing": ["tenant"]})).is_err(),
+        "max_size_bytes is required"
+    );
+    assert!(
+        serde_json::from_value::<SecretTypeTraits>(json!({"max_size_bytes": 1})).is_err(),
+        "allow_sharing is required"
+    );
+    assert!(
+        serde_json::from_value::<SecretTypeTraits>(
+            json!({"allow_sharing": ["tenant"], "max_size_bytes": 1})
+        )
+        .is_ok()
+    );
 }

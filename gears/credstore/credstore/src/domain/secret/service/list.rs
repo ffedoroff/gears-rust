@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
+use credstore_sdk::field;
 use credstore_sdk::{
     CredStorePluginClientV2, Credential, CredentialListItem, OwnerId, Secret, SecretRef, TenantId,
-    Validator,
 };
 use futures::stream::{self, StreamExt};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page, PageInfo, SortDir};
@@ -50,19 +50,19 @@ const SECRET_READ_CONCURRENCY: usize = 8;
 fn map_odata_err(err: &toolkit_odata::Error) -> DomainError {
     use toolkit_odata::Error;
     let (field, reason): (&'static str, &'static str) = match err {
-        Error::OrderMismatch => ("$orderby", "ORDER_MISMATCH"),
-        Error::FilterMismatch => ("$filter", "FILTER_MISMATCH"),
+        Error::OrderMismatch => ("$orderby", field::ORDER_MISMATCH),
+        Error::FilterMismatch => ("$filter", field::FILTER_MISMATCH),
         Error::InvalidCursor
         | Error::CursorInvalidBase64
         | Error::CursorInvalidJson
         | Error::CursorInvalidVersion
         | Error::CursorInvalidKeys
         | Error::CursorInvalidFields
-        | Error::CursorInvalidDirection => ("cursor", "INVALID_CURSOR"),
-        Error::InvalidOrderByField(_) => ("$orderby", "INVALID_ORDERBY_FIELD"),
-        Error::InvalidFilter(_) => ("$filter", "INVALID_FILTER"),
-        Error::InvalidLimit => ("limit", "INVALID_LIMIT"),
-        Error::OrderWithCursor => ("$orderby", "ORDER_WITH_CURSOR"),
+        | Error::CursorInvalidDirection => ("cursor", field::INVALID_CURSOR),
+        Error::InvalidOrderByField(_) => ("$orderby", field::INVALID_ORDERBY_FIELD),
+        Error::InvalidFilter(_) => ("$filter", field::INVALID_FILTER),
+        Error::InvalidLimit => ("limit", field::INVALID_LIMIT),
+        Error::OrderWithCursor => ("$orderby", field::ORDER_WITH_CURSOR),
         Error::Db(_) | Error::ParsingUnavailable(_) => {
             return DomainError::internal(format!("OData: {err}"));
         }
@@ -77,7 +77,7 @@ fn map_odata_err(err: &toolkit_odata::Error) -> DomainError {
 fn invalid_cursor(detail: impl Into<String>) -> DomainError {
     DomainError::InvalidRequest {
         field: "cursor",
-        reason: "INVALID_CURSOR",
+        reason: field::INVALID_CURSOR,
         detail: detail.into(),
     }
 }
@@ -86,31 +86,13 @@ fn invalid_cursor(detail: impl Into<String>) -> DomainError {
 /// construction [`Service::resolve_credential`] applies for the point read,
 /// so a list item and a point read of the same reference always agree.
 fn build_credential(key: &SecretRef, secret_type: String, reduced: &Reduced<'_>) -> Credential {
-    let (fallback, version, updated_at, owner_id, validator) = match reduced.own {
-        Some(o) => (
-            Some(credstore_sdk::Fallback::from(o.fallback)),
-            Some(o.version),
-            Some(o.updated_at),
-            Some(o.owner_id),
-            Some(Validator {
-                id: o.id,
-                version: o.version,
-            }),
-        ),
-        None => (None, None, None, None, None),
-    };
     Credential {
         reference: key.clone(),
         secret_type,
         sharing: reduced.effective.sharing,
-        fallback,
-        status: reduced.own_status(),
         inheritance: reduced.inheritance,
-        version,
-        updated_at,
-        owner_id,
         expires_at: reduced.effective.expires_at,
-        validator,
+        own: reduced.own_row(),
     }
 }
 
@@ -174,7 +156,7 @@ impl Service {
             Some(l) if l > self.list.max_limit => {
                 return Err(DomainError::InvalidRequest {
                     field: "limit",
-                    reason: "INVALID_LIMIT",
+                    reason: field::INVALID_LIMIT,
                     detail: format!("limit must be <= {}", self.list.max_limit),
                 });
             }

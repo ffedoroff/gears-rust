@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV2, Credential, CredentialPatch, CredentialStatus,
-    CredentialWrite, Fallback as SdkFallback, OwnerId, PatchField, PutOutcome, Secret, SecretRef,
-    SecretValue, SharingMode, StoreKey, TenantId, Validator, ValueVersion,
+    CredStorePluginClientV2, Credential, CredentialPatch, CredentialWrite, OwnerId, PatchField,
+    PutOutcome, Secret, SecretRef, SecretValue, SecretWrite, SharingMode, StoreKey, TenantId,
+    Validator, ValueVersion,
 };
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -29,7 +29,7 @@ use uuid::Uuid;
 use authz_resolver_sdk::pep::ResourceType;
 
 use crate::domain::authz::{self, actions, scope_for};
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, plugin_error_outcome};
 use crate::domain::ports::audit::{AuditEvent, AuditOperation, AuditOutcome, AuditSink, NoopAudit};
 use crate::domain::ports::metrics::{
     CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome, VerifyOp,
@@ -53,104 +53,6 @@ use crate::domain::secret::typing;
 /// Page size of the create-time downward type check's keyset walk over the
 /// tenants holding a reference with another type.
 const DESCENDANT_CHECK_PAGE: u64 = 100;
-
-/// Maps a [`CredStoreError`] from the plugin layer to a [`DomainError`].
-#[must_use]
-pub fn map_plugin_err(e: CredStoreError) -> DomainError {
-    match e {
-        CredStoreError::NotFound => DomainError::NotFound,
-        CredStoreError::AccessDenied => DomainError::AccessDenied { cause: None },
-        CredStoreError::ServiceUnavailable {
-            detail,
-            retry_after,
-        } => {
-            // The plugin's own detail may embed backend/infra specifics (a
-            // future vault-backed plugin's error text is not curated for the
-            // credstore boundary the way a CF-internal sibling's is, and could
-            // in principle carry sensitive material — e.g. echo a token being
-            // written). The wire already redacts it; for the same reason we do
-            // NOT log the raw detail either (a credential store must not risk
-            // secret material in its logs). We record only its length so
-            // operators can still tell an empty detail from a populated one
-            // when correlating an outage.
-            tracing::warn!(
-                detail_len = detail.len(),
-                "credstore: storage plugin reported unavailable (detail redacted)"
-            );
-            DomainError::ServiceUnavailable {
-                detail: "storage backend unavailable".to_owned(),
-                retry_after,
-                cause: None,
-            }
-        }
-        // Operator misconfiguration, not a transient outage: keep a stable,
-        // distinguishable detail and no `retry_after` so callers don't retry.
-        CredStoreError::NoPluginAvailable => DomainError::ServiceUnavailable {
-            detail: "no storage plugin registered".into(),
-            retry_after: None,
-            cause: None,
-        },
-        CredStoreError::Conflict => DomainError::Conflict,
-        // Expiry is the gear's own read-time verdict, never a plugin's: a
-        // plugin only stores versioned bytes. Treat it as a contract
-        // violation.
-        CredStoreError::SecretExpired => DomainError::Internal {
-            diagnostic: "plugin returned SecretExpired".to_owned(),
-            cause: None,
-        },
-        // These are plugin contract violations (a plugin should never return
-        // them for get/put/delete on this SPI). Their free-text payloads
-        // originate in the plugin, and — like the `ServiceUnavailable` detail
-        // above — a future non-CF backend's error text is not curated for the
-        // credstore boundary and could carry secret material. A credential
-        // store must not risk that in its own logs, so we drop the raw text
-        // and keep only its length as an internal diagnostic.
-        CredStoreError::InvalidSecretRef { reason } => DomainError::Internal {
-            diagnostic: format!(
-                "plugin returned InvalidSecretRef (detail redacted, {} bytes)",
-                reason.len()
-            ),
-            cause: None,
-        },
-        CredStoreError::UnsupportedTransition { detail } => DomainError::Internal {
-            diagnostic: format!(
-                "plugin returned UnsupportedTransition (detail redacted, {} bytes)",
-                detail.len()
-            ),
-            cause: None,
-        },
-        CredStoreError::TypeViolation { reason, detail } => DomainError::Internal {
-            diagnostic: format!(
-                "plugin returned TypeViolation (detail redacted, {} bytes)",
-                reason.len() + detail.len()
-            ),
-            cause: None,
-        },
-        CredStoreError::InvalidRequest { reason, detail } => DomainError::Internal {
-            diagnostic: format!(
-                "plugin returned InvalidRequest (detail redacted, {} bytes)",
-                reason.len() + detail.len()
-            ),
-            cause: None,
-        },
-        CredStoreError::Internal(s) => {
-            // Permanent (a version that exists but can never be read, or any
-            // other plugin fault): surfaced at once. Only the length of the
-            // text is logged - it is not curated for this boundary.
-            tracing::error!(
-                detail_len = s.len(),
-                "credstore: storage plugin reported an internal error (detail redacted)"
-            );
-            DomainError::Internal {
-                diagnostic: format!(
-                    "plugin returned Internal error (detail redacted, {} bytes)",
-                    s.len()
-                ),
-                cause: None,
-            }
-        }
-    }
-}
 
 /// Collection-read settings (`Service::list`, ADR-0005/ADR-0004), from
 /// `ListCfg`: the page-size cap (`limit`/`$top`).
@@ -200,8 +102,8 @@ struct AuditTarget {
     secret_type: String,
 }
 
-/// Selection-aware answer to the point read (`Service::get_item`, ADR-0004
-/// Amendment A): the resolved [`Credential`], its decrypted value when the
+/// Selection-aware answer to the point read (`Service::get_item`, ADR-0004,
+/// "Read actions follow the projection"): the resolved [`Credential`], its decrypted value when the
 /// projection named `secret` and the winner had one to serve, that value's
 /// own validator (the row it was actually served from — a concurrent switch
 /// can make this momentarily different from `credential.validator`), and the
@@ -366,7 +268,10 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
+    /// Returns [`DomainError::AccessDenied`] when the PDP denies `read`
+    /// outright or its scope excludes the caller's own tenant (decided before
+    /// any lookup, whether or not the reference exists). A record the scope's
+    /// type/reference constraints exclude is the canonical miss, `Ok(None)`.
     pub async fn get_record(
         &self,
         ctx: &SecurityContext,
@@ -383,18 +288,21 @@ impl Service {
     /// caller's own row (ADR-0005 "Reducing a reference to one item").
     /// Never carries the value — see [`Self::get_secret`]. Thin wrapper over
     /// [`Self::get_item`] with no projection (the unselected point read:
-    /// `read` alone, exactly as `CredStoreClientV1::get`).
+    /// `read` alone, exactly as `CredStoreClientV2::get_record`).
     ///
     /// Returns the assembled [`Credential`] together with the winning row's
     /// `(id, version)` whenever the caller holds no own row — the REST
-    /// layer's weak-`ETag` source (ADR-0004, D4): `Credential::validator`
-    /// stays `None` in that case (the caller has no row of its own to hold a
+    /// layer's weak-`ETag` source (ADR-0004, D4): `Credential::own`
+    /// is `None` in that case (the caller has no row of its own to hold a
     /// real validator for), so the weak hash has to come from here instead.
-    /// Not part of the SDK contract, hence not `CredStoreClientV1::get` itself.
+    /// Not part of the SDK contract, hence not `CredStoreClientV2::get_record` itself.
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
+    /// Returns [`DomainError::AccessDenied`] when the PDP denies `read`
+    /// outright or its scope excludes the caller's own tenant (decided before
+    /// any lookup, whether or not the reference exists). A record the scope's
+    /// type/reference constraints exclude is the canonical miss, `Ok(None)`.
     pub async fn resolve_credential(
         &self,
         ctx: &SecurityContext,
@@ -407,7 +315,7 @@ impl Service {
     }
 
     /// The projection-aware point read (`GET /credstore/v1/credentials/{ref}`,
-    /// ADR-0004 Amendment A — mirror of the write path's per-action authorization for
+    /// ADR-0004, "Read actions follow the projection" — mirror of the write path's per-action authorization for
     /// reads): resolves the candidates and reduces them exactly as
     /// [`Self::resolve_credential`] and the collection read do, evaluates
     /// the action(s) `fields` requires once each on the effective concrete
@@ -480,7 +388,8 @@ impl Service {
             list_filter::validate_select(f)?;
         }
 
-        // Amendment A's projection-to-action rule: `read` is required unless
+        // The projection-to-action rule (ADR-0004, "Read actions follow the
+        // projection"): `read` is required unless
         // this is a pure value request (`secret` named, no administrative
         // field alongside it) — the shape `get_secret` uses; `read_secret`
         // is required whenever `secret` is named. At least one is always
@@ -546,26 +455,7 @@ impl Service {
         }
         let resolved = self.resolve_stored(effective.secret_type_uuid).await?;
 
-        let (status, fallback, version, updated_at, owner_id, validator) = match own {
-            Some(o) => (
-                if o.is_expired(now) {
-                    CredentialStatus::Expired
-                } else if o.status == SecretStatus::Active {
-                    CredentialStatus::Active
-                } else {
-                    CredentialStatus::Declared
-                },
-                Some(SdkFallback::from(o.fallback)),
-                Some(o.version),
-                Some(o.updated_at),
-                Some(o.owner_id),
-                Some(Validator {
-                    id: o.id,
-                    version: o.version,
-                }),
-            ),
-            None => (CredentialStatus::None, None, None, None, None, None),
-        };
+        let own_row = own.map(|o| reduce::own_row_of(o, now));
 
         // `own` is `None` here only when `winner` is `Some` (we already
         // returned `Ok(None)` above when both were absent), so this is the
@@ -580,14 +470,9 @@ impl Service {
             reference: key.clone(),
             secret_type: resolved.gts_id,
             sharing: effective.sharing,
-            fallback,
-            status,
             inheritance,
-            version,
-            updated_at,
-            owner_id,
             expires_at: effective.expires_at,
-            validator,
+            own: own_row,
         };
 
         // Read the value only when it was asked for and the decisive row
@@ -737,13 +622,14 @@ impl Service {
     /// [`Self::get_item`], projected to exactly `reference`, `type`,
     /// `expires_at` and `secret` — the shape the SDK's `Secret` envelope
     /// wraps, and the same projection `CredStoreLocalClient::get_secret`
-    /// sends over the in-process trait (ADR-0004, "One item, one shape").
+    /// sends over the in-process trait (ADR-0004, "Read actions follow the projection").
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::AccessDenied`] if the PDP denies `read_secret`
     /// or the scope excludes the caller's tenant (a full denial is 403,
-    /// before any lookup, whether or not the reference exists).
+    /// before any lookup, whether or not the reference exists); constraints
+    /// that exclude the record give `Ok(None)`.
     /// Returns [`DomainError::SecretExpired`] if the decisive record is an
     /// expired `active` row (the answer never falls through to an ancestor).
     /// Returns [`DomainError::NotFound`] if the reference resolves to nothing
@@ -882,9 +768,6 @@ impl Service {
     /// check above never authorized. Since a row's type is immutable for its
     /// lifetime, a matching id means the caller's earlier type resolution and
     /// PDP scope still apply to the re-read.
-    ///
-    /// Returns `Ok(None)` when the *final* attempt reports `AccessDenied`,
-    /// folded into the anti-enumeration miss like a PDP denial.
     #[allow(
         clippy::too_many_arguments,
         reason = "carries the full resolve_for_get key plus the row being retried"
@@ -907,7 +790,6 @@ impl Service {
             .await
         {
             Ok(Some(v)) => Ok(Some((v, row.clone()))),
-            Err(DomainError::AccessDenied { .. }) => Ok(None),
             Err(e) => Err(e),
             Ok(None) => {
                 let fresh = self.repo.resolve_for_get(req, subject, key, chain).await?;
@@ -944,7 +826,6 @@ impl Service {
                         self.metrics.read_retry(ReadRetryOutcome::SecondMiss);
                         Err(Self::version_missing())
                     }
-                    Err(DomainError::AccessDenied { .. }) => Ok(None),
                     Err(e) => Err(e),
                 }
             }
@@ -982,22 +863,22 @@ impl Service {
         version: &ValueVersion,
     ) -> Result<Option<SecretValue>, DomainError> {
         let t0 = Instant::now();
-        let result = plugin.get(ctx, key, version).await.map_err(map_plugin_err);
+        let raw = plugin.get(ctx, key, version).await;
         let secs = t0.elapsed().as_secs_f64();
-        let outcome = match &result {
+        let outcome = match &raw {
             Ok(Some(_)) => Outcome::Success,
             Ok(None) => Outcome::NotFound,
-            Err(_) => Outcome::Error,
+            Err(e) => plugin_error_outcome(e),
         };
+        let result = raw.map_err(DomainError::from);
         self.metrics
             .dependency(Dep::Plugin, DepOp::PluginGet, outcome, secs);
         result
     }
 
     /// Create or replace the whole credential — record and, unless `value`
-    /// is an explicit `None`, its value together (ADR-0004, "Two write verbs
-    /// on one resource"; Amendment B, "The value-less record: reached only
-    /// on purpose").
+    /// is an explicit `None`, its value together (ADR-0007, "PUT: whole replace,
+    /// secret tri-state").
     ///
     /// A write targets the row of its own sharing class — `private` →
     /// `(tenant, ref, owner)`, `tenant`/`shared` → `(tenant, ref)` — so a private
@@ -1023,8 +904,8 @@ impl Service {
     /// `value: None` never touches the plugin at all on create
     /// (`insert_declared`, a plain `INSERT`) or on replace of an
     /// already-`declared` row (metadata-only, `update_metadata`, itself
-    /// skipped when nothing would change — ADR-0004 "A metadata-only write
-    /// that changes nothing bumps nothing"); on replace of an `active` row it
+    /// skipped when nothing would change — ADR-0007 "No-op rule, and why a secret
+    /// write always bumps"); on replace of an `active` row it
     /// removes the value in the same one compare-and-set `PATCH {"secret":
     /// null}` uses (`remove_value`), which records the destroy debts of the
     /// old version in the same transaction (the plugin is resolved only to
@@ -1118,7 +999,10 @@ impl Service {
         let sharing = write.sharing;
         let fallback = Fallback::from(write.fallback);
         let expires_at = write.expires_at;
-        let value = write.secret.as_ref();
+        let value = match &write.secret {
+            SecretWrite::Set(v) => Some(v),
+            SecretWrite::Null => None,
+        };
         let tenant = TenantId(ctx.subject_tenant_id());
         let owner = OwnerId(ctx.subject_id());
 
@@ -1229,7 +1113,7 @@ impl Service {
             };
             let resolved = self.resolve_stored(existing.secret_type_uuid).await?;
             // `write_secret` is also needed when a `null` removes a value
-            // this row already holds (Amendment B); never when `null`
+            // this row already holds (ADR-0007); never when `null`
             // replaces an already value-less row. The caller already holds
             // `write` on this type, so the row's state is its to learn: a
             // refusal here is a plain 403.
@@ -1307,7 +1191,7 @@ impl Service {
                             sharing,
                             fallback,
                             expires_at,
-                            plugin.supports_destroy(),
+                            plugin.destroyer().is_some(),
                         )
                         .await?
                         .ok_or(DomainError::VersionConflict)?;
@@ -1323,8 +1207,8 @@ impl Service {
                     // `null`: metadata-only, and a no-op (204, unchanged
                     // ETag, no bump) when nothing about the metadata would
                     // change either — the same rule `PATCH`'s metadata-only
-                    // no-op follows (ADR-0004, "A metadata-only write that
-                    // changes nothing bumps nothing").
+                    // no-op follows (ADR-0007, "No-op rule, and why a secret
+                    // write always bumps").
                     if sharing == existing.sharing
                         && fallback == existing.fallback
                         && expires_at == existing.expires_at
@@ -1427,7 +1311,7 @@ impl Service {
             .await?
         } else {
             // Explicit `null` on create: insert the row `declared` directly —
-            // no `value_version`, no backend call (ADR-0004 Amendment B).
+            // no `value_version`, no backend call (ADR-0007, "PUT: whole replace, secret tri-state").
             let id = Uuid::new_v4();
             let new = NewDeclaredSecret {
                 id,
@@ -1490,8 +1374,8 @@ impl Service {
         }
     }
 
-    /// Apply a partial change to the record, the value, or both (ADR-0004,
-    /// RFC 7396 JSON Merge Patch semantics). Never creates.
+    /// Apply a partial change to the record, the value, or both (ADR-0007, "PATCH: merge, never
+    /// creates"; RFC 7396 JSON Merge Patch semantics). Never creates.
     ///
     /// # Errors
     ///
@@ -1724,7 +1608,7 @@ impl Service {
                         merged_sharing,
                         merged_fallback,
                         merged_expires_at,
-                        plugin.supports_destroy(),
+                        plugin.destroyer().is_some(),
                     )
                     .await?
                     .ok_or(DomainError::VersionConflict)?;
@@ -1874,7 +1758,7 @@ impl Service {
             attempt_id: Uuid::new_v4(),
             key: store_key.clone(),
             reference: params.key.as_ref().to_owned(),
-            destroy_supported: plugin.supports_destroy(),
+            destroy_supported: plugin.destroyer().is_some(),
             heal_expired_intents: false,
         };
         self.announce_write(&attempt).await?;
@@ -1920,7 +1804,7 @@ impl Service {
     /// Any other repo failure is ambiguous: 503, the intent stays for a later
     /// heal and nothing is executed. An intent found already healed is a
     /// 503 and nothing else. Shared by `put`'s replace leg and
-    /// `patch {"secret": ...}` (ADR-0004); accepts a `declared` row too,
+    /// `patch {"secret": ...}` (ADR-0007); accepts a `declared` row too,
     /// switching it back to `active`.
     #[allow(
         clippy::too_many_arguments,
@@ -1943,7 +1827,7 @@ impl Service {
             attempt_id: Uuid::new_v4(),
             key: store_key.clone(),
             reference: existing.reference.clone(),
-            destroy_supported: plugin.supports_destroy(),
+            destroy_supported: plugin.destroyer().is_some(),
             heal_expired_intents: existing.heal.expired_intents,
         };
         self.announce_write(&attempt).await?;
@@ -2271,25 +2155,23 @@ impl Service {
             CleanupTask::Destroy { key, selector } => {
                 // Recorded only for destroy-capable plugins, but the plugin
                 // can change between recording and execution: a plugin
-                // without `destroy` has nothing to destroy.
-                if !plugin.supports_destroy() {
+                // without a destroyer has nothing to destroy.
+                let Some(destroyer) = plugin.destroyer() else {
                     self.delete_executed_debt(debt).await;
                     return;
-                }
+                };
                 (
                     DepOp::PluginDestroy,
-                    plugin.destroy(ctx, key, selector.clone()).await,
+                    destroyer.destroy(ctx, key, selector.clone()).await,
                 )
             }
         };
         self.metrics.dependency(
             Dep::Plugin,
             dep_op,
-            if result.is_ok() {
-                Outcome::Success
-            } else {
-                Outcome::Error
-            },
+            result
+                .as_ref()
+                .map_or_else(plugin_error_outcome, |()| Outcome::Success),
             t0.elapsed().as_secs_f64(),
         );
         match result {
@@ -2297,10 +2179,11 @@ impl Service {
             Err(e) => {
                 tracing::warn!(
                     op = op.as_str(),
-                    kind = if e.is_unavailable() {
-                        "unavailable"
-                    } else {
-                        "error"
+                    kind = match e {
+                        credstore_sdk::CredStorePluginError::Unavailable { .. } => "unavailable",
+                        credstore_sdk::CredStorePluginError::CredentialsRejected { .. } =>
+                            "credentials_rejected",
+                        _ => "error",
                     },
                     "credstore: store cleanup failed; the debt stays for a later request"
                 );
@@ -2367,22 +2250,18 @@ impl Service {
         value: &SecretValue,
     ) -> Result<ValueVersion, DomainError> {
         let t0 = Instant::now();
-        let result = plugin
+        let raw = plugin
             .put(ctx, key, SecretValue::new(value.as_bytes().to_vec()))
-            .await
-            .map_err(map_plugin_err);
+            .await;
         let secs = t0.elapsed().as_secs_f64();
         self.metrics.dependency(
             Dep::Plugin,
             DepOp::PluginPut,
-            if result.is_ok() {
-                Outcome::Success
-            } else {
-                Outcome::Error
-            },
+            raw.as_ref()
+                .map_or_else(plugin_error_outcome, |_| Outcome::Success),
             secs,
         );
-        result
+        raw.map_err(DomainError::from)
     }
 
     /// Delete an owned secret (section 6.3).

@@ -9,6 +9,13 @@
 //! a row or retire an intent pair that change with the [`CleanupDebt`]s it
 //! implies, atomically. Executing a debt is the caller's job, after the
 //! commit is confirmed ([`SecretRepo::delete_debt`] removes it afterwards).
+//!
+//! Which debts a transaction records is decided by one function,
+//! [`cleanup_tasks`] over a [`DeadContent`]; the methods below name the
+//! [`DeadContent`] they pass and do not restate the rule.
+//!
+//! [`cleanup_tasks`]: crate::domain::secret::cleanup::cleanup_tasks
+//! [`DeadContent`]: crate::domain::secret::cleanup::DeadContent
 
 use std::time::Duration;
 
@@ -29,10 +36,13 @@ pub trait SecretRepo: Send + Sync {
     /// Resolve the winning row for `req_tenant` walking the ordered `chain`
     /// (req first, root last), applying two-phase priority + sharing. The
     /// resolution predicate is `status = active OR (status = declared AND
-    /// fallback = none)` (ADR-0004, Suppression): a `declared`/`none` row
+    /// fallback = none)` (ADR-0008, Suppression): a `declared`/`none` row
     /// competes and, when nearest, wins (blocking the walk); a
     /// `declared`/`inherit` row never competes. The row carries the heal
-    /// flags ([`SecretRow::heal`]), computed by the same SQL.
+    /// flags ([`SecretRow::heal`]), computed by the same SQL. Unclamped by
+    /// design (a clamp would change which row wins): the service applies the
+    /// scope to the effective record and serves a value only from a decisive
+    /// row of the same type.
     async fn resolve_for_get(
         &self,
         req_tenant: TenantId,
@@ -56,7 +66,7 @@ pub trait SecretRepo: Send + Sync {
 
     /// Every row of the reference visible to the caller across `chain`
     /// (`req_tenant` first, root last), for the credential-**record** read
-    /// (ADR-0004 `get`): the caller's own-tenant rows of **any** status
+    /// (ADR-0004, "Read actions follow the projection"): the caller's own-tenant rows of **any** status
     /// (private-for-subject, tenant, shared — so the record view can report
     /// `declared`/`inherit` and its validator even though such a row never
     /// resolves), plus every ancestor's `shared` row that passes the
@@ -64,7 +74,10 @@ pub trait SecretRepo: Send + Sync {
     /// invisible here, exactly as it is to a value read). One SQL query;
     /// [`crate::domain::secret::service::Service`] reduces the hierarchy in
     /// memory (ADR-0005 "Reducing a reference to one item": nearest
-    /// resolvable row wins; a `declared`/`none` winner blocks).
+    /// resolvable row wins; a `declared`/`none` winner blocks). Unclamped by
+    /// design (a clamp would change which row wins): the service applies the
+    /// scope to the effective record and serves a value only from a decisive
+    /// row of the same type.
     async fn resolve_candidates(
         &self,
         req_tenant: TenantId,
@@ -89,7 +102,7 @@ pub trait SecretRepo: Send + Sync {
     /// (mirrors the partial unique indexes): `Private` → `(tenant, ref, owner)`,
     /// `Tenant`/`Shared` → `(tenant, ref)` among non-private — of **either**
     /// resting status, so `put` can see a `declared` row it must treat as
-    /// "already exists" (ADR-0004: "does my tenant hold a row under this
+    /// "already exists" (ADR-0007, "PUT: whole replace, secret tri-state": "does my tenant hold a row under this
     /// reference" counts a `declared` row too). Unlike [`Self::find_own`]
     /// this never crosses the private boundary, so a private write does not see a
     /// coexisting tenant/shared secret (and vice-versa) — they coexist per design.
@@ -105,7 +118,9 @@ pub trait SecretRepo: Send + Sync {
 
     /// True iff `tenant` is within `scope`, ignoring credential-type
     /// predicates (the fail-closed own-tenant gate; type narrowing is
-    /// applied by the lookups themselves).
+    /// applied in SQL by the own-row lookups of writes and deletes and by the
+    /// collection's candidate query; a read applies it in the service to the
+    /// record it serves).
     async fn scope_includes_tenant(
         &self,
         scope: &AccessScope,
@@ -172,7 +187,7 @@ pub trait SecretRepo: Send + Sync {
         references: &[String],
     ) -> Result<Vec<SecretRow>, DomainError>;
 
-    // ── Write protocol (ADR-0006 section 6.2) ───────────────────────────────
+    // ── Write protocol (DESIGN section 6.2; ADR-0006, "The protocol") ──
 
     /// tx0 of a secret write: announce the attempt before `plugin.put` —
     /// insert `{attempt_id, tenant_id, record_id, reference, lease_until =
@@ -193,8 +208,9 @@ pub trait SecretRepo: Send + Sync {
     ///   no older version can exist).
     /// * [`IntentCommit::Lost`] — the insert hit the reference's create-only
     ///   uniqueness (a definite loss): the intent deletion commits anyway,
-    ///   together with a recorded `purge(key)` debt (the fresh record id can
-    ///   never get a row).
+    ///   together with the tasks [`cleanup_tasks`] selects for
+    ///   `DeadContent::LostWrite { row_exists: false, .. }` (the fresh record
+    ///   id can never get a row).
     /// * [`IntentCommit::IntentLost`] — the intent was already healed; the
     ///   transaction changed nothing.
     ///
@@ -207,8 +223,8 @@ pub trait SecretRepo: Send + Sync {
         attempt: &WriteAttempt,
     ) -> Result<IntentCommit<()>, DomainError>;
 
-    /// Create-with-no-value path (ADR-0004 Amendment B, "The value-less
-    /// record: reached only on purpose"): ONE plain `INSERT` — `status =
+    /// Create-with-no-value path (ADR-0007, "PUT: whole replace, secret tri-state": the
+    /// value-less record, reached only on purpose): ONE plain `INSERT` — `status =
     /// declared`, `value_version` `NULL`. No plugin call is ever made and no
     /// intent is written. A unique-index conflict maps to the existing
     /// `Conflict` error.
@@ -229,19 +245,18 @@ pub trait SecretRepo: Send + Sync {
     /// `destroy(Below)` safe holds only for a CAS on the version read before
     /// the `put`. Accepts a **`declared`** current row — `PUT`'s replace leg
     /// and `PATCH {"secret": …}` both switch a `declared` row to `active`
-    /// this way (ADR-0004).
+    /// this way (ADR-0007).
     ///
-    /// * [`IntentCommit::Committed`] — the post-write row, plus a recorded
-    ///   `destroy(key, Below(new_value_version))` debt when
-    ///   `attempt.destroy_supported`; when `attempt.heal_expired_intents`,
+    /// * [`IntentCommit::Committed`] — the post-write row, plus the tasks
+    ///   [`cleanup_tasks`] selects for `DeadContent::Superseded { new, .. }`
+    ///   (with `attempt.destroy_supported`); when `attempt.heal_expired_intents`,
     ///   the same transaction deletes the record's expired intents
     ///   (`lease_until < now()`, re-checked in the DELETE) and reports how
     ///   many.
     /// * [`IntentCommit::Lost`] — 0 rows affected (a definite loss; the caller
-    ///   maps it to a conflict). The intent deletion commits anyway, with a
-    ///   recorded `destroy(key, Exactly(new_value_version))` debt if a row
-    ///   with this record id still exists (and the plugin supports destroy),
-    ///   else a `purge(key)` debt.
+    ///   maps it to a conflict). The intent deletion commits anyway, with the
+    ///   tasks [`cleanup_tasks`] selects for `DeadContent::LostWrite { .. }`
+    ///   (`row_exists` read in the same transaction, `attempt.destroy_supported`).
     /// * [`IntentCommit::IntentLost`] — the intent was already healed; the
     ///   transaction changed nothing.
     ///
@@ -266,8 +281,9 @@ pub trait SecretRepo: Send + Sync {
     /// Failed-create heal: the expired intents of `(tenant, reference)`
     /// whose record id has NO `credstore_secrets` row (`NOT EXISTS`, never a
     /// `COUNT`) are deleted (`lease_until < now()` re-checked in the DELETE;
-    /// an intent another instance already took is skipped) and a `purge(key)`
-    /// debt is recorded for each distinct key, all in ONE transaction. Finds
+    /// an intent another instance already took is skipped) and the tasks
+    /// [`cleanup_tasks`] selects for `DeadContent::DeadKey { .. }` are
+    /// recorded for each distinct key, all in ONE transaction. Finds
     /// nothing without writing anything. The caller executes the returned
     /// debts after the commit.
     async fn heal_failed_creates(
@@ -284,7 +300,7 @@ pub trait SecretRepo: Send + Sync {
     /// already-deleted row affects nothing and is not an error.
     async fn delete_debt(&self, id: Uuid) -> Result<(), DomainError>;
 
-    /// Metadata-only update (ADR-0004 `PATCH` with no `value` key): ONE
+    /// Metadata-only update (ADR-0007, "PATCH: merge, never creates", with no `value` key): ONE
     /// transaction — `UPDATE … SET sharing, fallback, expires_at, version =
     /// version + 1, updated_at = now() WHERE id = ? [AND version = ?]`;
     /// never touches `value_version` or `status`. 0 rows affected →
@@ -299,14 +315,12 @@ pub trait SecretRepo: Send + Sync {
         expires_at: Option<OffsetDateTime>,
     ) -> Result<Option<SecretRow>, DomainError>;
 
-    /// Secret removal (ADR-0004 `PATCH {"secret": null}`): ONE transaction —
+    /// Secret removal (ADR-0007, "PATCH: merge, never creates", `{"secret": null}`): ONE transaction —
     /// the compare-and-set `UPDATE … SET value_version = NULL, status =
     /// declared, sharing, fallback, expires_at, version = version + 1,
     /// updated_at = now() WHERE id = ? [AND version = ?]` plus, when the row
-    /// held a value version `old` and `destroy_supported`, the recorded debts
-    /// `destroy(key, Below(old))` and `destroy(key, Exactly(old))` (never
-    /// `delete_key`: a concurrent writer may already have put a newer version
-    /// under the same key). 0 rows affected → `Ok(None)`. Returns the
+    /// held a value version `old`, the tasks [`cleanup_tasks`] selects for
+    /// `DeadContent::Removed { old, .. }` (with `destroy_supported`). 0 rows affected → `Ok(None)`. Returns the
     /// post-write (now `declared`) row and the debts it recorded. No intent
     /// (there is no `put`) and never a store call.
     #[allow(
@@ -326,8 +340,8 @@ pub trait SecretRepo: Send + Sync {
 
     /// Delete record (section 6.3): ONE transaction — `DELETE` the row (CAS
     /// on `expected_version` when given; 0 rows affected →
-    /// `DomainError::NotFound`) and record a `purge(key)` debt, where
-    /// `key = (tenant_id, id)`. Returns the debt; the caller executes it
+    /// `DomainError::NotFound`) and record the tasks [`cleanup_tasks`] selects
+    /// for `DeadContent::DeadKey { key }`, where `key = (tenant_id, id)`. Returns the debt; the caller executes it
     /// after the commit.
     async fn delete_by_id(
         &self,
@@ -336,7 +350,7 @@ pub trait SecretRepo: Send + Sync {
         expected_version: Option<i64>,
     ) -> Result<Vec<CleanupDebt>, DomainError>;
 
-    // ── Verification after an ambiguous commit (ADR-0006 section 6.2) ───────
+    // ── Verification after an ambiguous commit (DESIGN 6.2; ADR-0006) ──
 
     /// Verification of [`Self::insert_active`] after an ambiguous commit:
     /// ONE transaction that starts with a LOCKING read of the attempt's own
@@ -348,8 +362,8 @@ pub trait SecretRepo: Send + Sync {
     /// * intent gone, row points at `new.value_version` →
     ///   [`WriteVerification::Committed`];
     /// * intent gone, row does not → [`WriteVerification::NotApplied`], with
-    ///   the recorded `destroy(Exactly(vv))` debt (or `purge(key)` when no
-    ///   row has the record id).
+    ///   the tasks [`cleanup_tasks`] selects for `DeadContent::LostWrite { .. }`
+    ///   (`row_exists` read in the verification transaction).
     ///
     /// `Err` means the verification itself failed: the outcome stays unknown.
     async fn verify_insert_active(
@@ -383,7 +397,9 @@ pub trait SecretRepo: Send + Sync {
     /// pending delete holds the lock). No row → [`DeleteVerification::Committed`];
     /// a row → the delete runs again with the same precondition
     /// ([`DeleteVerification::Retried`], or
-    /// [`DeleteVerification::PreconditionFailed`] when the row changed).
+    /// [`DeleteVerification::PreconditionFailed`] when the row changed). The
+    /// retried delete records its cleanup debt through `cleanup_tasks`
+    /// (`DeadContent::DeadKey`), exactly like [`Self::delete_by_id`].
     async fn verify_delete(
         &self,
         scope: &AccessScope,

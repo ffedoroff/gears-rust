@@ -11,6 +11,8 @@ use time::OffsetDateTime;
 use toolkit_db::secure::Scopable;
 use uuid::Uuid;
 
+use super::enums::{DbCleanupOp, DbDestroySelector};
+
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "credstore_store_cleanup")]
 #[secure(unrestricted)]
@@ -21,9 +23,9 @@ pub struct Model {
     pub tenant_id: Uuid,
     pub record_id: Uuid,
     /// `1` = purge (`delete_key`), `2` = destroy.
-    pub op: i16,
+    pub op: DbCleanupOp,
     /// Destroy only: `1` = below, `2` = exact; `NULL` for purge.
-    pub selector: Option<i16>,
+    pub selector: Option<DbDestroySelector>,
     /// Destroy only: the value version; `NULL` for purge.
     pub version: Option<String>,
     /// Database clock.

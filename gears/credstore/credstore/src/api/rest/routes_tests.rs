@@ -24,7 +24,9 @@ use crate::domain::secret::test_support::{
     FakeDir, FakeMetrics, FakePlugin, FakePluginSelector, FakeSecretRepo, action_deny_enforcer,
     catalog_type_resolver, deny_enforcer, make_ctx, mock_enforcer,
 };
-use credstore_sdk::{CredentialWrite, Fallback, SecretRef, SecretType, SecretValue, SharingMode};
+use credstore_sdk::{
+    CredentialWrite, Fallback, SecretRef, SecretType, SecretValue, SecretWrite, SharingMode,
+};
 
 use super::register_routes;
 use crate::api::rest::dto::weak_etag;
@@ -313,7 +315,7 @@ fn generic_write(sharing: SharingMode, value: &str) -> CredentialWrite {
         sharing,
         fallback: Fallback::Inherit,
         expires_at: None,
-        secret: Some(SecretValue::from(value)),
+        secret: SecretWrite::Set(SecretValue::from(value)),
     }
 }
 
@@ -1636,7 +1638,7 @@ async fn if_match_non_ascii_is_400_invalid_if_match() {
     assert_eq!(read_secret(&h, "nonascii").await, "v");
 }
 
-// ── GET /credentials/{ref}?$select=... (ADR-0004 Amendment A) ───────────────
+// ── GET /credentials/{ref}?$select=... (ADR-0004, "Read actions follow the projection") ───────────────
 // The withdrawn `GET /credentials/{ref}/secret` is superseded by
 // `$select=reference,type,expires_at,secret` on the point read.
 

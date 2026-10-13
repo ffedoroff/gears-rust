@@ -69,8 +69,7 @@ pub fn credential_type_resource(gts_id: &str) -> ResourceType {
 /// here now so the vocabulary is complete and stable.
 pub mod actions {
     /// Collection read (Phase 3). Also implied by `read` (a record reader
-    /// can list what it can read), per ADR-0004's "Implications between the
-    /// actions".
+    /// can list what it can read), per the action implications in the PRD.
     pub const LIST: &str = "list";
     /// Point read of the credential record (`GET /credentials/{ref}`).
     pub const READ: &str = "read";
@@ -80,7 +79,7 @@ pub mod actions {
     /// `DELETE /credentials/{ref}`.
     pub const DELETE: &str = "delete";
     /// Point read of the value: `GET /credentials/{ref}` (or the collection)
-    /// with `value` named in `$select` (ADR-0004 Amendment A).
+    /// with `value` named in `$select` (ADR-0004, "Read actions follow the projection").
     pub const READ_SECRET: &str = "read_secret";
     /// `PUT`/`PATCH` of the `value` field.
     pub const WRITE_SECRET: &str = "write_secret";

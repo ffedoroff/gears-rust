@@ -1,10 +1,15 @@
 // Updated: 2026-10-06 by Constructor Tech
-//! `DomainError` → [`CanonicalError`] boundary mapping for the credstore REST layer.
+//! `DomainError` → [`CanonicalError`] boundary mapping: the single mapping
+//! behind both the REST layer and the in-process SDK client (platform error
+//! ADR 0005). Wire codes come from the SDK constants
+//! ([`credstore_sdk::reason`], [`credstore_sdk::field`]), never from local
+//! literals.
 
 use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::typing::reasons;
+use credstore_sdk::field;
+use credstore_sdk::reason::{aborted, failed_precondition, permission_denied};
 
 // ---------------------------------------------------------------------------
 // Resource marker
@@ -22,7 +27,7 @@ impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
         match err {
             DomainError::InvalidSecretRef { detail } => CredentialResource::invalid_argument()
-                .with_field_violation("reference", detail, "INVALID_SECRET_REF")
+                .with_field_violation("reference", detail, field::INVALID_SECRET_REF)
                 .create(),
             DomainError::NotFound => CredentialResource::not_found("credential not found")
                 .with_resource("credential")
@@ -37,7 +42,7 @@ impl From<DomainError> for CanonicalError {
                 .with_precondition_violation(
                     "secret",
                     "the credential's secret has expired; renew the credential",
-                    "SECRET_EXPIRED",
+                    failed_precondition::SECRET_EXPIRED,
                 )
                 .with_override(Http::status_code(409))
                 .create(),
@@ -49,26 +54,26 @@ impl From<DomainError> for CanonicalError {
             // No 412 in the canonical model; optimistic-lock conflicts are Aborted (409).
             DomainError::VersionConflict => {
                 CredentialResource::aborted("credential version precondition failed")
-                    .with_reason("OPTIMISTIC_LOCK_FAILURE")
+                    .with_reason(aborted::OPTIMISTIC_LOCK_FAILURE)
                     .create()
             }
             DomainError::InvalidPrecondition { detail } => CredentialResource::invalid_argument()
-                .with_field_violation("If-Match", detail, "INVALID_IF_MATCH")
+                .with_field_violation("If-Match", detail, field::INVALID_IF_MATCH)
                 .create(),
             // No 428 in the canonical model; a missing mandatory `If-Match` is
             // a request the client must fix → invalid_argument (400) with its
             // own reason so clients can tell "absent" from "malformed".
             DomainError::PreconditionRequired { detail } => CredentialResource::invalid_argument()
-                .with_field_violation("If-Match", detail, "IF_MATCH_REQUIRED")
+                .with_field_violation("If-Match", detail, field::IF_MATCH_REQUIRED)
                 .create(),
-            // ADR-0004: the type-conflict reasons are canonical `Aborted`
+            // ADR-0007 (write conflicts): the type-conflict reasons are canonical `Aborted`
             // (409, like a version conflict — the request contended with
             // state it didn't expect); every other trait-violation reason
             // stays `InvalidArgument` (400).
             DomainError::TypeViolation { reason, detail, .. }
-                if reason == reasons::TYPE_IMMUTABLE
-                    || reason == reasons::TYPE_MISMATCH_WITH_INHERITED
-                    || reason == reasons::TYPE_MISMATCH_WITH_DESCENDANT =>
+                if reason == aborted::TYPE_IMMUTABLE
+                    || reason == aborted::TYPE_MISMATCH_WITH_INHERITED
+                    || reason == aborted::TYPE_MISMATCH_WITH_DESCENDANT =>
             {
                 CredentialResource::aborted(detail)
                     .with_reason(reason)
@@ -90,11 +95,15 @@ impl From<DomainError> for CanonicalError {
                 .create(),
             DomainError::UnsupportedTransition { detail } => {
                 CredentialResource::failed_precondition()
-                    .with_precondition_violation("sharing", detail, "UNSUPPORTED_TRANSITION")
+                    .with_precondition_violation(
+                        "sharing",
+                        detail,
+                        failed_precondition::UNSUPPORTED_TRANSITION,
+                    )
                     .create()
             }
             DomainError::AccessDenied { .. } => CredentialResource::permission_denied()
-                .with_reason("ACCESS_DENIED")
+                .with_reason(permission_denied::ACCESS_DENIED)
                 .create(),
             DomainError::ServiceUnavailable {
                 detail,

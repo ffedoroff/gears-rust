@@ -13,7 +13,9 @@
 //! chain alone, which is what lets it be called from either place without
 //! threading `Service`'s private fields through a module boundary.
 
-use credstore_sdk::{CredentialStatus, InheritanceStatus, OwnerId, SharingMode, TenantId};
+use credstore_sdk::{
+    CredentialStatus, InheritanceStatus, OwnRow, OwnerId, SharingMode, TenantId, Validator,
+};
 use time::OffsetDateTime;
 
 use crate::domain::secret::model::{Fallback, SecretRow, SecretStatus};
@@ -49,22 +51,40 @@ pub(crate) struct Reduced<'a> {
 }
 
 impl Reduced<'_> {
-    /// The caller's own-row `status` (`none`/`declared`/`active`/`expired`) —
-    /// never a property of the effective row (ADR-0004, "Two
-    /// representations"). `expired` is derived from `expires_at` here, at
-    /// read time.
+    /// The caller's own row as the SDK reports it: its `status`
+    /// (`declared`/`active`/`expired`, `expired` derived from `expires_at`
+    /// here, at read time), `fallback`, `updated_at`, `owner_id` and the
+    /// validator naming this generation — never a property of the effective
+    /// row (ADR-0004, "Read actions follow the projection"). `None` when the
+    /// caller holds no own row.
     #[must_use]
-    pub(crate) fn own_status(&self) -> CredentialStatus {
-        match self.own {
-            Some(o) if o.is_expired(OffsetDateTime::now_utc()) => CredentialStatus::Expired,
-            Some(o) if o.status == SecretStatus::Active => CredentialStatus::Active,
-            Some(_) => CredentialStatus::Declared,
-            None => CredentialStatus::None,
-        }
+    pub(crate) fn own_row(&self) -> Option<OwnRow> {
+        self.own.map(|o| own_row_of(o, OffsetDateTime::now_utc()))
     }
 }
 
-/// A row is a resolution candidate (ADR-0004, Suppression): `active` (expired
+/// The SDK view of the caller's own row `o`, with `expired` judged at `now`.
+#[must_use]
+pub(crate) fn own_row_of(o: &SecretRow, now: OffsetDateTime) -> OwnRow {
+    OwnRow {
+        status: if o.is_expired(now) {
+            CredentialStatus::Expired
+        } else if o.status == SecretStatus::Active {
+            CredentialStatus::Active
+        } else {
+            CredentialStatus::Declared
+        },
+        fallback: o.fallback.into(),
+        updated_at: o.updated_at,
+        owner_id: o.owner_id,
+        validator: Validator {
+            id: o.id,
+            version: o.version,
+        },
+    }
+}
+
+/// A row is a resolution candidate (ADR-0008, Resolution): `active` (expired
 /// or not — an expired record is still the decisive one), or `declared` with
 /// `fallback: none` (a suppressing row that competes and, when nearest,
 /// wins). A `declared`/`inherit` row never competes. Mirrors
@@ -135,7 +155,7 @@ pub(crate) fn reduce_reference<'a>(
         if w.status == SecretStatus::Declared {
             // A declared/none winner blocks the walk — the caller's own row
             // or an ancestor's, either way the outcome is the same name
-            // (ADR-0004, Suppression).
+            // (ADR-0008, Resolution).
             InheritanceStatus::Suppressed
         } else if own.is_some_and(|o| o.id == w.id) {
             let ancestor_candidate_exists = candidates.iter().any(|r| r.tenant_id != req);
@@ -150,7 +170,7 @@ pub(crate) fn reduce_reference<'a>(
     } else {
         // Nothing (of the effective type) resolves; the caller has an own
         // `declared`/`inherit` row with nothing behind it — reported as `Own`
-        // (ADR-0004: "choose Own and document").
+        // (ADR-0008, "Resolution": the caller's own row reports `Own`).
         InheritanceStatus::Own
     };
 
