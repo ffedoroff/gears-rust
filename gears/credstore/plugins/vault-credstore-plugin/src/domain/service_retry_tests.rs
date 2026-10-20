@@ -41,6 +41,13 @@ impl FakeTransport {
             .len()
     }
 
+    fn requests(&self) -> Vec<VaultRequest> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn methods(&self) -> Vec<HttpMethod> {
         self.seen
             .lock()
@@ -210,7 +217,7 @@ async fn forbidden_is_not_retried_and_is_credentials_rejected() {
 // -- put -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn put_is_never_retried() {
+async fn put_is_never_retried_on_the_limit_call() {
     for first in [
         Err(TransportError::Timeout),
         Err(TransportError::Connect),
@@ -219,25 +226,73 @@ async fn put_is_never_retried() {
         reply(503, ""),
         reply(429, ""),
     ] {
-        let fake = FakeTransport::new(vec![first, reply(200, PUT_OK)]);
+        let fake = FakeTransport::new(vec![first, reply(204, ""), reply(200, PUT_OK)]);
         let err = service(&fake, 5)
             .put_value(&key(), SecretValue::from("v"))
             .await
             .unwrap_err();
         assert!(err.is_unavailable());
-        assert_eq!(fake.calls(), 1, "a put must be sent at most once");
+        assert_eq!(
+            fake.calls(),
+            1,
+            "the limit call is sent at most once and no data write follows"
+        );
     }
 }
 
 #[tokio::test]
-async fn put_succeeds_on_the_first_attempt() {
-    let fake = FakeTransport::new(vec![reply(200, PUT_OK)]);
-    let version = service(&fake, 5)
+async fn put_is_never_retried_on_the_data_write() {
+    for second in [
+        Err(TransportError::Timeout),
+        Err(TransportError::Connect),
+        Err(TransportError::Other),
+        reply(500, ""),
+        reply(503, ""),
+        reply(429, ""),
+    ] {
+        let fake = FakeTransport::new(vec![reply(204, ""), second, reply(200, PUT_OK)]);
+        let err = service(&fake, 5)
+            .put_value(&key(), SecretValue::from("v"))
+            .await
+            .unwrap_err();
+        assert!(err.is_unavailable());
+        assert_eq!(fake.calls(), 2, "limit call once, data write once");
+    }
+}
+
+#[tokio::test]
+async fn put_forbidden_on_the_limit_call_is_credentials_rejected_without_a_write() {
+    let fake = FakeTransport::new(vec![
+        reply(403, r#"{"errors":["permission denied"]}"#),
+        reply(200, PUT_OK),
+    ]);
+    let err = service(&fake, 5)
         .put_value(&key(), SecretValue::from("v"))
+        .await
+        .unwrap_err();
+    assert!(err.is_credentials_rejected());
+    assert_eq!(fake.calls(), 1);
+}
+
+#[tokio::test]
+async fn put_sets_the_limit_before_writing_the_data() {
+    let fake = FakeTransport::new(vec![reply(204, ""), reply(200, PUT_OK)]);
+    let k = key();
+    let version = service(&fake, 5)
+        .put_value(&k, SecretValue::from("v"))
         .await
         .expect("ok");
     assert_eq!(version, vv("4"));
-    assert_eq!(fake.calls(), 1);
+    let seen = fake.requests();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].method, HttpMethod::Post);
+    assert!(seen[0].url.contains("/metadata/"), "{}", seen[0].url);
+    assert_eq!(
+        seen[0].json_body.as_deref(),
+        Some(r#"{"max_versions":100}"#)
+    );
+    assert_eq!(seen[1].method, HttpMethod::Post);
+    assert!(seen[1].url.contains("/data/"), "{}", seen[1].url);
 }
 
 // -- delete_key ------------------------------------------------------------------

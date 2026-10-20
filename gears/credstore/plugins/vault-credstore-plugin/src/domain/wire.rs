@@ -145,6 +145,14 @@ pub struct DestroyRequestBody {
     pub versions: Vec<u64>,
 }
 
+/// Body of a KV v2 `POST metadata/...` call that sets the key's own version
+/// limit. Vault ignores `options.max_versions` in a data write, so the limit
+/// has to be set through the metadata endpoint.
+#[derive(Serialize)]
+pub struct MetadataRequestBody {
+    pub max_versions: u32,
+}
+
 /// Serializes a request body for the transport.
 ///
 /// # Errors
@@ -420,6 +428,24 @@ pub fn classify_put_response(
         return parse_put_body(body);
     }
     Err(map_error_status(status, body, None, &[encoded_value]))
+}
+
+/// Classifies a `POST metadata` (key settings) response: `2xx` (Vault answers
+/// `204`) succeeds, anything else is a backend failure. Unlike a delete, a
+/// `404` is not success: the call creates the metadata, so a `404` means a
+/// wrong mount.
+///
+/// # Errors
+/// See [`map_error_status`].
+pub fn classify_metadata_write_response(
+    status: u16,
+    body: &str,
+) -> Result<(), CredStorePluginError> {
+    if is_success(status) {
+        Ok(())
+    } else {
+        Err(map_error_status(status, body, None, &[]))
+    }
 }
 
 /// Classifies a `DELETE` metadata or `POST` destroy response: `2xx` or a

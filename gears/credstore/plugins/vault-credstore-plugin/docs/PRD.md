@@ -137,7 +137,8 @@ flowchart LR
 
 - The deployment provides a Vault or OpenBao server with a **KV v2** mount reachable from the host process, and a token whose policy covers the plugin's key space (the minimal policy is in [DESIGN §4.1](./DESIGN.md#41-security-and-data-protection)).
 - The mount **MUST** have `delete_version_after = 0s` (no version expires by age) and `cas_required = false` (the plugin writes without compare-and-set; the gear's PostgreSQL compare-and-set decides the winner of concurrent writes).
-- The mount's `max_versions` **MUST** exceed the number of versions one key can hold at once. Vault keeps 10 versions per key by default, and `max_versions = 0` or unset also means 10, not unlimited. Superseded versions are destroyed by the gear right after each commit, so a key normally holds one or two; when more than the limit pile up above the record's pointer (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not, since destroyed versions still count; versions below the pointer are evicted first and are harmless), Vault drops the oldest, possibly the version a record points at, and that record answers an internal error (500) until it is rewritten. An operator who wants more headroom sets a larger `max_versions` on the mount.
+- The plugin **MUST** set the key's own `max_versions` to 100 before every `put` (not the mount's: the mount's `max_versions` is not an operator obligation). Vault keeps the larger of the mount's and the key's limit, 10 when both are `0` or unset (`0` is not unlimited), and destroyed versions count, so a lower mount value is harmless. Superseded versions are destroyed by the gear right after each commit, so a key normally holds one or two; when more than 100 pile up above the record's pointer (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not; versions below the pointer are evicted first and are harmless), Vault drops the oldest, possibly the version a record points at, and that record answers an internal error (500) until it is rewritten. 100 is a constant of the plugin and **MUST NOT** be lowered in a later version: the next write to each existing key would remove every version beyond the new limit at once.
+- The token's policy **MUST** give `create` and `update` on the key's metadata path, because setting `max_versions` is a `POST` to the metadata endpoint (`create` while the metadata does not exist yet, `update` afterwards).
 - The plugin does not verify any of this at startup or later: these are operator obligations.
 - Exactly one backend plugin serves a CredStore instance; this plugin is selected by its configured vendor (default `openbao`) and cannot serve the same instance as `static-credstore-plugin`.
 
@@ -154,7 +155,7 @@ flowchart LR
 
 ### 4.2 Out of Scope
 
-- Provisioning or administering Vault: enabling the mount, setting `max_versions`, writing policies, issuing tokens, running Vault Agent.
+- Provisioning or administering Vault: enabling the mount, setting `delete_version_after` and `cas_required`, writing policies, issuing tokens, running Vault Agent.
 - TLS settings (CA bundle, client certificates, server name overrides): the HTTP client's defaults apply.
 - Authentication methods other than a token: no Kubernetes, AppRole, JWT or cloud login, and no token renewal or lease management inside the plugin. A sidecar does that.
 - Startup or periodic checks of Vault, the mount, its configuration or the token's policy; health probes.
@@ -174,7 +175,7 @@ flowchart LR
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-vault-fr-put`
 
-`put` **MUST** store the bytes as a new version under the record's key and return only after Vault confirmed the write, handing back the version number Vault assigned. It **MUST NOT** overwrite or modify an existing version and **MUST NOT** use compare-and-set. Empty values, binary values and values of at least 64 KiB **MUST** round-trip byte for byte.
+`put` **MUST** first set the key's own `max_versions` to 100 (a `POST` to the key's metadata, repeatable and allowed before the first write) and only then store the bytes as a new version under the record's key, returning only after Vault confirmed the write and handing back the version number Vault assigned. If setting `max_versions` fails, `put` **MUST** fail with the error of that call and **MUST NOT** write the data. It **MUST NOT** overwrite or modify an existing version and **MUST NOT** use compare-and-set. Empty values, binary values and values of at least 64 KiB **MUST** round-trip byte for byte.
 
 - **Rationale**: The gear's write protocol relies on a durable, provider-assigned version and on exact bytes; concurrent writers to one key each get their own version and the gear's database picks the winner.
 - **Actors**: `cpt-cf-credstore-vault-actor-credstore-gear`, `cpt-cf-credstore-vault-actor-vault`
@@ -223,7 +224,7 @@ The plugin **MUST** authenticate every request with a Vault token and **MUST** a
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-vault-fr-retries`
 
-`get`, `delete_key` and `destroy` (including the metadata read inside `destroy(Below)`) **MUST** be retried on transient failures (no response, timeout, `5xx`, `408`, `429`) with exponential backoff and jitter, at most `retry.max_attempts` attempts in total (default 3), the pause starting at `retry.base_delay_ms` (default 100 ms) and never exceeding two seconds. `put` **MUST NOT** be retried: after a request was sent its outcome can be ambiguous, and the gear's write intent already covers an orphaned version.
+`get`, `delete_key` and `destroy` (including the metadata read inside `destroy(Below)`) **MUST** be retried on transient failures (no response, timeout, `5xx`, `408`, `429`) with exponential backoff and jitter, at most `retry.max_attempts` attempts in total (default 3), the pause starting at `retry.base_delay_ms` (default 100 ms) and never exceeding two seconds. `put` **MUST NOT** be retried, and neither is its `max_versions` call: after a request was sent its outcome can be ambiguous, and the gear's write intent already covers an orphaned version.
 
 - **Rationale**: Retrying an idempotent call hides a blip of the backend from the caller; retrying a write would create a second version nobody references.
 - **Actors**: `cpt-cf-credstore-vault-actor-credstore-gear`, `cpt-cf-credstore-vault-actor-vault`
@@ -287,7 +288,7 @@ The plugin **MUST** pass every check of the SDK conformance suite (`credstore_sd
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-vault-nfr-bounded-latency`
 
-Every Vault request **MUST** be bounded by `timeout_secs` (default 5 s). With the defaults a `put` therefore returns within about 5 s, a `get` or `delete_key` within about 15 s (three attempts plus backoff of at most 0.3 s) and a `destroy(Below)` within about 30 s (two calls). The gear's write-intent lease is far above the `put` bound by its own configuration floor.
+Every Vault request **MUST** be bounded by `timeout_secs` (default 5 s). With the defaults a `put` therefore returns within about 10 s (two calls), a `get` or `delete_key` within about 15 s (three attempts plus backoff of at most 0.3 s) and a `destroy(Below)` within about 30 s (two calls). The gear's write-intent lease is far above the `put` bound by its own configuration floor.
 
 - **Threshold**: The configured bounds hold in the failure-injection unit tests (a scripted transport counts attempts; the HTTP client enforces the timeout).
 - **Rationale**: The gear adds no timeouts of its own for backend I/O and relies on the plugin's.
@@ -367,7 +368,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 - The value is a durable immutable version in Vault.
 
 **Alternative Flows**:
-- **Vault unavailable during `put`**: the plugin answers "unavailable" after one attempt; the gear's write intent covers a version that may have been stored.
+- **Vault unavailable during `put`**: the plugin answers "unavailable" after one attempt of the failing call (if the `max_versions` call failed, nothing was written); the gear's write intent covers a version that may have been stored.
 - **Vault unavailable during `get`**: the plugin retries within its budget, then answers "unavailable".
 
 #### Clean Up After a Commit
@@ -428,7 +429,8 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 - [ ] `get` answers "no value" for absent, soft-deleted, destroyed and evicted versions and for version `0`; it reports an internal (permanent) error, distinct from "no value" and from a transient outage (the gear answers 500), for an entry the plugin did not write or can never read; the answers are verified against the real server's response shapes.
 - [ ] `destroy(Below)` over a key with many versions destroys exactly the versions below the cut, soft-deleted ones included, and is idempotent.
 - [ ] A rotated token file is used after one rejected request; a persistent `403` is "credentials rejected" and never leaks the token.
-- [ ] Idempotent operations retry transient failures up to the configured attempts; `put` is never retried.
+- [ ] Idempotent operations retry transient failures up to the configured attempts; `put` is never retried, on neither of its two calls.
+- [ ] Every `put` sets the key's `max_versions` to 100 before it writes; when that call fails (`5xx`, `403`, others), the `put` fails and no data is written.
 - [ ] A missing mount is an error for every operation, never a missing secret and never a successful delete.
 - [ ] Configuration with zero or several token sources, bad paths, a zero timeout or out-of-range retry values is rejected with the key named; unknown keys are rejected.
 - [ ] No secret byte and no token appears in any log line, error message or `Debug` output exercised by the tests.
@@ -456,9 +458,9 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| More versions than `max_versions` accumulate above a record's pointer (orphans of failed or ambiguous writes, versions of CAS losers, destroyed or not). | Vault drops the oldest versions, possibly the referenced one (versions below the pointer go first); the record answers an internal error (500) until rewritten. | Documented mount obligation with the 10-version default spelled out; operators size `max_versions` for their failure profile; superseded versions are destroyed after each commit. |
+| More than 100 versions accumulate above a record's pointer (orphans of failed or ambiguous writes, versions of CAS losers, destroyed or not). | Vault drops the oldest versions, possibly the referenced one (versions below the pointer go first); the record answers an internal error (500) until rewritten. | The plugin sets the key's `max_versions` to 100 before every `put` (a lower mount value is harmless); superseded versions are destroyed after each commit. |
 | The token is revoked or its policy is too narrow. | Every call fails as "credentials rejected" (503 from the gear). | Explicit, logged `403` handling; documented minimal policy verified by the integration tests; sidecar rotation without restart. |
-| The mount is misconfigured (`delete_version_after`, `cas_required`, wrong name). | Versions expire, writes fail, or calls fail with an explained error. | Documented operator obligations; a missing mount is an error, not a miss; no silent success. |
+| The mount is misconfigured (`delete_version_after`, `cas_required`, wrong name) or the policy lacks `create` / `update` on the metadata path. | Versions expire, writes fail, or calls fail with an explained error. | Documented operator obligations; a missing mount is an error, not a miss; no silent success. |
 | A write is sent and its response is lost. | An unreferenced version stays in Vault. | The plugin never retries `put`; the gear's write intent covers the orphan and cleans it later. |
 | Vault is sealed or unreachable. | All operations fail as "unavailable". | Bounded retries for idempotent calls; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job); recovery needs no restart. |
 | The Vault token file is world-readable or the token is exposed in the environment. | Token compromise. | Documented least-privilege file permissions and the sidecar pattern; the plugin never logs the token. |

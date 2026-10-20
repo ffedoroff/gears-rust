@@ -26,14 +26,14 @@ All versions of a record live under one KV v2 path:
 
 | Operation | Vault call | Notes |
 |-----------|------------|-------|
-| `put` | `POST /v1/{mount}/data/...` `{"data":{"value":"<base64>"}}` | No `cas`. Returns `data.version`. Never retried. |
+| `put` | `POST /v1/{mount}/metadata/...` `{"max_versions":100}`, then `POST /v1/{mount}/data/...` `{"data":{"value":"<base64>"}}` | The first call sets the key's own `max_versions` (idempotent, allowed before the first write); if it fails, the `put` fails and nothing is written. No `cas`. Returns `data.version`. Neither call is retried. |
 | `get(version)` | `GET /v1/{mount}/data/...?version=N` | `404` (absent, soft-deleted, destroyed or evicted) is `None`. |
 | `delete_key` | `DELETE /v1/{mount}/metadata/...` | Removes all versions. `404` is success. |
 | `destroy(Exactly(N))` | `POST /v1/{mount}/destroy/...` `{"versions":[N]}` | |
 | `destroy(Below(N))` | `GET /v1/{mount}/metadata/...`, then `POST /v1/{mount}/destroy/...` | Destroys the versions below `N` that are not destroyed yet; no call when there are none. |
 
 `get`, `delete_key` and `destroy` are retried with bounded exponential backoff
-on transient failures; `put` is sent at most once.
+on transient failures; `put` (both of its calls) is sent at most once.
 
 ## Authentication
 
@@ -52,23 +52,27 @@ provides a **KV v2** mount with:
 
 - `delete_version_after = 0s` (versions never expire by age);
 - `cas_required = false` (the plugin writes without `cas`; the gear's
-  `PostgreSQL` compare-and-set decides the winner);
-- a `max_versions` the versions of one key stay below. Vault keeps **10
-  versions per key by default**; `max_versions = 0` or unset also means 10,
-  not unlimited. Superseded versions are destroyed after each commit, so a key
-  normally holds one or two. If more versions than the limit pile up above
-  a record's pointer (orphans of failed or ambiguous writes, versions of CAS
-  losers, destroyed or not), Vault drops the oldest,
-  possibly the one a record points at, and that record answers
-  an internal error (500) until it is rewritten. Set a larger `max_versions` on
-  the mount if that is a concern.
+  `PostgreSQL` compare-and-set decides the winner).
+
+The mount's `max_versions` is not an operator obligation: before every `put`
+the plugin sets the key's own `max_versions` to 100. Vault keeps the larger of
+the mount's and the key's limit (10 when both are `0` or unset; `0` is not
+unlimited) and counts destroyed versions, so a lower value on the mount is
+harmless. Superseded versions are destroyed after each commit, so a key
+normally holds one or two. If more than 100 versions pile up above a record's
+pointer (orphans of failed or ambiguous writes, versions of CAS losers,
+destroyed or not), Vault drops the oldest, possibly the one a record points
+at, and that record answers an internal error (500) until it is rewritten.
+The 100 is a constant of the plugin and is never lowered: the next write to
+every existing key would remove the versions beyond the new window.
 
 The token needs only this policy (replace `secret` and `credstore` with the
-configured `mount` and `path_prefix`):
+configured `mount` and `path_prefix`); `create` and `update` on the metadata
+path are for the `max_versions` call of `put`:
 
 ```hcl
 path "secret/data/credstore/*"     { capabilities = ["create", "update", "read"] }
-path "secret/metadata/credstore/*" { capabilities = ["read", "delete"] }
+path "secret/metadata/credstore/*" { capabilities = ["create", "update", "read", "delete"] }
 path "secret/destroy/credstore/*"  { capabilities = ["update"] }
 ```
 

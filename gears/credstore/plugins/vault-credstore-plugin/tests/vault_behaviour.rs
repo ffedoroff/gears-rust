@@ -203,8 +203,26 @@ async fn set_mount_max_versions(vault: &VaultFixture, max_versions: u32) {
     assert!(status < 300, "{status} {body}");
 }
 
+/// Writes a version with a raw `POST data/...` (root token), bypassing the
+/// plugin, so the key's own `max_versions` stays whatever the test set.
+async fn raw_write(vault: &VaultFixture, key: &StoreKey, text: &str) {
+    let body = json!({"data": {"value": text}});
+    let (status, resp) = vault
+        .raw("POST", &key_path(vault, "data", key), Some(body))
+        .await;
+    assert_eq!(status, 200, "{resp}");
+}
+
+async fn key_max_versions(vault: &VaultFixture, key: &StoreKey) -> Value {
+    let (status, body) = vault
+        .raw("GET", &key_path(vault, "metadata", key), None)
+        .await;
+    assert_eq!(status, 200, "metadata of an existing key: {body}");
+    body["data"]["max_versions"].clone()
+}
+
 docker_test! {
-    async fn exceeding_max_versions_evicts_the_oldest_and_reads_as_none(vault) {
+    async fn put_sets_the_key_limit_to_100_whatever_the_mount_says(vault) {
         set_mount_max_versions(&vault, 3).await;
         let svc = vault.plugin();
         let key = fresh_key();
@@ -213,31 +231,50 @@ docker_test! {
             versions.push(put(&svc, &key, &format!("value {i}")).await);
         }
 
-        // The two oldest are gone for good; Vault answers 404 `{"errors":[]}`.
+        assert_eq!(key_max_versions(&vault, &key).await, json!(100));
+        // The mount's 3 does not apply: the larger limit of the two wins.
+        for (i, v) in versions.iter().enumerate() {
+            assert_eq!(read(&svc, &key, v).await, Some(format!("value {}", i + 1)));
+        }
+        assert_eq!(metadata_versions(&vault, &key).await.as_object().unwrap().len(), 5);
+    }
+}
+
+docker_test! {
+    async fn exceeding_100_versions_evicts_the_oldest_and_reads_as_none(vault) {
+        set_mount_max_versions(&vault, 3).await;
+        let svc = vault.plugin();
+        let key = fresh_key();
+        let mut versions = Vec::new();
+        for i in 1..=101 {
+            versions.push(put(&svc, &key, &format!("value {i}")).await);
+        }
+
+        // The oldest is gone for good; Vault answers 404 `{"errors":[]}`.
         let (status, body) = raw_read(&vault, &key, 1).await;
         assert_eq!(status, 404);
         assert_eq!(body["errors"], json!([]));
         assert_eq!(read(&svc, &key, &versions[0]).await, None);
-        assert_eq!(read(&svc, &key, &versions[1]).await, None);
-        assert_eq!(read(&svc, &key, &versions[2]).await.as_deref(), Some("value 3"));
-        assert_eq!(read(&svc, &key, &versions[4]).await.as_deref(), Some("value 5"));
+        assert_eq!(read(&svc, &key, &versions[1]).await.as_deref(), Some("value 2"));
+        assert_eq!(read(&svc, &key, &versions[100]).await.as_deref(), Some("value 101"));
         let meta = metadata_versions(&vault, &key).await;
-        assert_eq!(meta.as_object().unwrap().len(), 3, "{meta}");
+        assert_eq!(meta.as_object().unwrap().len(), 100, "{meta}");
 
         // Cleanup still works on what is left.
-        svc.destroy_value(&key, &DestroySelector::Below(versions[4].clone())).await.unwrap();
-        assert_eq!(read(&svc, &key, &versions[2]).await, None);
-        assert_eq!(read(&svc, &key, &versions[4]).await.as_deref(), Some("value 5"));
+        svc.destroy_value(&key, &DestroySelector::Below(versions[100].clone())).await.unwrap();
+        assert_eq!(read(&svc, &key, &versions[1]).await, None);
+        assert_eq!(read(&svc, &key, &versions[100]).await.as_deref(), Some("value 101"));
     }
 }
 
 docker_test! {
     async fn a_per_key_max_versions_can_only_raise_the_mount_limit(vault) {
-        // Observed: the effective limit is the larger of the mount's and the
-        // key's `max_versions` (0 = unset; 10 when both are unset). A smaller
-        // per-key value does not shrink the mount's limit.
+        // Vault's own rule: the effective limit is the larger of the mount's
+        // and the key's `max_versions` (0 = unset; 10 when both are unset). A
+        // smaller per-key value does not shrink the mount's limit, which is
+        // why the plugin's key limit of 100 holds under any lower mount value.
+        // Written with raw calls: a plugin `put` would reset the key to 100.
         set_mount_max_versions(&vault, 3).await;
-        let svc = vault.plugin();
 
         let smaller = fresh_key();
         let (status, _) = vault
@@ -250,8 +287,8 @@ docker_test! {
             .await;
         assert_eq!(status, 204);
         for i in 1..=8 {
-            put(&svc, &smaller, &format!("v{i}")).await;
-            put(&svc, &larger, &format!("v{i}")).await;
+            raw_write(&vault, &smaller, &format!("v{i}")).await;
+            raw_write(&vault, &larger, &format!("v{i}")).await;
         }
         assert_eq!(metadata_versions(&vault, &smaller).await.as_object().unwrap().len(), 3);
         assert_eq!(metadata_versions(&vault, &larger).await.as_object().unwrap().len(), 5);
@@ -260,18 +297,31 @@ docker_test! {
 
 docker_test! {
     async fn default_retention_without_max_versions_is_ten_versions(vault) {
-        // Mount `max_versions = 0` (unset) and no per-key value: Vault keeps 10.
+        // Vault's own rule: mount `max_versions = 0` (unset) and no per-key
+        // value keep 10 versions (0 is not unlimited).
         set_mount_max_versions(&vault, 0).await;
         let svc = vault.plugin();
+        let raw_key = fresh_key();
+        for i in 1..=12 {
+            raw_write(&vault, &raw_key, &format!("v{i}")).await;
+        }
+        // (Raw values are not base64, so they are inspected at Vault, not
+        // through the plugin's `get`.)
+        assert_eq!(raw_read(&vault, &raw_key, 1).await.0, 404);
+        assert_eq!(raw_read(&vault, &raw_key, 2).await.0, 404);
+        assert_eq!(raw_read(&vault, &raw_key, 3).await.0, 200);
+        assert_eq!(metadata_versions(&vault, &raw_key).await.as_object().unwrap().len(), 10);
+
+        // The same mount, a key written by the plugin: its own 100 applies.
         let key = fresh_key();
         let mut versions = Vec::new();
         for i in 1..=12 {
             versions.push(put(&svc, &key, &format!("v{i}")).await);
         }
-        assert_eq!(read(&svc, &key, &versions[0]).await, None);
-        assert_eq!(read(&svc, &key, &versions[1]).await, None);
-        assert_eq!(read(&svc, &key, &versions[2]).await.as_deref(), Some("v3"));
-        assert_eq!(metadata_versions(&vault, &key).await.as_object().unwrap().len(), 10);
+        for (i, v) in versions.iter().enumerate() {
+            assert_eq!(read(&svc, &key, v).await, Some(format!("v{}", i + 1)));
+        }
+        assert_eq!(metadata_versions(&vault, &key).await.as_object().unwrap().len(), 12);
     }
 }
 

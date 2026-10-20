@@ -68,6 +68,13 @@ fn an_invalid_configuration_is_rejected_as_the_gear_rejects_it() {
 #[tokio::test]
 async fn the_client_writes_through_the_configured_mount_and_prefix() {
     let server = MockServer::start();
+    let limit = server.mock(|when, then| {
+        when.method(POST)
+            .path_includes("/v1/kv-new/metadata/migrated/")
+            .header("X-Vault-Token", "s.test-token")
+            .json_body(serde_json::json!({"max_versions": 100}));
+        then.status(204);
+    });
     let put = server.mock(|when, then| {
         when.method(POST)
             .path_includes("/v1/kv-new/data/migrated/")
@@ -92,5 +99,6 @@ async fn the_client_writes_through_the_configured_mount_and_prefix() {
         .expect("put");
 
     assert_eq!(version, ValueVersion::new("1"));
+    limit.assert_calls(1);
     put.assert_calls(1);
 }

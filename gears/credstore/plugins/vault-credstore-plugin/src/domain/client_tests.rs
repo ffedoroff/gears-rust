@@ -61,6 +61,11 @@ async fn put_then_get_roundtrip_through_trait() {
 
     server.mock(|when, then| {
         when.method(POST)
+            .path_includes("/v1/secret/metadata/credstore/");
+        then.status(204);
+    });
+    server.mock(|when, then| {
+        when.method(POST)
             .path_includes("/v1/secret/data/credstore/");
         then.status(200)
             .json_body(serde_json::json!({"data": {"version": 1}}));
