@@ -34,12 +34,8 @@ pub struct Model {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub reference: String,
-    /// Sharing mode: 1=Private, 2=Tenant, 3=Shared.
     pub sharing: DbSharing,
     pub owner_id: Uuid,
-    /// Status: 2=Active, 4=Declared. Codes 1 (provisioning) and 3
-    /// (deprovisioning) are retired by ADR-0006 and reserved, never
-    /// reassigned.
     pub status: DbStatus,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
@@ -57,9 +53,8 @@ pub struct Model {
     /// (`credstore_secrets_value_version_check`). The store key is
     /// `(tenant_id, id)`.
     pub value_version: Option<String>,
-    /// Suppression fallback: 1=Inherit (default), 2=None. Stored on every row,
-    /// consulted only for a `Declared` row's resolution competition
-    /// (ADR-0008, Suppression).
+    /// Suppression fallback, consulted only for a `Declared` row's resolution
+    /// competition (ADR-0008, Suppression).
     pub fallback: DbFallback,
 }
 

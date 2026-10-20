@@ -17,7 +17,7 @@ use sea_orm::entity::prelude::*;
 
 use crate::domain::secret::model::{CleanupTask, Fallback, SecretStatus};
 
-/// `credstore_secrets.sharing` - 1 private, 2 tenant, 3 shared.
+/// `credstore_secrets.sharing`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
 pub enum DbSharing {
@@ -29,9 +29,9 @@ pub enum DbSharing {
     Shared,
 }
 
-/// `credstore_secrets.status` - 2 active, 4 declared. Codes 1 (provisioning)
-/// and 3 (deprovisioning) are retired by ADR-0006: reserved, never reassigned,
-/// and rejected by the column's `CHECK`.
+/// `credstore_secrets.status`. Codes 1 (provisioning) and 3 (deprovisioning)
+/// are retired by ADR-0006: reserved, never reassigned, and rejected by the
+/// column's `CHECK`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
 pub enum DbStatus {
@@ -41,7 +41,7 @@ pub enum DbStatus {
     Declared,
 }
 
-/// `credstore_secrets.fallback` - 1 inherit (the column default), 2 none.
+/// `credstore_secrets.fallback`; `Inherit` is the column default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
 pub enum DbFallback {
@@ -51,7 +51,7 @@ pub enum DbFallback {
     None,
 }
 
-/// `credstore_store_cleanup.op` - 1 purge (`delete_key`), 2 destroy.
+/// `credstore_store_cleanup.op`; `Purge` runs `delete_key`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
 pub enum DbCleanupOp {
@@ -61,7 +61,7 @@ pub enum DbCleanupOp {
     Destroy,
 }
 
-/// `credstore_store_cleanup.selector` (destroy only) - 1 below, 2 exact.
+/// `credstore_store_cleanup.selector`, set for `Destroy` only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
 pub enum DbDestroySelector {

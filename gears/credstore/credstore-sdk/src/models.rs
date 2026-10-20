@@ -779,8 +779,7 @@ mod models_tests {
     fn credential_list_item_carries_no_secret_in_metadata_mode() {
         let credential = Credential {
             reference: SecretRef::new("ref").expect("valid"),
-            secret_type: "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"
-                .to_owned(),
+            secret_type: crate::types::SecretType::generic().gts_id().to_owned(),
             sharing: SharingMode::Tenant,
             inheritance: InheritanceStatus::Own,
             expires_at: None,
