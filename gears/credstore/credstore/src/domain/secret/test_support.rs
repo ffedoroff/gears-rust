@@ -631,9 +631,8 @@ struct FakeKeyState {
 /// In-memory versioned plugin store keyed by `(tenant_id, record_id)`: the
 /// n-th `put` under a key returns version `"n"`. By default it declares
 /// `destroy` support (like the static and Vault plugins);
-/// [`FakePlugin::without_destroy`] models a backend that does not (AWS
-/// Secrets Manager, Azure Key Vault). Fault-injection hooks cover the
-/// write-protocol tests, and every `destroy`/`delete_key` call is recorded.
+/// [`FakePlugin::without_destroy`] models a backend that does not. Fault-injection
+/// hooks cover the write-protocol tests, and every `destroy`/`delete_key` call is recorded.
 pub struct FakePlugin {
     store: Mutex<HashMap<PluginKey, FakeKeyState>>,
     destroy_supported: bool,
