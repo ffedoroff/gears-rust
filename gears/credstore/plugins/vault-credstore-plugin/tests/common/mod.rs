@@ -71,7 +71,7 @@ path "{mount}/data/{prefix}/*" {{
   capabilities = ["create", "update", "read"]
 }}
 path "{mount}/metadata/{prefix}/*" {{
-  capabilities = ["read", "delete"]
+  capabilities = ["create", "update", "read", "delete"]
 }}
 path "{mount}/destroy/{prefix}/*" {{
   capabilities = ["update"]
@@ -157,8 +157,8 @@ impl VaultFixture {
     }
 
     /// The mount, the policy and the plugin's token, as `docs/DESIGN.md`
-    /// prescribes for production (apart from the large `max_versions`, which
-    /// keeps the many-versions tests clear of the retention limit).
+    /// prescribes for production (apart from the mount's `max_versions`, which
+    /// is not an obligation: the plugin sets 100 on every key it writes).
     async fn configure(&mut self) {
         let (status, body) = self
             .raw_as(

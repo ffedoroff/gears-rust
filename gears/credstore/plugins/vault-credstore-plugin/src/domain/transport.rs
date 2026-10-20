@@ -25,7 +25,7 @@ use toolkit_macros::domain_model;
 pub enum HttpMethod {
     /// `GET` (value read, metadata read).
     Get,
-    /// `POST` (value write, destroy).
+    /// `POST` (value write, key settings, destroy).
     Post,
     /// `DELETE` (metadata removal).
     Delete,

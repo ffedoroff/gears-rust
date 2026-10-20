@@ -420,6 +420,31 @@ fn classify_get_response_status_boundaries() {
 }
 
 #[test]
+fn metadata_request_body_carries_only_max_versions() {
+    let body = to_json_body(&MetadataRequestBody { max_versions: 100 }).expect("ok");
+    assert_eq!(body, r#"{"max_versions":100}"#);
+}
+
+#[test]
+fn classify_metadata_write_response_2xx_succeeds_and_the_rest_fails() {
+    classify_metadata_write_response(204, "").expect("ok");
+    classify_metadata_write_response(200, "{}").expect("ok");
+    assert!(
+        classify_metadata_write_response(503, "")
+            .unwrap_err()
+            .is_unavailable()
+    );
+    assert!(
+        classify_metadata_write_response(403, FORBIDDEN_403)
+            .unwrap_err()
+            .is_credentials_rejected()
+    );
+    // Unlike a delete, a plain 404 is not success here.
+    assert!(classify_metadata_write_response(404, "").is_err());
+    assert!(classify_metadata_write_response(400, "{}").is_err());
+}
+
+#[test]
 fn classify_put_response_2xx_returns_version() {
     let got = classify_put_response(200, r#"{"data":{"version":3}}"#, "aGk=").expect("ok");
     assert_eq!(got, "3");

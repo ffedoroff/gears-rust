@@ -13,7 +13,7 @@
 //! (no response, `5xx`, `408`, `429`) under the configured [`RetryPolicy`].
 //! `put` is never retried: a failure after the request was sent is ambiguous
 //! (Vault may have stored a version), and the gear's write intent already
-//! covers that.
+//! covers that. The same goes for the metadata call that precedes each `put`.
 use std::sync::Arc;
 
 use credstore_sdk::{CredStorePluginError, DestroySelector, SecretValue, StoreKey, ValueVersion};
@@ -23,6 +23,17 @@ use super::retry::RetryPolicy;
 use super::transport::{HttpMethod, TransportError, VaultRequest, VaultResponse, VaultTransport};
 use super::wire;
 use crate::config::VaultCredStorePluginConfig;
+
+/// The `max_versions` the plugin sets on every key before each `put`.
+///
+/// Vault applies the larger of the mount's and the key's limit (both unset
+/// means 10), counts destroyed versions against it, and drops everything
+/// older than the window on the next write. A key-level 100 keeps the versions
+/// the gear still refers to from being evicted, whatever the mount says. It is
+/// a constant of the plugin and **MUST NOT** be lowered in a later version:
+/// the next write to every existing key would delete the versions beyond the
+/// new window.
+pub const KEY_MAX_VERSIONS: u32 = 100;
 
 /// Vault / `OpenBao` KV v2 backend client.
 ///
@@ -205,7 +216,10 @@ impl Service {
     }
 
     /// Writes a new version under `key` (no `cas`) and returns the version
-    /// number the backend assigned, as a string. Not retried.
+    /// number the backend assigned, as a string. Before the write it sets the
+    /// key's own `max_versions` to [`KEY_MAX_VERSIONS`] (`POST metadata`, `204`,
+    /// idempotent, allowed before the first write); if that call fails, the
+    /// `put` fails and nothing is written. Neither call is retried.
     ///
     /// # Errors
     /// As in [`Self::get_value`].
@@ -219,6 +233,18 @@ impl Service {
             record_id = %key.record_id,
             "vault credstore plugin: put"
         );
+        let limit = wire::to_json_body(&wire::MetadataRequestBody {
+            max_versions: KEY_MAX_VERSIONS,
+        })?;
+        let limit_response = self
+            .call(
+                Self::request(HttpMethod::Post, self.metadata_url(key), Some(limit)),
+                RetryPolicy::no_retry(),
+                &[],
+            )
+            .await?;
+        wire::classify_metadata_write_response(limit_response.status, &limit_response.body)?;
+
         let encoded = wire::encode_value(value.as_bytes());
         let body = wire::to_json_body(&wire::PutRequestBody::new(&encoded))?;
 

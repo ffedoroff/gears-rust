@@ -116,10 +116,17 @@ async fn get_non_numeric_version_is_internal_error() {
 }
 
 #[tokio::test]
-async fn put_sends_no_cas_and_returns_assigned_version() {
+async fn put_sets_max_versions_on_the_key_then_writes_without_cas() {
     let server = MockServer::start();
     let k = key();
-    let mock = server.mock(|when, then| {
+    let limit = server.mock(|when, then| {
+        when.method(POST)
+            .path(meta_path(&k))
+            .header("X-Vault-Token", "test-token")
+            .json_body(serde_json::json!({"max_versions": 100}));
+        then.status(204);
+    });
+    let write = server.mock(|when, then| {
         when.method(POST)
             .path(data_path(&k))
             .header("X-Vault-Token", "test-token")
@@ -134,12 +141,61 @@ async fn put_sends_no_cas_and_returns_assigned_version() {
         .await
         .expect("ok");
     assert_eq!(v, vv("5"));
-    mock.assert();
+    limit.assert();
+    write.assert();
+}
+
+#[tokio::test]
+async fn put_fails_without_writing_when_the_limit_call_fails() {
+    for status in [500_u16, 503] {
+        let server = MockServer::start();
+        let k = key();
+        let limit = server.mock(|when, then| {
+            when.method(POST).path(meta_path(&k));
+            then.status(status);
+        });
+        let write = server.mock(|when, then| {
+            when.method(POST).path(data_path(&k));
+            then.status(200)
+                .json_body(serde_json::json!({"data": {"version": 1}}));
+        });
+        let svc = service_from(&config_for(&server));
+        let err = svc.put_value(&k, SecretValue::from("x")).await.unwrap_err();
+        assert!(err.is_unavailable(), "status {status}");
+        assert_eq!(limit.calls(), 1, "the limit call is not retried");
+        assert_eq!(write.calls(), 0, "no data write after a failed limit call");
+    }
+}
+
+#[tokio::test]
+async fn put_403_on_the_limit_call_is_credentials_rejected_and_writes_nothing() {
+    let server = MockServer::start();
+    let k = key();
+    let limit = server.mock(|when, then| {
+        when.method(POST).path(meta_path(&k));
+        then.status(403)
+            .json_body(serde_json::json!({"errors": ["permission denied"]}));
+    });
+    let write = server.mock(|when, then| {
+        when.method(POST).path(data_path(&k));
+        then.status(200)
+            .json_body(serde_json::json!({"data": {"version": 1}}));
+    });
+    let svc = service_from(&config_for(&server));
+    let err = svc.put_value(&k, SecretValue::from("x")).await.unwrap_err();
+    assert!(err.is_credentials_rejected());
+    assert_eq!(write.calls(), 0);
+    limit.assert();
 }
 
 #[tokio::test]
 async fn put_5xx_is_unavailable_and_not_retried() {
     let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST)
+            .path_includes("/v1/secret/metadata/credstore/");
+        then.status(204);
+    });
     let mock = server.mock(|when, then| {
         when.method(POST)
             .path_includes("/v1/secret/data/credstore/");
@@ -390,6 +446,11 @@ async fn forbidden_maps_to_credentials_rejected_and_is_not_retried() {
 #[tokio::test]
 async fn put_400_is_internal_with_vault_text_and_without_the_secret() {
     let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST)
+            .path_includes("/v1/secret/metadata/credstore/");
+        then.status(204);
+    });
     server.mock(|when, then| {
         when.method(POST)
             .path_includes("/v1/secret/data/credstore/");
