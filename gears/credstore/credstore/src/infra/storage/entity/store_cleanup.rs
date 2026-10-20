@@ -22,9 +22,8 @@ pub struct Model {
     /// The store key `(tenant_id, record_id)` the debt applies to.
     pub tenant_id: Uuid,
     pub record_id: Uuid,
-    /// `1` = purge (`delete_key`), `2` = destroy.
     pub op: DbCleanupOp,
-    /// Destroy only: `1` = below, `2` = exact; `NULL` for purge.
+    /// Destroy only; `NULL` for purge.
     pub selector: Option<DbDestroySelector>,
     /// Destroy only: the value version; `NULL` for purge.
     pub version: Option<String>,
