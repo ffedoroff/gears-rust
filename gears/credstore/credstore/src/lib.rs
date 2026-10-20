@@ -5,9 +5,11 @@
 pub mod api;
 pub mod client;
 pub mod config;
+#[doc(hidden)]
 pub mod domain;
 pub mod gear;
 pub(crate) mod gts;
+#[doc(hidden)]
 pub mod infra;
 
 pub use gear::CredStoreGear;

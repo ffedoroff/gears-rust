@@ -22,7 +22,7 @@
 //!
 //! Docker required: without it the suite skips, unless
 //! `CREDSTORE_PG_REQUIRE_DOCKER=1` turns the skip into a failure, as CI sets
-//! it. Run via `make test-credstore-pg` or:
+//! it. Run via `make test-integration LANE=credstore-pg` or:
 //!
 //! ```sh
 //! cargo nextest run -p cf-gears-credstore --features integration --test pg_migrations_test
@@ -429,7 +429,7 @@ async fn insert_migrated_row(
          VALUES ('{id}', '{TENANT}', 'probe-{id}', 2, '{}', {status}, {value_version}, {fallback},
                  '{}')",
         Uuid::new_v4(),
-        Uuid::from_u128(0xC0FF_EE),
+        Uuid::from_u128(0x00C0_FFEE),
     ))
     .await
     .map(|_| ())

@@ -1,8 +1,8 @@
 // Updated: 2026-10-06 by Constructor Tech
 //! Infrastructure layer — DB, storage, error classifiers.
 pub mod audit;
-pub mod canonical_mapping;
-pub mod error_conv;
+mod canonical_mapping;
+mod error_conv;
 pub mod metrics;
 pub mod plugin_select;
 pub mod sdk_error_mapping;
