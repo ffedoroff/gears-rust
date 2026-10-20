@@ -52,18 +52,18 @@ The plugin is a thin, stateless adapter running as an in-process ToolKit gear (`
 
 Every operation is one or two Vault KV v2 calls:
 
-- `put` is one `POST` that creates a new version; Vault returns the version number, which is the `ValueVersion`.
+- `put` is two `POST`s: the first sets the key's own `max_versions` to 100 through the metadata endpoint, the second creates a new version; Vault returns the version number, which is the `ValueVersion`.
 - `get` is one `GET` of a named version.
 - `delete_key` is one `DELETE` of the key's metadata, which removes all versions.
 - `destroy(Exactly(v))` is one `POST` to the destroy endpoint; `destroy(Below(v))` first reads the key's metadata to learn which versions exist, then destroys those below `v`.
 
-The plugin adds three things the contract leaves to the backend: **token authentication with rotation** (a rejected request re-reads the token source once and is retried once), **bounded retries** of the idempotent operations with exponential backoff (never of `put`), and a **precise classification of Vault's answers** into the plugin error type (`CredStorePluginError`). The latter matters because Vault signals very different situations with the same status code: `404` means an absent key, a soft-deleted version, a destroyed version or a missing mount, and each of these maps differently (§3.3).
+The plugin adds three things the contract leaves to the backend: **token authentication with rotation** (a rejected request re-reads the token source once and is retried once), **bounded retries** of the idempotent operations with exponential backoff (never of `put`, and never of its metadata call), and a **precise classification of Vault's answers** into the plugin error type (`CredStorePluginError`). The latter matters because Vault signals very different situations with the same status code: `404` means an absent key, a soft-deleted version, a destroyed version or a missing mount, and each of these maps differently (§3.3).
 
 ### 1.2 Architecture Drivers
 
 | Driver | Design allocation |
 |---|---|
-| Exact bytes, durable versions (ADR-0006) | One KV v2 write per `put`, never overwritten, never `cas`; the value is stored base64-encoded in one field; the version is Vault's own number |
+| Exact bytes, durable versions (ADR-0006) | One KV v2 write per `put` (preceded by the key's `max_versions` call), never overwritten, never `cas`; the value is stored base64-encoded in one field; the version is Vault's own number |
 | Ordered versions with `destroy` | KV v2 numbers versions per key from 1, increasing; a destroyed number is never reissued (verified by the conformance suite) |
 | Idempotent `delete_key` / `destroy` | A plain `404` and Vault's `204` for a missing key or version are success; `destroy(Below)` makes no call when nothing is left to destroy |
 | Token rotation without restart | `TokenStore` caches the token; a `403` makes the transport re-read the source once and resend the request once if the token changed |
@@ -128,7 +128,7 @@ The plugin does not cache values, batch calls, list keys or keep any state of th
 
 - [ ] `p3` - **ID**: `cpt-cf-credstore-vault-principle-retry-transient-only`
 
-Only failures that say nothing about the outcome of a read or an idempotent change (no response, timeout, `5xx`, `408`, `429`) are retried. Any other response, `4xx` included, is final. A `403` is handled once by the transport (token re-read) and then final. `put` is sent at most once, because after the request left the process its outcome can be ambiguous, and a second `put` would create a second version nobody references; the gear's write intent already covers the possibly stored first one.
+Only failures that say nothing about the outcome of a read or an idempotent change (no response, timeout, `5xx`, `408`, `429`) are retried. Any other response, `4xx` included, is final. A `403` is handled once by the transport (token re-read) and then final. `put` is sent at most once (and so is the metadata call before it), because after the request left the process its outcome can be ambiguous, and a second `put` would create a second version nobody references; the gear's write intent already covers the possibly stored first one.
 
 #### No silent success
 
@@ -146,7 +146,7 @@ The token lives in `VaultToken` (redacted `Debug`) and `Arc<str>` in the token s
 
 - [ ] `p3` - **ID**: `cpt-cf-credstore-vault-principle-documented-obligations`
 
-The mount settings (`delete_version_after`, `cas_required`, `max_versions`), the ACL policy and the token delivery are the operator's. The plugin does not read `{mount}/config`, does not probe health at start and does not verify the token's capabilities. §4.2 and §4.3 state what happens when an obligation is violated.
+The mount settings (`delete_version_after`, `cas_required`), the ACL policy and the token delivery are the operator's. The plugin does not read `{mount}/config`, does not probe health at start and does not verify the token's capabilities. §4.2 and §4.3 state what happens when an obligation is violated.
 
 ### 2.2 Constraints
 
@@ -187,7 +187,7 @@ The gear's `StoreKey { tenant_id, record_id }` (two UUIDs) maps to the path segm
 | Endpoint | Path | Used by |
 |---|---|---|
 | data | `{mount}/data/{path_prefix}/{tenant_id}/{record_id}` | `put`, `get` |
-| metadata | `{mount}/metadata/{path_prefix}/{tenant_id}/{record_id}` | `delete_key`, the version listing of `destroy(Below)` |
+| metadata | `{mount}/metadata/{path_prefix}/{tenant_id}/{record_id}` | `put` (sets the key's `max_versions`), `delete_key`, the version listing of `destroy(Below)` |
 | destroy | `{mount}/destroy/{path_prefix}/{tenant_id}/{record_id}` | `destroy` |
 
 All are called as `{address}/v1/{path}`. The plugin never interprets `tenant_id`; it is opaque path material.
@@ -225,7 +225,7 @@ All calls carry `X-Vault-Token` (and `X-Vault-Namespace` when configured). "Tran
 
 | Operation | HTTP call | Success | `404` | Other errors |
 |---|---|---|---|---|
-| `put(key, value)` | `POST data/...` with `{"data":{"value":"<base64>"}}` (no `cas`) | `200` with `data.version` -> that version | Explained `404` (missing mount) -> `Internal`; a plain `404` on a write does not occur | Not retried. Transient -> `Unavailable`; `403` -> `CredentialsRejected`; `400` -> `Internal` with Vault's text; anything else -> `Internal` |
+| `put(key, value)` | First `POST metadata/...` with `{"max_versions":100}`, then `POST data/...` with `{"data":{"value":"<base64>"}}` (no `cas`). The data call is sent only after the metadata call succeeded | `204` / `2xx` on the metadata call, then `200` with `data.version` -> that version | Explained `404` (missing mount) -> `Internal`; a plain `404` on a write does not occur | Neither call is retried. On either call: transient -> `Unavailable`; `403` -> `CredentialsRejected` (the token source is re-read once, as for any call); `400` -> `Internal` with Vault's text; anything else -> `Internal`. A failure of the metadata call fails the `put` and no data call is made; a plain `404` on the metadata call is not success (the call creates the metadata, so a `404` means a wrong mount) |
 | `get(key, version)` | `GET data/...?version=N` (never sent for `N = 0`) | `200` with a value -> bytes | Plain `404` (absent, soft-deleted, destroyed, evicted, key missing) -> `None`; explained `404` -> `Internal` | Retried on transient. `403` -> `CredentialsRejected`; an entry with no string `value` or invalid base64 -> `Internal` (permanent); unexpected shape -> `Internal` |
 | `delete_key(key)` | `DELETE metadata/...` | `204` / `2xx` -> `Ok` | Plain `404` -> `Ok`; explained `404` -> `Internal` | Retried on transient; `403` -> `CredentialsRejected`; others -> `Internal` |
 | `destroy(key, Exactly(v))` | `POST destroy/...` with `{"versions":[v]}` (no call for `v = 0`) | `204` -> `Ok` | Plain `404` -> `Ok`; explained `404` -> `Internal` | As `delete_key` |
@@ -255,6 +255,8 @@ Observed against `hashicorp/vault` 2.1.1 and 1.21 (dev server) and pinned by the
 
 | Situation | Vault's answer |
 |---|---|
+| `POST metadata/...` with `{"max_versions":N}`, before or after the first write | `204`, no body; repeating it is idempotent; needs `create` (metadata does not exist yet) or `update` (it does) on the path |
+| `POST data/...` with `options.max_versions` | The option is silently ignored: the limit can only be set through the metadata endpoint |
 | `POST data/...` | `200`, body `{"data":{"version":N,"created_time":...,"deletion_time":"","destroyed":false,"custom_metadata":null}}` |
 | `GET data/...?version=N`, live version | `200`, `{"data":{"data":{"value":"..."},"metadata":{"version":N,"deletion_time":"","destroyed":false,...}}}` |
 | Version never written, key never written, version evicted by `max_versions` | `404`, `{"errors":[]}` |
@@ -270,7 +272,7 @@ Observed against `hashicorp/vault` 2.1.1 and 1.21 (dev server) and pinned by the
 | `POST destroy/...` with an empty version list | `400`, `{"errors":["no version number provided"]}` (the plugin never sends one) |
 | After `DELETE metadata/...`, a new `POST data/...` | Numbering restarts at version 1 |
 
-Retention: the effective number of versions Vault keeps per key is the larger of the mount's and the key's own `max_versions` (the key's value can raise the limit but not lower it below the mount's); both `0`/unset means 10. Versions beyond it are removed oldest first and then answer as "never written".
+Retention: the effective number of versions Vault keeps per key is the larger of the mount's and the key's own `max_versions` (the key's value can raise the limit but not lower it below the mount's); both `0`/unset means 10, not unlimited. Destroyed versions count. Versions beyond the limit are removed oldest first and then answer as "never written". Lowering the effective limit removes, at the key's next write, every version older than the new window.
 
 #### Constructing the client outside the gear
 
@@ -358,6 +360,10 @@ sequenceDiagram
     participant T as ReqwestTransport
     participant V as Vault
     G->>S: put(key, value)
+    S->>T: POST metadata/prefix/tenant/record {"max_versions":100}
+    T->>V: X-Vault-Token, body
+    V-->>T: 204
+    T-->>S: status
     S->>S: base64-encode, build body (value by reference)
     S->>T: POST data/prefix/tenant/record
     T->>V: X-Vault-Token, body
@@ -366,7 +372,7 @@ sequenceDiagram
     S-->>G: ValueVersion(N)
 ```
 
-One attempt. A transport failure or a `5xx` after the request was sent is `Unavailable`; whether Vault stored the version is unknown, which the gear's write intent covers. A `403` goes through the token re-read of the transport (below) before it surfaces; a `403` proves nothing was executed, so that resend cannot duplicate a write.
+One attempt per call. The key's own `max_versions` is set first; if that call fails (any error class of the table in §3.3), `put` returns the error and the data call is not made. A transport failure or a `5xx` after the request was sent is `Unavailable`; whether Vault stored the version is unknown, which the gear's write intent covers. A `403` goes through the token re-read of the transport (below) before it surfaces; a `403` proves nothing was executed, so that resend cannot duplicate a write.
 
 #### Read a version
 
@@ -480,9 +486,11 @@ path "secret/data/credstore/*" {
   capabilities = ["create", "update", "read"]
 }
 
-# Read the version list (destroy of versions below a cut); remove a key.
+# Set the key's own max_versions before every put (create while the metadata
+# does not exist yet, update afterwards); read the version list (destroy of
+# versions below a cut); remove a key.
 path "secret/metadata/credstore/*" {
-  capabilities = ["read", "delete"]
+  capabilities = ["create", "update", "read", "delete"]
 }
 
 # Destroy versions.
@@ -501,21 +509,20 @@ When `token_file` is used, the file is readable by the plugin's service account 
 
 #### Mount settings
 
-The plugin needs a **KV v2** mount (`vault secrets enable -path=secret -version=2 kv`, or the mount's `options.version = 2`). The operator **MUST** set:
+The plugin needs a **KV v2** mount (`vault secrets enable -path=secret -version=2 kv`, or the mount's `options.version = 2`). The operator **MUST** set the two settings below. The `max_versions` of the mount is not an obligation: the plugin sets the key's own `max_versions` to 100 before every `put` (see Retention).
 
 | Setting | Required value | If violated |
 |---|---|---|
 | `delete_version_after` | `0s` (disabled) | Versions are soft-deleted after the interval; `get` then answers "no value" for a version a record still points at, and the record answers an internal error (500) until rewritten |
 | `cas_required` | `false` | Every `put` is refused by Vault with `400 check-and-set parameter required for this call`; the plugin surfaces it as an internal error |
-| `max_versions` | Larger than the number of versions one key can hold at once (see below) | Vault drops the oldest versions of a key beyond the limit |
 
 ```bash
-vault write secret/config max_versions=20 delete_version_after=0s cas_required=false
+vault write secret/config delete_version_after=0s cas_required=false
 ```
 
-**Retention.** Vault keeps **10 versions per key by default**; `max_versions = 0` or unset also means 10, not unlimited. The effective limit of a key is the larger of the mount's `max_versions` and the key's own (`vault kv metadata put -max-versions=N`); a key's own value can raise the limit above the mount's but not lower it. Set a larger `max_versions` on the mount (or per key) if you need more.
+**Retention.** Vault keeps **10 versions per key by default**; `max_versions = 0` or unset also means 10, not unlimited. The effective limit of a key is the larger of the mount's `max_versions` and the key's own; destroyed versions count, and lowering the limit removes at the key's next write every version beyond the new window. The plugin sets the key's own `max_versions` to 100 (`POST {mount}/metadata/{path_prefix}/{tenant_id}/{record_id}` with `{"max_versions":100}`) before every `put`: the call needs no knowledge of whether the key exists, is idempotent, and works before the first write (`options.max_versions` in a data write is ignored by Vault). If it fails, the `put` fails and nothing is written. A lower `max_versions` on the mount is harmless, since the key's 100 is larger; a higher one raises the limit for all keys. 100 is a constant of the plugin and **MUST NOT** be lowered in a later version, because the next write to every existing key would remove the versions beyond the new window.
 
-What exceeding it means for CredStore: a key normally holds one or two versions, because the gear destroys superseded versions right after each commit. If more versions than the limit pile up above the version a record points at (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not, since destroyed versions still count; versions below the pointer are evicted first and are harmless), Vault removes the oldest ones, which may include the referenced version. The plugin then answers "no value" for it, the gear finds that the pointer did not move, and the record answers an internal error (500) until it is rewritten (CredStore DESIGN §4.6). The plugin does not check these settings, at startup or later.
+What exceeding it means for CredStore: a key normally holds one or two versions, because the gear destroys superseded versions right after each commit. If more than 100 versions pile up above the version a record points at (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not, since destroyed versions still count; versions below the pointer are evicted first and are harmless), Vault removes the oldest ones, which may include the referenced version. The plugin then answers "no value" for it, the gear finds that the pointer did not move, and the record answers an internal error (500) until it is rewritten (CredStore DESIGN §4.6). The plugin does not check the mount settings, at startup or later.
 
 #### Token delivery: the Vault Agent sidecar pattern (Kubernetes)
 
@@ -560,7 +567,7 @@ Other deployments follow the same shape: any process that keeps a valid token in
 
 | Condition | What the plugin does | Operator action |
 |---|---|---|
-| Vault unreachable, timeouts, `5xx`, `429` | Idempotent calls retried within their budget, then `Unavailable`; `put` fails after one attempt | Restore Vault; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job) |
+| Vault unreachable, timeouts, `5xx`, `429` | Idempotent calls retried within their budget, then `Unavailable`; `put` fails after one attempt of either of its calls (the metadata call or the data call) | Restore Vault; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job) |
 | Vault sealed (`503`) | As above; the message includes `Vault is sealed` | Unseal |
 | Token revoked, expired, or policy too narrow (`403`) | Token source re-read once; if unchanged or still rejected, `CredentialsRejected` with a `403` message and a `warn` log naming the token source, never the token | Renew the token or fix the policy; a changed `token_file` is picked up without restart |
 | `token_file` missing, empty or malformed | `Unavailable` for the calls that need a token; startup is not affected | Provide the file |
@@ -569,7 +576,8 @@ Other deployments follow the same shape: any process that keeps a valid token in
 | Mount is not KV v2 | Reads and writes hit different paths than expected and fail or return unexpected shapes (`Internal`) | Use a KV v2 mount |
 | `cas_required = true` | Every `put` fails with `Internal` carrying Vault's `check-and-set` text | Set `cas_required = false` |
 | `delete_version_after` not `0s` | Versions disappear by age; affected records answer an internal error (500) | Set `0s`; rewrite affected records |
-| More versions than the retention limit | The oldest are evicted; the referenced one may be among them (500) | Raise `max_versions`; rewrite affected records |
+| More than 100 versions above a record's pointer | The oldest are evicted; the referenced one may be among them (500) | Rewrite affected records; a higher `max_versions` on the mount raises the limit for all keys |
+| The policy lacks `create` or `update` on the metadata path | The `POST metadata` of every `put` is refused (`403`), so every `put` fails with `CredentialsRejected` and nothing is written | Add `create` and `update` to the metadata path of the policy |
 | Entry written by something else | `Internal` for that version (the gear answers 500) | Keep the prefix exclusive to CredStore |
 | Response not valid JSON or not the KV v2 shape | `Internal` | Check for a proxy between the plugin and Vault |
 | `put` times out after the request was sent | `Unavailable`; a version may exist | None: the gear's write intent tracks it and the record's next write or delete removes it |
@@ -579,7 +587,7 @@ Enablement gates before production use:
 
 | Gate | Required resolution |
 |---|---|
-| Mount | KV v2 with `delete_version_after = 0s`, `cas_required = false` and a `max_versions` sized for the failure profile (default 10) |
+| Mount | KV v2 with `delete_version_after = 0s` and `cas_required = false`; the plugin sets `max_versions` of each key itself |
 | Policy | The minimal policy of §4.1, nothing wider; token without the default policy where possible |
 | Token delivery | A sidecar writing `token_file`, or a deliberately long-lived `token` / `token_env` with a rotation procedure |
 | Transport security | An `https://` address and the platform's trust roots, or an intermediary that provides TLS |

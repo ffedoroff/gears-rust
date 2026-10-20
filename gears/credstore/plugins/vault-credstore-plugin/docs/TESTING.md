@@ -3,9 +3,9 @@ Updated:  2026-10-03 by Constructor Tech
 
 # Testing Strategy — Vault CredStore Plugin
 
-> **Status: implemented.** The suite is **195 tests** — 158 unit tests that run in
-> every `cargo test`, and 37 Docker-backed integration tests (21 SDK conformance
-> checks and 16 Vault behaviour tests) that are `#[ignore]`d, are run by hand and
+> **Status: implemented.** The suite is **206 tests** — 168 unit tests that run in
+> every `cargo test`, and 38 Docker-backed integration tests (21 SDK conformance
+> checks and 17 Vault behaviour tests) that are `#[ignore]`d, are run by hand and
 > never run in CI. This is the test plan for `cf-gears-vault-credstore-plugin`,
 > paired with [DESIGN.md](./DESIGN.md).
 
@@ -53,15 +53,15 @@ only and never starts a container.
 ## 2. Layer 1 — Unit Tests (in-crate)
 
 Co-located `*_tests.rs` modules, no network beyond a loopback mock server, no
-Docker. 158 tests:
+Docker. 168 tests:
 
 | Module | Tests | What is covered |
 |---|---|---|
 | `config_tests` | 19 | Defaults; explicit values; unknown keys rejected (also inside `retry`); `${VAR}` expansion of `token` and `token_file`; `token_env` is a name and is not expanded; `Debug` hides the token; exactly one token source (none and several rejected, empty values rejected); validation of `address`, `mount`, `path_prefix`, `namespace`, `timeout_secs`, `retry` bounds; errors never contain the token |
 | `domain::retry_tests` | 7 | Default policy; no-retry policy; backoff doubles and is capped at 2 s (also for absurd inputs); jitter stays in the upper half of the backoff |
-| `domain::wire_tests` | 50 | KV paths and URL joining; base64 coding; request bodies (no `cas`); read-body parsing for live, null, soft-deleted and destroyed shapes (the real Vault bodies are constants), foreign entries (`Internal`), malformed bodies (`Internal`, body never echoed); metadata parsing (destroyed vs soft-deleted, numeric sort, junk keys); `error_text` flattening, truncation and redaction; the status classification table for every operation, including plain vs explained `404`, `403`, `400`, `408`, `429`, `5xx`, status boundaries |
-| `domain::service_tests` | 26 | The service over the real HTTP transport and a mock server: headers, bodies, paths, `put` without `cas`, retries counted per operation (a `get` is attempted `max_attempts` times, a `put` once), `Retry-After` reaching the error, soft-deleted and `version=0` handling, a missing mount as an error for `get` and `destroy`, `destroy(Below)` selection including soft-deleted versions, no call for `Below(0|1)` and `Exactly(0)`, the encoded secret absent from a `400` message, the token absent from a `403` message |
-| `domain::service_retry_tests` | 17 | The retry policy through a scripted fake transport: which failures retry (timeout, connect, no token, `5xx`, `408`, `429`), which do not (`404`, `400`, `403`, `401`), `max_attempts = 1`, giving up after exactly `max_attempts`, `put` never retried for any failure kind, each call of `destroy(Below)` having its own budget, selection of versions from the metadata map |
+| `domain::wire_tests` | 52 | KV paths and URL joining; base64 coding; request bodies (no `cas`; the `{"max_versions":100}` body of the metadata call); read-body parsing for live, null, soft-deleted and destroyed shapes (the real Vault bodies are constants), foreign entries (`Internal`), malformed bodies (`Internal`, body never echoed); metadata parsing (destroyed vs soft-deleted, numeric sort, junk keys); `error_text` flattening, truncation and redaction; the status classification table for every operation, including plain vs explained `404`, `403`, `400`, `408`, `429`, `5xx`, status boundaries; the classification of the metadata `POST` of `put` (`2xx` succeeds, a plain `404` does not) |
+| `domain::service_tests` | 28 | The service over the real HTTP transport and a mock server: headers, bodies, paths, `put` setting the key's `max_versions` to 100 through `POST metadata` and then writing without `cas`, a failed metadata call (`500`, `503`) failing the `put` with no data request, a `403` on the metadata call as `CredentialsRejected` with no data request, retries counted per operation (a `get` is attempted `max_attempts` times, a `put` once), `Retry-After` reaching the error, soft-deleted and `version=0` handling, a missing mount as an error for `get` and `destroy`, `destroy(Below)` selection including soft-deleted versions, no call for `Below(0|1)` and `Exactly(0)`, the encoded secret absent from a `400` message, the token absent from a `403` message |
+| `domain::service_retry_tests` | 19 | The retry policy through a scripted fake transport: which failures retry (timeout, connect, no token, `5xx`, `408`, `429`), which do not (`404`, `400`, `403`, `401`), `max_attempts = 1`, giving up after exactly `max_attempts`, `put` never retried for any failure kind, on the metadata call as well as on the data call, the metadata `POST` with `{"max_versions":100}` sent before the data write, a `403` on the metadata call ending the `put` with no data request, each call of `destroy(Below)` having its own budget, selection of versions from the metadata map |
 | `domain::client_tests` | 4 | The trait implementation delegates to the service |
 | `infra::http_tests` | 18 | Token and namespace headers, body and content type, verbs, connect failure; **403 handling**: token file re-read and one resend with the new token (and its body), no resend for an unchanged file, an unreadable file or an inline token, a second `403` is final, the new token is cached afterwards; a missing token file is a credentials error that sends nothing, and a file that appears later is used; `Retry-After` parsing (seconds, cap, ignored forms) |
 | `infra::token_tests` | 17 | Source selection from the config; trimming; unusable tokens (empty, spaces, tabs, non-ASCII) fail startup without echoing the token; environment source (set, unset, empty); lazy file source; caching until a rejection; rotation, unchanged, truncated and deleted file; a cache that another request already refreshed |
@@ -115,9 +115,10 @@ HTTP API with the root token.
   `0.0.0.0:8200`, `IPC_LOCK` capability, through `testcontainers`
   (`GenericImage`). The fixture polls `/v1/sys/health` until the server answers.
 - **Mount**: a KV v2 mount `credstore-it` configured as production prescribes
-  (`delete_version_after = 0s`, `cas_required = false`) with a large
-  `max_versions` (1000) so that the many-versions tests stay clear of the
-  retention limit; tests about retention lower it explicitly.
+  (`delete_version_after = 0s`, `cas_required = false`); the plugin sets the
+  key's own `max_versions` to 100 before every `put`, so the mount's value is
+  not an obligation. The policy for the metadata path includes `create` and
+  `update` for that call.
 - **Path prefix**: `it-<random>` per fixture.
 - **Policy and token**: the minimal policy of the docs for that mount and
   prefix, and a token created with it (`no_default_policy`).
@@ -137,9 +138,10 @@ HTTP API with the root token.
 | `destroyed_version_answers_404_and_reads_as_none` | The same for a destroyed version (`destroyed = true`); a destroyed number, even the newest, is not reissued |
 | `unissued_versions_answer_404_and_version_zero_is_never_sent` | Absent version and absent key answer `404 {"errors":[]}` and read as `None`; `?version=0` returns the latest version at Vault (documented) and the plugin never sends it |
 | `entries_not_written_by_the_plugin_are_internal` | A hand-written entry without `value`, and one whose `value` is not base64, are a permanent `Internal` error |
-| `exceeding_max_versions_evicts_the_oldest_and_reads_as_none` | With a mount limit of 3 and five writes, the two oldest read as `None`, the others are exact, and `destroy(Below)` still works |
-| `a_per_key_max_versions_can_only_raise_the_mount_limit` | Observed retention rule: the effective limit is the larger of the mount's and the key's `max_versions` |
-| `default_retention_without_max_versions_is_ten_versions` | Mount `max_versions = 0` keeps 10 versions per key |
+| `put_sets_the_key_limit_to_100_whatever_the_mount_says` | With a mount limit of 3 and five `put`s, the key's metadata shows `max_versions = 100` and all five versions read back exactly |
+| `exceeding_100_versions_evicts_the_oldest_and_reads_as_none` | 101 `put`s: version 1 answers `404 {"errors":[]}` and reads as `None`, versions 2 and 101 are exact, the metadata lists 100, and `destroy(Below)` still works |
+| `a_per_key_max_versions_can_only_raise_the_mount_limit` | Vault's own rule, written with raw calls: the effective limit is the larger of the mount's and the key's `max_versions` (why the plugin's 100 holds under any lower mount value) |
+| `default_retention_without_max_versions_is_ten_versions` | Vault's own rule with raw writes: mount `max_versions = 0` and no key limit keep 10 versions; a key written by the plugin on the same mount keeps all 12 |
 | `destroy_below_over_many_versions` | 30 versions: `Below(25)` destroys 1 to 24 (a soft-deleted one among them) and keeps 25 to 30 byte-exact; repeated and raised cuts are idempotent; `Exactly` for one version, for a destroyed one and for one never issued |
 | `destroy_and_delete_on_missing_keys_succeed` | `destroy` and `delete_key` of a key that was never written succeed, repeatedly |
 | `delete_key_removes_every_version` | After `delete_key` the metadata is gone and every version reads as `None`; Vault restarts the numbering at 1 (documented) |
