@@ -2,7 +2,6 @@
 //! Infrastructure layer — DB, storage, error classifiers.
 pub mod audit;
 mod canonical_mapping;
-mod error_conv;
 pub mod metrics;
 pub mod plugin_select;
 pub mod sdk_error_mapping;
