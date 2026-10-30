@@ -4,7 +4,7 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the Static CredStore Plugin.
 #
-# Fills credstore's extension point (`CredStorePluginClientV1`), declared by
+# Fills credstore's extension point (`CredStorePluginClientV2`), declared by
 # `implements`. This plugin's vendor and priority are read from source.
 
 gear(
@@ -25,10 +25,9 @@ gear(
     # The point this plugin implements, by the GTS spec its host declares. The
     # declaration is the role; the `impl` in this crate is only checked against
     # it. No `sdk`: the host's SDK is the host's.
-    implements = "cf.core.credstore.plugin.v1~",
+    implements = "cf.core.credstore.plugin.v2~",
 
-    # `secrets` is a list of credential entries. It is not offered as a
-    # control: a form that saved one would be writing a secret into the
-    # description, and no control could render the list anyway.
+    # The plugin's whole configuration: values are written through the
+    # credstore API, never configured.
     config_schema = config(exposes = ["vendor", "priority"]),
 )

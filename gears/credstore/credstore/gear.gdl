@@ -42,7 +42,7 @@ gear(
     # under and this gear selects by. Declared, and checked against the sdk: the
     # spec must be a `PluginV1` type it declares, the trait a `pub trait` in it.
     extension_points = [
-        extension_point("cf.core.credstore.plugin.v1~", trait = "CredStorePluginClientV1"),
+        extension_point("cf.core.credstore.plugin.v2~", trait = "CredStorePluginClientV2"),
     ],
 
     # Deliberately empty rather than absent: `test-support` pulls an
