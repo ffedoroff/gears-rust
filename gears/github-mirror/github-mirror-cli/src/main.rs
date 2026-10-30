@@ -11,7 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use authn_resolver_sdk::AuthNResolverClient;
 use clap::{Parser, Subcommand};
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, SecretRef, SecretValue, SharingMode, WritePrecondition,
+    CredStoreClientV2, CredStoreError, CredentialWrite, Fallback, PutPrecondition, SecretRef,
+    SecretType, SecretValue, SecretWrite, SharingMode,
 };
 use figment::Figment;
 use figment::providers::Serialized;
@@ -496,32 +497,30 @@ impl Runtime {
         token: &SecretString,
     ) -> Result<()> {
         let credstore = self
-            .wait_for(ClientHub::try_get::<dyn CredStoreClientV1>)
+            .wait_for(ClientHub::try_get::<dyn CredStoreClientV2>)
             .await?;
         let key = SecretRef::new(secret.key.clone())?;
+        let write = || CredentialWrite {
+            secret_type: Some(SecretType::generic().into()),
+            sharing: SharingMode::Tenant,
+            fallback: Fallback::Inherit,
+            expires_at: None,
+            secret: SecretWrite::Set(SecretValue::from(token.expose())),
+        };
         let saved = match credstore
-            .create(
-                ctx,
-                &key,
-                SecretValue::from(token.expose()),
-                SharingMode::Tenant,
-            )
+            .put(ctx, &key, write(), PutPrecondition::CreateOnly)
             .await
+            .map_err(CredStoreError::from)
         {
-            Err(CredStoreError::Conflict) => {
-                credstore
-                    .put(
-                        ctx,
-                        &key,
-                        SecretValue::from(token.expose()),
-                        SharingMode::Tenant,
-                        WritePrecondition::Exists,
-                    )
-                    .await
-            }
+            Err(CredStoreError::AlreadyExists) => credstore
+                .put(ctx, &key, write(), PutPrecondition::Exists)
+                .await
+                .map_err(CredStoreError::from),
             other => other,
         };
-        saved.map_err(|e| anyhow!("could not save the GitHub token in the credential store: {e}"))
+        saved
+            .map(|_| ())
+            .map_err(|e| anyhow!("could not save the GitHub token in the credential store: {e}"))
     }
 
     async fn stop(self) -> Result<()> {

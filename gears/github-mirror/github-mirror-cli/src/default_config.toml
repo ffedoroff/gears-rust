@@ -28,8 +28,8 @@ file = "credstore.db"
 [gears.credstore.config]
 vendor = "constructorfabric"
 
+# Values are written through the credstore API: the CLI stores the GitHub token itself.
 [gears.static-credstore-plugin.config]
-secrets = []
 
 [gears.github-mirror.database]
 server = "sqlite"

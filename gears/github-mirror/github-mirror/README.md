@@ -88,6 +88,18 @@ single gear-wide credential: every tenant's sync authenticates to GitHub with it
 don't point one deployment's token at repositories whose visibility should differ per
 tenant.
 
+The credential store takes values only through its API, never from configuration.
+The `github-mirror` CLI writes the token itself. A server started from
+`config/github-mirror-dev.yaml` needs it written once per start, because the static
+backend plugin keeps values in memory:
+
+```bash
+curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/github-token" \
+  -H "Content-Type: application/json" \
+  -H 'If-None-Match: *' \
+  -d "{\"type\": \"gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~\", \"sharing\": \"tenant\", \"secret\": \"$GITHUB_TOKEN\"}"
+```
+
 ## Documentation
 
 - [PRD](../docs/PRD.md) — product requirements, including the current increment's scope

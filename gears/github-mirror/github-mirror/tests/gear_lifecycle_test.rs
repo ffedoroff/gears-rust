@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use credstore_sdk::CredStoreClientV1;
+use credstore_sdk::CredStoreClientV2;
 use credstore_sdk::test_util::MockCredStoreClient;
 use github_mirror::GithubMirrorGear;
 use github_mirror::domain::error::DomainError;
@@ -99,7 +99,7 @@ fn token_secret_config(api_base_url: &str) -> serde_json::Value {
 
 fn hub_with(credstore: MockCredStoreClient) -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn CredStoreClientV1>(Arc::new(credstore));
+    hub.register::<dyn CredStoreClientV2>(Arc::new(credstore));
     hub
 }
 

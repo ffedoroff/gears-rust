@@ -10,7 +10,7 @@ use toolkit::{Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
 use tracing::{info, warn};
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
-use credstore_sdk::{CredStoreClientV1, SecretRef};
+use credstore_sdk::{CredStoreClientV2, CredStoreError, SecretRef};
 use github_mirror_sdk::GithubMirrorClientV1;
 use toolkit_security::SecurityContext;
 use toolkit_utils::SecretString;
@@ -48,7 +48,7 @@ const GEAR_ACTOR_ID: Uuid = uuid::uuid!("00000000-0000-cf01-0000-676d73797374");
 const SERVICE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
 
 struct CredstoreToken {
-    credstore: Arc<dyn CredStoreClientV1>,
+    credstore: Arc<dyn CredStoreClientV2>,
     secret: GithubTokenSecret,
     key: SecretRef,
 }
@@ -57,7 +57,7 @@ impl CredstoreToken {
     fn new(ctx: &GearCtx, secret: GithubTokenSecret) -> anyhow::Result<Self> {
         let credstore = ctx
             .client_hub()
-            .get::<dyn CredStoreClientV1>()
+            .get::<dyn CredStoreClientV2>()
             .map_err(|e| anyhow::anyhow!("failed to get the credential store: {e}"))?;
         let key = SecretRef::new(secret.key.clone())
             .map_err(|e| anyhow::anyhow!("invalid github_token_secret key: {e}"))?;
@@ -79,7 +79,7 @@ impl TokenSource for CredstoreToken {
 }
 
 async fn github_token(
-    credstore: &dyn CredStoreClientV1,
+    credstore: &dyn CredStoreClientV2,
     secret: &GithubTokenSecret,
     key: &SecretRef,
 ) -> anyhow::Result<Option<SecretString>> {
@@ -88,20 +88,27 @@ async fn github_token(
         .subject_type(SERVICE_SUBJECT_TYPE)
         .subject_tenant_id(secret.tenant_id)
         .build()?;
-    let found = credstore
-        .get(&system_ctx, key)
+    let found = match credstore
+        .get_secret(&system_ctx, key)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!("failed to read the GitHub token from the credential store: {e}")
-        })?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the credential store has no secret `{}` for tenant {}",
-                secret.key,
-                secret.tenant_id
-            )
-        })?;
-    let token = std::str::from_utf8(found.value.as_bytes())
+        .map_err(CredStoreError::from)
+    {
+        Ok(found) => found,
+        Err(CredStoreError::NotFound) => None,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to read the GitHub token from the credential store: {e}"
+            ));
+        }
+    }
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "the credential store has no secret `{}` for tenant {}",
+            secret.key,
+            secret.tenant_id
+        )
+    })?;
+    let token = std::str::from_utf8(found.secret.as_bytes())
         .map_err(|e| anyhow::anyhow!("the GitHub token secret is not UTF-8: {e}"))?;
     Ok((!token.is_empty()).then(|| SecretString::new(token)))
 }
