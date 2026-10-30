@@ -245,7 +245,7 @@ async fn without_database_config_init_keeps_memory_storage_and_warns() {
 async fn init_does_not_need_authz_in_the_hub() {
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn TenantResolverClient>(Arc::new(MockTenantResolverClient::single_tenant()));
-    hub.register::<dyn CredStoreClientV1>(Arc::new(MockCredStoreClient::empty()));
+    hub.register::<dyn CredStoreClientV2>(Arc::new(MockCredStoreClient::empty()));
     hub.register::<dyn TypesRegistryClient>(Arc::new(AcceptingTypesRegistry(
         MockTypesRegistryClient::new(),
     )));

@@ -217,13 +217,12 @@ pub(in crate::domain::services) fn parse_secret_ref(
     raw_ref: &str,
 ) -> Result<credstore_sdk::SecretRef, DomainError> {
     let bare = raw_ref.strip_prefix("cred://").unwrap_or(raw_ref);
-    credstore_sdk::SecretRef::new(bare)
-        .map_err(|e| {
-            DomainError::validation(format!(
-                "invalid secret_ref '{raw_ref}': {}",
-                CredStoreError::from(e)
-            ))
-        })
+    credstore_sdk::SecretRef::new(bare).map_err(|e| {
+        DomainError::validation(format!(
+            "invalid secret_ref '{raw_ref}': {}",
+            CredStoreError::from(e)
+        ))
+    })
 }
 
 /// Validate bind constraints against the **closest** ancestor with a matching

@@ -223,8 +223,8 @@ gears:
       #           header: "api-key"
       #           prefix: ""
       #           secret_ref: "azure-openai-key-tenant-b"
-      #     # NOTE: tenant secret_ref values need matching entries under
-      #     # gears.static-credstore-plugin.config.secrets
+      #     # NOTE: tenant secret_ref values need matching credentials written
+      #     # through the credstore API
 
   static-mini-chat-audit-plugin:
     config:
