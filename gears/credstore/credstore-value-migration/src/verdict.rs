@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn a_matching_fingerprint_is_copied_verified() {
-        let r = row(Some(compute_fp(&KEY, b"v")), Some(1));
+        let r = row(Some(compute_fp(&KEY, b"v").unwrap()), Some(1));
         let verdict = judged(&r, Some(b"v"), Some(&KEY));
         assert!(
             matches!(&verdict, Verdict::Copy { verified: true, value } if value.as_bytes() == b"v"),
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn a_different_value_or_key_is_a_mismatch() {
-        let r = row(Some(compute_fp(&KEY, b"v")), Some(1));
+        let r = row(Some(compute_fp(&KEY, b"v").unwrap()), Some(1));
         // (what differs, the value judged, the byte the fence key is made of)
         let cases: Vec<(&str, &str, u8)> =
             vec![("another value", "w", KEY[0]), ("another key", "v", 1)];
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn an_absent_value_is_missing_before_anything_else() {
-        let r = row(Some(compute_fp(&KEY, b"v")), Some(2));
+        let r = row(Some(compute_fp(&KEY, b"v").unwrap()), Some(2));
         let verdict = judged(&r, None, None);
         assert!(
             matches!(verdict, Verdict::Missing),
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn another_fence_key_id_cannot_be_verified() {
-        let r = row(Some(compute_fp(&KEY, b"v")), Some(2));
+        let r = row(Some(compute_fp(&KEY, b"v").unwrap()), Some(2));
         let verdict = judged(&r, Some(b"v"), Some(&KEY));
         assert!(
             matches!(verdict, Verdict::UnknownFenceKey),
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn a_fingerprint_without_a_fence_key_is_never_copied() {
-        let r = row(Some(compute_fp(&KEY, b"v")), Some(1));
+        let r = row(Some(compute_fp(&KEY, b"v").unwrap()), Some(1));
         let verdict = judged(&r, Some(b"v"), None);
         assert!(
             matches!(verdict, Verdict::UnknownFenceKey),

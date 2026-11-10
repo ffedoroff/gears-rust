@@ -148,7 +148,8 @@ fn dataset() -> Dataset {
             let mut row = row;
             row.fp = Some(credstore_value_migration::fence::compute_fp(
                 &FENCE_KEY, &value,
-            ));
+            )
+            .unwrap());
             row
         } else {
             row

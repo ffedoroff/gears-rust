@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use credstore_sdk::CREDENTIAL_RESOURCE_TYPE;
-use event_broker_sdk::gts::derived_event_type_schema;
 use event_broker_sdk::{Event, EventBrokerApi, GtsTypeId};
 use serde_json::json;
 use toolkit_gts::gts_id;
@@ -188,14 +187,27 @@ fn audit_topic() -> serde_json::Value {
     })
 }
 
-/// The derived event-type schema registered in the types-registry.
+/// The derived event-type schema registered in the types-registry: the payload
+/// contract narrows the base's `data` member, the governing metadata is
+/// `x-gts-traits` (topic, allowed subject types, per-tenant partitioning).
 fn audit_event_type() -> serde_json::Value {
-    derived_event_type_schema(
-        SECRET_AUDIT_EVENT_TYPE_ID,
-        AUDIT_TOPIC_ID,
-        audit_data_schema(),
-        &[CREDENTIAL_RESOURCE_TYPE],
-    )
+    json!({
+        "$id": format!("{}{SECRET_AUDIT_EVENT_TYPE_ID}", toolkit_gts::GTS_ID_URI_PREFIX),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "x-gts-traits": {
+            "topic": AUDIT_TOPIC_ID,
+            "allowed_subject_types": [CREDENTIAL_RESOURCE_TYPE],
+            "partition_key": "/tenant_id",
+        },
+        "type": "object",
+        "allOf": [
+            { "$ref": toolkit_gts::gts_uri!("cf.core.events.event.v1~") },
+            {
+                "type": "object",
+                "properties": { "data": audit_data_schema() },
+            },
+        ],
+    })
 }
 
 /// Declare the audit topic and event type in the types-registry.

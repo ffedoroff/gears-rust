@@ -279,7 +279,7 @@ fn build_facade_with_client_and_purge(
 /// tenant-lifecycle metrics port supplied by the caller.
 fn build_facade_with_tenant_metrics(
     server: &MockServer,
-    client: Arc<dyn CredStoreClientV1>,
+    client: Arc<dyn CredStoreClientV2>,
     hook: Arc<dyn TenantAccountPurgeHook>,
     tenant_metrics: Arc<dyn TenantLifecycleMetricsPort>,
 ) -> TenantFacade {
@@ -2833,7 +2833,7 @@ async fn deprovision_created_with_realm_gone_deletes_secret_and_returns_not_foun
     );
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     let ctx = build_system_ctx(Uuid::nil());
     let req = deprovision_req(
@@ -2878,7 +2878,7 @@ async fn deprovision_created_with_realm_gone_retries_when_secret_delete_fails() 
     );
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     let ctx = build_system_ctx(Uuid::nil());
     let req = deprovision_req(
@@ -2919,7 +2919,7 @@ async fn deprovision_with_unconfirmed_token_404_stays_retryable() {
         );
         let facade = build_facade_with_unified_client(
             &server,
-            Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+            Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
         );
         let ctx = build_system_ctx(Uuid::nil());
         let req = deprovision_req(
@@ -2994,7 +2994,7 @@ async fn deprovision_created_with_cached_token_and_realm_gone_deletes_secret() {
     mutator.seed_get(SECRET_REF, "per-realm-ra-secret");
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     facade
         .kc_factory
@@ -3049,7 +3049,7 @@ async fn deprovision_created_with_realm_and_secret_gone_returns_not_found() {
     let mutator = Arc::new(ConfigurableStubOpenBao::default());
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     let ctx = build_system_ctx(Uuid::nil());
     let req = deprovision_req(
@@ -3089,7 +3089,7 @@ async fn deprovision_with_unreadable_secret_and_realm_present_keeps_credstore_re
     let mutator = Arc::new(ConfigurableStubOpenBao::default());
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     let ctx = build_system_ctx(Uuid::nil());
     let req = deprovision_req(
@@ -3130,7 +3130,7 @@ async fn deprovision_adopted_with_realm_gone_keeps_operator_secret() {
     mutator.seed_get(SECRET_REF, "operator-owned-secret");
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     let ctx = build_system_ctx(Uuid::nil());
     let req = deprovision_req(
@@ -3263,7 +3263,7 @@ async fn deprovision_created_with_realm_gone_and_secret_read_error_returns_not_f
     ));
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     let ctx = build_system_ctx(Uuid::nil());
     let req = deprovision_req(
@@ -3353,7 +3353,7 @@ async fn deprovision_created_with_group_already_gone_finishes_realm_teardown() {
     mutator.seed_get(SECRET_REF, "per-realm-ra-secret");
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     let ctx = build_system_ctx(Uuid::nil());
     let req = deprovision_req(
@@ -3411,7 +3411,7 @@ async fn deprovision_created_with_group_already_gone_and_remaining_tenants_retur
     mutator.seed_get(SECRET_REF, "per-realm-ra-secret");
     let facade = build_facade_with_unified_client(
         &server,
-        Arc::clone(&mutator) as Arc<dyn CredStoreClientV1>,
+        Arc::clone(&mutator) as Arc<dyn CredStoreClientV2>,
     );
     let ctx = build_system_ctx(Uuid::nil());
     let req = deprovision_req(

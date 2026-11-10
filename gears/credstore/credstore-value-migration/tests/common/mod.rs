@@ -425,7 +425,7 @@ impl Row {
             sharing: 2,
             owner: Uuid::nil(),
             status: 2,
-            fp: Some(compute_fp(&FENCE_KEY, value)),
+            fp: Some(compute_fp(&FENCE_KEY, value).unwrap()),
             fp_key_id: Some(1),
             ty: TYPE_A,
         }
@@ -440,7 +440,7 @@ impl Row {
 
     fn refingerprinted(mut self) -> Self {
         if self.fp.is_some() {
-            self.fp = Some(compute_fp(&FENCE_KEY, &self.value()));
+            self.fp = Some(compute_fp(&FENCE_KEY, &self.value()).unwrap());
         }
         self
     }

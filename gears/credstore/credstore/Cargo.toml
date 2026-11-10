@@ -40,9 +40,6 @@ axum = { workspace = true }
 # Bounded-concurrency value reads in a list selecting `secret` (DESIGN §4.6):
 # `stream::iter(...).buffer_unordered(SECRET_READ_CONCURRENCY)`.
 futures = { workspace = true }
-# SHA-256 for the weak ETag hash in the REST layer (AWS-LC, the workspace's
-# FIPS-capable crypto backend).
-aws-lc-rs = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 serde = { workspace = true }

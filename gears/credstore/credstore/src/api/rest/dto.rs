@@ -402,15 +402,13 @@ impl CredentialDto {
 #[must_use]
 pub fn weak_etag(tenant_id: Uuid, reference: &str, winner_id: Uuid, winner_version: i64) -> String {
     let input = format!("{tenant_id}|{reference}|{winner_id}|{winner_version}");
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, input.as_bytes());
-    let hex: String = digest.as_ref()[..8]
-        .iter()
-        .fold(String::new(), |mut acc, b| {
-            use std::fmt::Write as _;
-            // Writing into a String cannot fail.
-            let _written = write!(acc, "{b:02x}");
-            acc
-        });
+    let digest = toolkit_security::crypto::hash::Sha256::digest(input.as_bytes());
+    let hex: String = digest[..8].iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write as _;
+        // Writing into a String cannot fail.
+        let _written = write!(acc, "{b:02x}");
+        acc
+    });
     format!("W/\"{hex}\"")
 }
 

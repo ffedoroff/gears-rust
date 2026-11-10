@@ -333,7 +333,7 @@ impl CachedPlanes {
         ttl: Duration,
         max_stale: Duration,
     ) -> Self {
-        let credstore: Arc<dyn CredStoreClientV1> = Arc::new(MockCredStoreClient::empty());
+        let credstore: Arc<dyn CredStoreClientV2> = Arc::new(MockCredStoreClient::empty());
         let metrics = Arc::new(CacheMetrics::default());
         let cache = Arc::new(ProxyConfigCache::new(ttl, max_stale, 100, metrics.clone()));
         let reader = CachedProxyConfigReader::new(
