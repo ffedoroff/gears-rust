@@ -2,12 +2,16 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 pub mod api;
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod error;
 pub mod field;
 pub mod gts;
 pub mod models;
 pub mod plugin_api;
 pub mod reason;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub mod types;
 
 pub use ::gts::GtsId;
