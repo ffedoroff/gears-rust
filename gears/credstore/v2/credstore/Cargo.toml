@@ -26,12 +26,15 @@ toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-db = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
-toolkit-odata = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 tenant-resolver-sdk = { workspace = true }
+tenant-resolver = { workspace = true }
 types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
 
 async-trait = { workspace = true }
+axum = { workspace = true }
 # Bounded-concurrency value reads in a list selecting `secret` (DESIGN §4.6):
 # `stream::iter(...).buffer_unordered(SECRET_READ_CONCURRENCY)`.
 futures = { workspace = true }
@@ -41,11 +44,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 jsonschema = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 time = { workspace = true }
+utoipa = { workspace = true }
 opentelemetry = { workspace = true, features = ["metrics"] }
 # Link-time GTS permission catalog (`src/gts/permissions.rs`): declares
 # AuthzPermissionV1 instances into the toolkit-gts inventory that
@@ -61,6 +66,7 @@ gts = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+tower = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
